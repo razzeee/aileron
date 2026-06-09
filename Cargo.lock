@@ -19,6 +19,7 @@ dependencies = [
  "aileron-varlink",
  "anyhow",
  "chrono",
+ "glib",
  "gtk4",
  "libadwaita",
  "serde",
@@ -53,6 +54,7 @@ name = "aileron-demo"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "glib",
  "gtk4",
  "libadwaita",
  "reqwest",

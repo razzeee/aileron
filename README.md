@@ -2,7 +2,7 @@
 
 A system-level local AI API for Linux — the missing counterpart to Apple's FoundationModels framework.
 
-Aileron provides sandboxed applications with access to on-device inference through [xdg-desktop-portal](https://github.com/flatpak/xdg-desktop-portal), with no network exposure, no shared REST server, and no inference engine code running in the host session.
+Aileron provides sandboxed applications with access to on-device inference through [xdg-desktop-portal](https://github.com/flatpak/xdg-desktop-portal), with no network exposure, no shared REST server, and no inference engine code running in the host session. Everything runs locally; no cloud dependency, ever.
 
 ## Problem
 
@@ -31,7 +31,7 @@ Aileron solves both. All IPC is over a Varlink Unix socket. Flatpak sandboxes ca
                                                (inside OCI image)
 ```
 
-The management UI (`aileron`) also speaks directly to the daemon over the same Varlink socket. It runs outside any sandbox.
+The management UI (`aileron`) also speaks directly to the daemon over the same Varlink socket and runs outside any sandbox.
 
 ## Workspace
 
@@ -43,6 +43,13 @@ The management UI (`aileron`) also speaks directly to the daemon over the same V
 | `aileron-demo` | binary | Sandboxed GTK4 article summarizer; end-to-end demo app |
 | `aileron-varlink` | library | Varlink IDL files and generated bindings |
 | `aileron-ipc` | library | Varlink client/server connection helpers |
+
+Container images live in `images/`:
+
+| Directory | Description |
+|---|---|
+| `images/llm/` | llama-cpp-python image for text generation and structured output |
+| `images/asr/` | faster-whisper image for audio transcription |
 
 ## Building
 
@@ -66,20 +73,18 @@ sudo apt install podman
 ### Build all crates
 
 ```sh
-cargo build --workspace
+cargo build --workspace --release
 ```
 
 ### Build only the daemon and portal (no GTK required)
 
 ```sh
-cargo build -p aileron-daemon -p aileron-portal
+cargo build -p aileron-daemon -p aileron-portal --release
 ```
 
 ## Installation
 
 ### Daemon
-
-Copy the binary and install the systemd user service:
 
 ```sh
 install -Dm755 target/release/aileron-daemon ~/.local/bin/aileron-daemon
@@ -95,9 +100,24 @@ The daemon listens on `$XDG_RUNTIME_DIR/aileron.socket`.
 
 ```sh
 install -Dm755 target/release/aileron-portal ~/.local/bin/aileron-portal
-```
 
-The portal must be registered with xdg-desktop-portal. See the [xdg-desktop-portal documentation](https://flatpak.github.io/xdg-desktop-portal/docs/) for how to install a portal backend.
+# systemd user service
+install -Dm644 systemd/aileron-portal.service \
+    ~/.config/systemd/user/aileron-portal.service
+
+# xdg-desktop-portal descriptor (tells the portal frontend which interfaces
+# this backend implements)
+install -Dm644 portal/aileron.portal \
+    /usr/share/xdg-desktop-portal/portals/aileron.portal
+
+# D-Bus session service activation file
+install -Dm644 \
+    portal/org.freedesktop.impl.portal.desktop.aileron.service \
+    /usr/share/dbus-1/services/org.freedesktop.impl.portal.desktop.aileron.service
+
+systemctl --user daemon-reload
+systemctl --user enable --now aileron-portal
+```
 
 ### Management UI
 
@@ -106,35 +126,73 @@ install -Dm755 target/release/aileron ~/.local/bin/aileron
 aileron
 ```
 
-## Getting started
+## Building container images
 
-### 1. Pull a model
+Images are built with `podman build` (or `docker build`). Model weights must either be baked in at build time or mounted at runtime.
 
-Pull an OCI image that implements the container stdio protocol:
+### LLM image
 
 ```sh
-# Using the management UI:
+cd images/llm
+
+# CPU-only, bake in a model from HuggingFace:
+podman build \
+    --build-arg MODEL_URL="https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF/resolve/main/Llama-3.2-3B-Instruct-Q4_K_M.gguf" \
+    -t ghcr.io/aileron/llama3.2-3b-instruct:latest .
+
+# NVIDIA GPU (requires nvidia-container-toolkit):
+podman build \
+    --build-arg CMAKE_ARGS="-DLLAMA_CUDA=on" \
+    --build-arg MODEL_URL="..." \
+    -t ghcr.io/aileron/llama3.2-3b-instruct:cuda .
+
+# Mount a local model file at runtime instead of baking it in:
+podman run --rm -i \
+    -v /path/to/model.gguf:/model/model.gguf:ro \
+    ghcr.io/aileron/llama3.2-3b-instruct:latest
+```
+
+Supported environment variables:
+
+| Variable | Default | Description |
+|---|---|---|
+| `MODEL_PATH` | `/model/model.gguf` | Path to the GGUF model file |
+| `N_CTX` | `4096` | Context window size |
+| `N_GPU_LAYERS` | `0` | Number of layers to offload to GPU |
+
+### ASR image
+
+```sh
+cd images/asr
+
+podman build \
+    --build-arg MODEL_SIZE=small \
+    -t ghcr.io/aileron/whisper-small:latest .
+```
+
+Supported environment variables:
+
+| Variable | Default | Description |
+|---|---|---|
+| `MODEL_SIZE` | `small` | Whisper model size (tiny/base/small/medium/large-v3) |
+| `MODEL_PATH` | `/model` | Directory for cached model weights |
+| `DEVICE` | `cpu` | Inference device (`cpu` or `cuda`) |
+| `COMPUTE_TYPE` | `int8` | Quantisation type (`int8`, `float16`, `float32`) |
+
+## Getting started
+
+### 1. Pull and assign a model
+
+```sh
+# Start the management UI
 aileron
-# → Models page → enter image ref → Pull
-
-# Or directly via the future aileron-cli (not yet implemented):
-# aileron pull ghcr.io/aileron/llama3.2-3b-instruct:latest
 ```
 
-### 2. Assign a use-case
+In the **Models** page, enter an image reference and click **Pull**. Once pulled, click **Delete** ▸ dropdown ▸ **Assign use-case** to bind the image to a use-case token.
 
-Open the management UI, right-click the model, and select "Assign use-case". Or use the Varlink interface directly:
+### 2. Grant permission to an app
 
-```
-aileron.Models.AssignUseCase(
-    image_ref: "ghcr.io/aileron/llama3.2-3b-instruct:latest",
-    use_case:  "llm.summarize"
-)
-```
-
-### 3. Grant permission to an app
-
-The first time an app requests inference, Aileron will deny it (no entry exists). Grant access through the Permissions page in the management UI, or set it directly:
+The first time an app requests inference, Aileron denies it (no entry exists). Grant access in the **Permissions** page, or directly via Varlink:
 
 ```
 aileron.Permissions.SetAppPermission(
@@ -144,13 +202,13 @@ aileron.Permissions.SetAppPermission(
 )
 ```
 
-### 4. Run the demo app
+### 3. Run the demo app
 
 ```sh
 cargo run -p aileron-demo
 ```
 
-Paste or fetch an article URL, then click **Summarize**. The app calls the portal with `llm.summarize`; the portal forwards to the daemon; the daemon runs the assigned container and streams tokens back.
+Paste or fetch an article URL, then click **Summarize**. Tokens stream into the output view as they arrive from the container.
 
 ## Use-case tokens
 
@@ -171,17 +229,18 @@ The daemon exposes four interfaces over `$XDG_RUNTIME_DIR/aileron.socket`.
 
 ### `aileron.Inference`
 
-Create sessions, generate text, transcribe audio, describe images.
+Create sessions, generate text, get structured JSON output, transcribe audio, describe images.
 
 ```varlink
 method CreateSession(app_id: string, use_case: string) -> (session_id: string)
 method Generate(session_id: string, prompt: string) -> (token: string)
+method GenerateStructured(session_id: string, prompt: string, schema: string) -> (result: string)
 method Transcribe(session_id: string, audio: string) -> (text: string)
 method Describe(session_id: string, image: string) -> (text: string)
 method EndSession(session_id: string) -> ()
 ```
 
-`audio` and `image` are base64-encoded bytes.
+`audio` and `image` are base64-encoded bytes. `schema` is a JSON Schema object serialised as a string.
 
 ### `aileron.Models`
 
@@ -216,27 +275,72 @@ Full IDL: [`crates/aileron-varlink/varlink/`](crates/aileron-varlink/varlink/)
 
 ## Container stdio protocol
 
-Each OCI image must implement a simple newline-delimited JSON protocol over stdin/stdout. No ports, no sockets — the container has no network access.
+Each OCI image implements a simple newline-delimited JSON protocol over stdin/stdout. No ports, no sockets — the container has no network access.
 
-**Request (daemon → container):**
+### Streaming text generation
+
 ```json
-{"id": "uuid", "type": "generate", "prompt": "...", "max_tokens": 512}
-{"id": "uuid", "type": "transcribe", "audio": "<base64>"}
-{"id": "uuid", "type": "describe", "image": "<base64>"}
+// request
+{"id": "uuid", "type": "generate", "prompt": "Summarise this: ...", "max_tokens": 512}
+
+// response (one line per token)
+{"id": "uuid", "token": "Here"}
+{"id": "uuid", "token": " is", "done": true}
 ```
 
-**Response (container → daemon, streamed):**
+### Structured output
+
+The daemon sends a `response_format` object containing the caller's JSON Schema. The container must constrain sampling to valid JSON (e.g. via llama.cpp grammar) and reply with a single `result` line. The daemon validates the result against the schema before returning it; mismatches produce a `SchemaValidationFailed` error.
+
 ```json
-{"id": "uuid", "token": "Hello"}
-{"id": "uuid", "token": " world"}
-{"id": "uuid", "done": true}
+// request
+{
+  "id": "uuid",
+  "type": "generate_structured",
+  "prompt": "Extract the author and year from: ...",
+  "max_tokens": 256,
+  "response_format": {
+    "type": "json_schema",
+    "schema": {
+      "type": "object",
+      "properties": {
+        "author": {"type": "string"},
+        "year":   {"type": "integer"}
+      },
+      "required": ["author", "year"]
+    }
+  }
+}
+
+// response (single line)
+{"id": "uuid", "result": "{\"author\": \"Turing\", \"year\": 1950}", "done": true}
+```
+
+### Audio transcription
+
+```json
+// request
+{"id": "uuid", "type": "transcribe", "audio": "<base64 PCM 16kHz mono f32le>"}
+
+// response (streamed segment text)
+{"id": "uuid", "token": "Hello world.", "done": true}
+```
+
+### Image description
+
+```json
+// request
+{"id": "uuid", "type": "describe", "image": "<base64 PNG or JPEG>"}
+
+// response (streamed)
+{"id": "uuid", "token": "A cat", "done": true}
 ```
 
 ## Container lifecycle
 
-- Containers are started on demand, the first time a session uses a given use-case.
+- Containers start on demand, the first time a session uses a given use-case.
 - One container runs per use-case, shared across all sessions for that use-case.
-- Idle containers are terminated after 5 minutes (configurable).
+- Idle containers are terminated after 5 minutes (configurable via the daemon).
 - A crash in the container kills only that container, not the daemon.
 
 ## Data files
@@ -248,9 +352,9 @@ Each OCI image must implement a simple newline-delimited JSON protocol over stdi
 
 ## Security properties
 
-- No inference engine code runs in the daemon process.
-- No REST API, no TCP, no UDP. The attack surface is the Varlink Unix socket and D-Bus.
-- OCI images are content-addressed; image refs can be pinned to a digest.
+- No inference engine code runs in the daemon process. A crash in llama.cpp kills the container, not the daemon.
+- No REST API, no TCP, no UDP. Attack surface is the Varlink Unix socket and D-Bus.
+- OCI images are content-addressed; image refs can be pinned to a digest (`@sha256:...`).
 - Per-app permissions are enforced in the daemon, not the portal.
 - `aileron-demo` is a real Flatpak sandbox — it cannot reach the Varlink socket directly.
 - The daemon runs with `PrivateNetwork=yes` in the systemd unit.
@@ -260,8 +364,6 @@ Each OCI image must implement a simple newline-delimited JSON protocol over stdi
 - GPU/accelerator selection (the container runtime handles this)
 - Multi-user (the daemon is a user service, one instance per login session)
 - Model signature verification (podman trust policy handles this)
-- Structured output / typed responses (plain text streaming only)
-- Cloud model fallback
 - A system-wide shared model store
 
 ## License

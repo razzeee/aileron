@@ -2,29 +2,45 @@
 
 use gtk4::prelude::*;
 use libadwaita::prelude::*;
-use gtk4::{Box, Button, Entry, ListBox, Orientation, ProgressBar, ScrolledWindow};
-use libadwaita::{ActionRow, PreferencesGroup};
+use gtk4::{Box, Button, Entry, Label, ListBox, Orientation, ProgressBar, ScrolledWindow};
+use libadwaita::{ActionRow, PreferencesGroup, PreferencesPage};
 
 pub fn build() -> gtk4::Widget {
-    let vbox = Box::new(Orientation::Vertical, 12);
-    vbox.set_margin_top(12);
-    vbox.set_margin_bottom(12);
-    vbox.set_margin_start(12);
-    vbox.set_margin_end(12);
+    let page = PreferencesPage::new();
 
-    // ── Pull section ──────────────────────────────────────────────────────────
+    // ── Pull group ────────────────────────────────────────────────────────────
     let pull_group = PreferencesGroup::new();
     pull_group.set_title("Pull Model");
+    pull_group.set_description(Some("Enter an OCI image reference to pull a new model."));
 
+    // The pull row is a horizontal Box inside an ActionRow's child.
     let image_entry = Entry::builder()
         .placeholder_text("ghcr.io/aileron/llama3.2-3b-instruct:latest")
         .hexpand(true)
         .build();
 
+    let pull_button = Button::with_label("Pull");
+    pull_button.add_css_class("suggested-action");
+
     let progress = ProgressBar::new();
     progress.set_visible(false);
 
-    let pull_button = Button::with_label("Pull");
+    let pull_row_box = Box::new(Orientation::Horizontal, 8);
+    pull_row_box.set_margin_top(8);
+    pull_row_box.set_margin_bottom(4);
+    pull_row_box.append(&image_entry);
+    pull_row_box.append(&pull_button);
+
+    let pull_vbox = Box::new(Orientation::Vertical, 4);
+    pull_vbox.set_margin_top(4);
+    pull_vbox.set_margin_bottom(8);
+    pull_vbox.set_margin_start(12);
+    pull_vbox.set_margin_end(12);
+    pull_vbox.append(&pull_row_box);
+    pull_vbox.append(&progress);
+
+    pull_group.add(&pull_vbox);
+
     {
         let entry = image_entry.clone();
         let progress = progress.clone();
@@ -35,7 +51,6 @@ pub fn build() -> gtk4::Widget {
             }
             progress.set_visible(true);
             progress.pulse();
-
             let progress_clone = progress.clone();
             std::thread::spawn(move || {
                 use aileron_varlink::aileron_Models::VarlinkClientInterface;
@@ -50,45 +65,35 @@ pub fn build() -> gtk4::Widget {
         });
     }
 
-    let pull_row = Box::new(Orientation::Horizontal, 8);
-    pull_row.append(&image_entry);
-    pull_row.append(&pull_button);
+    page.add(&pull_group);
 
-    let pull_box = Box::new(Orientation::Vertical, 4);
-    pull_box.append(&pull_row);
-    pull_box.append(&progress);
-    pull_group.add(&pull_box);
-
-    vbox.append(&pull_group);
-
-    // ── Installed models list ─────────────────────────────────────────────────
+    // ── Installed models group ────────────────────────────────────────────────
     let models_group = PreferencesGroup::new();
     models_group.set_title("Installed Models");
 
     let refresh_button = Button::with_label("Refresh");
+    models_group.set_header_suffix(Some(&refresh_button));
+
     let list_box = ListBox::new();
     list_box.set_selection_mode(gtk4::SelectionMode::None);
-
-    {
-        let list_box = list_box.clone();
-        refresh_button.connect_clicked(move |_| {
-            refresh_model_list(&list_box);
-        });
-    }
-
-    refresh_model_list(&list_box);
+    list_box.add_css_class("boxed-list");
 
     let scroll = ScrolledWindow::builder()
         .hexpand(true)
         .vexpand(true)
+        .min_content_height(200)
         .child(&list_box)
         .build();
-
-    models_group.add(&refresh_button);
     models_group.add(&scroll);
-    vbox.append(&models_group);
 
-    vbox.upcast()
+    {
+        let list_box = list_box.clone();
+        refresh_button.connect_clicked(move |_| refresh_model_list(&list_box));
+    }
+    refresh_model_list(&list_box);
+
+    page.add(&models_group);
+    page.upcast()
 }
 
 fn refresh_model_list(list_box: &ListBox) {
@@ -97,7 +102,6 @@ fn refresh_model_list(list_box: &ListBox) {
     }
 
     use aileron_varlink::aileron_Models::VarlinkClientInterface;
-
     let conn = match aileron_ipc::client::connect() {
         Ok(c) => c,
         Err(e) => {
@@ -115,36 +119,33 @@ fn refresh_model_list(list_box: &ListBox) {
                 let row = ActionRow::new();
                 row.set_title("No models installed");
                 list_box.append(&row);
+                return;
             }
             for model in &reply.models {
                 let row = ActionRow::new();
                 row.set_title(&model.image_ref);
                 let size_mb = model.size_bytes / 1_000_000;
-                let use_cases = model.use_cases.join(", ");
-                row.set_subtitle(&format!(
-                    "{size_mb} MB  |  use-cases: {}",
-                    if use_cases.is_empty() {
-                        "none".to_string()
-                    } else {
-                        use_cases
-                    }
-                ));
+                let use_cases = if model.use_cases.is_empty() {
+                    "none".to_string()
+                } else {
+                    model.use_cases.join(", ")
+                };
+                row.set_subtitle(&format!("{size_mb} MB  ·  use-cases: {use_cases}"));
 
                 let delete_btn = Button::with_label("Delete");
                 delete_btn.add_css_class("destructive-action");
+                delete_btn.set_valign(gtk4::Align::Center);
                 let image_ref = model.image_ref.clone();
                 let list_box_ref = list_box.clone();
                 delete_btn.connect_clicked(move |_| {
                     use aileron_varlink::aileron_Models::VarlinkClientInterface;
                     if let Ok(conn) = aileron_ipc::client::connect() {
-                        let mut client =
-                            aileron_varlink::aileron_Models::VarlinkClient::new(conn);
-                        let _ = client.delete(image_ref.clone()).call();
+                        let mut c = aileron_varlink::aileron_Models::VarlinkClient::new(conn);
+                        let _ = c.delete(image_ref.clone()).call();
                     }
                     refresh_model_list(&list_box_ref);
                 });
                 row.add_suffix(&delete_btn);
-
                 list_box.append(&row);
             }
         }

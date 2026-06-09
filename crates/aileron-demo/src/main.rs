@@ -8,6 +8,7 @@ fn main() {
         )
         .init();
 
+    libadwaita::init().expect("failed to initialise libadwaita");
     let application = app::build_app();
     application.run();
 }

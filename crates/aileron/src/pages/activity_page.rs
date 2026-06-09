@@ -2,25 +2,30 @@
 
 use gtk4::prelude::*;
 use libadwaita::prelude::*;
-use gtk4::{Box, Button, ListBox, Orientation, ScrolledWindow};
-use libadwaita::{ActionRow, PreferencesGroup};
+use gtk4::{Button, ListBox, ScrolledWindow};
+use libadwaita::{ActionRow, PreferencesGroup, PreferencesPage};
 
 pub fn build() -> gtk4::Widget {
-    let vbox = Box::new(Orientation::Vertical, 12);
-    vbox.set_margin_top(12);
-    vbox.set_margin_bottom(12);
-    vbox.set_margin_start(12);
-    vbox.set_margin_end(12);
+    let page = PreferencesPage::new();
 
     let group = PreferencesGroup::new();
     group.set_title("Active Sessions");
+    group.set_description(Some("Refreshes automatically every 2 seconds."));
 
     let list_box = ListBox::new();
     list_box.set_selection_mode(gtk4::SelectionMode::None);
+    list_box.add_css_class("boxed-list");
+
+    let scroll = ScrolledWindow::builder()
+        .hexpand(true)
+        .vexpand(true)
+        .min_content_height(300)
+        .child(&list_box)
+        .build();
+    group.add(&scroll);
 
     refresh_sessions(&list_box);
 
-    // Auto-refresh every 2 seconds.
     {
         let list_box = list_box.clone();
         glib::timeout_add_seconds_local(2, move || {
@@ -29,15 +34,8 @@ pub fn build() -> gtk4::Widget {
         });
     }
 
-    let scroll = ScrolledWindow::builder()
-        .hexpand(true)
-        .vexpand(true)
-        .child(&list_box)
-        .build();
-
-    group.add(&scroll);
-    vbox.append(&group);
-    vbox.upcast()
+    page.add(&group);
+    page.upcast()
 }
 
 fn refresh_sessions(list_box: &ListBox) {
@@ -46,9 +44,8 @@ fn refresh_sessions(list_box: &ListBox) {
     }
 
     use aileron_varlink::aileron_Sessions::VarlinkClientInterface;
-
     let conn = match aileron_ipc::client::connect() {
-        Ok(c) => c,
+        Ok(_c) => _c,
         Err(_) => {
             let row = ActionRow::new();
             row.set_title("Daemon not reachable");
@@ -64,6 +61,7 @@ fn refresh_sessions(list_box: &ListBox) {
                 let row = ActionRow::new();
                 row.set_title("No active sessions");
                 list_box.append(&row);
+                return;
             }
             for session in &reply.sessions {
                 let row = ActionRow::new();
@@ -72,19 +70,18 @@ fn refresh_sessions(list_box: &ListBox) {
 
                 let kill_btn = Button::with_label("Kill");
                 kill_btn.add_css_class("destructive-action");
-                let session_id = session.session_id.clone();
+                kill_btn.set_valign(gtk4::Align::Center);
+                let session_id  = session.session_id.clone();
                 let list_box_ref = list_box.clone();
                 kill_btn.connect_clicked(move |_| {
                     use aileron_varlink::aileron_Sessions::VarlinkClientInterface;
                     if let Ok(conn) = aileron_ipc::client::connect() {
-                        let mut client =
-                            aileron_varlink::aileron_Sessions::VarlinkClient::new(conn);
-                        let _ = client.kill_session(session_id.clone()).call();
+                        let mut c = aileron_varlink::aileron_Sessions::VarlinkClient::new(conn);
+                        let _ = c.kill_session(session_id.clone()).call();
                     }
                     refresh_sessions(&list_box_ref);
                 });
                 row.add_suffix(&kill_btn);
-
                 list_box.append(&row);
             }
         }

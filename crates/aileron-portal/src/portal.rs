@@ -106,4 +106,28 @@ impl AiPortalBackend {
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         Ok(())
     }
+
+    /// `schema`: JSON Schema object serialised as a string.
+    /// Returns a JSON string that validates against the schema.
+    async fn generate_structured(
+        &self,
+        session_id: &str,
+        prompt: &str,
+        schema: &str,
+    ) -> zbus::fdo::Result<String> {
+        use aileron_varlink::aileron_Inference::VarlinkClientInterface;
+
+        let conn = aileron_ipc::client::connect()
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn);
+        let reply = client
+            .generate_structured(
+                session_id.to_string(),
+                prompt.to_string(),
+                schema.to_string(),
+            )
+            .call()
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        Ok(reply.result)
+    }
 }

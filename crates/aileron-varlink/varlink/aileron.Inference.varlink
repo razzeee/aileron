@@ -12,6 +12,11 @@ method CreateSession(app_id: string, use_case: string) -> (session_id: string)
 # Returns a stream of token strings.
 method Generate(session_id: string, prompt: string) -> (token: string)
 
+# Generate text constrained to a JSON Schema.
+# schema: a JSON Schema object serialised as a string (e.g. '{"type":"object","properties":{...}}')
+# Returns a single JSON string that validates against the provided schema.
+method GenerateStructured(session_id: string, prompt: string, schema: string) -> (result: string)
+
 # Transcribe audio. Session must have been created with use_case: asr.transcribe
 # audio: raw PCM bytes encoded as base64 (16kHz mono f32le)
 method Transcribe(session_id: string, audio: string) -> (text: string)
@@ -26,3 +31,5 @@ method EndSession(session_id: string) -> ()
 error PermissionDenied(app_id: string, use_case: string)
 error SessionNotFound(session_id: string)
 error NoModelAssigned(use_case: string)
+# Returned when GenerateStructured produces output that does not validate against the schema.
+error SchemaValidationFailed(reason: string)

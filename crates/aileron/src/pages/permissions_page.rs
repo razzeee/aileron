@@ -2,42 +2,38 @@
 
 use gtk4::prelude::*;
 use libadwaita::prelude::*;
-use gtk4::{Box, Button, ListBox, Orientation, ScrolledWindow};
-use libadwaita::{ActionRow, PreferencesGroup, SwitchRow};
+use gtk4::{Button, ListBox, ScrolledWindow};
+use libadwaita::{ActionRow, PreferencesGroup, PreferencesPage, SwitchRow};
 
 pub fn build() -> gtk4::Widget {
-    let vbox = Box::new(Orientation::Vertical, 12);
-    vbox.set_margin_top(12);
-    vbox.set_margin_bottom(12);
-    vbox.set_margin_start(12);
-    vbox.set_margin_end(12);
+    let page = PreferencesPage::new();
 
     let group = PreferencesGroup::new();
     group.set_title("App Permissions");
 
     let refresh_button = Button::with_label("Refresh");
+    group.set_header_suffix(Some(&refresh_button));
+
     let list_box = ListBox::new();
     list_box.set_selection_mode(gtk4::SelectionMode::None);
-
-    {
-        let list_box = list_box.clone();
-        refresh_button.connect_clicked(move |_| {
-            refresh_permissions(&list_box);
-        });
-    }
-
-    refresh_permissions(&list_box);
+    list_box.add_css_class("boxed-list");
 
     let scroll = ScrolledWindow::builder()
         .hexpand(true)
         .vexpand(true)
+        .min_content_height(300)
         .child(&list_box)
         .build();
-
-    group.add(&refresh_button);
     group.add(&scroll);
-    vbox.append(&group);
-    vbox.upcast()
+
+    {
+        let list_box = list_box.clone();
+        refresh_button.connect_clicked(move |_| refresh_permissions(&list_box));
+    }
+    refresh_permissions(&list_box);
+
+    page.add(&group);
+    page.upcast()
 }
 
 fn refresh_permissions(list_box: &ListBox) {
@@ -46,7 +42,6 @@ fn refresh_permissions(list_box: &ListBox) {
     }
 
     use aileron_varlink::aileron_Permissions::VarlinkClientInterface;
-
     let conn = match aileron_ipc::client::connect() {
         Ok(c) => c,
         Err(e) => {
@@ -64,37 +59,31 @@ fn refresh_permissions(list_box: &ListBox) {
                 let row = ActionRow::new();
                 row.set_title("No permissions recorded");
                 list_box.append(&row);
+                return;
             }
             for perm in &reply.permissions {
                 let row = SwitchRow::builder()
                     .title(&perm.use_case)
                     .active(perm.allowed)
                     .build();
-
                 let subtitle = match &perm.last_used {
                     Some(lu) => format!("{} — last used: {}", perm.app_id, lu),
                     None => perm.app_id.clone(),
                 };
                 row.set_subtitle(&subtitle);
 
-                let app_id = perm.app_id.clone();
+                let app_id   = perm.app_id.clone();
                 let use_case = perm.use_case.clone();
                 row.connect_active_notify(move |switch| {
                     use aileron_varlink::aileron_Permissions::VarlinkClientInterface;
                     let allowed = switch.is_active();
                     if let Ok(conn) = aileron_ipc::client::connect() {
-                        let mut client =
-                            aileron_varlink::aileron_Permissions::VarlinkClient::new(conn);
-                        let _ = client
-                            .set_app_permission(
-                                app_id.clone(),
-                                use_case.clone(),
-                                allowed,
-                            )
+                        let mut c = aileron_varlink::aileron_Permissions::VarlinkClient::new(conn);
+                        let _ = c
+                            .set_app_permission(app_id.clone(), use_case.clone(), allowed)
                             .call();
                     }
                 });
-
                 list_box.append(&row);
             }
         }

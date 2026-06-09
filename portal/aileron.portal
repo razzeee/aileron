@@ -1,0 +1,4 @@
+[portal]
+DBusName=org.freedesktop.impl.portal.desktop.aileron
+Interfaces=org.freedesktop.impl.portal.AI;
+UseIn=gnome;kde;lxqt;

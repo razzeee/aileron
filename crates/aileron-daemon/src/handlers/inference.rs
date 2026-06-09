@@ -4,8 +4,8 @@ use uuid::Uuid;
 
 use crate::state::SharedState;
 use aileron_varlink::aileron_Inference::{
-    Call_CreateSession, Call_Describe, Call_EndSession, Call_Generate, Call_Transcribe,
-    VarlinkCallError, VarlinkInterface,
+    Call_CreateSession, Call_Describe, Call_EndSession, Call_Generate,
+    Call_GenerateStructured, Call_Transcribe, VarlinkCallError, VarlinkInterface,
 };
 
 pub struct InferenceHandler {
@@ -168,6 +168,60 @@ impl VarlinkInterface for InferenceHandler {
                 return call.reply_session_not_found(session_id);
             }
             call.reply()
+        })
+    }
+
+    fn generate_structured(
+        &self,
+        call: &mut dyn Call_GenerateStructured,
+        session_id: String,
+        prompt: String,
+        schema: String,
+    ) -> varlink::Result<()> {
+        let rt = tokio::runtime::Handle::current();
+        rt.block_on(async {
+            let mut guard = self.state.0.lock().await;
+
+            let (app_id, use_case) = match guard.sessions.get(&session_id) {
+                Some(s) => (s.app_id.clone(), s.use_case.clone()),
+                None => return call.reply_session_not_found(session_id),
+            };
+
+            let image_ref = match guard.assignments.get(&use_case) {
+                Some(r) => r.to_string(),
+                None => return call.reply_no_model_assigned(use_case),
+            };
+
+            let _ = guard.permissions.touch(&app_id, &use_case);
+
+            // Parse the caller-supplied schema string into a JSON value so it
+            // can be forwarded to the container and used for validation.
+            let schema_value: serde_json::Value = match serde_json::from_str(&schema) {
+                Ok(v) => v,
+                Err(e) => return call.reply_schema_validation_failed(
+                    format!("invalid schema JSON: {e}")
+                ),
+            };
+
+            let container = guard.containers.get_or_spawn(&use_case, &image_ref)
+                .map_err(io_err)?;
+
+            match container.generate_structured(&prompt, 1024, &schema_value) {
+                Ok(result) => call.reply(result),
+                Err(e) => {
+                    let msg = e.to_string();
+                    // Distinguish validation failures from I/O failures.
+                    if msg.contains("not valid JSON")
+                        || msg.contains("expected ")
+                        || msg.contains("missing required")
+                        || msg.contains("is not in enum")
+                    {
+                        call.reply_schema_validation_failed(msg)
+                    } else {
+                        Err(io_err(msg))
+                    }
+                }
+            }
         })
     }
 }

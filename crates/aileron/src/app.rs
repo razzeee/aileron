@@ -1,8 +1,8 @@
 use gtk4::prelude::*;
 use libadwaita::prelude::*;
-use libadwaita::{Application, ApplicationWindow, HeaderBar, NavigationView, NavigationPage};
+use libadwaita::{Application, ApplicationWindow, HeaderBar, ToolbarView, ViewStack, ViewSwitcher};
 
-use crate::pages::{models_page, permissions_page, activity_page};
+use crate::pages::{activity_page, models_page, permissions_page};
 
 pub fn build_app() -> Application {
     let app = Application::builder()
@@ -17,64 +17,44 @@ pub fn build_app() -> Application {
 }
 
 fn build_window(app: &Application) {
-    let nav_view = NavigationView::new();
+    // AdwViewStack provides the per-page title/icon metadata that AdwViewSwitcher needs.
+    let stack = ViewStack::new();
 
-    // Models page
-    let models_nav = NavigationPage::builder()
-        .title("Models")
-        .tag("models")
-        .child(&models_page::build())
+    let models_page = stack.add_titled(&models_page::build(), Some("models"), "Models");
+    models_page.set_icon_name(Some("drive-harddisk-symbolic"));
+
+    let perms_page = stack.add_titled(
+        &permissions_page::build(),
+        Some("permissions"),
+        "Permissions",
+    );
+    perms_page.set_icon_name(Some("system-lock-screen-symbolic"));
+
+    let activity_page = stack.add_titled(
+        &activity_page::build(),
+        Some("activity"),
+        "Activity",
+    );
+    activity_page.set_icon_name(Some("emblem-synchronizing-symbolic"));
+
+    // The switcher sits in the header bar.
+    let switcher = ViewSwitcher::builder()
+        .stack(&stack)
+        .policy(libadwaita::ViewSwitcherPolicy::Wide)
         .build();
 
-    // Permissions page
-    let perms_nav = NavigationPage::builder()
-        .title("Permissions")
-        .tag("permissions")
-        .child(&permissions_page::build())
-        .build();
-
-    // Activity page
-    let activity_nav = NavigationPage::builder()
-        .title("Activity")
-        .tag("activity")
-        .child(&activity_page::build())
-        .build();
-
-    nav_view.add(&models_nav);
-
-    // Sidebar switcher row
-    let toolbar_view = libadwaita::ToolbarView::new();
     let header = HeaderBar::new();
-
-    // Navigation switcher buttons in the header.
-    let switcher = libadwaita::ViewSwitcher::new();
-    let stack = gtk4::Stack::new();
-
-    stack.add_named(&models_page::build(), Some("models"));
-    stack.add_named(&permissions_page::build(), Some("permissions"));
-    stack.add_named(&activity_page::build(), Some("activity"));
-
-    stack.child_by_name("models")
-        .unwrap()
-        .set_property("title", "Models");
-    stack.child_by_name("permissions")
-        .unwrap()
-        .set_property("title", "Permissions");
-    stack.child_by_name("activity")
-        .unwrap()
-        .set_property("title", "Activity");
-
-    switcher.set_stack(Some(&stack));
     header.set_title_widget(Some(&switcher));
 
+    let toolbar_view = ToolbarView::new();
     toolbar_view.add_top_bar(&header);
     toolbar_view.set_content(Some(&stack));
 
     let window = ApplicationWindow::builder()
         .application(app)
         .title("Aileron")
-        .default_width(800)
-        .default_height(600)
+        .default_width(860)
+        .default_height(640)
         .content(&toolbar_view)
         .build();
 

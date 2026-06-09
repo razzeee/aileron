@@ -4,10 +4,34 @@
 /// newline-delimited JSON requests on stdin and emits newline-delimited JSON
 /// response chunks on stdout.
 ///
-/// Protocol:
-///   Request:  {"id":"<uuid>","type":"generate","prompt":"...","max_tokens":512}
-///   Response: {"id":"<uuid>","token":"Hello"}
-///             {"id":"<uuid>","done":true}
+/// ## Protocol
+///
+/// ### Streaming text generation
+/// Request:
+///   {"id":"<uuid>","type":"generate","prompt":"...","max_tokens":512}
+/// Response (one line per token, final line has done:true):
+///   {"id":"<uuid>","token":"Hello"}
+///   {"id":"<uuid>","token":" world","done":true}
+///
+/// ### Structured output (JSON Schema constrained)
+/// Request:
+///   {"id":"<uuid>","type":"generate_structured","prompt":"...",
+///    "max_tokens":1024,
+///    "response_format":{"type":"json_schema","schema":{...}}}
+/// Response (single line, no streaming):
+///   {"id":"<uuid>","result":"{\"name\":\"Alice\",\"age\":30}","done":true}
+///
+/// ### Audio transcription
+/// Request:
+///   {"id":"<uuid>","type":"transcribe","audio":"<base64 PCM>"}
+/// Response (streamed tokens, same as generate):
+///   {"id":"<uuid>","token":"Hello world","done":true}
+///
+/// ### Image description
+/// Request:
+///   {"id":"<uuid>","type":"describe","image":"<base64 PNG/JPEG>"}
+/// Response (same as generate):
+///   {"id":"<uuid>","token":"A cat sitting...","done":true}
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -15,6 +39,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Stdio};
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -53,7 +78,7 @@ impl Container {
     }
 
     /// Send a generate request and collect streamed token responses.
-    /// The callback `on_token` is called for each token as it arrives.
+    /// `on_token` is called once per token as it arrives.
     pub fn generate(
         &mut self,
         prompt: &str,
@@ -68,6 +93,7 @@ impl Container {
             max_tokens: Some(max_tokens),
             audio: None,
             image: None,
+            response_format: None,
         };
         let line = serde_json::to_string(&req)? + "\n";
         self.stdin.write_all(line.as_bytes())?;
@@ -82,7 +108,7 @@ impl Container {
             }
             let resp: ContainerResponse = serde_json::from_str(buf.trim())?;
             if resp.id != id {
-                continue; // stale from previous request
+                continue;
             }
             if let Some(token) = resp.token {
                 on_token(token);
@@ -92,6 +118,60 @@ impl Container {
             }
         }
         Ok(())
+    }
+
+    /// Send a structured-output request.
+    ///
+    /// `schema` must be a valid JSON Schema object (as a `serde_json::Value`).
+    /// The container must reply with a single `result` field containing a JSON
+    /// string.  The daemon validates that string against the schema before
+    /// returning it to the caller.
+    ///
+    /// Returns the validated JSON string.
+    pub fn generate_structured(
+        &mut self,
+        prompt: &str,
+        max_tokens: u32,
+        schema: &Value,
+    ) -> Result<String> {
+        let id = Uuid::new_v4().to_string();
+        let req = ContainerRequest {
+            id: id.clone(),
+            r#type: "generate_structured".to_string(),
+            prompt: Some(prompt.to_string()),
+            max_tokens: Some(max_tokens),
+            audio: None,
+            image: None,
+            response_format: Some(ResponseFormat {
+                r#type: "json_schema".to_string(),
+                schema: schema.clone(),
+            }),
+        };
+        let line = serde_json::to_string(&req)? + "\n";
+        self.stdin.write_all(line.as_bytes())?;
+        self.stdin.flush()?;
+        self.last_used = std::time::Instant::now();
+
+        // Structured responses arrive as a single line with `result`.
+        loop {
+            let mut buf = String::new();
+            let n = self.stdout.read_line(&mut buf)?;
+            if n == 0 {
+                bail!("container stdout closed unexpectedly");
+            }
+            let resp: ContainerResponse = serde_json::from_str(buf.trim())?;
+            if resp.id != id {
+                continue;
+            }
+            if let Some(result) = resp.result {
+                // Validate the returned JSON against the schema.
+                validate_json_schema(&result, schema)?;
+                return Ok(result);
+            }
+            if resp.done.unwrap_or(false) {
+                bail!("container sent done without a result field");
+            }
+        }
     }
 
     /// Send a transcribe request and return the full transcript.
@@ -104,6 +184,7 @@ impl Container {
             max_tokens: None,
             audio: Some(audio),
             image: None,
+            response_format: None,
         };
         let line = serde_json::to_string(&req)? + "\n";
         self.stdin.write_all(line.as_bytes())?;
@@ -122,6 +203,7 @@ impl Container {
             max_tokens: None,
             audio: None,
             image: Some(image),
+            response_format: None,
         };
         let line = serde_json::to_string(&req)? + "\n";
         self.stdin.write_all(line.as_bytes())?;
@@ -153,6 +235,175 @@ impl Container {
     }
 }
 
+// ── Schema validation ─────────────────────────────────────────────────────────
+
+/// Validate `json_str` against a JSON Schema `schema`.
+///
+/// This is a structural validator covering the subset of JSON Schema most
+/// useful for structured output: type, required, properties, items,
+/// minLength/maxLength, minimum/maximum, enum.  It does not implement the full
+/// JSON Schema specification.
+fn validate_json_schema(json_str: &str, schema: &Value) -> Result<()> {
+    let value: Value = serde_json::from_str(json_str)
+        .context("model output is not valid JSON")?;
+    validate_value(&value, schema, "$")
+}
+
+fn validate_value(value: &Value, schema: &Value, path: &str) -> Result<()> {
+    // $ref, allOf, anyOf, oneOf are not supported — reject them explicitly so
+    // callers know they're outside this validator's scope.
+    if schema.get("$ref").is_some() {
+        bail!("{path}: $ref is not supported in structured output schemas");
+    }
+
+    let schema_type = schema.get("type").and_then(|v| v.as_str());
+
+    // type check
+    match schema_type {
+        Some("object") => {
+            let obj = value.as_object().with_context(|| {
+                format!("{path}: expected object, got {}", value_type_name(value))
+            })?;
+
+            // required fields
+            if let Some(required) = schema.get("required").and_then(|v| v.as_array()) {
+                for req in required {
+                    let key = req.as_str().unwrap_or("");
+                    if !obj.contains_key(key) {
+                        bail!("{path}: missing required field '{key}'");
+                    }
+                }
+            }
+
+            // property schemas
+            if let Some(props) = schema.get("properties").and_then(|v| v.as_object()) {
+                for (key, prop_schema) in props {
+                    if let Some(field_val) = obj.get(key) {
+                        validate_value(
+                            field_val,
+                            prop_schema,
+                            &format!("{path}.{key}"),
+                        )?;
+                    }
+                }
+            }
+
+            // additionalProperties: false
+            if schema
+                .get("additionalProperties")
+                .and_then(|v| v.as_bool())
+                == Some(false)
+            {
+                if let Some(props) = schema.get("properties").and_then(|v| v.as_object()) {
+                    for key in obj.keys() {
+                        if !props.contains_key(key) {
+                            bail!("{path}: unexpected additional property '{key}'");
+                        }
+                    }
+                }
+            }
+        }
+        Some("array") => {
+            let arr = value.as_array().with_context(|| {
+                format!("{path}: expected array, got {}", value_type_name(value))
+            })?;
+            if let Some(items_schema) = schema.get("items") {
+                for (i, item) in arr.iter().enumerate() {
+                    validate_value(item, items_schema, &format!("{path}[{i}]"))?;
+                }
+            }
+            if let Some(min) = schema.get("minItems").and_then(|v| v.as_u64()) {
+                if arr.len() < min as usize {
+                    bail!("{path}: array length {} < minItems {min}", arr.len());
+                }
+            }
+            if let Some(max) = schema.get("maxItems").and_then(|v| v.as_u64()) {
+                if arr.len() > max as usize {
+                    bail!("{path}: array length {} > maxItems {max}", arr.len());
+                }
+            }
+        }
+        Some("string") => {
+            let s = value.as_str().with_context(|| {
+                format!("{path}: expected string, got {}", value_type_name(value))
+            })?;
+            if let Some(min) = schema.get("minLength").and_then(|v| v.as_u64()) {
+                if s.len() < min as usize {
+                    bail!("{path}: string length {} < minLength {min}", s.len());
+                }
+            }
+            if let Some(max) = schema.get("maxLength").and_then(|v| v.as_u64()) {
+                if s.len() > max as usize {
+                    bail!("{path}: string length {} > maxLength {max}", s.len());
+                }
+            }
+            check_enum(value, schema, path)?;
+        }
+        Some("number") | Some("integer") => {
+            let n = value.as_f64().with_context(|| {
+                format!("{path}: expected number, got {}", value_type_name(value))
+            })?;
+            if schema_type == Some("integer") && value.as_i64().is_none() {
+                bail!("{path}: expected integer, got non-integer number {n}");
+            }
+            if let Some(min) = schema.get("minimum").and_then(|v| v.as_f64()) {
+                if n < min {
+                    bail!("{path}: {n} < minimum {min}");
+                }
+            }
+            if let Some(max) = schema.get("maximum").and_then(|v| v.as_f64()) {
+                if n > max {
+                    bail!("{path}: {n} > maximum {max}");
+                }
+            }
+            check_enum(value, schema, path)?;
+        }
+        Some("boolean") => {
+            if !value.is_boolean() {
+                bail!("{path}: expected boolean, got {}", value_type_name(value));
+            }
+        }
+        Some("null") => {
+            if !value.is_null() {
+                bail!("{path}: expected null, got {}", value_type_name(value));
+            }
+        }
+        Some(other) => bail!("{path}: unsupported schema type '{other}'"),
+        None => {
+            // No type constraint — just check enum if present.
+            check_enum(value, schema, path)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn check_enum(value: &Value, schema: &Value, path: &str) -> Result<()> {
+    if let Some(variants) = schema.get("enum").and_then(|v| v.as_array()) {
+        if !variants.contains(value) {
+            bail!(
+                "{path}: value {:?} is not in enum {:?}",
+                value,
+                variants
+            );
+        }
+    }
+    Ok(())
+}
+
+fn value_type_name(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+// ── Pool ──────────────────────────────────────────────────────────────────────
+
 /// Pool of running containers, keyed by use-case.
 pub struct ContainerPool {
     containers: HashMap<String, Container>,
@@ -169,11 +420,7 @@ impl ContainerPool {
     }
 
     /// Get or spawn a container for a use-case + image ref pair.
-    pub fn get_or_spawn(
-        &mut self,
-        use_case: &str,
-        image_ref: &str,
-    ) -> Result<&mut Container> {
+    pub fn get_or_spawn(&mut self, use_case: &str, image_ref: &str) -> Result<&mut Container> {
         if !self.containers.contains_key(use_case) {
             let c = Container::spawn(image_ref)?;
             self.containers.insert(use_case.to_string(), c);
@@ -213,7 +460,7 @@ impl ContainerPool {
     }
 }
 
-// ── internal protocol types ──────────────────────────────────────────────────
+// ── Internal protocol types ───────────────────────────────────────────────────
 
 #[derive(Serialize)]
 struct ContainerRequest {
@@ -227,11 +474,24 @@ struct ContainerRequest {
     audio: Option<Vec<u8>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     image: Option<Vec<u8>>,
+    /// Present only for `generate_structured` requests.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_format: Option<ResponseFormat>,
+}
+
+/// Instructs the container to constrain output to a JSON Schema.
+#[derive(Serialize)]
+struct ResponseFormat {
+    r#type: String,   // always "json_schema"
+    schema: Value,
 }
 
 #[derive(Deserialize)]
 struct ContainerResponse {
     id: String,
+    /// Present in streaming token responses.
     token: Option<String>,
+    /// Present in structured output responses (the full JSON string).
+    result: Option<String>,
     done: Option<bool>,
 }
