@@ -1,7 +1,6 @@
 /// aileron-demo — sandboxed GTK4 article summarizer.
 use gtk4::prelude::*;
 use gtk4::{Box, Button, Entry, Label, Orientation, ScrolledWindow, TextBuffer, TextView};
-use libadwaita::prelude::*;
 use libadwaita::{Application, ApplicationWindow, HeaderBar, ToolbarView};
 
 pub fn build_app() -> Application {

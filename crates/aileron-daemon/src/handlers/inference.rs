@@ -11,11 +11,12 @@ use aileron_varlink::aileron_Inference::{
 
 pub struct InferenceHandler {
     state: SharedState,
+    rt: tokio::runtime::Handle,
 }
 
 impl InferenceHandler {
-    pub fn new(state: SharedState) -> Self {
-        Self { state }
+    pub fn new(state: SharedState, rt: tokio::runtime::Handle) -> Self {
+        Self { state, rt }
     }
 }
 
@@ -31,8 +32,7 @@ impl VarlinkInterface for InferenceHandler {
         app_id: String,
         use_case: String,
     ) -> varlink::Result<()> {
-        let rt = tokio::runtime::Handle::current();
-        rt.block_on(async {
+        self.rt.block_on(async {
             let mut guard = self.state.0.lock().await;
 
             // Permission check — skipped entirely when allow_all is set.
@@ -82,8 +82,7 @@ impl VarlinkInterface for InferenceHandler {
         session_id: String,
         prompt: String,
     ) -> varlink::Result<()> {
-        let rt = tokio::runtime::Handle::current();
-        rt.block_on(async {
+        self.rt.block_on(async {
             let mut guard = self.state.0.lock().await;
 
             let (app_id, use_case) = match guard.sessions.get(&session_id) {
@@ -120,8 +119,7 @@ impl VarlinkInterface for InferenceHandler {
         session_id: String,
         audio: String,
     ) -> varlink::Result<()> {
-        let rt = tokio::runtime::Handle::current();
-        rt.block_on(async {
+        self.rt.block_on(async {
             let mut guard = self.state.0.lock().await;
 
             let (app_id, use_case) = match guard.sessions.get(&session_id) {
@@ -155,8 +153,7 @@ impl VarlinkInterface for InferenceHandler {
         session_id: String,
         image: String,
     ) -> varlink::Result<()> {
-        let rt = tokio::runtime::Handle::current();
-        rt.block_on(async {
+        self.rt.block_on(async {
             let mut guard = self.state.0.lock().await;
 
             let (app_id, use_case) = match guard.sessions.get(&session_id) {
@@ -189,8 +186,7 @@ impl VarlinkInterface for InferenceHandler {
         call: &mut dyn Call_EndSession,
         session_id: String,
     ) -> varlink::Result<()> {
-        let rt = tokio::runtime::Handle::current();
-        rt.block_on(async {
+        self.rt.block_on(async {
             let mut guard = self.state.0.lock().await;
             if guard.sessions.remove(&session_id).is_none() {
                 return call.reply_session_not_found(session_id);
@@ -206,8 +202,7 @@ impl VarlinkInterface for InferenceHandler {
         prompt: String,
         schema: String,
     ) -> varlink::Result<()> {
-        let rt = tokio::runtime::Handle::current();
-        rt.block_on(async {
+        self.rt.block_on(async {
             let mut guard = self.state.0.lock().await;
 
             let (app_id, use_case) = match guard.sessions.get(&session_id) {

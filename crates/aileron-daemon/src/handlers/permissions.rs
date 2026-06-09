@@ -10,18 +10,18 @@ fn io_err(_msg: impl std::fmt::Display) -> varlink::Error {
 
 pub struct PermissionsHandler {
     state: SharedState,
+    rt: tokio::runtime::Handle,
 }
 
 impl PermissionsHandler {
-    pub fn new(state: SharedState) -> Self {
-        Self { state }
+    pub fn new(state: SharedState, rt: tokio::runtime::Handle) -> Self {
+        Self { state, rt }
     }
 }
 
 impl VarlinkInterface for PermissionsHandler {
     fn list_app_permissions(&self, call: &mut dyn Call_ListAppPermissions) -> varlink::Result<()> {
-        let rt = tokio::runtime::Handle::current();
-        rt.block_on(async {
+        self.rt.block_on(async {
             let guard = self.state.0.lock().await;
             let result: Vec<AppPermission> = guard
                 .permissions
@@ -45,8 +45,7 @@ impl VarlinkInterface for PermissionsHandler {
         use_case: String,
         allowed: bool,
     ) -> varlink::Result<()> {
-        let rt = tokio::runtime::Handle::current();
-        rt.block_on(async {
+        self.rt.block_on(async {
             let mut guard = self.state.0.lock().await;
             guard
                 .permissions

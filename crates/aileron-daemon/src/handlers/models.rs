@@ -13,18 +13,18 @@ fn io_err(_msg: impl std::fmt::Display) -> varlink::Error {
 
 pub struct ModelsHandler {
     state: SharedState,
+    rt: tokio::runtime::Handle,
 }
 
 impl ModelsHandler {
-    pub fn new(state: SharedState) -> Self {
-        Self { state }
+    pub fn new(state: SharedState, rt: tokio::runtime::Handle) -> Self {
+        Self { state, rt }
     }
 }
 
 impl VarlinkInterface for ModelsHandler {
     fn list(&self, call: &mut dyn Call_List) -> varlink::Result<()> {
-        let rt = tokio::runtime::Handle::current();
-        rt.block_on(async {
+        self.rt.block_on(async {
             let output = tokio::process::Command::new("podman")
                 .args(["images", "--format", "json"])
                 .output()
@@ -65,8 +65,7 @@ impl VarlinkInterface for ModelsHandler {
     }
 
     fn pull(&self, call: &mut dyn Call_Pull, image_ref: String) -> varlink::Result<()> {
-        let rt = tokio::runtime::Handle::current();
-        rt.block_on(async {
+        self.rt.block_on(async {
             let status = tokio::process::Command::new("podman")
                 .args(["pull", &image_ref])
                 .status()
@@ -87,8 +86,7 @@ impl VarlinkInterface for ModelsHandler {
     }
 
     fn delete(&self, call: &mut dyn Call_Delete, image_ref: String) -> varlink::Result<()> {
-        let rt = tokio::runtime::Handle::current();
-        rt.block_on(async {
+        self.rt.block_on(async {
             let status = tokio::process::Command::new("podman")
                 .args(["rmi", &image_ref])
                 .status()
@@ -111,8 +109,7 @@ impl VarlinkInterface for ModelsHandler {
         image_ref: String,
         use_case: String,
     ) -> varlink::Result<()> {
-        let rt = tokio::runtime::Handle::current();
-        rt.block_on(async {
+        self.rt.block_on(async {
             let mut guard = self.state.0.lock().await;
             guard
                 .assignments

@@ -8,18 +8,18 @@ use aileron_varlink::aileron_Sessions::{
 
 pub struct SessionsHandler {
     state: SharedState,
+    rt: tokio::runtime::Handle,
 }
 
 impl SessionsHandler {
-    pub fn new(state: SharedState) -> Self {
-        Self { state }
+    pub fn new(state: SharedState, rt: tokio::runtime::Handle) -> Self {
+        Self { state, rt }
     }
 }
 
 impl VarlinkInterface for SessionsHandler {
     fn list_active(&self, call: &mut dyn Call_ListActive) -> varlink::Result<()> {
-        let rt = tokio::runtime::Handle::current();
-        rt.block_on(async {
+        self.rt.block_on(async {
             let guard = self.state.0.lock().await;
             let sessions: Vec<SessionInfo> = guard
                 .sessions
@@ -40,8 +40,7 @@ impl VarlinkInterface for SessionsHandler {
         call: &mut dyn Call_KillSession,
         session_id: String,
     ) -> varlink::Result<()> {
-        let rt = tokio::runtime::Handle::current();
-        rt.block_on(async {
+        self.rt.block_on(async {
             let mut guard = self.state.0.lock().await;
             let session = match guard.sessions.remove(&session_id) {
                 Some(s) => s,

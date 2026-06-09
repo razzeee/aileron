@@ -23,12 +23,13 @@ pub async fn run(state: SharedState) -> Result<()> {
     }
 
     let state_for_thread = state.clone();
-    tokio::task::spawn_blocking(move || run_varlink_service(state_for_thread, &addr)).await??;
+    let rt = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || run_varlink_service(state_for_thread, rt, &addr)).await??;
 
     Ok(())
 }
 
-fn run_varlink_service(state: SharedState, addr: &str) -> Result<()> {
+fn run_varlink_service(state: SharedState, rt: tokio::runtime::Handle, addr: &str) -> Result<()> {
     use aileron_varlink::aileron_Inference;
     use aileron_varlink::aileron_Models;
     use aileron_varlink::aileron_Permissions;
@@ -42,15 +43,19 @@ fn run_varlink_service(state: SharedState, addr: &str) -> Result<()> {
         vec![
             Box::new(aileron_Inference::new(Box::new(InferenceHandler::new(
                 state.clone(),
+                rt.clone(),
             )))),
             Box::new(aileron_Models::new(Box::new(ModelsHandler::new(
                 state.clone(),
+                rt.clone(),
             )))),
             Box::new(aileron_Permissions::new(Box::new(PermissionsHandler::new(
                 state.clone(),
+                rt.clone(),
             )))),
             Box::new(aileron_Sessions::new(Box::new(SessionsHandler::new(
                 state.clone(),
+                rt.clone(),
             )))),
         ],
     );
