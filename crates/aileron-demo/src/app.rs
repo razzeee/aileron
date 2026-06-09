@@ -1,13 +1,9 @@
 /// aileron-demo — sandboxed GTK4 article summarizer.
-///
-/// Flatpak-sandboxed app that calls the AI portal to summarize article text.
-/// All AI inference is routed through `org.freedesktop.portal.AI` — no direct
-/// connection to the daemon socket.
 
 use gtk4::prelude::*;
 use libadwaita::prelude::*;
 use libadwaita::{Application, ApplicationWindow, HeaderBar, ToolbarView};
-use gtk4::{Box, Button, Entry, Label, Orientation, ScrolledWindow, TextView, TextBuffer};
+use gtk4::{Box, Button, Entry, Label, Orientation, ScrolledWindow, TextBuffer, TextView};
 
 pub fn build_app() -> Application {
     let app = Application::builder()
@@ -22,7 +18,6 @@ pub fn build_app() -> Application {
 }
 
 fn build_window(app: &Application) {
-    // ── UI layout ─────────────────────────────────────────────────────────────
     let vbox = Box::new(Orientation::Vertical, 12);
     vbox.set_margin_top(12);
     vbox.set_margin_bottom(12);
@@ -35,13 +30,12 @@ fn build_window(app: &Application) {
         .hexpand(true)
         .build();
     let fetch_button = Button::with_label("Fetch");
-
     let url_row = Box::new(Orientation::Horizontal, 8);
     url_row.append(&url_entry);
     url_row.append(&fetch_button);
     vbox.append(&url_row);
 
-    // Editable text area (source)
+    // Source text area
     let source_buffer = TextBuffer::new(None);
     let source_view = TextView::builder()
         .buffer(&source_buffer)
@@ -50,12 +44,13 @@ fn build_window(app: &Application) {
         .hexpand(true)
         .vexpand(true)
         .build();
-    let source_scroll = ScrolledWindow::builder()
-        .child(&source_view)
-        .vexpand(true)
-        .build();
     vbox.append(&Label::builder().label("Article text").xalign(0.0).build());
-    vbox.append(&source_scroll);
+    vbox.append(
+        &ScrolledWindow::builder()
+            .child(&source_view)
+            .vexpand(true)
+            .build(),
+    );
 
     // Summarize button
     let summarize_button = Button::builder()
@@ -73,16 +68,17 @@ fn build_window(app: &Application) {
         .hexpand(true)
         .vexpand(true)
         .build();
-    let output_scroll = ScrolledWindow::builder()
-        .child(&output_view)
-        .vexpand(true)
-        .build();
     vbox.append(&Label::builder().label("Summary").xalign(0.0).build());
-    vbox.append(&output_scroll);
+    vbox.append(
+        &ScrolledWindow::builder()
+            .child(&output_view)
+            .vexpand(true)
+            .build(),
+    );
 
     // ── Fetch handler ─────────────────────────────────────────────────────────
     {
-        let url_entry = url_entry.clone();
+        let url_entry     = url_entry.clone();
         let source_buffer = source_buffer.clone();
         fetch_button.connect_clicked(move |_| {
             let url = url_entry.text().to_string();
@@ -90,19 +86,17 @@ fn build_window(app: &Application) {
                 return;
             }
             let source_buffer = source_buffer.clone();
-            std::thread::spawn(move || {
-                match fetch_article_text(&url) {
-                    Ok(text) => {
-                        glib::MainContext::default().invoke(move || {
-                            source_buffer.set_text(&text);
-                        });
-                    }
-                    Err(e) => {
-                        let msg = format!("[fetch error: {e}]");
-                        glib::MainContext::default().invoke(move || {
-                            source_buffer.set_text(&msg);
-                        });
-                    }
+            glib::spawn_future_local(async move {
+                let result: Result<String, String> =
+                    gio::spawn_blocking(move || {
+                        fetch_article_text(&url).map_err(|e| e.to_string())
+                    })
+                    .await
+                    .unwrap_or_else(|e| Err(format!("thread panic: {e:?}")));
+
+                match result {
+                    Ok(text) => source_buffer.set_text(&text),
+                    Err(e)   => source_buffer.set_text(&format!("[fetch error: {e}]")),
                 }
             });
         });
@@ -118,23 +112,20 @@ fn build_window(app: &Application) {
             if text.trim().is_empty() {
                 return;
             }
-
-            let output_buffer = output_buffer.clone();
             output_buffer.set_text("Summarizing…");
 
-            std::thread::spawn(move || {
-                match summarize_via_portal(&text) {
-                    Ok(summary) => {
-                        glib::MainContext::default().invoke(move || {
-                            output_buffer.set_text(&summary);
-                        });
-                    }
-                    Err(e) => {
-                        let msg = format!("[error: {e}]");
-                        glib::MainContext::default().invoke(move || {
-                            output_buffer.set_text(&msg);
-                        });
-                    }
+            let output_buffer = output_buffer.clone();
+            glib::spawn_future_local(async move {
+                let result: Result<String, String> =
+                    gio::spawn_blocking(move || {
+                        summarize_via_portal(&text).map_err(|e| e.to_string())
+                    })
+                    .await
+                    .unwrap_or_else(|e| Err(format!("thread panic: {e:?}")));
+
+                match result {
+                    Ok(summary) => output_buffer.set_text(&summary),
+                    Err(e)      => output_buffer.set_text(&format!("[error: {e}]")),
                 }
             });
         });
@@ -157,14 +148,12 @@ fn build_window(app: &Application) {
     window.present();
 }
 
-/// Fetch article text over HTTP and strip HTML tags.
 fn fetch_article_text(url: &str) -> anyhow::Result<String> {
     let response = reqwest::blocking::get(url)?;
     let html = response.text()?;
     Ok(strip_html(&html))
 }
 
-/// Very lightweight HTML stripping (for demo purposes).
 fn strip_html(html: &str) -> String {
     let mut output = String::with_capacity(html.len());
     let mut inside_tag = false;
@@ -179,14 +168,9 @@ fn strip_html(html: &str) -> String {
             _ => {}
         }
     }
-    // Collapse whitespace.
     output.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Call the AI portal to summarize text.
-///
-/// Inside a Flatpak sandbox the app cannot reach the Varlink socket directly;
-/// it goes through D-Bus → xdg-desktop-portal → aileron-portal → aileron-daemon.
 fn summarize_via_portal(text: &str) -> anyhow::Result<String> {
     use zbus::blocking::Connection;
 
@@ -198,19 +182,16 @@ fn summarize_via_portal(text: &str) -> anyhow::Result<String> {
         "org.freedesktop.portal.AI",
     )?;
 
-    // Create session.
-    let session_id: String = proxy.call("CreateSession", &("org.aileron.Demo", "llm.summarize"))?;
+    let session_id: String =
+        proxy.call("CreateSession", &("org.aileron.Demo", "llm.summarize"))?;
 
     let prompt = format!(
         "Summarize the following article in a few sentences:\n\n{}",
         &text[..text.len().min(4096)]
     );
 
-    // Generate summary (prompt is plain text; the portal accepts String args).
     let summary: String = proxy.call("Generate", &(&session_id, &prompt))?;
-
-    // End session.
-    let _: () = proxy.call("EndSession", &(&session_id,))?;
+    let _: ()           = proxy.call("EndSession", &(&session_id,))?;
 
     Ok(summary)
 }

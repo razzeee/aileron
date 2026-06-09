@@ -59,7 +59,14 @@ Container images live in `images/`:
 # Rust toolchain
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
-# System libraries (Debian/Ubuntu)
+# System libraries — Fedora
+sudo dnf install \
+    gtk4-devel \
+    libadwaita-devel \
+    dbus-devel \
+    pkg-config
+
+# System libraries — Debian/Ubuntu
 sudo apt install \
     libgtk-4-dev \
     libadwaita-1-dev \
@@ -67,7 +74,8 @@ sudo apt install \
     pkg-config
 
 # Runtime dependency
-sudo apt install podman
+sudo dnf install podman   # Fedora
+sudo apt install podman   # Debian/Ubuntu
 ```
 
 ### Build all crates

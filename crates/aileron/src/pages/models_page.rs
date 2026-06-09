@@ -2,7 +2,7 @@
 
 use gtk4::prelude::*;
 use libadwaita::prelude::*;
-use gtk4::{Box, Button, Entry, Label, ListBox, Orientation, ProgressBar, ScrolledWindow};
+use gtk4::{Box, Button, Entry, ListBox, Orientation, ProgressBar, ScrolledWindow};
 use libadwaita::{ActionRow, PreferencesGroup, PreferencesPage};
 
 pub fn build() -> gtk4::Widget {
@@ -13,7 +13,6 @@ pub fn build() -> gtk4::Widget {
     pull_group.set_title("Pull Model");
     pull_group.set_description(Some("Enter an OCI image reference to pull a new model."));
 
-    // The pull row is a horizontal Box inside an ActionRow's child.
     let image_entry = Entry::builder()
         .placeholder_text("ghcr.io/aileron/llama3.2-3b-instruct:latest")
         .hexpand(true)
@@ -42,7 +41,7 @@ pub fn build() -> gtk4::Widget {
     pull_group.add(&pull_vbox);
 
     {
-        let entry = image_entry.clone();
+        let entry    = image_entry.clone();
         let progress = progress.clone();
         pull_button.connect_clicked(move |_| {
             let image_ref = entry.text().to_string();
@@ -51,16 +50,19 @@ pub fn build() -> gtk4::Widget {
             }
             progress.set_visible(true);
             progress.pulse();
+
             let progress_clone = progress.clone();
-            std::thread::spawn(move || {
-                use aileron_varlink::aileron_Models::VarlinkClientInterface;
-                if let Ok(conn) = aileron_ipc::client::connect() {
-                    let mut client = aileron_varlink::aileron_Models::VarlinkClient::new(conn);
-                    let _ = client.pull(image_ref).call();
-                }
-                glib::MainContext::default().invoke(move || {
-                    progress_clone.set_fraction(1.0);
-                });
+            glib::spawn_future_local(async move {
+                let _ = gio::spawn_blocking(move || {
+                    use aileron_varlink::aileron_Models::VarlinkClientInterface;
+                    if let Ok(conn) = aileron_ipc::client::connect() {
+                        let mut client =
+                            aileron_varlink::aileron_Models::VarlinkClient::new(conn);
+                        let _ = client.pull(image_ref).call();
+                    }
+                })
+                .await;
+                progress_clone.set_fraction(1.0);
             });
         });
     }
@@ -135,7 +137,7 @@ fn refresh_model_list(list_box: &ListBox) {
                 let delete_btn = Button::with_label("Delete");
                 delete_btn.add_css_class("destructive-action");
                 delete_btn.set_valign(gtk4::Align::Center);
-                let image_ref = model.image_ref.clone();
+                let image_ref    = model.image_ref.clone();
                 let list_box_ref = list_box.clone();
                 delete_btn.connect_clicked(move |_| {
                     use aileron_varlink::aileron_Models::VarlinkClientInterface;

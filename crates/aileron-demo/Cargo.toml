@@ -16,6 +16,7 @@ tracing-subscriber = { workspace = true }
 gtk4     = { workspace = true }
 libadwaita = { workspace = true }
 glib     = { workspace = true }
+gio      = { workspace = true }
 reqwest  = { workspace = true }
 zbus     = { workspace = true }
 serde    = { workspace = true }
