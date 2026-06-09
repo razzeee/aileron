@@ -34,9 +34,27 @@ impl VarlinkInterface for InferenceHandler {
         rt.block_on(async {
             let mut guard = self.state.0.lock().await;
 
-            match guard.permissions.check(&app_id, &use_case) {
-                Some(true) => {}
-                _ => return call.reply_permission_denied(app_id, use_case),
+            // Permission check — skipped entirely when allow_all is set.
+            if !guard.config.allow_all {
+                match guard.permissions.check(&app_id, &use_case) {
+                    Some(true) => {}
+                    Some(false) => return call.reply_permission_denied(app_id, use_case),
+                    None => {
+                        if guard.config.auto_grant {
+                            // First encounter: grant and persist.
+                            tracing::info!(
+                                "auto-granting {app_id} / {use_case} (AILERON_AUTO_GRANT)"
+                            );
+                            if let Err(e) =
+                                guard.permissions.set(app_id.clone(), use_case.clone(), true)
+                            {
+                                tracing::warn!("failed to persist auto-grant: {e}");
+                            }
+                        } else {
+                            return call.reply_permission_denied(app_id, use_case);
+                        }
+                    }
+                }
             }
 
             if guard.assignments.get(&use_case).is_none() {

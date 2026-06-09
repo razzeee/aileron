@@ -408,7 +408,7 @@ fn value_type_name(v: &Value) -> &'static str {
 pub struct ContainerPool {
     containers: HashMap<String, Container>,
     /// Idle timeout in seconds (default 300 = 5 min).
-    idle_timeout_secs: u64,
+    pub idle_timeout_secs: u64,
 }
 
 impl ContainerPool {

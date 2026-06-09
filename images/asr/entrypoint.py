@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Aileron ASR container entrypoint.
+Aileron ASR container entrypoint — whisper.cpp backend (via pywhispercpp).
 
-Reads newline-delimited JSON from stdin, writes responses to stdout.
+Reads newline-delimited JSON requests from stdin, writes responses to stdout.
 
 Supported request types:
   transcribe  – transcribe base64-encoded raw PCM (16 kHz mono f32le)
@@ -17,23 +17,16 @@ import tempfile
 import traceback
 import wave
 
-from faster_whisper import WhisperModel
+from pywhispercpp.model import Model
 
-MODEL_SIZE   = os.environ.get("MODEL_SIZE", "small")
-MODEL_PATH   = os.environ.get("MODEL_PATH", "/model")
-DEVICE       = os.environ.get("DEVICE", "cpu")
-COMPUTE_TYPE = os.environ.get("COMPUTE_TYPE", "int8")
+MODEL_SIZE = os.environ.get("MODEL_SIZE", "base")
+MODEL_DIR  = os.environ.get("MODEL_DIR", "/model")
 
 
-def load_model() -> WhisperModel:
-    sys.stderr.write(f"[aileron-asr] loading whisper-{MODEL_SIZE}\n")
+def load_model() -> Model:
+    sys.stderr.write(f"[aileron-asr] loading whisper.cpp model: {MODEL_SIZE}\n")
     sys.stderr.flush()
-    return WhisperModel(
-        MODEL_SIZE,
-        device=DEVICE,
-        compute_type=COMPUTE_TYPE,
-        download_root=MODEL_PATH,
-    )
+    return Model(MODEL_SIZE, models_dir=MODEL_DIR)
 
 
 def send(obj: dict) -> None:
@@ -41,30 +34,24 @@ def send(obj: dict) -> None:
     sys.stdout.flush()
 
 
-def pcm_f32le_to_wav(raw_bytes: bytes, sample_rate: int = 16000) -> bytes:
-    """Wrap raw f32le PCM in a WAV container so faster-whisper can read it."""
+def pcm_f32le_to_wav(raw_bytes: bytes, sample_rate: int = 16000) -> str:
+    """Wrap raw f32le PCM in a WAV container that whisper.cpp can read."""
     num_frames = len(raw_bytes) // 4  # 4 bytes per f32 sample
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-        wav_path = f.name
+    samples = struct.unpack(f"{num_frames}f", raw_bytes)
+    int16_samples = [max(-32768, min(32767, int(s * 32767))) for s in samples]
 
-    with wave.open(wav_path, "wb") as wf:
+    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    with wave.open(tmp.name, "wb") as wf:
         wf.setnchannels(1)
-        wf.setsampwidth(2)          # write as 16-bit PCM
+        wf.setsampwidth(2)
         wf.setframerate(sample_rate)
-        # Convert f32le → int16
-        samples = struct.unpack(f"{num_frames}f", raw_bytes)
-        int16 = struct.pack(
-            f"{num_frames}h",
-            *[max(-32768, min(32767, int(s * 32767))) for s in samples],
-        )
-        wf.writeframes(int16)
-
-    return wav_path
+        wf.writeframes(struct.pack(f"{num_frames}h", *int16_samples))
+    return tmp.name
 
 
-def handle_transcribe(model: WhisperModel, req: dict) -> None:
-    req_id     = req["id"]
-    audio_b64  = req.get("audio", "")
+def handle_transcribe(model: Model, req: dict) -> None:
+    req_id    = req["id"]
+    audio_b64 = req.get("audio", "")
 
     try:
         raw_pcm = base64.b64decode(audio_b64)
@@ -74,9 +61,11 @@ def handle_transcribe(model: WhisperModel, req: dict) -> None:
 
     wav_path = pcm_f32le_to_wav(raw_pcm)
     try:
-        segments, _ = model.transcribe(wav_path, beam_size=5)
-        for segment in segments:
-            send({"id": req_id, "token": segment.text})
+        segments = model.transcribe(wav_path)
+        for seg in segments:
+            # pywhispercpp segments have a .text attribute
+            text = seg.text if hasattr(seg, "text") else str(seg)
+            send({"id": req_id, "token": text})
         send({"id": req_id, "done": True})
     finally:
         os.unlink(wav_path)
@@ -103,13 +92,12 @@ def main() -> None:
             if req_type == "transcribe":
                 handle_transcribe(model, req)
             else:
-                req_id = req.get("id", "unknown")
-                send({"id": req_id, "error": "unsupported_type", "reason": req_type})
+                send({"id": req.get("id", "unknown"),
+                      "error": "unsupported_type", "reason": req_type})
         except Exception:
-            req_id = req.get("id", "unknown")
             sys.stderr.write(traceback.format_exc())
             sys.stderr.flush()
-            send({"id": req_id, "error": "internal_error", "done": True})
+            send({"id": req.get("id", "unknown"), "error": "internal_error", "done": True})
 
 
 if __name__ == "__main__":

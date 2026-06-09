@@ -104,6 +104,14 @@ systemctl --user enable --now aileron-daemon
 
 The daemon listens on `$XDG_RUNTIME_DIR/aileron.socket`.
 
+**Daemon flags:**
+
+| Flag | Env var | Default | Description |
+|---|---|---|---|
+| `--allow-all` | `AILERON_ALLOW_ALL` | false | Bypass all permission checks (dev/test only) |
+| `--auto-grant` | `AILERON_AUTO_GRANT` | false | Grant permission automatically on first use |
+| `--idle-timeout-secs` | `AILERON_IDLE_TIMEOUT_SECS` | 300 | Container idle timeout in seconds |
+
 ### Portal backend
 
 ```sh
@@ -187,7 +195,51 @@ Supported environment variables:
 | `DEVICE` | `cpu` | Inference device (`cpu` or `cuda`) |
 | `COMPUTE_TYPE` | `int8` | Quantisation type (`int8`, `float16`, `float32`) |
 
-## Getting started
+## End-to-end test with the stub container
+
+The stub container requires no model download and responds instantly. It implements the full protocol, so it exercises every layer — daemon, Varlink, container stdio, and back.
+
+```sh
+# 1. Build the daemon
+cargo build -p aileron-daemon
+
+# 2. Build the stub image (no model download needed)
+podman build -t aileron/stub:latest images/stub/
+
+# 3. Start the daemon in allow-all + auto-grant mode
+#    --allow-all  skips permission checks entirely
+#    --auto-grant persists a grant on first use (use one or the other)
+AILERON_ALLOW_ALL=1 ./target/debug/aileron-daemon &
+
+# 4. Assign the stub image to a use-case
+varlink call unix:$XDG_RUNTIME_DIR/aileron.socket \
+    aileron.Models.AssignUseCase \
+    '{"image_ref":"aileron/stub:latest","use_case":"llm.summarize"}'
+
+# 5. Create a session
+varlink call unix:$XDG_RUNTIME_DIR/aileron.socket \
+    aileron.Inference.CreateSession \
+    '{"app_id":"test","use_case":"llm.summarize"}'
+# → {"session_id": "..."}   copy the value
+
+# 6. Generate (replace SESSION_ID)
+varlink call unix:$XDG_RUNTIME_DIR/aileron.socket \
+    aileron.Inference.Generate \
+    '{"session_id":"SESSION_ID","prompt":"Hello world"}'
+# → {"token": "Hello world"}   stub echoes the prompt back
+
+# 7. End the session
+varlink call unix:$XDG_RUNTIME_DIR/aileron.socket \
+    aileron.Inference.EndSession \
+    '{"session_id":"SESSION_ID"}'
+
+# 8. Stop the daemon
+kill %1
+```
+
+Install the `varlink` CLI with: `cargo install varlink-cli`
+
+## Getting started (with a real model)
 
 ### 1. Pull and assign a model
 
