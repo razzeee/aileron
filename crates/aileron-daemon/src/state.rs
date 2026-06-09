@@ -6,6 +6,7 @@ use tokio::sync::Mutex;
 use crate::assignments::Assignments;
 use crate::config::Config;
 use crate::container::ContainerPool;
+use crate::hardware::Variant;
 use crate::permissions::PermissionStore;
 
 #[derive(Debug, Clone)]
@@ -22,6 +23,8 @@ pub struct Inner {
     pub assignments: Assignments,
     pub containers: ContainerPool,
     pub sessions: HashMap<String, Session>,
+    /// Best available hardware variant, detected once at startup.
+    pub variant: Variant,
 }
 
 #[derive(Clone)]
@@ -33,12 +36,14 @@ impl SharedState {
         let assignments = Assignments::load()?;
         let mut containers = ContainerPool::new();
         containers.idle_timeout_secs = config.idle_timeout_secs;
+        let variant = crate::hardware::detect();
         Ok(Self(Arc::new(Mutex::new(Inner {
             config,
             permissions,
             assignments,
             containers,
             sessions: HashMap::new(),
+            variant,
         }))))
     }
 }

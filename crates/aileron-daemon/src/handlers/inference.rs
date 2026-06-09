@@ -42,14 +42,11 @@ impl VarlinkInterface for InferenceHandler {
                     Some(false) => return call.reply_permission_denied(app_id, use_case),
                     None => {
                         if guard.config.auto_grant {
-                            // First encounter: grant and persist.
                             tracing::info!(
                                 "auto-granting {app_id} / {use_case} (AILERON_AUTO_GRANT)"
                             );
                             if let Err(e) =
-                                guard
-                                    .permissions
-                                    .set(app_id.clone(), use_case.clone(), true)
+                                guard.permissions.set(app_id.clone(), use_case.clone(), true)
                             {
                                 tracing::warn!("failed to persist auto-grant: {e}");
                             }
@@ -60,8 +57,32 @@ impl VarlinkInterface for InferenceHandler {
                 }
             }
 
-            if guard.assignments.get(&use_case).is_none() {
-                return call.reply_no_model_assigned(use_case);
+            let image_ref = match guard.assignments.get(&use_case) {
+                Some(r) => crate::hardware::resolve(r, guard.variant),
+                None => return call.reply_no_model_assigned(use_case),
+            };
+
+            // Warm up the container now so Generate doesn't block silently.
+            // Status lines from the container's stderr are forwarded as
+            // continues replies if the caller used `more`, otherwise logged.
+            let wants_more = call.wants_more();
+            let (status_tx, status_rx) = std::sync::mpsc::channel::<String>();
+            guard
+                .containers
+                .get_or_spawn(&use_case, &image_ref, move |msg| {
+                    let _ = status_tx.send(msg);
+                })
+                .map_err(io_err)?;
+
+            // Drain any status messages collected during startup.
+            if wants_more {
+                call.set_continues(true);
+                for msg in status_rx.try_iter() {
+                    // Reuse session_id field as a status carrier — prefix with
+                    // "status:" so the caller can distinguish it from the real ID.
+                    call.reply(format!("status:{}", msg))?;
+                }
+                call.set_continues(false);
             }
 
             let session_id = Uuid::new_v4().to_string();
@@ -91,7 +112,7 @@ impl VarlinkInterface for InferenceHandler {
             };
 
             let image_ref = match guard.assignments.get(&use_case) {
-                Some(r) => r.to_string(),
+                Some(r) => crate::hardware::resolve(r, guard.variant),
                 None => return call.reply_no_model_assigned(use_case),
             };
 
@@ -99,17 +120,30 @@ impl VarlinkInterface for InferenceHandler {
 
             let container = guard
                 .containers
-                .get_or_spawn(&use_case, &image_ref)
+                .get_or_spawn(&use_case, &image_ref, |_| {})
                 .map_err(io_err)?;
 
-            let mut last_token = String::new();
+            let wants_more = call.wants_more();
+            let mut tokens: Vec<String> = Vec::new();
+
             container
-                .generate(&prompt, 512, |token| {
-                    last_token = token;
+                .generate(None, &prompt, 512, |token| {
+                    tokens.push(token);
                 })
                 .map_err(io_err)?;
 
-            call.reply(last_token)
+            if wants_more && tokens.len() > 1 {
+                // Stream all but the last token with continues=true.
+                call.set_continues(true);
+                for token in &tokens[..tokens.len() - 1] {
+                    call.reply(token.clone())?;
+                }
+                call.set_continues(false);
+            }
+
+            // Final (or only) token — sent without continues.
+            let last = tokens.into_iter().last().unwrap_or_default();
+            call.reply(last)
         })
     }
 
@@ -128,7 +162,7 @@ impl VarlinkInterface for InferenceHandler {
             };
 
             let image_ref = match guard.assignments.get(&use_case) {
-                Some(r) => r.to_string(),
+                Some(r) => crate::hardware::resolve(r, guard.variant),
                 None => return call.reply_no_model_assigned(use_case),
             };
 
@@ -138,7 +172,7 @@ impl VarlinkInterface for InferenceHandler {
 
             let container = guard
                 .containers
-                .get_or_spawn(&use_case, &image_ref)
+                .get_or_spawn(&use_case, &image_ref, |_| {})
                 .map_err(io_err)?;
 
             let text = container.transcribe(audio_bytes).map_err(io_err)?;
@@ -162,7 +196,7 @@ impl VarlinkInterface for InferenceHandler {
             };
 
             let image_ref = match guard.assignments.get(&use_case) {
-                Some(r) => r.to_string(),
+                Some(r) => crate::hardware::resolve(r, guard.variant),
                 None => return call.reply_no_model_assigned(use_case),
             };
 
@@ -172,7 +206,7 @@ impl VarlinkInterface for InferenceHandler {
 
             let container = guard
                 .containers
-                .get_or_spawn(&use_case, &image_ref)
+                .get_or_spawn(&use_case, &image_ref, |_| {})
                 .map_err(io_err)?;
 
             let text = container.describe(image_bytes).map_err(io_err)?;
@@ -211,7 +245,7 @@ impl VarlinkInterface for InferenceHandler {
             };
 
             let image_ref = match guard.assignments.get(&use_case) {
-                Some(r) => r.to_string(),
+                Some(r) => crate::hardware::resolve(r, guard.variant),
                 None => return call.reply_no_model_assigned(use_case),
             };
 
@@ -228,10 +262,10 @@ impl VarlinkInterface for InferenceHandler {
 
             let container = guard
                 .containers
-                .get_or_spawn(&use_case, &image_ref)
+                .get_or_spawn(&use_case, &image_ref, |_| {})
                 .map_err(io_err)?;
 
-            match container.generate_structured(&prompt, 1024, &schema_value) {
+            match container.generate_structured(None, &prompt, 1024, &schema_value) {
                 Ok(result) => call.reply(result),
                 Err(e) => {
                     let msg = e.to_string();

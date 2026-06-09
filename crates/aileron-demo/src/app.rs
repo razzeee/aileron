@@ -109,19 +109,38 @@ fn build_window(app: &Application) {
             if text.trim().is_empty() {
                 return;
             }
-            output_buffer.set_text("Summarizing…");
+            output_buffer.set_text("");
 
-            let output_buffer = output_buffer.clone();
-            glib::spawn_future_local(async move {
-                let result: Result<String, String> = gio::spawn_blocking(move || {
-                    summarize_via_portal(&text).map_err(|e| e.to_string())
-                })
-                .await
-                .unwrap_or_else(|e| Err(format!("thread panic: {e:?}")));
+            // Channel: background thread sends tokens; glib main loop appends them.
+            let (tx, rx) = std::sync::mpsc::channel::<Option<String>>();
 
-                match result {
-                    Ok(summary) => output_buffer.set_text(&summary),
-                    Err(e) => output_buffer.set_text(&format!("[error: {e}]")),
+            let output_buffer_clone = output_buffer.clone();
+            // Poll the receiver on the main loop.
+            glib::timeout_add_local(std::time::Duration::from_millis(16), move || {
+                loop {
+                    match rx.try_recv() {
+                        Ok(Some(token)) => {
+                            let end = output_buffer_clone.end_iter();
+                            output_buffer_clone.insert(&mut output_buffer_clone.end_iter(), &token);
+                            let _ = end;
+                        }
+                        Ok(None) => {
+                            // Done sentinel.
+                            return glib::ControlFlow::Break;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            return glib::ControlFlow::Break;
+                        }
+                    }
+                }
+                glib::ControlFlow::Continue
+            });
+
+            // Background thread: call GenerateStream and listen for signals.
+            std::thread::spawn(move || {
+                if let Err(e) = summarize_streaming(&text, tx) {
+                    eprintln!("[aileron-demo] summarize error: {e}");
                 }
             });
         });
@@ -151,42 +170,225 @@ fn fetch_article_text(url: &str) -> anyhow::Result<String> {
 }
 
 fn strip_html(html: &str) -> String {
-    let mut output = String::with_capacity(html.len());
+    // Drop <script>…</script> and <style>…</style> blocks (case-insensitive,
+    // including tags with attributes like <style media="screen">).
+    let mut s = html.to_string();
+    for tag in &["script", "style"] {
+        let open = format!("<{}", tag);
+        let close = format!("</{}>", tag);
+        let s_lower = s.to_lowercase();
+        let mut out = String::with_capacity(s.len());
+        let mut pos = 0;
+        let bytes = s_lower.as_bytes();
+        let ob = open.as_bytes();
+        let cb = close.as_bytes();
+        while pos < bytes.len() {
+            if let Some(rel) = s_lower[pos..].find(open.as_str()) {
+                out.push_str(&s[pos..pos + rel]);
+                let after_open = pos + rel;
+                if let Some(rel2) = s_lower[after_open..].find(close.as_str()) {
+                    pos = after_open + rel2 + cb.len();
+                } else {
+                    pos = bytes.len();
+                }
+                let _ = ob;
+            } else {
+                out.push_str(&s[pos..]);
+                break;
+            }
+        }
+        s = out;
+    }
+
+    // Strip remaining tags; emit newline for block-level close tags.
+    let block_close = ["</p>", "</div>", "</li>", "</h1>", "</h2>", "</h3>",
+                       "</h4>", "</article>", "</section>", "</header>", "</nav>"];
+    let s_lower = s.to_lowercase();
+    let mut output = String::with_capacity(s.len());
     let mut inside_tag = false;
-    for ch in html.chars() {
+    let mut tag_buf = String::new();
+    for ch in s.chars() {
         match ch {
-            '<' => inside_tag = true,
+            '<' => {
+                inside_tag = true;
+                tag_buf.clear();
+                tag_buf.push('<');
+            }
             '>' => {
                 inside_tag = false;
-                output.push(' ');
+                tag_buf.push('>');
+                let tb = tag_buf.to_lowercase();
+                if block_close.iter().any(|t| tb.starts_with(t)) {
+                    output.push('\n');
+                } else {
+                    output.push(' ');
+                }
+                tag_buf.clear();
             }
-            _ if !inside_tag => output.push(ch),
-            _ => {}
+            _ if inside_tag => tag_buf.push(ch),
+            _ => output.push(ch),
         }
     }
-    output.split_whitespace().collect::<Vec<_>>().join(" ")
+    let _ = s_lower;
+
+    // Return from the first substantial paragraph (>200 chars) that doesn't
+    // look like boilerplate (cookie notices, nav menus, etc.).
+    let boilerplate_hints = ["cookie", "privacy", "login", "register", "newsletter"];
+    let paragraphs: Vec<&str> = output
+        .split('\n')
+        .map(|p| p.trim())
+        .filter(|p| !p.is_empty())
+        .collect();
+
+    let article_start = paragraphs
+        .iter()
+        .position(|p| {
+            let lower = p.to_lowercase();
+            p.len() > 200 && !boilerplate_hints.iter().any(|h| lower.contains(h))
+        })
+        .unwrap_or(0);
+
+    paragraphs[article_start..]
+        .iter()
+        .flat_map(|p| [*p, "\n\n"])
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .pipe(decode_html_entities)
 }
 
-fn summarize_via_portal(text: &str) -> anyhow::Result<String> {
+/// Decode common HTML entities. stdlib-only, no external crate.
+fn decode_html_entities(s: String) -> String {
+    // Named entities ordered longest-first within each group to avoid
+    // partial matches (e.g. &amp; before &a).
+    const NAMED: &[(&str, &str)] = &[
+        ("&amp;",   "&"),
+        ("&lt;",    "<"),
+        ("&gt;",    ">"),
+        ("&quot;",  "\""),
+        ("&apos;",  "'"),
+        ("&nbsp;",  " "),
+        ("&mdash;", "—"),
+        ("&ndash;", "–"),
+        ("&laquo;", "«"),
+        ("&raquo;", "»"),
+        ("&hellip;","…"),
+        ("&copy;",  "©"),
+        ("&reg;",   "®"),
+        ("&trade;", "™"),
+    ];
+
+    let mut result = s;
+    // Named entities.
+    for (entity, replacement) in NAMED {
+        result = result.replace(entity, replacement);
+    }
+    // Decimal numeric entities: &#NNN;
+    let mut out = String::with_capacity(result.len());
+    let mut chars = result.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '&' && chars.peek() == Some(&'#') {
+            chars.next(); // consume '#'
+            let mut digits = String::new();
+            let hex = chars.peek() == Some(&'x') || chars.peek() == Some(&'X');
+            if hex { chars.next(); }
+            while let Some(&d) = chars.peek() {
+                if d == ';' { chars.next(); break; }
+                if d.is_ascii_alphanumeric() { digits.push(d); chars.next(); } else { break; }
+            }
+            let codepoint = if hex {
+                u32::from_str_radix(&digits, 16).ok()
+            } else {
+                digits.parse::<u32>().ok()
+            };
+            if let Some(c) = codepoint.and_then(char::from_u32) {
+                out.push(c);
+            } else {
+                out.push_str(if hex { "&#x" } else { "&#" });
+                out.push_str(&digits);
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+trait Pipe: Sized {
+    fn pipe<T>(self, f: impl FnOnce(Self) -> T) -> T { f(self) }
+}
+impl Pipe for String {}
+
+/// Call `GenerateStream` on the portal and forward tokens via `tx`.
+/// Sends `Some(token)` for each token, then `None` when done.
+fn summarize_streaming(
+    text: &str,
+    tx: std::sync::mpsc::Sender<Option<String>>,
+) -> anyhow::Result<()> {
     use zbus::blocking::Connection;
 
-    let conn = Connection::session()?;
-    let proxy = zbus::blocking::Proxy::new(
-        &conn,
-        "org.freedesktop.portal.Desktop",
-        "/org/freedesktop/portal/desktop",
-        "org.freedesktop.portal.AI",
-    )?;
+    const BUS: &str = "org.freedesktop.impl.portal.desktop.aileron";
+    const PATH: &str = "/org/freedesktop/portal/desktop";
+    const IFACE: &str = "org.freedesktop.impl.portal.AI";
 
-    let session_id: String = proxy.call("CreateSession", &("org.aileron.Demo", "llm.summarize"))?;
+    // Separate connections for method calls and signal subscriptions —
+    // the blocking zbus connection is single-threaded; mixing signals and
+    // method calls on the same connection causes deadlocks.
+    let call_conn   = Connection::session()?;
+    let signal_conn = Connection::session()?;
+
+    let proxy = zbus::blocking::Proxy::new(&call_conn, BUS, PATH, IFACE)?;
+    let sig_proxy = zbus::blocking::Proxy::new(&signal_conn, BUS, PATH, IFACE)?;
+
+    // Subscribe to ModelLoading on the signal connection before calling
+    // CreateSession, so no signals are missed during the model load.
+    let mut loading_iter = sig_proxy.receive_signal("ModelLoading")?;
+
+    let tx_loading = tx.clone();
+    let loading_thread = std::thread::spawn(move || {
+        let mut first = true;
+        for msg in &mut loading_iter {
+            if let Ok(body) = msg.body().deserialize::<(String,)>() {
+                if first {
+                    let _ = tx_loading.send(Some("Loading model…\n".to_string()));
+                    first = false;
+                }
+                let _ = tx_loading.send(Some(format!("\u{23F3} {}\n", body.0)));
+            }
+        }
+    });
+
+    // CreateSession blocks on the call connection until the container is ready.
+    let session_id: String =
+        proxy.call("CreateSession", &("org.aileron.Demo", "llm.summarize"))?;
+
+    drop(loading_thread);
 
     let prompt = format!(
-        "Summarize the following article in a few sentences:\n\n{}",
-        &text[..text.len().min(4096)]
+        "Summarize the following article in 3-5 sentences:\n\n{}",
+        &text[..text.len().min(8192)]
     );
 
-    let summary: String = proxy.call("Generate", &(&session_id, &prompt))?;
-    let _: () = proxy.call("EndSession", &(&session_id,))?;
+    // Subscribe to TokenReceived on the signal connection.
+    let mut token_iter = sig_proxy.receive_signal("TokenReceived")?;
 
-    Ok(summary)
+    // GenerateStream returns immediately; tokens arrive as D-Bus signals.
+    let _: () = proxy.call("GenerateStream", &(&session_id, &prompt))?;
+
+    for msg in &mut token_iter {
+        let body = msg.body();
+        let (sig_session, token, done): (String, String, bool) = body.deserialize()?;
+        if sig_session != session_id {
+            continue;
+        }
+        tx.send(Some(token))?;
+        if done {
+            break;
+        }
+    }
+
+    let _: () = proxy.call("EndSession", &(&session_id,))?;
+    tx.send(None)?;
+    Ok(())
 }

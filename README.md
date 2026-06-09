@@ -144,29 +144,70 @@ aileron
 
 ## Building container images
 
-Images are built with `podman build` (or `docker build`). Model weights must either be baked in at build time or mounted at runtime.
+Images are built with `podman build` (or `docker build`). Model weights are baked in at build time via `MODEL_URL`, or you can mount a local GGUF file at runtime.
 
 ### LLM image
 
+Four Dockerfiles are provided — pick the one that matches your hardware:
+
+| Dockerfile | Hardware | Notes |
+|---|---|---|
+| `Dockerfile` | CPU (any) | Default, works everywhere |
+| `Dockerfile.cuda` | NVIDIA GPU | Requires `nvidia-container-toolkit` on host |
+| `Dockerfile.rocm` | AMD GPU | Requires ROCm drivers on host |
+| `Dockerfile.vulkan` | Any Vulkan GPU | NVIDIA / AMD / Intel Arc, no proprietary drivers needed |
+
+**Naming convention:** tag images as `<name>:cpu`, `<name>:cuda`, `<name>:rocm`, `<name>:vulkan`.
+When you assign a base ref with no tag (e.g. `aileron/llama3.2-3b-instruct`), the daemon appends
+the detected hardware variant automatically at runtime. Assigning an explicit tag (e.g. `:cpu`) pins it.
+
 ```sh
-cd images/llm
+MODEL_URL="https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF/resolve/main/Llama-3.2-3B-Instruct-Q4_K_M.gguf"
 
-# CPU-only, bake in a model from HuggingFace:
+# CPU — works on any machine, no GPU required:
 podman build \
-    --build-arg MODEL_URL="https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF/resolve/main/Llama-3.2-3B-Instruct-Q4_K_M.gguf" \
-    -t ghcr.io/aileron/llama3.2-3b-instruct:latest .
+    --build-arg MODEL_URL="$MODEL_URL" \
+    -t aileron/llama3.2-3b-instruct:cpu \
+    images/llm
 
-# NVIDIA GPU (requires nvidia-container-toolkit):
+# NVIDIA GPU (requires nvidia-container-toolkit on host):
 podman build \
-    --build-arg CMAKE_ARGS="-DLLAMA_CUDA=on" \
-    --build-arg MODEL_URL="..." \
-    -t ghcr.io/aileron/llama3.2-3b-instruct:cuda .
+    --build-arg MODEL_URL="$MODEL_URL" \
+    -f images/llm/Dockerfile.cuda \
+    -t aileron/llama3.2-3b-instruct:cuda \
+    images/llm
 
-# Mount a local model file at runtime instead of baking it in:
+# AMD GPU (requires ROCm drivers on host):
+podman build \
+    --build-arg MODEL_URL="$MODEL_URL" \
+    -f images/llm/Dockerfile.rocm \
+    -t aileron/llama3.2-3b-instruct:rocm \
+    images/llm
+
+# Any Vulkan-capable GPU (NVIDIA / AMD / Intel Arc — no proprietary drivers needed):
+podman build \
+    --build-arg MODEL_URL="$MODEL_URL" \
+    -f images/llm/Dockerfile.vulkan \
+    -t aileron/llama3.2-3b-instruct:vulkan \
+    images/llm
+
+# Mount a local GGUF file at runtime instead of baking it in:
+podman build -t aileron/llama3.2-3b-instruct:cpu images/llm
 podman run --rm -i \
     -v /path/to/model.gguf:/model/model.gguf:ro \
-    ghcr.io/aileron/llama3.2-3b-instruct:latest
+    aileron/llama3.2-3b-instruct:cpu
 ```
+
+After building, assign the base ref (no tag) so the daemon picks the right variant automatically:
+
+```sh
+varlink call "unix:$XDG_RUNTIME_DIR/aileron.socket/aileron.Models.AssignUseCase" \
+    '{"image_ref":"aileron/llama3.2-3b-instruct","use_case":"llm.summarize"}'
+```
+
+The daemon detects your hardware once at startup (logged as `hardware variant: cuda`) and resolves
+`aileron/llama3.2-3b-instruct` → `aileron/llama3.2-3b-instruct:cuda` at container spawn time.
+Override with `AILERON_VARIANT=cpu|cuda|rocm|vulkan` if needed.
 
 Supported environment variables:
 
@@ -174,16 +215,16 @@ Supported environment variables:
 |---|---|---|
 | `MODEL_PATH` | `/model/model.gguf` | Path to the GGUF model file |
 | `N_CTX` | `4096` | Context window size |
-| `N_GPU_LAYERS` | `0` | Number of layers to offload to GPU |
+| `N_GPU_LAYERS` | auto | Layers to offload; auto-detected if unset (`-1` = all) |
+| `N_THREADS` | all cores | CPU threads (used when GPU is not available) |
 
 ### ASR image
 
 ```sh
-cd images/asr
-
 podman build \
     --build-arg MODEL_SIZE=small \
-    -t ghcr.io/aileron/whisper-small:latest .
+    -t aileron/whisper-small:latest \
+    images/asr
 ```
 
 Supported environment variables:
@@ -206,31 +247,25 @@ cargo build -p aileron-daemon
 # 2. Build the stub image (no model download needed)
 podman build -t aileron/stub:latest images/stub/
 
-# 3. Start the daemon in allow-all + auto-grant mode
-#    --allow-all  skips permission checks entirely
-#    --auto-grant persists a grant on first use (use one or the other)
-AILERON_ALLOW_ALL=1 ./target/debug/aileron-daemon &
+# 3. Start the daemon in allow-all mode (skips permission checks)
+AILERON_ALLOW_ALL=true ./target/debug/aileron-daemon &
 
 # 4. Assign the stub image to a use-case
-varlink call unix:$XDG_RUNTIME_DIR/aileron.socket \
-    aileron.Models.AssignUseCase \
-    '{"image_ref":"aileron/stub:latest","use_case":"llm.summarize"}'
+varlink call "unix:$XDG_RUNTIME_DIR/aileron.socket/aileron.Models.AssignUseCase" \
+    '{"image_ref":"localhost/aileron/stub:latest","use_case":"llm.summarize"}'
 
 # 5. Create a session
-varlink call unix:$XDG_RUNTIME_DIR/aileron.socket \
-    aileron.Inference.CreateSession \
+varlink call "unix:$XDG_RUNTIME_DIR/aileron.socket/aileron.Inference.CreateSession" \
     '{"app_id":"test","use_case":"llm.summarize"}'
 # → {"session_id": "..."}   copy the value
 
 # 6. Generate (replace SESSION_ID)
-varlink call unix:$XDG_RUNTIME_DIR/aileron.socket \
-    aileron.Inference.Generate \
+varlink call "unix:$XDG_RUNTIME_DIR/aileron.socket/aileron.Inference.Generate" \
     '{"session_id":"SESSION_ID","prompt":"Hello world"}'
-# → {"token": "Hello world"}   stub echoes the prompt back
+# → {"token": "world"}   stub echoes the last word of the prompt
 
 # 7. End the session
-varlink call unix:$XDG_RUNTIME_DIR/aileron.socket \
-    aileron.Inference.EndSession \
+varlink call "unix:$XDG_RUNTIME_DIR/aileron.socket/aileron.Inference.EndSession" \
     '{"session_id":"SESSION_ID"}'
 
 # 8. Stop the daemon

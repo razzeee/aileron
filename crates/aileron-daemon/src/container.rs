@@ -35,6 +35,7 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Stdio};
+use std::thread;
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -55,19 +56,87 @@ pub struct Container {
 }
 
 impl Container {
-    /// Spawn `podman run --rm -i <image_ref>`.
-    pub fn spawn(image_ref: &str) -> Result<Self> {
+    /// Spawn a hardened `podman run` for the given image and block until the
+    /// entrypoint signals it is ready by writing `ready` to stderr.
+    ///
+    /// The `on_status` callback is called with human-readable progress lines
+    /// from the container's stderr while we wait (e.g. model loading messages).
+    /// It may be called from a background thread.
+    ///
+    /// Isolation flags applied:
+    ///   --network=none       no network access whatsoever
+    ///   --read-only          root filesystem is read-only
+    ///   --tmpfs /tmp         writable scratch space (in-memory only)
+    ///   --no-new-privileges  prevents setuid/setcap escalation
+    ///   --cap-drop=all       drops every Linux capability
+    ///   --security-opt=no-new-privileges  belt-and-suspenders with the kernel
+    ///   --pids-limit=256     limits fork bombs
+    ///   --memory=4g          caps RAM usage
+    pub fn spawn(
+        image_ref: &str,
+        mut on_status: impl FnMut(String) + Send + 'static,
+    ) -> Result<Self> {
         info!("spawning container for {}", image_ref);
         let mut child = std::process::Command::new("podman")
-            .args(["run", "--rm", "-i", image_ref])
+            .args([
+                "run", "--rm", "-i",
+                "--network=none",
+                "--read-only",
+                "--tmpfs=/tmp:rw,noexec,nosuid,size=256m",
+                "--cap-drop=all",
+                "--security-opt=no-new-privileges",
+                "--pids-limit=256",
+                "--memory=4g",
+                image_ref,
+            ])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .with_context(|| format!("failed to spawn podman for {}", image_ref))?;
 
-        let stdin = child.stdin.take().expect("piped stdin");
+        let stdin  = child.stdin.take().expect("piped stdin");
         let stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
+        let stderr = BufReader::new(child.stderr.take().expect("piped stderr"));
+
+        // Read stderr lines in a background thread, forwarding them to
+        // `on_status` and watching for the "ready" sentinel.
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        thread::spawn(move || {
+            let mut signalled = false;
+            for line in stderr.lines() {
+                match line {
+                    Ok(l) => {
+                        info!("[container stderr] {}", l);
+                        let lower = l.to_lowercase();
+                        if !signalled && lower.contains("ready") {
+                            let _ = ready_tx.send(Ok(()));
+                            signalled = true;
+                        } else if !signalled {
+                            on_status(l);
+                        }
+                    }
+                    Err(e) => {
+                        if !signalled {
+                            let _ = ready_tx.send(Err(e.to_string()));
+                            signalled = true;
+                        }
+                        break;
+                    }
+                }
+            }
+            // If stderr closed without a ready line, signal an error.
+            if !signalled {
+                let _ = ready_tx.send(Err("container exited before ready".to_string()));
+            }
+        });
+
+        // Block until the container is ready or fails.
+        match ready_rx.recv() {
+            Ok(Ok(())) => info!("container ready: {}", image_ref),
+            Ok(Err(e)) => bail!("container failed to start: {}", e),
+            Err(_)     => bail!("container stderr thread dropped before ready"),
+        }
 
         Ok(Self {
             image_ref: image_ref.to_string(),
@@ -82,6 +151,7 @@ impl Container {
     /// `on_token` is called once per token as it arrives.
     pub fn generate(
         &mut self,
+        system: Option<&str>,
         prompt: &str,
         max_tokens: u32,
         mut on_token: impl FnMut(String),
@@ -90,6 +160,7 @@ impl Container {
         let req = ContainerRequest {
             id: id.clone(),
             r#type: "generate".to_string(),
+            system: system.map(str::to_string),
             prompt: Some(prompt.to_string()),
             max_tokens: Some(max_tokens),
             audio: None,
@@ -131,6 +202,7 @@ impl Container {
     /// Returns the validated JSON string.
     pub fn generate_structured(
         &mut self,
+        system: Option<&str>,
         prompt: &str,
         max_tokens: u32,
         schema: &Value,
@@ -139,6 +211,7 @@ impl Container {
         let req = ContainerRequest {
             id: id.clone(),
             r#type: "generate_structured".to_string(),
+            system: system.map(str::to_string),
             prompt: Some(prompt.to_string()),
             max_tokens: Some(max_tokens),
             audio: None,
@@ -181,6 +254,7 @@ impl Container {
         let req = ContainerRequest {
             id: id.clone(),
             r#type: "transcribe".to_string(),
+            system: None,
             prompt: None,
             max_tokens: None,
             audio: Some(audio),
@@ -200,6 +274,7 @@ impl Container {
         let req = ContainerRequest {
             id: id.clone(),
             r#type: "describe".to_string(),
+            system: None,
             prompt: None,
             max_tokens: None,
             audio: None,
@@ -408,9 +483,16 @@ impl ContainerPool {
     }
 
     /// Get or spawn a container for a use-case + image ref pair.
-    pub fn get_or_spawn(&mut self, use_case: &str, image_ref: &str) -> Result<&mut Container> {
+    /// `on_status` receives human-readable loading messages while the container
+    /// starts up (only called on a cold start, not for warm containers).
+    pub fn get_or_spawn(
+        &mut self,
+        use_case: &str,
+        image_ref: &str,
+        on_status: impl FnMut(String) + Send + 'static,
+    ) -> Result<&mut Container> {
         if !self.containers.contains_key(use_case) {
-            let c = Container::spawn(image_ref)?;
+            let c = Container::spawn(image_ref, on_status)?;
             self.containers.insert(use_case.to_string(), c);
         }
         Ok(self.containers.get_mut(use_case).unwrap())
@@ -455,6 +537,8 @@ impl ContainerPool {
 struct ContainerRequest {
     id: String,
     r#type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    system: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     prompt: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

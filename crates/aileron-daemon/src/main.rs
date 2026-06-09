@@ -6,6 +6,7 @@ mod assignments;
 mod config;
 mod container;
 mod handlers;
+mod hardware;
 mod permissions;
 mod service;
 mod state;
