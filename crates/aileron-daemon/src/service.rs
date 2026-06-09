@@ -1,10 +1,9 @@
 /// Varlink service entry point for the daemon.
-
 use anyhow::Result;
 use tracing::info;
 
-use crate::state::SharedState;
 use crate::handlers::{InferenceHandler, ModelsHandler, PermissionsHandler, SessionsHandler};
+use crate::state::SharedState;
 
 pub async fn run(state: SharedState) -> Result<()> {
     let addr = aileron_ipc::varlink_address();
@@ -24,8 +23,7 @@ pub async fn run(state: SharedState) -> Result<()> {
     }
 
     let state_for_thread = state.clone();
-    tokio::task::spawn_blocking(move || run_varlink_service(state_for_thread, &addr))
-        .await??;
+    tokio::task::spawn_blocking(move || run_varlink_service(state_for_thread, &addr)).await??;
 
     Ok(())
 }
@@ -42,18 +40,18 @@ fn run_varlink_service(state: SharedState, addr: &str) -> Result<()> {
         env!("CARGO_PKG_VERSION"),
         "https://github.com/aileron-project/aileron",
         vec![
-            Box::new(aileron_Inference::new(Box::new(
-                InferenceHandler::new(state.clone()),
-            ))),
-            Box::new(aileron_Models::new(Box::new(
-                ModelsHandler::new(state.clone()),
-            ))),
-            Box::new(aileron_Permissions::new(Box::new(
-                PermissionsHandler::new(state.clone()),
-            ))),
-            Box::new(aileron_Sessions::new(Box::new(
-                SessionsHandler::new(state.clone()),
-            ))),
+            Box::new(aileron_Inference::new(Box::new(InferenceHandler::new(
+                state.clone(),
+            )))),
+            Box::new(aileron_Models::new(Box::new(ModelsHandler::new(
+                state.clone(),
+            )))),
+            Box::new(aileron_Permissions::new(Box::new(PermissionsHandler::new(
+                state.clone(),
+            )))),
+            Box::new(aileron_Sessions::new(Box::new(SessionsHandler::new(
+                state.clone(),
+            )))),
         ],
     );
 

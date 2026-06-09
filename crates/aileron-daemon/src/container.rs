@@ -32,7 +32,6 @@
 ///   {"id":"<uuid>","type":"describe","image":"<base64 PNG/JPEG>"}
 /// Response (same as generate):
 ///   {"id":"<uuid>","token":"A cat sitting...","done":true}
-
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Stdio};
@@ -45,7 +44,9 @@ use uuid::Uuid;
 
 /// A running container for a single use-case.
 pub struct Container {
+    #[allow(dead_code)]
     pub image_ref: String,
+    /// Kept alive to prevent the container process from being killed on drop.
     #[allow(dead_code)]
     child: Child,
     stdin: ChildStdin,
@@ -244,8 +245,7 @@ impl Container {
 /// minLength/maxLength, minimum/maximum, enum.  It does not implement the full
 /// JSON Schema specification.
 fn validate_json_schema(json_str: &str, schema: &Value) -> Result<()> {
-    let value: Value = serde_json::from_str(json_str)
-        .context("model output is not valid JSON")?;
+    let value: Value = serde_json::from_str(json_str).context("model output is not valid JSON")?;
     validate_value(&value, schema, "$")
 }
 
@@ -279,21 +279,13 @@ fn validate_value(value: &Value, schema: &Value, path: &str) -> Result<()> {
             if let Some(props) = schema.get("properties").and_then(|v| v.as_object()) {
                 for (key, prop_schema) in props {
                     if let Some(field_val) = obj.get(key) {
-                        validate_value(
-                            field_val,
-                            prop_schema,
-                            &format!("{path}.{key}"),
-                        )?;
+                        validate_value(field_val, prop_schema, &format!("{path}.{key}"))?;
                     }
                 }
             }
 
             // additionalProperties: false
-            if schema
-                .get("additionalProperties")
-                .and_then(|v| v.as_bool())
-                == Some(false)
-            {
+            if schema.get("additionalProperties").and_then(|v| v.as_bool()) == Some(false) {
                 if let Some(props) = schema.get("properties").and_then(|v| v.as_object()) {
                     for key in obj.keys() {
                         if !props.contains_key(key) {
@@ -381,11 +373,7 @@ fn validate_value(value: &Value, schema: &Value, path: &str) -> Result<()> {
 fn check_enum(value: &Value, schema: &Value, path: &str) -> Result<()> {
     if let Some(variants) = schema.get("enum").and_then(|v| v.as_array()) {
         if !variants.contains(value) {
-            bail!(
-                "{path}: value {:?} is not in enum {:?}",
-                value,
-                variants
-            );
+            bail!("{path}: value {:?} is not in enum {:?}", value, variants);
         }
     }
     Ok(())
@@ -436,6 +424,7 @@ impl ContainerPool {
     }
 
     /// Kill all containers.
+    #[allow(dead_code)]
     pub fn kill_all(&mut self) {
         let keys: Vec<_> = self.containers.keys().cloned().collect();
         for k in keys {
@@ -482,7 +471,7 @@ struct ContainerRequest {
 /// Instructs the container to constrain output to a JSON Schema.
 #[derive(Serialize)]
 struct ResponseFormat {
-    r#type: String,   // always "json_schema"
+    r#type: String, // always "json_schema"
     schema: Value,
 }
 

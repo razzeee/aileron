@@ -3,7 +3,6 @@ use anyhow::Result;
 /// Helpers for setting up the server-side Varlink socket.
 /// The actual `varlink::VarlinkService` is assembled by the daemon; this module
 /// only provides path / socket utilities used during startup.
-
 use std::path::PathBuf;
 
 /// Return the filesystem path for the Unix socket.

@@ -1,8 +1,7 @@
 /// Activity page — live list of active sessions, polled every 2 seconds.
-
 use gtk4::prelude::*;
-use libadwaita::prelude::*;
 use gtk4::{Button, ListBox, ScrolledWindow};
+use libadwaita::prelude::*;
 use libadwaita::{ActionRow, PreferencesGroup, PreferencesPage};
 
 pub fn build() -> gtk4::Widget {
@@ -71,7 +70,7 @@ fn refresh_sessions(list_box: &ListBox) {
                 let kill_btn = Button::with_label("Kill");
                 kill_btn.add_css_class("destructive-action");
                 kill_btn.set_valign(gtk4::Align::Center);
-                let session_id  = session.session_id.clone();
+                let session_id = session.session_id.clone();
                 let list_box_ref = list_box.clone();
                 kill_btn.connect_clicked(move |_| {
                     use aileron_varlink::aileron_Sessions::VarlinkClientInterface;

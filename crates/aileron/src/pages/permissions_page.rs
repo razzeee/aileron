@@ -1,8 +1,7 @@
 /// Permissions page — per-app, per-use-case toggles with last-used timestamps.
-
 use gtk4::prelude::*;
-use libadwaita::prelude::*;
 use gtk4::{Button, ListBox, ScrolledWindow};
+use libadwaita::prelude::*;
 use libadwaita::{ActionRow, PreferencesGroup, PreferencesPage, SwitchRow};
 
 pub fn build() -> gtk4::Widget {
@@ -72,7 +71,7 @@ fn refresh_permissions(list_box: &ListBox) {
                 };
                 row.set_subtitle(&subtitle);
 
-                let app_id   = perm.app_id.clone();
+                let app_id = perm.app_id.clone();
                 let use_case = perm.use_case.clone();
                 row.connect_active_notify(move |switch| {
                     use aileron_varlink::aileron_Permissions::VarlinkClientInterface;

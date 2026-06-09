@@ -1,12 +1,11 @@
 /// Shared mutable daemon state, behind a single `Arc<Mutex<…>>`.
-
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::assignments::Assignments;
-use crate::container::ContainerPool;
 use crate::config::Config;
+use crate::container::ContainerPool;
 use crate::permissions::PermissionStore;
 
 #[derive(Debug, Clone)]

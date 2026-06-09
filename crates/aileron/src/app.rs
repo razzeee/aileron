@@ -30,11 +30,7 @@ fn build_window(app: &Application) {
     );
     perms_page.set_icon_name(Some("system-lock-screen-symbolic"));
 
-    let activity_page = stack.add_titled(
-        &activity_page::build(),
-        Some("activity"),
-        "Activity",
-    );
+    let activity_page = stack.add_titled(&activity_page::build(), Some("activity"), "Activity");
     activity_page.set_icon_name(Some("emblem-synchronizing-symbolic"));
 
     // The switcher sits in the header bar.

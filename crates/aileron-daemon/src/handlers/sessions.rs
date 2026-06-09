@@ -1,13 +1,10 @@
 /// Varlink handler for `aileron.Sessions`.
-
 use crate::state::SharedState;
+#[allow(unused_imports)]
+// VarlinkCallError is a supertrait; its methods reach us via Call_* dyn objects
 use aileron_varlink::aileron_Sessions::{
     Call_KillSession, Call_ListActive, SessionInfo, VarlinkCallError, VarlinkInterface,
 };
-
-fn io_err(_msg: impl std::fmt::Display) -> varlink::Error {
-    varlink::Error::from(varlink::ErrorKind::Io(std::io::ErrorKind::Other))
-}
 
 pub struct SessionsHandler {
     state: SharedState,

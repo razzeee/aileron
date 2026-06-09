@@ -1,9 +1,8 @@
 /// aileron-demo — sandboxed GTK4 article summarizer.
-
 use gtk4::prelude::*;
+use gtk4::{Box, Button, Entry, Label, Orientation, ScrolledWindow, TextBuffer, TextView};
 use libadwaita::prelude::*;
 use libadwaita::{Application, ApplicationWindow, HeaderBar, ToolbarView};
-use gtk4::{Box, Button, Entry, Label, Orientation, ScrolledWindow, TextBuffer, TextView};
 
 pub fn build_app() -> Application {
     let app = Application::builder()
@@ -78,7 +77,7 @@ fn build_window(app: &Application) {
 
     // ── Fetch handler ─────────────────────────────────────────────────────────
     {
-        let url_entry     = url_entry.clone();
+        let url_entry = url_entry.clone();
         let source_buffer = source_buffer.clone();
         fetch_button.connect_clicked(move |_| {
             let url = url_entry.text().to_string();
@@ -87,16 +86,15 @@ fn build_window(app: &Application) {
             }
             let source_buffer = source_buffer.clone();
             glib::spawn_future_local(async move {
-                let result: Result<String, String> =
-                    gio::spawn_blocking(move || {
-                        fetch_article_text(&url).map_err(|e| e.to_string())
-                    })
-                    .await
-                    .unwrap_or_else(|e| Err(format!("thread panic: {e:?}")));
+                let result: Result<String, String> = gio::spawn_blocking(move || {
+                    fetch_article_text(&url).map_err(|e| e.to_string())
+                })
+                .await
+                .unwrap_or_else(|e| Err(format!("thread panic: {e:?}")));
 
                 match result {
                     Ok(text) => source_buffer.set_text(&text),
-                    Err(e)   => source_buffer.set_text(&format!("[fetch error: {e}]")),
+                    Err(e) => source_buffer.set_text(&format!("[fetch error: {e}]")),
                 }
             });
         });
@@ -116,16 +114,15 @@ fn build_window(app: &Application) {
 
             let output_buffer = output_buffer.clone();
             glib::spawn_future_local(async move {
-                let result: Result<String, String> =
-                    gio::spawn_blocking(move || {
-                        summarize_via_portal(&text).map_err(|e| e.to_string())
-                    })
-                    .await
-                    .unwrap_or_else(|e| Err(format!("thread panic: {e:?}")));
+                let result: Result<String, String> = gio::spawn_blocking(move || {
+                    summarize_via_portal(&text).map_err(|e| e.to_string())
+                })
+                .await
+                .unwrap_or_else(|e| Err(format!("thread panic: {e:?}")));
 
                 match result {
                     Ok(summary) => output_buffer.set_text(&summary),
-                    Err(e)      => output_buffer.set_text(&format!("[error: {e}]")),
+                    Err(e) => output_buffer.set_text(&format!("[error: {e}]")),
                 }
             });
         });
@@ -182,8 +179,7 @@ fn summarize_via_portal(text: &str) -> anyhow::Result<String> {
         "org.freedesktop.portal.AI",
     )?;
 
-    let session_id: String =
-        proxy.call("CreateSession", &("org.aileron.Demo", "llm.summarize"))?;
+    let session_id: String = proxy.call("CreateSession", &("org.aileron.Demo", "llm.summarize"))?;
 
     let prompt = format!(
         "Summarize the following article in a few sentences:\n\n{}",
@@ -191,7 +187,7 @@ fn summarize_via_portal(text: &str) -> anyhow::Result<String> {
     );
 
     let summary: String = proxy.call("Generate", &(&session_id, &prompt))?;
-    let _: ()           = proxy.call("EndSession", &(&session_id,))?;
+    let _: () = proxy.call("EndSession", &(&session_id,))?;
 
     Ok(summary)
 }

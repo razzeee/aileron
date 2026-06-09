@@ -10,22 +10,48 @@
 /// placed in `$OUT_DIR`.  The module name matches the file stem produced by the
 /// generator (dots in the interface name are replaced with underscores).
 
-#[allow(non_snake_case, clippy::all)]
+// The varlink code generator produces non-standard names (e.g. `Call_Foo`,
+// `Foo_Args`).  Suppress the relevant lints for these modules only.
+#[allow(
+    non_snake_case,
+    non_camel_case_types,
+    dead_code,
+    unused_imports,
+    clippy::all
+)]
 pub mod aileron_Inference {
     include!(concat!(env!("OUT_DIR"), "/aileron.Inference.rs"));
 }
 
-#[allow(non_snake_case, clippy::all)]
+#[allow(
+    non_snake_case,
+    non_camel_case_types,
+    dead_code,
+    unused_imports,
+    clippy::all
+)]
 pub mod aileron_Models {
     include!(concat!(env!("OUT_DIR"), "/aileron.Models.rs"));
 }
 
-#[allow(non_snake_case, clippy::all)]
+#[allow(
+    non_snake_case,
+    non_camel_case_types,
+    dead_code,
+    unused_imports,
+    clippy::all
+)]
 pub mod aileron_Permissions {
     include!(concat!(env!("OUT_DIR"), "/aileron.Permissions.rs"));
 }
 
-#[allow(non_snake_case, clippy::all)]
+#[allow(
+    non_snake_case,
+    non_camel_case_types,
+    dead_code,
+    unused_imports,
+    clippy::all
+)]
 pub mod aileron_Sessions {
     include!(concat!(env!("OUT_DIR"), "/aileron.Sessions.rs"));
 }

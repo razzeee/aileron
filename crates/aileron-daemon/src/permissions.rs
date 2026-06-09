@@ -1,7 +1,6 @@
 /// Per-app, per-use-case permission records.
 ///
 /// Persisted at `$XDG_DATA_HOME/aileron/permissions.json`.
-
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -20,12 +19,13 @@ pub struct PermissionStore(pub HashMap<String, PermissionEntry>);
 
 impl PermissionStore {
     fn path() -> PathBuf {
-        let data_home = std::env::var("XDG_DATA_HOME")
-            .unwrap_or_else(|_| {
-                let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-                format!("{}/.local/share", home)
-            });
-        PathBuf::from(data_home).join("aileron").join("permissions.json")
+        let data_home = std::env::var("XDG_DATA_HOME").unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+            format!("{}/.local/share", home)
+        });
+        PathBuf::from(data_home)
+            .join("aileron")
+            .join("permissions.json")
     }
 
     pub fn load() -> Result<Self> {

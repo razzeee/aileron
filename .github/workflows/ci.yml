@@ -1,0 +1,156 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ── Core crates (no GTK) ────────────────────────────────────────────────────
+  # Runs on a plain ubuntu runner; builds and tests everything except the two
+  # GTK binaries.  This is the fast path that catches most regressions.
+  core:
+    name: Core — check / test / clippy / fmt
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo registry + build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: core-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: core-${{ runner.os }}-
+
+      - name: Install system deps (dbus only)
+        run: sudo apt-get install -y --no-install-recommends libdbus-1-dev pkg-config
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: cargo check (core crates only)
+        run: >
+          cargo check
+          -p aileron-varlink
+          -p aileron-ipc
+          -p aileron-daemon
+          -p aileron-portal
+
+      - name: cargo test (core crates only)
+        run: >
+          cargo test
+          -p aileron-varlink
+          -p aileron-ipc
+          -p aileron-daemon
+          -p aileron-portal
+
+      - name: cargo clippy (core crates only)
+        run: >
+          cargo clippy
+          -p aileron-varlink
+          -p aileron-ipc
+          -p aileron-daemon
+          -p aileron-portal
+          -- -D warnings
+
+  # ── GTK crates ──────────────────────────────────────────────────────────────
+  # Installs libgtk-4-dev and libadwaita-1-dev, then checks and clips the UI
+  # binaries.  Tests are skipped here because they require a running display.
+  gtk:
+    name: GTK — check / clippy
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo registry + build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: gtk-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: gtk-${{ runner.os }}-
+
+      - name: Install GTK system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-4-dev \
+            libadwaita-1-dev \
+            libdbus-1-dev \
+            pkg-config
+
+      - name: cargo check (all crates)
+        run: cargo check --workspace
+
+      - name: cargo clippy (GTK crates)
+        run: >
+          cargo clippy
+          -p aileron
+          -p aileron-demo
+          -- -D warnings
+
+  # ── Stub container image ────────────────────────────────────────────────────
+  # Verifies the stub Dockerfile builds successfully, then smoke-tests the
+  # container protocol by piping a generate request directly to it.
+  stub-image:
+    name: Stub container — build + protocol smoke test
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build stub image
+        run: podman build -t aileron/stub:ci images/stub/
+
+      - name: Protocol smoke test — generate
+        run: |
+          REQUEST='{"id":"test-1","type":"generate","prompt":"hello world","max_tokens":16}'
+          OUTPUT=$(echo "$REQUEST" | podman run --rm -i aileron/stub:ci)
+          echo "Output: $OUTPUT"
+          # Must contain at least one token line and a done:true line
+          echo "$OUTPUT" | grep -q '"token"'
+          echo "$OUTPUT" | grep -q '"done":true'
+
+      - name: Protocol smoke test — generate_structured
+        run: |
+          SCHEMA='{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}'
+          REQUEST=$(printf '{"id":"test-2","type":"generate_structured","prompt":"extract","max_tokens":64,"response_format":{"type":"json_schema","schema":%s}}' "$SCHEMA")
+          OUTPUT=$(echo "$REQUEST" | podman run --rm -i aileron/stub:ci)
+          echo "Output: $OUTPUT"
+          echo "$OUTPUT" | grep -q '"result"'
+          echo "$OUTPUT" | grep -q '"done":true'
+          # result must be valid JSON containing the required field
+          RESULT=$(echo "$OUTPUT" | python3 -c "import sys,json; lines=[json.loads(l) for l in sys.stdin]; print(lines[-1]['result'])")
+          echo "$RESULT" | python3 -c "import sys,json; d=json.load(sys.stdin); assert 'name' in d, f'missing name field: {d}'"
+
+      - name: Protocol smoke test — transcribe
+        run: |
+          # Empty base64 audio is fine for the stub — it ignores the bytes.
+          AUDIO=$(python3 -c "import base64; print(base64.b64encode(b'').decode())")
+          REQUEST=$(printf '{"id":"test-3","type":"transcribe","audio":"%s"}' "$AUDIO")
+          OUTPUT=$(echo "$REQUEST" | podman run --rm -i aileron/stub:ci)
+          echo "Output: $OUTPUT"
+          echo "$OUTPUT" | grep -q '"done":true'

@@ -15,7 +15,9 @@ pub use config::Config;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive("aileron_daemon=info".parse()?))
+        .with_env_filter(
+            EnvFilter::from_default_env().add_directive("aileron_daemon=info".parse()?),
+        )
         .init();
 
     let config = Config::parse();
@@ -24,7 +26,9 @@ async fn main() -> anyhow::Result<()> {
         tracing::warn!("AILERON_ALLOW_ALL is set — all permission checks are bypassed");
     }
     if config.auto_grant {
-        tracing::warn!("AILERON_AUTO_GRANT is set — first-use permissions are granted automatically");
+        tracing::warn!(
+            "AILERON_AUTO_GRANT is set — first-use permissions are granted automatically"
+        );
     }
 
     info!("aileron-daemon starting");

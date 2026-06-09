@@ -1,6 +1,7 @@
 /// Varlink handler for `aileron.Models`.
-
 use crate::state::SharedState;
+#[allow(unused_imports)]
+// VarlinkCallError is a supertrait; its methods reach us via Call_* dyn objects
 use aileron_varlink::aileron_Models::{
     Call_AssignUseCase, Call_Delete, Call_List, Call_Pull, ModelInfo, PullProgress,
     VarlinkCallError, VarlinkInterface,
@@ -30,8 +31,8 @@ impl VarlinkInterface for ModelsHandler {
                 .await
                 .map_err(io_err)?;
 
-            let images: Vec<PodmanImage> = serde_json::from_slice(&output.stdout)
-                .unwrap_or_default();
+            let images: Vec<PodmanImage> =
+                serde_json::from_slice(&output.stdout).unwrap_or_default();
 
             let guard = self.state.0.lock().await;
             let assignments = guard.assignments.all();

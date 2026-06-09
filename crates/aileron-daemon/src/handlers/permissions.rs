@@ -1,5 +1,4 @@
 /// Varlink handler for `aileron.Permissions`.
-
 use crate::state::SharedState;
 use aileron_varlink::aileron_Permissions::{
     AppPermission, Call_ListAppPermissions, Call_SetAppPermission, VarlinkInterface,
@@ -20,10 +19,7 @@ impl PermissionsHandler {
 }
 
 impl VarlinkInterface for PermissionsHandler {
-    fn list_app_permissions(
-        &self,
-        call: &mut dyn Call_ListAppPermissions,
-    ) -> varlink::Result<()> {
+    fn list_app_permissions(&self, call: &mut dyn Call_ListAppPermissions) -> varlink::Result<()> {
         let rt = tokio::runtime::Handle::current();
         rt.block_on(async {
             let guard = self.state.0.lock().await;
