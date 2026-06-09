@@ -1,0 +1,38 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/aileron-varlink",
+    "crates/aileron-ipc",
+    "crates/aileron-daemon",
+    "crates/aileron-portal",
+    "crates/aileron",
+    "crates/aileron-demo",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+authors = ["Aileron contributors"]
+
+[workspace.dependencies]
+aileron-varlink = { path = "crates/aileron-varlink" }
+aileron-ipc     = { path = "crates/aileron-ipc" }
+
+tokio    = { version = "1", features = ["full"] }
+serde    = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid     = { version = "1", features = ["v4"] }
+anyhow   = "1"
+thiserror = "1"
+tracing  = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+varlink           = "13"
+varlink_generator = "13"
+
+zbus   = { version = "4", features = ["tokio"] }
+gtk4   = { version = "0.9", features = ["v4_12"] }
+libadwaita = { version = "0.7", features = ["v1_5"] }
+reqwest = { version = "0.12", features = ["blocking"] }
+chrono = "0.4"

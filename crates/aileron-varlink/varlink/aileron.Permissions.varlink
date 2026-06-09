@@ -1,0 +1,14 @@
+# aileron.Permissions — per-app, per-use-case permission management
+
+interface aileron.Permissions
+
+type AppPermission (
+    app_id: string,
+    use_case: string,
+    allowed: bool,
+    last_used: ?string
+)
+
+method ListAppPermissions() -> (permissions: []AppPermission)
+
+method SetAppPermission(app_id: string, use_case: string, allowed: bool) -> ()

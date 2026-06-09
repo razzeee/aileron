@@ -1,0 +1,17 @@
+# aileron.Sessions — active session inspection
+
+interface aileron.Sessions
+
+type SessionInfo (
+    session_id: string,
+    app_id: string,
+    use_case: string,
+    started_at: string
+)
+
+method ListActive() -> (sessions: []SessionInfo)
+
+# Kill a running session (terminates the container if no other sessions use it).
+method KillSession(session_id: string) -> ()
+
+error SessionNotFound(session_id: string)

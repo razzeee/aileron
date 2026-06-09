@@ -1,0 +1,21 @@
+[package]
+name = "aileron-demo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "aileron-demo"
+path = "src/main.rs"
+
+[dependencies]
+tokio    = { workspace = true }
+anyhow   = { workspace = true }
+tracing  = { workspace = true }
+tracing-subscriber = { workspace = true }
+gtk4     = { workspace = true }
+libadwaita = { workspace = true }
+reqwest  = { workspace = true }
+zbus     = { workspace = true }
+serde    = { workspace = true }
+serde_json = { workspace = true }

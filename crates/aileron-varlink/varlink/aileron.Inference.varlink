@@ -1,0 +1,28 @@
+# aileron.Inference — text/audio/vision inference sessions
+
+interface aileron.Inference
+
+# Create a session for a given use-case and app_id.
+# Returns a session_id to use in subsequent calls.
+# The daemon checks/prompts permissions at this point.
+method CreateSession(app_id: string, use_case: string) -> (session_id: string)
+
+# Start a streaming text generation session.
+# use_case: one of llm.summarize, llm.translate, llm.rephrase, llm.classify, llm.extract
+# Returns a stream of token strings.
+method Generate(session_id: string, prompt: string) -> (token: string)
+
+# Transcribe audio. Session must have been created with use_case: asr.transcribe
+# audio: raw PCM bytes encoded as base64 (16kHz mono f32le)
+method Transcribe(session_id: string, audio: string) -> (text: string)
+
+# Describe an image. Session must have been created with vision.describe or vision.segment
+# image: PNG or JPEG bytes encoded as base64
+method Describe(session_id: string, image: string) -> (text: string)
+
+# End a session and release the container.
+method EndSession(session_id: string) -> ()
+
+error PermissionDenied(app_id: string, use_case: string)
+error SessionNotFound(session_id: string)
+error NoModelAssigned(use_case: string)

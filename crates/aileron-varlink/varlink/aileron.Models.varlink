@@ -1,0 +1,31 @@
+# aileron.Models — OCI model management
+
+interface aileron.Models
+
+type ModelInfo (
+    image_ref: string,
+    use_cases: []string,
+    size_bytes: int,
+    pulled_at: string
+)
+
+method List() -> (models: []ModelInfo)
+
+type PullProgress (
+    image_ref: string,
+    bytes_pulled: int,
+    total_bytes: int,
+    done: bool
+)
+
+# Streams progress events until done: true.
+method Pull(image_ref: string) -> (progress: PullProgress)
+
+method Delete(image_ref: string) -> ()
+
+# Assign a use-case token to a pulled image.
+# Only one image may be assigned per use-case at a time; replaces any existing assignment.
+method AssignUseCase(image_ref: string, use_case: string) -> ()
+
+error ImageNotFound(image_ref: string)
+error PullFailed(image_ref: string, reason: string)

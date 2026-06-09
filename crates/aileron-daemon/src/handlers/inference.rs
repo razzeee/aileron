@@ -1,0 +1,201 @@
+/// Varlink handler for `aileron.Inference`.
+
+use uuid::Uuid;
+
+use crate::state::SharedState;
+use aileron_varlink::aileron_Inference::{
+    Call_CreateSession, Call_Describe, Call_EndSession, Call_Generate, Call_Transcribe,
+    VarlinkCallError, VarlinkInterface,
+};
+
+pub struct InferenceHandler {
+    state: SharedState,
+}
+
+impl InferenceHandler {
+    pub fn new(state: SharedState) -> Self {
+        Self { state }
+    }
+}
+
+/// Convert an anyhow / string error into a varlink::Error.
+fn io_err(msg: impl std::fmt::Display) -> varlink::Error {
+    varlink::Error::from(varlink::ErrorKind::Io(std::io::ErrorKind::Other))
+}
+
+impl VarlinkInterface for InferenceHandler {
+    fn create_session(
+        &self,
+        call: &mut dyn Call_CreateSession,
+        app_id: String,
+        use_case: String,
+    ) -> varlink::Result<()> {
+        let rt = tokio::runtime::Handle::current();
+        rt.block_on(async {
+            let mut guard = self.state.0.lock().await;
+
+            match guard.permissions.check(&app_id, &use_case) {
+                Some(true) => {}
+                _ => return call.reply_permission_denied(app_id, use_case),
+            }
+
+            if guard.assignments.get(&use_case).is_none() {
+                return call.reply_no_model_assigned(use_case);
+            }
+
+            let session_id = Uuid::new_v4().to_string();
+            let session = crate::state::Session {
+                session_id: session_id.clone(),
+                app_id,
+                use_case,
+                started_at: chrono::Utc::now(),
+            };
+            guard.sessions.insert(session_id.clone(), session);
+            call.reply(session_id)
+        })
+    }
+
+    fn generate(
+        &self,
+        call: &mut dyn Call_Generate,
+        session_id: String,
+        prompt: String,
+    ) -> varlink::Result<()> {
+        let rt = tokio::runtime::Handle::current();
+        rt.block_on(async {
+            let mut guard = self.state.0.lock().await;
+
+            let (app_id, use_case) = match guard.sessions.get(&session_id) {
+                Some(s) => (s.app_id.clone(), s.use_case.clone()),
+                None => return call.reply_session_not_found(session_id),
+            };
+
+            let image_ref = match guard.assignments.get(&use_case) {
+                Some(r) => r.to_string(),
+                None => return call.reply_no_model_assigned(use_case),
+            };
+
+            let _ = guard.permissions.touch(&app_id, &use_case);
+
+            let container = guard.containers.get_or_spawn(&use_case, &image_ref)
+                .map_err(|e| io_err(e))?;
+
+            let mut last_token = String::new();
+            container.generate(&prompt, 512, |token| {
+                last_token = token;
+            })
+            .map_err(|e| io_err(e))?;
+
+            call.reply(last_token)
+        })
+    }
+
+    fn transcribe(
+        &self,
+        call: &mut dyn Call_Transcribe,
+        session_id: String,
+        audio: String,
+    ) -> varlink::Result<()> {
+        let rt = tokio::runtime::Handle::current();
+        rt.block_on(async {
+            let mut guard = self.state.0.lock().await;
+
+            let (app_id, use_case) = match guard.sessions.get(&session_id) {
+                Some(s) => (s.app_id.clone(), s.use_case.clone()),
+                None => return call.reply_session_not_found(session_id),
+            };
+
+            let image_ref = match guard.assignments.get(&use_case) {
+                Some(r) => r.to_string(),
+                None => return call.reply_no_model_assigned(use_case),
+            };
+
+            let _ = guard.permissions.touch(&app_id, &use_case);
+
+            let audio_bytes = base64_decode(&audio).map_err(|e| io_err(e))?;
+
+            let container = guard.containers.get_or_spawn(&use_case, &image_ref)
+                .map_err(|e| io_err(e))?;
+
+            let text = container.transcribe(audio_bytes).map_err(|e| io_err(e))?;
+
+            call.reply(text)
+        })
+    }
+
+    fn describe(
+        &self,
+        call: &mut dyn Call_Describe,
+        session_id: String,
+        image: String,
+    ) -> varlink::Result<()> {
+        let rt = tokio::runtime::Handle::current();
+        rt.block_on(async {
+            let mut guard = self.state.0.lock().await;
+
+            let (app_id, use_case) = match guard.sessions.get(&session_id) {
+                Some(s) => (s.app_id.clone(), s.use_case.clone()),
+                None => return call.reply_session_not_found(session_id),
+            };
+
+            let image_ref = match guard.assignments.get(&use_case) {
+                Some(r) => r.to_string(),
+                None => return call.reply_no_model_assigned(use_case),
+            };
+
+            let _ = guard.permissions.touch(&app_id, &use_case);
+
+            let image_bytes = base64_decode(&image).map_err(|e| io_err(e))?;
+
+            let container = guard.containers.get_or_spawn(&use_case, &image_ref)
+                .map_err(|e| io_err(e))?;
+
+            let text = container.describe(image_bytes).map_err(|e| io_err(e))?;
+
+            call.reply(text)
+        })
+    }
+
+    fn end_session(
+        &self,
+        call: &mut dyn Call_EndSession,
+        session_id: String,
+    ) -> varlink::Result<()> {
+        let rt = tokio::runtime::Handle::current();
+        rt.block_on(async {
+            let mut guard = self.state.0.lock().await;
+            if guard.sessions.remove(&session_id).is_none() {
+                return call.reply_session_not_found(session_id);
+            }
+            call.reply()
+        })
+    }
+}
+
+fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
+    let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut table = [255u8; 256];
+    for (i, &b) in alphabet.iter().enumerate() {
+        table[b as usize] = i as u8;
+    }
+
+    let clean: Vec<u8> = s.bytes().filter(|&b| b != b'=').collect();
+    let mut out = Vec::with_capacity(clean.len() * 3 / 4);
+    let mut buf = 0u32;
+    let mut bits = 0u32;
+
+    for b in clean {
+        let v = table[b as usize];
+        if v == 255 {
+            return Err(format!("invalid base64 char: {}", b as char));
+        }
+        buf = (buf << 6) | v as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+            buf &= (1 << bits) - 1;
+        }
+    }
+    Ok(out)
+}

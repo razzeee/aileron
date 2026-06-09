@@ -1,0 +1,63 @@
+/// Varlink handler for `aileron.Sessions`.
+
+use crate::state::SharedState;
+use aileron_varlink::aileron_Sessions::{
+    Call_KillSession, Call_ListActive, SessionInfo, VarlinkCallError, VarlinkInterface,
+};
+
+fn io_err(_msg: impl std::fmt::Display) -> varlink::Error {
+    varlink::Error::from(varlink::ErrorKind::Io(std::io::ErrorKind::Other))
+}
+
+pub struct SessionsHandler {
+    state: SharedState,
+}
+
+impl SessionsHandler {
+    pub fn new(state: SharedState) -> Self {
+        Self { state }
+    }
+}
+
+impl VarlinkInterface for SessionsHandler {
+    fn list_active(&self, call: &mut dyn Call_ListActive) -> varlink::Result<()> {
+        let rt = tokio::runtime::Handle::current();
+        rt.block_on(async {
+            let guard = self.state.0.lock().await;
+            let sessions: Vec<SessionInfo> = guard
+                .sessions
+                .values()
+                .map(|s| SessionInfo {
+                    session_id: s.session_id.clone(),
+                    app_id: s.app_id.clone(),
+                    use_case: s.use_case.clone(),
+                    started_at: s.started_at.to_rfc3339(),
+                })
+                .collect();
+            call.reply(sessions)
+        })
+    }
+
+    fn kill_session(
+        &self,
+        call: &mut dyn Call_KillSession,
+        session_id: String,
+    ) -> varlink::Result<()> {
+        let rt = tokio::runtime::Handle::current();
+        rt.block_on(async {
+            let mut guard = self.state.0.lock().await;
+            let session = match guard.sessions.remove(&session_id) {
+                Some(s) => s,
+                None => return call.reply_session_not_found(session_id),
+            };
+            let use_case_still_used = guard
+                .sessions
+                .values()
+                .any(|s| s.use_case == session.use_case);
+            if !use_case_still_used {
+                guard.containers.kill(&session.use_case);
+            }
+            call.reply()
+        })
+    }
+}

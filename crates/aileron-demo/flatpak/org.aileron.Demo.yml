@@ -1,0 +1,35 @@
+app-id: org.aileron.Demo
+runtime: org.gnome.Platform
+runtime-version: '47'
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+
+command: aileron-demo
+
+finish-args:
+  # Wayland display
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --share=ipc
+  # Network access for fetching article URLs only.
+  - --share=network
+  # Required portals — AI portal grants access to aileron-daemon.
+  - --talk-name=org.freedesktop.portal.Desktop
+  # No access to $XDG_RUNTIME_DIR of the host session (no direct socket access).
+
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+  env:
+    CARGO_HOME: /run/build/aileron-demo/cargo
+
+modules:
+  - name: aileron-demo
+    buildsystem: simple
+    build-commands:
+      - cargo build --release --package aileron-demo
+      - install -Dm755 target/release/aileron-demo /app/bin/aileron-demo
+    sources:
+      - type: git
+        url: .
+        branch: main

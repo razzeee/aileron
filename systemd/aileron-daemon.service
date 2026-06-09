@@ -1,0 +1,20 @@
+[Unit]
+Description=Aileron local AI daemon
+Documentation=https://github.com/aileron-project/aileron
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/aileron-daemon
+Restart=on-failure
+RestartSec=3
+
+# Restrict network access — all IPC is over the Unix socket.
+PrivateNetwork=yes
+
+# The socket lives in $XDG_RUNTIME_DIR which systemd already exposes to user services.
+Environment="XDG_RUNTIME_DIR=%t"
+
+[Install]
+WantedBy=graphical-session.target

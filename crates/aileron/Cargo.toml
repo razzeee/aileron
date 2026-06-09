@@ -1,0 +1,24 @@
+[package]
+name = "aileron"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "aileron"
+path = "src/main.rs"
+
+[dependencies]
+aileron-varlink = { workspace = true }
+aileron-ipc     = { workspace = true }
+tokio           = { workspace = true }
+serde           = { workspace = true }
+serde_json      = { workspace = true }
+anyhow          = { workspace = true }
+thiserror       = { workspace = true }
+tracing         = { workspace = true }
+tracing-subscriber = { workspace = true }
+gtk4            = { workspace = true }
+libadwaita      = { workspace = true }
+varlink         = { workspace = true }
+chrono          = { workspace = true }
