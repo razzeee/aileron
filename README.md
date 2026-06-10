@@ -176,14 +176,14 @@ varlink call "unix:$XDG_RUNTIME_DIR/aileron.socket/aileron.Models.AssignUseCase"
     '{"image_ref":"localhost/aileron/stub:latest","use_case":"llm.summarize"}'
 
 # 5. Create a session
-varlink call "unix:$XDG_RUNTIME_DIR/aileron.socket/aileron.Inference.CreateSession" \
-    '{"app_id":"test","use_case":"llm.summarize"}'
+varlink call "unix:$XDG_RUNTIME_DIR/aileron.socket/aileron.Inference.CreateLanguageModelSession" \
+    '{"app_id":"test","use_case":"llm.summarize","instructions":"You are a concise test assistant."}'
 # → {"session_id": "..."}   copy the value
 
 # 6. Generate (replace SESSION_ID)
-varlink call "unix:$XDG_RUNTIME_DIR/aileron.socket/aileron.Inference.Generate" \
-    '{"session_id":"SESSION_ID","prompt":"Hello world"}'
-# → {"token": "world"}   stub echoes the last word of the prompt
+varlink call "unix:$XDG_RUNTIME_DIR/aileron.socket/aileron.Inference.Respond" \
+    '{"session_id":"SESSION_ID","prompt":"Hello world","options":{"maximum_response_tokens":64,"temperature":0.0,"sampling_mode":"greedy"}}'
+# → {"content": "Hello world"}   stub echoes the prompt
 
 # 7. End the session
 varlink call "unix:$XDG_RUNTIME_DIR/aileron.socket/aileron.Inference.EndSession" \
@@ -248,15 +248,28 @@ The daemon exposes four interfaces over `$XDG_RUNTIME_DIR/aileron.socket`.
 Create sessions, generate text, get structured JSON output, transcribe audio, describe images.
 
 ```varlink
-method CreateSession(app_id: string, use_case: string) -> (session_id: string)
-method Generate(session_id: string, prompt: string) -> (token: string)
-method GenerateStructured(session_id: string, prompt: string, schema: string) -> (result: string)
+type ModelAvailability (is_available: bool, reason: string)
+type GenerationOptions (maximum_response_tokens: int, temperature: float, sampling_mode: string)
+type GuidedField (name: string, kind: string, description: string, required: bool)
+
+method GetLanguageModelAvailability(app_id: string, use_case: string) -> (availability: ModelAvailability)
+method CreateLanguageModelSession(app_id: string, use_case: string, instructions: string) -> (session_id: string)
+method Prewarm(session_id: string, prompt_prefix: string) -> ()
+method Respond(session_id: string, prompt: string, options: GenerationOptions) -> (content: string)
+method StreamResponse(session_id: string, prompt: string, options: GenerationOptions) -> (token: string)
+method RespondGuided(session_id: string, prompt: string, fields: []GuidedField, options: GenerationOptions) -> (content: string)
 method Transcribe(session_id: string, audio: string) -> (text: string)
 method Describe(session_id: string, image: string) -> (text: string)
 method EndSession(session_id: string) -> ()
 ```
 
-`audio` and `image` are base64-encoded bytes. `schema` is a JSON Schema object serialised as a string.
+`instructions` are stored on the session and forwarded to text containers as the container `system` prompt. `audio` is raw 16 kHz mono f32le PCM bytes encoded as base64. `image` is PNG or JPEG bytes encoded as base64.
+
+`GenerationOptions.maximum_response_tokens` must be greater than zero and fit in `u32`. `temperature` must be finite and non-negative. `sampling_mode` must be non-empty; today the daemon validates it but only forwards `maximum_response_tokens` to containers as `max_tokens`.
+
+`GuidedField.kind` supports `string`, `number`, `integer`, `boolean`, and `string_array`. The daemon converts guided fields into a JSON Schema object with `additionalProperties: false`, sends it to the container as `response_format.schema`, then validates the returned JSON before replying.
+
+Inference errors are represented as Varlink errors: `PermissionDenied`, `SessionNotFound`, `ModelUnavailable`, `InvalidGenerationOptions`, `GuidedGenerationFailed`, and `GenerationFailed`.
 
 ### `aileron.Models`
 
@@ -264,7 +277,7 @@ Pull, list, delete, and assign OCI images.
 
 ```varlink
 method List() -> (models: []ModelInfo)
-method Pull(image_ref: string) -> (progress: PullProgress)
+method Pull(image_ref: string) -> (progress: PullProgress, auto_assigned: []string, conflicts: []UseCaseConflict)
 method Delete(image_ref: string) -> ()
 method AssignUseCase(image_ref: string, use_case: string) -> ()
 ```
@@ -289,36 +302,78 @@ method KillSession(session_id: string) -> ()
 
 ## D-Bus portal interface
 
-`aileron-portal` registers on the session bus as `org.freedesktop.impl.portal.desktop.aileron` at path `/org/freedesktop/portal/desktop`, interface `org.freedesktop.impl.portal.AI`.
+`aileron-portal` is the sandbox-facing API. It registers on the session bus as `org.freedesktop.impl.portal.desktop.aileron` at path `/org/freedesktop/portal/desktop`, interface `org.freedesktop.impl.portal.AI`.
+
+The portal does not talk to containers directly. It translates D-Bus calls into `aileron.Inference` Varlink calls, and the daemon owns permissions, sessions, model assignments, and container stdio.
 
 ### Methods
 
 | Method | Parameters | Returns | Notes |
 |---|---|---|---|
-| `CreateSession` | `app_id: s, use_case: s` | `session_id: s` | Blocks until the model container is ready; fires `ModelLoading` signals during load |
-| `Generate` | `session_id: s, prompt: s` | `text: s` | Returns full generated text (non-streaming) |
-| `GenerateStream` | `session_id: s, prompt: s` | — | Returns immediately; fires `TokenReceived` signals |
-| `GenerateStructured` | `session_id: s, prompt: s, schema: s` | `result: s` | JSON Schema-constrained output |
+| `GetLanguageModelAvailability` | `app_id: s, use_case: s` | `(is_available: b, reason: s)` | Checks whether an assigned image is present locally |
+| `CreateLanguageModelSession` | `app_id: s, use_case: s, instructions: s` | `session_id: s` | Creates a session; does not start the container by itself |
+| `Prewarm` | `session_id: s, prompt_prefix: s` | `()` | Starts the backing container before the first response |
+| `Respond` | `session_id: s, prompt: s, options: (xds)` | `content: s` | Returns full generated text |
+| `StreamResponse` | `session_id: s, prompt: s, options: (xds)` | `()` | Emits `TokenReceived` signals; final token has `done=true` |
+| `RespondGuided` | `session_id: s, prompt: s, fields: a(sssb), options: (xds)` | `content: s` | Returns JSON matching guided fields |
 | `Transcribe` | `session_id: s, audio_b64: s` | `text: s` | 16 kHz mono f32le PCM, base64 |
 | `Describe` | `session_id: s, image_b64: s` | `text: s` | PNG or JPEG, base64 |
-| `EndSession` | `session_id: s` | — | |
+| `EndSession` | `session_id: s` | `()` | |
+
+`options: (xds)` is `GenerationOptions`: `maximum_response_tokens` as int64, `temperature` as float64, and `sampling_mode` as string. `fields: a(sssb)` is an array of `GuidedField`: name, kind, description, required.
 
 ### Signals
 
 | Signal | Parameters | Fired when |
 |---|---|---|
-| `ModelLoading` | `message: s` | Container is starting up during `CreateSession` |
-| `TokenReceived` | `session_id: s, token: s, done: b` | Each token during `GenerateStream` |
+| `ModelLoading` | `message: s` | The portal is about to start a cold text-generation container |
+| `TokenReceived` | `session_id: s, token: s, done: b` | Each token during `StreamResponse` |
+
+D-Bus callers see underlying Varlink failures as `org.freedesktop.DBus.Error.Failed` with the Varlink error text.
+
+## Portal-to-container API boundary
+
+There is no direct portal-to-container transport. The complete inference API path is:
+
+1. Sandboxed app calls `org.freedesktop.impl.portal.AI` over session D-Bus.
+2. `aileron-portal` maps that call to `aileron.Inference` over the daemon's Varlink Unix socket.
+3. `aileron-daemon` validates permissions/options, resolves the assigned image for the session use-case, and serializes one request at a time to the use-case container over stdio.
+4. The container returns newline-delimited JSON chunks on stdout; the daemon aggregates or streams them back through Varlink, and the portal returns a D-Bus value or emits D-Bus signals.
+
+The stable API surfaces are the D-Bus portal interface, the Varlink `aileron.Inference` interface, and the container stdio protocol below. Containers should not assume anything about D-Bus, and portal clients should not assume anything about container JSON beyond the semantics exposed by the portal methods.
 
 ## Container stdio protocol
 
-Each OCI image implements a simple newline-delimited JSON protocol over stdin/stdout. No ports, no sockets — the container has `--network=none`.
+Each OCI image implements a simple newline-delimited JSON protocol over stdin/stdout. No ports, no sockets; the container has `--network=none`. The daemon is the only process that speaks this protocol.
+
+### Framing and readiness
+
+- Every stdin/stdout line is one UTF-8 JSON object.
+- The container signals readiness by writing a stderr line containing `ready` after model initialization.
+- Stderr lines before readiness are human-readable loading/status messages.
+- Every request has an `id` string and a `type` string.
+- Every response for a request echoes the same `id`.
+- Successful streamed responses end with a line where `done` is `true`.
+- Containers are used serially per use-case; do not rely on multiplexed in-flight requests.
+
+### Request fields
+
+| Field | Type | Used by | Description |
+|---|---|---|---|
+| `id` | string | all requests | Correlation ID generated by the daemon |
+| `type` | string | all requests | One of `generate`, `generate_structured`, `transcribe`, `describe` |
+| `system` | string | `generate`, `generate_structured` | Session instructions from `CreateLanguageModelSession` |
+| `prompt` | string | `generate`, `generate_structured`, optionally `describe` | User prompt or image prompt |
+| `max_tokens` | number | `generate`, `generate_structured`, optionally `describe` | Derived from `GenerationOptions.maximum_response_tokens` for text requests |
+| `audio` | string | `transcribe` | Base64-encoded raw PCM bytes, 16 kHz mono f32le |
+| `image` | string | `describe` | Base64-encoded PNG or JPEG bytes |
+| `response_format` | object | `generate_structured` | `{ "type": "json_schema", "schema": ... }` |
 
 All requests may include an optional `system` field (string) to set the system prompt. The entrypoint defaults to: _"You are a helpful assistant. Always respond in the same language as the user's message."_
 
 ### Streaming text generation
 
-```json
+```jsonc
 // request
 {"id": "uuid", "type": "generate", "prompt": "Summarise this: ...", "max_tokens": 512}
 
@@ -329,9 +384,9 @@ All requests may include an optional `system` field (string) to set the system p
 
 ### Structured output
 
-The daemon sends a `response_format` object containing the caller's JSON Schema. The container constrains sampling to valid JSON via llama.cpp grammar and replies with a single `result` line. The daemon validates the result against the schema before returning it; mismatches produce a `SchemaValidationFailed` error.
+The daemon sends a `response_format` object containing the caller's JSON Schema. The container constrains sampling to valid JSON via llama.cpp grammar and replies with a single `result` line. The daemon validates the result against the schema before returning it; mismatches produce `GuidedGenerationFailed`.
 
-```json
+```jsonc
 // request
 {
   "id": "uuid",
@@ -357,7 +412,7 @@ The daemon sends a `response_format` object containing the caller's JSON Schema.
 
 ### Audio transcription
 
-```json
+```jsonc
 // request
 {"id": "uuid", "type": "transcribe", "audio": "<base64 PCM 16kHz mono f32le>"}
 
@@ -367,7 +422,7 @@ The daemon sends a `response_format` object containing the caller's JSON Schema.
 
 ### Image description
 
-```json
+```jsonc
 // request
 {"id": "uuid", "type": "describe", "image": "<base64 PNG or JPEG>"}
 
@@ -377,10 +432,12 @@ The daemon sends a `response_format` object containing the caller's JSON Schema.
 
 ## Container lifecycle
 
-- Containers start on demand when `CreateSession` is called — the daemon waits for the container to signal `ready` on stderr before returning the session ID.
-- Loading status lines (e.g. model file, GPU detected) are forwarded to the caller as D-Bus `ModelLoading` signals during the wait.
+- Containers start on demand when `Prewarm` or the first inference call needs an assigned use-case image.
+- The daemon waits for the container to signal `ready` on stderr before using it.
+- The portal emits `ModelLoading("starting model")` before cold text-generation calls that may start a container.
 - One container runs per use-case, shared across all sessions for that use-case.
-- Idle containers are terminated after 5 minutes (configurable via `--idle-timeout-secs`).
+- `EndSession` removes the session, but the per-use-case container remains pooled until idle timeout.
+- Idle containers are terminated after 5 minutes by default (configurable via `--idle-timeout-secs`).
 - A crash in the container kills only that container, not the daemon.
 
 ## Hardware variant selection

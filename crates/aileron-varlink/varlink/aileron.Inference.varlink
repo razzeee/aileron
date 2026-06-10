@@ -46,7 +46,7 @@ method Transcribe(session_id: string, audio: string) -> (text: string)
 # image: PNG or JPEG bytes encoded as base64
 method Describe(session_id: string, image: string) -> (text: string)
 
-# End a session and release the container.
+# End a session. The per-use-case container remains pooled until idle timeout.
 method EndSession(session_id: string) -> ()
 
 error PermissionDenied(app_id: string, use_case: string)
