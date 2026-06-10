@@ -18,20 +18,21 @@ Aileron solves both. All IPC is over a Varlink Unix socket. Flatpak sandboxes ca
 ```
 ┌─────────────────────────────────────────┐
 │  Flatpak sandbox                        │
-│  aileron-demo  ──── D-Bus ────────────► │──► org.freedesktop.portal.AI
+│  aileron-demo  ──── D-Bus ────────────► │──► org.freedesktop.impl.portal.AI
 └─────────────────────────────────────────┘             │
                                                         │ D-Bus
                                                  aileron-portal
                                                         │ Varlink (Unix socket)
                                                  aileron-daemon
-                                                        │ stdin/stdout
-                                                 podman container
+                                                        │ stdin/stdout (hardened podman)
+                                                 OCI container
                                                         │
                                                llama.cpp / whisper.cpp
-                                               (inside OCI image)
+                                               (inside image, no network)
 ```
 
-The management UI (`aileron`) also speaks directly to the daemon over the same Varlink socket and runs outside any sandbox.
+The management UI (`aileron`) speaks directly to the daemon over the same Varlink socket and runs outside any sandbox.
+
 
 ## Workspace
 
@@ -366,11 +367,34 @@ method ListActive() -> (sessions: []SessionInfo)
 method KillSession(session_id: string) -> ()
 ```
 
-Full IDL: [`crates/aileron-varlink/varlink/`](crates/aileron-varlink/varlink/)
+## D-Bus portal interface
+
+`aileron-portal` registers on the session bus as `org.freedesktop.impl.portal.desktop.aileron` at path `/org/freedesktop/portal/desktop`, interface `org.freedesktop.impl.portal.AI`.
+
+### Methods
+
+| Method | Parameters | Returns | Notes |
+|---|---|---|---|
+| `CreateSession` | `app_id: s, use_case: s` | `session_id: s` | Blocks until the model container is ready; fires `ModelLoading` signals during load |
+| `Generate` | `session_id: s, prompt: s` | `text: s` | Returns full generated text (non-streaming) |
+| `GenerateStream` | `session_id: s, prompt: s` | — | Returns immediately; fires `TokenReceived` signals |
+| `GenerateStructured` | `session_id: s, prompt: s, schema: s` | `result: s` | JSON Schema-constrained output |
+| `Transcribe` | `session_id: s, audio_b64: s` | `text: s` | 16 kHz mono f32le PCM, base64 |
+| `Describe` | `session_id: s, image_b64: s` | `text: s` | PNG or JPEG, base64 |
+| `EndSession` | `session_id: s` | — | |
+
+### Signals
+
+| Signal | Parameters | Fired when |
+|---|---|---|
+| `ModelLoading` | `message: s` | Container is starting up during `CreateSession` |
+| `TokenReceived` | `session_id: s, token: s, done: b` | Each token during `GenerateStream` |
 
 ## Container stdio protocol
 
-Each OCI image implements a simple newline-delimited JSON protocol over stdin/stdout. No ports, no sockets — the container has no network access.
+Each OCI image implements a simple newline-delimited JSON protocol over stdin/stdout. No ports, no sockets — the container has `--network=none`.
+
+All requests may include an optional `system` field (string) to set the system prompt. The entrypoint defaults to: _"You are a helpful assistant. Always respond in the same language as the user's message."_
 
 ### Streaming text generation
 
@@ -378,14 +402,14 @@ Each OCI image implements a simple newline-delimited JSON protocol over stdin/st
 // request
 {"id": "uuid", "type": "generate", "prompt": "Summarise this: ...", "max_tokens": 512}
 
-// response (one line per token)
+// response (one line per token, final line has done:true)
 {"id": "uuid", "token": "Here"}
 {"id": "uuid", "token": " is", "done": true}
 ```
 
 ### Structured output
 
-The daemon sends a `response_format` object containing the caller's JSON Schema. The container must constrain sampling to valid JSON (e.g. via llama.cpp grammar) and reply with a single `result` line. The daemon validates the result against the schema before returning it; mismatches produce a `SchemaValidationFailed` error.
+The daemon sends a `response_format` object containing the caller's JSON Schema. The container constrains sampling to valid JSON via llama.cpp grammar and replies with a single `result` line. The daemon validates the result against the schema before returning it; mismatches produce a `SchemaValidationFailed` error.
 
 ```json
 // request
@@ -433,10 +457,40 @@ The daemon sends a `response_format` object containing the caller's JSON Schema.
 
 ## Container lifecycle
 
-- Containers start on demand, the first time a session uses a given use-case.
+- Containers start on demand when `CreateSession` is called — the daemon waits for the container to signal `ready` on stderr before returning the session ID.
+- Loading status lines (e.g. model file, GPU detected) are forwarded to the caller as D-Bus `ModelLoading` signals during the wait.
 - One container runs per use-case, shared across all sessions for that use-case.
-- Idle containers are terminated after 5 minutes (configurable via the daemon).
+- Idle containers are terminated after 5 minutes (configurable via `--idle-timeout-secs`).
 - A crash in the container kills only that container, not the daemon.
+
+## Hardware variant selection
+
+The daemon probes the host once at startup and selects the best available image variant:
+
+| Detection | Variant tag | How |
+|---|---|---|
+| `nvidia-smi` reports a GPU | `:cuda` | NVIDIA CUDA |
+| `rocm-smi` reports a GPU | `:rocm` | AMD ROCm |
+| `vulkaninfo` reports a device | `:vulkan` | Any Vulkan GPU |
+| Nothing found | `:cpu` | CPU fallback |
+
+When you assign a base image ref with no tag (e.g. `aileron/llama3.2-3b-instruct`), the daemon appends the detected variant automatically. An explicit tag (e.g. `:cpu`) pins it. Override with `AILERON_VARIANT=cpu|cuda|rocm|vulkan`.
+
+## Container security
+
+Every container is spawned with:
+
+```
+--network=none          # no network access
+--read-only             # read-only root filesystem
+--tmpfs=/tmp            # in-memory scratch, noexec
+--cap-drop=all          # no Linux capabilities
+--security-opt=no-new-privileges
+--pids-limit=256        # fork bomb protection
+--memory=4g             # OOM protection
+```
+
+Running under rootless podman additionally places the container in a user namespace where container root maps to your unprivileged uid.
 
 ## Data files
 
@@ -447,16 +501,16 @@ The daemon sends a `response_format` object containing the caller's JSON Schema.
 
 ## Security properties
 
-- No inference engine code runs in the daemon process. A crash in llama.cpp kills the container, not the daemon.
+- No inference engine code runs in the daemon process. A crash in llama.cpp kills only the container.
 - No REST API, no TCP, no UDP. Attack surface is the Varlink Unix socket and D-Bus.
+- Containers run with `--network=none`, `--cap-drop=all`, `--read-only`, and `--security-opt=no-new-privileges` (see [Container security](#container-security)).
+- Rootless podman places containers in a user namespace — container root maps to your unprivileged uid.
 - OCI images are content-addressed; image refs can be pinned to a digest (`@sha256:...`).
 - Per-app permissions are enforced in the daemon, not the portal.
-- `aileron-demo` is a real Flatpak sandbox — it cannot reach the Varlink socket directly.
 - The daemon runs with `PrivateNetwork=yes` in the systemd unit.
 
 ## Out of scope for v1
 
-- GPU/accelerator selection (the container runtime handles this)
 - Multi-user (the daemon is a user service, one instance per login session)
 - Model signature verification (podman trust policy handles this)
 - A system-wide shared model store

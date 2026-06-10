@@ -1,11 +1,15 @@
-FROM python:3.12-slim
+FROM nvidia/cuda:13.3.0-devel-ubuntu24.04
 
-# CPU-only whisper.cpp build.
-# For GPU acceleration use Dockerfile.cuda.
+# NVIDIA CUDA build of pywhispercpp.
+# Requires nvidia-container-toolkit on the host.
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3 python3-pip python3-dev \
         build-essential cmake \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf python3 /usr/bin/python
+
+ENV CMAKE_ARGS="-DWHISPER_CUDA=on"
 
 RUN pip install --no-cache-dir "pywhispercpp>=1.2.0"
 

@@ -6,12 +6,20 @@ Reads newline-delimited JSON requests from stdin, writes responses to stdout.
 
 Supported request types:
   transcribe  – transcribe base64-encoded raw PCM (16 kHz mono f32le)
+
+GPU auto-detection order (highest priority first):
+  1. N_GPU_LAYERS env var set explicitly → use as-is
+  2. CUDA device present                → offload all layers
+  3. Vulkan device present              → offload all layers
+  4. No accelerator found               → CPU only
 """
 
 import base64
 import json
 import os
+import shutil
 import struct
+import subprocess
 import sys
 import tempfile
 import traceback
@@ -23,8 +31,43 @@ MODEL_SIZE = os.environ.get("MODEL_SIZE", "base")
 MODEL_DIR  = os.environ.get("MODEL_DIR", "/model")
 
 
+def detect_device() -> str:
+    """Return 'cuda', 'vulkan', or 'cpu'."""
+    explicit = os.environ.get("AILERON_DEVICE")
+    if explicit:
+        sys.stderr.write(f"[aileron-asr] device: {explicit} (AILERON_DEVICE override)\n")
+        return explicit
+
+    if shutil.which("nvidia-smi"):
+        try:
+            out = subprocess.check_output(
+                ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                stderr=subprocess.DEVNULL,
+            ).decode().strip()
+            if out:
+                sys.stderr.write(f"[aileron-asr] CUDA GPU detected: {out.splitlines()[0]}\n")
+                return "cuda"
+        except Exception:
+            pass
+
+    if shutil.which("vulkaninfo"):
+        try:
+            out = subprocess.check_output(
+                ["vulkaninfo", "--summary"], stderr=subprocess.DEVNULL
+            ).decode()
+            if "deviceName" in out or "deviceType" in out:
+                sys.stderr.write("[aileron-asr] Vulkan device detected\n")
+                return "vulkan"
+        except Exception:
+            pass
+
+    sys.stderr.write("[aileron-asr] no GPU detected — using CPU\n")
+    return "cpu"
+
+
 def load_model() -> Model:
-    sys.stderr.write(f"[aileron-asr] loading whisper.cpp model: {MODEL_SIZE}\n")
+    device = detect_device()
+    sys.stderr.write(f"[aileron-asr] loading whisper model: {MODEL_SIZE} (device={device})\n")
     sys.stderr.flush()
     return Model(MODEL_SIZE, models_dir=MODEL_DIR)
 
@@ -36,7 +79,7 @@ def send(obj: dict) -> None:
 
 def pcm_f32le_to_wav(raw_bytes: bytes, sample_rate: int = 16000) -> str:
     """Wrap raw f32le PCM in a WAV container that whisper.cpp can read."""
-    num_frames = len(raw_bytes) // 4  # 4 bytes per f32 sample
+    num_frames = len(raw_bytes) // 4
     samples = struct.unpack(f"{num_frames}f", raw_bytes)
     int16_samples = [max(-32768, min(32767, int(s * 32767))) for s in samples]
 
@@ -63,7 +106,6 @@ def handle_transcribe(model: Model, req: dict) -> None:
     try:
         segments = model.transcribe(wav_path)
         for seg in segments:
-            # pywhispercpp segments have a .text attribute
             text = seg.text if hasattr(seg, "text") else str(seg)
             send({"id": req_id, "token": text})
         send({"id": req_id, "done": True})

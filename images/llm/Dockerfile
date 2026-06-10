@@ -9,7 +9,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN pip install --no-cache-dir \
     "llama-cpp-python>=0.2.90" \
-    "instructor>=1.3.0" \
     jsonschema
 
 COPY download_model.py /download_model.py
@@ -22,5 +21,10 @@ RUN if [ -n "$MODEL_URL" ]; then \
     fi
 
 COPY entrypoint.py /entrypoint.py
+
+# Declare which use-cases this image supports.
+# The aileron daemon reads this label at pull time and auto-assigns unoccupied
+# use-cases, prompting the user to resolve any conflicts.
+LABEL aileron.use_cases="llm.summarize,llm.translate,llm.rephrase,llm.classify,llm.extract"
 
 ENTRYPOINT ["python", "/entrypoint.py"]

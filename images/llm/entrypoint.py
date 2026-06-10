@@ -22,11 +22,8 @@ import shutil
 import subprocess
 import sys
 import traceback
-from typing import Optional
 
-import instructor
 from llama_cpp import Llama
-from pydantic import BaseModel
 
 MODEL_PATH = os.environ.get("MODEL_PATH", "/model/model.gguf")
 N_CTX      = int(os.environ.get("N_CTX", "4096"))
@@ -96,23 +93,18 @@ def detect_gpu_layers() -> int:
     return 0
 
 
-def load_model() -> tuple[Llama, instructor.Instructor]:
+def load_model() -> Llama:
     n_gpu_layers = detect_gpu_layers()
     sys.stderr.write(f"[aileron-llm] loading {MODEL_PATH}"
                      f" (ctx={N_CTX}, gpu_layers={n_gpu_layers})\n")
     sys.stderr.flush()
-    llm = Llama(
+    return Llama(
         model_path=MODEL_PATH,
         n_ctx=N_CTX,
         n_gpu_layers=n_gpu_layers,
         n_threads=N_THREADS,
         verbose=False,
     )
-    client = instructor.patch(
-        create=llm.create_chat_completion_openai_v1,
-        mode=instructor.Mode.JSON_SCHEMA,
-    )
-    return llm, client
 
 
 def send(obj: dict) -> None:
@@ -120,76 +112,36 @@ def send(obj: dict) -> None:
     sys.stdout.flush()
 
 
-# ── Dynamic Pydantic model builder ───────────────────────────────────────────
-
-def _build_model(schema: dict) -> type[BaseModel]:
-    """Build a Pydantic model class from a JSON Schema dict at runtime."""
-    from pydantic import create_model
-    import pydantic
-
-    def _annotation(prop: dict) -> type:
-        t = prop.get("type")
-        if t == "string":
-            return str
-        if t == "integer":
-            return int
-        if t == "number":
-            return float
-        if t == "boolean":
-            return bool
-        if t == "array":
-            inner = _annotation(prop.get("items", {}))
-            return list[inner]  # type: ignore[valid-type]
-        # object or unknown → dict
-        return dict
-
-    props   = schema.get("properties", {})
-    required = set(schema.get("required", list(props.keys())))
-    fields: dict = {}
-    for name, prop in props.items():
-        ann = _annotation(prop)
-        if name in required:
-            fields[name] = (ann, ...)
-        else:
-            fields[name] = (Optional[ann], None)
-
-    return create_model("DynamicModel", **fields)
 
 
 # ── Request handlers ──────────────────────────────────────────────────────────
 
-def handle_generate(client: instructor.Instructor, req: dict) -> None:
-    """Stream a plain text response as tokens using a single-field model."""
+def handle_generate(llm: Llama, req: dict) -> None:
+    """Stream tokens using plain chat completion — no instructor overhead."""
     req_id     = req["id"]
     prompt     = req.get("prompt", "")
     max_tokens = int(req.get("max_tokens", 512))
     system     = req.get("system", DEFAULT_SYSTEM)
 
-    class Response(BaseModel):
-        response: str
-
-    # Partial streaming: each partial object arrives with the `response` field
-    # filled in progressively. We diff successive values to emit tokens.
-    prev = ""
-    for partial in client.chat.completions.create_partial(
-        response_model=Response,
+    for chunk in llm.create_chat_completion(
         messages=[
             {"role": "system", "content": system},
             {"role": "user",   "content": prompt},
         ],
         max_tokens=max_tokens,
+        stream=True,
     ):
-        current = partial.response or ""
-        if current and current != prev:
-            token = current[len(prev):]
+        delta = chunk["choices"][0].get("delta", {})
+        token = delta.get("content", "")
+        if token:
             send({"id": req_id, "token": token})
-            prev = current
 
     send({"id": req_id, "done": True})
 
 
-def handle_generate_structured(client: instructor.Instructor, req: dict) -> None:
-    """Return a single structured JSON result constrained to the caller's schema."""
+def handle_generate_structured(llm: Llama, req: dict) -> None:
+    """Return a single structured JSON result constrained to the caller's schema
+    using llama.cpp's native grammar-based sampling."""
     req_id     = req["id"]
     prompt     = req.get("prompt", "")
     max_tokens = int(req.get("max_tokens", 1024))
@@ -197,28 +149,35 @@ def handle_generate_structured(client: instructor.Instructor, req: dict) -> None
     system     = req.get("system", DEFAULT_SYSTEM)
 
     try:
-        model_cls = _build_model(schema)
-    except Exception as e:
-        send({"id": req_id, "error": "schema_validation_failed",
-              "reason": f"could not build model from schema: {e}"})
-        return
+        from llama_cpp import LlamaGrammar
+        grammar = LlamaGrammar.from_json_schema(json.dumps(schema))
+    except Exception:
+        grammar = LlamaGrammar.from_string('root ::= value\n', verbose=False)
+
+    result_text = llm.create_chat_completion(
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user",   "content": prompt},
+        ],
+        max_tokens=max_tokens,
+        grammar=grammar,
+        stream=False,
+    )["choices"][0]["message"]["content"].strip()
 
     try:
-        result = client.chat.completions.create(
-            response_model=model_cls,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user",   "content": prompt},
-            ],
-            max_tokens=max_tokens,
-        )
-        send({"id": req_id, "result": result.model_dump_json(), "done": True})
-    except Exception as e:
+        from jsonschema import validate as jsonschema_validate, ValidationError
+        parsed = json.loads(result_text)
+        if schema:
+            jsonschema_validate(instance=parsed, schema=schema)
+    except (json.JSONDecodeError, ValidationError) as e:
         send({"id": req_id, "error": "schema_validation_failed", "reason": str(e)})
+        return
+
+    send({"id": req_id, "result": result_text, "done": True})
 
 
 def main() -> None:
-    _llm, client = load_model()
+    llm = load_model()
     sys.stderr.write("[aileron-llm] ready\n")
     sys.stderr.flush()
 
@@ -236,9 +195,9 @@ def main() -> None:
         req_type = req.get("type", "")
         try:
             if req_type == "generate":
-                handle_generate(client, req)
+                handle_generate(llm, req)
             elif req_type == "generate_structured":
-                handle_generate_structured(client, req)
+                handle_generate_structured(llm, req)
             else:
                 req_id = req.get("id", "unknown")
                 send({"id": req_id, "error": "unsupported_type", "reason": req_type})

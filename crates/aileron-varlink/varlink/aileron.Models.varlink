@@ -18,8 +18,22 @@ type PullProgress (
     done: bool
 )
 
-# Streams progress events until done: true.
-method Pull(image_ref: string) -> (progress: PullProgress)
+# A use-case that is already assigned to a different image.
+# Returned in the final PullProgress reply (done: true) when a conflict exists.
+type UseCaseConflict (
+    use_case: string,
+    current_image: string,
+    new_image: string
+)
+
+# Streams progress events. The final reply (done: true) includes:
+#   auto_assigned  — use-cases that were assigned automatically (previously unoccupied)
+#   conflicts      — use-cases already assigned to a different image; user must resolve
+method Pull(image_ref: string) -> (
+    progress: PullProgress,
+    auto_assigned: []string,
+    conflicts: []UseCaseConflict
+)
 
 method Delete(image_ref: string) -> ()
 

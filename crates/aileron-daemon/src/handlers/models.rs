@@ -1,10 +1,9 @@
 /// Varlink handler for `aileron.Models`.
 use crate::state::SharedState;
 #[allow(unused_imports)]
-// VarlinkCallError is a supertrait; its methods reach us via Call_* dyn objects
 use aileron_varlink::aileron_Models::{
     Call_AssignUseCase, Call_Delete, Call_List, Call_Pull, ModelInfo, PullProgress,
-    VarlinkCallError, VarlinkInterface,
+    UseCaseConflict, VarlinkCallError, VarlinkInterface,
 };
 
 fn io_err(_msg: impl std::fmt::Display) -> varlink::Error {
@@ -31,8 +30,13 @@ impl VarlinkInterface for ModelsHandler {
                 .await
                 .map_err(io_err)?;
 
-            let images: Vec<PodmanImage> =
-                serde_json::from_slice(&output.stdout).unwrap_or_default();
+            let images: Vec<PodmanImage> = match serde_json::from_slice(&output.stdout) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!("failed to parse podman images JSON: {e}");
+                    vec![]
+                }
+            };
 
             let guard = self.state.0.lock().await;
             let assignments = guard.assignments.all();
@@ -55,7 +59,7 @@ impl VarlinkInterface for ModelsHandler {
                         image_ref,
                         use_cases,
                         size_bytes: img.size.unwrap_or(0) as i64,
-                        pulled_at: img.created.clone().unwrap_or_default(),
+                        pulled_at: img.created,
                     }
                 })
                 .collect();
@@ -76,12 +80,47 @@ impl VarlinkInterface for ModelsHandler {
                 return call.reply_pull_failed(image_ref, "podman pull failed".to_string());
             }
 
-            call.reply(PullProgress {
-                image_ref,
-                bytes_pulled: 0,
-                total_bytes: 0,
-                done: true,
-            })
+            // Inspect image labels to find suggested use-cases.
+            let suggested = read_use_case_label(&image_ref).await;
+
+            // Resolve auto-assignments and conflicts.
+            let mut guard = self.state.0.lock().await;
+            let mut auto_assigned: Vec<String> = Vec::new();
+            let mut conflicts: Vec<UseCaseConflict> = Vec::new();
+
+            for use_case in suggested {
+                match guard.assignments.get(&use_case) {
+                    None => {
+                        // Unassigned — assign automatically.
+                        if let Err(e) = guard.assignments.assign(use_case.clone(), image_ref.clone()) {
+                            tracing::warn!("auto-assign {use_case} failed: {e}");
+                        } else {
+                            auto_assigned.push(use_case);
+                        }
+                    }
+                    Some(current) if current == image_ref => {
+                        // Already assigned to this image — no-op.
+                    }
+                    Some(current) => {
+                        conflicts.push(UseCaseConflict {
+                            use_case,
+                            current_image: current.to_string(),
+                            new_image: image_ref.clone(),
+                        });
+                    }
+                }
+            }
+
+            call.reply(
+                PullProgress {
+                    image_ref,
+                    bytes_pulled: 0,
+                    total_bytes: 0,
+                    done: true,
+                },
+                auto_assigned,
+                conflicts,
+            )
         })
     }
 
@@ -128,6 +167,51 @@ struct PodmanImage {
     names: Option<Vec<String>>,
     #[serde(rename = "Size")]
     size: Option<u64>,
-    #[serde(rename = "Created")]
-    created: Option<String>,
+    /// podman returns either a Unix timestamp (integer) or an RFC3339 string
+    /// depending on the version — accept both.
+    #[serde(rename = "Created", default, deserialize_with = "deserialize_created")]
+    created: String,
+}
+
+fn deserialize_created<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    use serde::Deserialize;
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum CreatedField {
+        Timestamp(i64),
+        Str(String),
+    }
+    Ok(match CreatedField::deserialize(d)? {
+        CreatedField::Timestamp(ts) => {
+            // Convert Unix timestamp to RFC3339.
+            chrono::DateTime::from_timestamp(ts, 0)
+                .map(|dt| dt.to_rfc3339())
+                .unwrap_or_default()
+        }
+        CreatedField::Str(s) => s,
+    })
+}
+
+/// Read the `aileron.use_cases` label from a local image via `podman inspect`.
+/// Returns a list of use-case tokens, or an empty vec if the label is absent.
+async fn read_use_case_label(image_ref: &str) -> Vec<String> {
+    let output = tokio::process::Command::new("podman")
+        .args(["inspect", "--format", "{{index .Labels \"aileron.use_cases\"}}", image_ref])
+        .output()
+        .await;
+
+    match output {
+        Ok(out) if out.status.success() => {
+            let label = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if label.is_empty() {
+                return vec![];
+            }
+            label
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        }
+        _ => vec![],
+    }
 }

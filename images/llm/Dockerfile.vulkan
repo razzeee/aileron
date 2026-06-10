@@ -15,7 +15,6 @@ ENV CMAKE_ARGS="-DLLAMA_VULKAN=on"
 
 RUN pip install --no-cache-dir \
     "llama-cpp-python>=0.2.90" \
-    "instructor>=1.3.0" \
     jsonschema
 
 COPY download_model.py /download_model.py
@@ -28,5 +27,7 @@ RUN if [ -n "$MODEL_URL" ]; then \
     fi
 
 COPY entrypoint.py /entrypoint.py
+
+LABEL aileron.use_cases="llm.summarize,llm.translate,llm.rephrase,llm.classify,llm.extract"
 
 ENTRYPOINT ["python", "/entrypoint.py"]
