@@ -14,6 +14,7 @@ pub struct Session {
     pub session_id: String,
     pub app_id: String,
     pub use_case: String,
+    pub instructions: String,
     pub started_at: chrono::DateTime<chrono::Utc>,
 }
 

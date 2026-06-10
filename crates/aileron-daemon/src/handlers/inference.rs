@@ -1,12 +1,15 @@
 /// Varlink handler for `aileron.Inference`.
+use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
 use crate::state::SharedState;
 #[allow(unused_imports)]
-// VarlinkCallError is a supertrait; its methods reach us via Call_* dyn objects
+// VarlinkCallError is a supertrait; its methods reach us via Call_* dyn objects.
 use aileron_varlink::aileron_Inference::{
-    Call_CreateSession, Call_Describe, Call_EndSession, Call_Generate, Call_GenerateStructured,
-    Call_Transcribe, VarlinkCallError, VarlinkInterface,
+    Call_CreateLanguageModelSession, Call_Describe, Call_EndSession,
+    Call_GetLanguageModelAvailability, Call_Prewarm, Call_Respond, Call_RespondGuided,
+    Call_StreamResponse, Call_Transcribe, GenerationOptions, GuidedField, ModelAvailability,
+    VarlinkCallError, VarlinkInterface,
 };
 
 pub struct InferenceHandler {
@@ -20,22 +23,58 @@ impl InferenceHandler {
     }
 }
 
-/// Convert an anyhow / string error into a varlink::Error.
 fn io_err(_msg: impl std::fmt::Display) -> varlink::Error {
     varlink::Error::from(varlink::ErrorKind::Io(std::io::ErrorKind::Other))
 }
 
 impl VarlinkInterface for InferenceHandler {
-    fn create_session(
+    fn get_language_model_availability(
         &self,
-        call: &mut dyn Call_CreateSession,
+        call: &mut dyn Call_GetLanguageModelAvailability,
+        _app_id: String,
+        use_case: String,
+    ) -> varlink::Result<()> {
+        self.rt.block_on(async {
+            let image_ref = {
+                let guard = self.state.0.lock().await;
+                match guard.assignments.get(&use_case) {
+                    Some(r) => crate::hardware::resolve(r, guard.variant),
+                    None => {
+                        return call.reply(ModelAvailability {
+                            is_available: false,
+                            reason: format!("no model assigned for {use_case}"),
+                        })
+                    }
+                }
+            };
+
+            let status = tokio::process::Command::new("podman")
+                .args(["image", "exists", &image_ref])
+                .status()
+                .await
+                .map_err(io_err)?;
+
+            call.reply(ModelAvailability {
+                is_available: status.success(),
+                reason: if status.success() {
+                    "available".to_string()
+                } else {
+                    format!("assigned image {image_ref} is not present locally")
+                },
+            })
+        })
+    }
+
+    fn create_language_model_session(
+        &self,
+        call: &mut dyn Call_CreateLanguageModelSession,
         app_id: String,
         use_case: String,
+        instructions: String,
     ) -> varlink::Result<()> {
         self.rt.block_on(async {
             let mut guard = self.state.0.lock().await;
 
-            // Permission check — skipped entirely when allow_all is set.
             if !guard.config.allow_all {
                 match guard.permissions.check(&app_id, &use_case) {
                     Some(true) => {}
@@ -46,7 +85,9 @@ impl VarlinkInterface for InferenceHandler {
                                 "auto-granting {app_id} / {use_case} (AILERON_AUTO_GRANT)"
                             );
                             if let Err(e) =
-                                guard.permissions.set(app_id.clone(), use_case.clone(), true)
+                                guard
+                                    .permissions
+                                    .set(app_id.clone(), use_case.clone(), true)
                             {
                                 tracing::warn!("failed to persist auto-grant: {e}");
                             }
@@ -57,32 +98,8 @@ impl VarlinkInterface for InferenceHandler {
                 }
             }
 
-            let image_ref = match guard.assignments.get(&use_case) {
-                Some(r) => crate::hardware::resolve(r, guard.variant),
-                None => return call.reply_no_model_assigned(use_case),
-            };
-
-            // Warm up the container now so Generate doesn't block silently.
-            // Status lines from the container's stderr are forwarded as
-            // continues replies if the caller used `more`, otherwise logged.
-            let wants_more = call.wants_more();
-            let (status_tx, status_rx) = std::sync::mpsc::channel::<String>();
-            guard
-                .containers
-                .get_or_spawn(&use_case, &image_ref, move |msg| {
-                    let _ = status_tx.send(msg);
-                })
-                .map_err(io_err)?;
-
-            // Drain any status messages collected during startup.
-            if wants_more {
-                call.set_continues(true);
-                for msg in status_rx.try_iter() {
-                    // Reuse session_id field as a status carrier — prefix with
-                    // "status:" so the caller can distinguish it from the real ID.
-                    call.reply(format!("status:{}", msg))?;
-                }
-                call.set_continues(false);
+            if guard.assignments.get(&use_case).is_none() {
+                return call.reply_model_unavailable(format!("no model assigned for {use_case}"));
             }
 
             let session_id = Uuid::new_v4().to_string();
@@ -90,6 +107,7 @@ impl VarlinkInterface for InferenceHandler {
                 session_id: session_id.clone(),
                 app_id,
                 use_case,
+                instructions,
                 started_at: chrono::Utc::now(),
             };
             guard.sessions.insert(session_id.clone(), session);
@@ -97,23 +115,119 @@ impl VarlinkInterface for InferenceHandler {
         })
     }
 
-    fn generate(
+    fn prewarm(
         &self,
-        call: &mut dyn Call_Generate,
+        call: &mut dyn Call_Prewarm,
         session_id: String,
-        prompt: String,
+        _prompt_prefix: String,
     ) -> varlink::Result<()> {
         self.rt.block_on(async {
             let mut guard = self.state.0.lock().await;
-
-            let (app_id, use_case) = match guard.sessions.get(&session_id) {
-                Some(s) => (s.app_id.clone(), s.use_case.clone()),
+            let use_case = match guard.sessions.get(&session_id) {
+                Some(s) => s.use_case.clone(),
                 None => return call.reply_session_not_found(session_id),
             };
-
             let image_ref = match guard.assignments.get(&use_case) {
                 Some(r) => crate::hardware::resolve(r, guard.variant),
-                None => return call.reply_no_model_assigned(use_case),
+                None => {
+                    return call
+                        .reply_model_unavailable(format!("no model assigned for {use_case}"))
+                }
+            };
+
+            guard
+                .containers
+                .get_or_spawn(&use_case, &image_ref, |_| {})
+                .map_err(io_err)?;
+
+            call.reply()
+        })
+    }
+
+    fn respond(
+        &self,
+        call: &mut dyn Call_Respond,
+        session_id: String,
+        prompt: String,
+        options: GenerationOptions,
+    ) -> varlink::Result<()> {
+        self.rt.block_on(async {
+            let mut content = String::new();
+            match generate_tokens(&self.state, &mut content, session_id, prompt, options).await {
+                Ok(()) => call.reply(content),
+                Err(GenerationError::SessionNotFound(id)) => call.reply_session_not_found(id),
+                Err(GenerationError::ModelUnavailable(reason)) => {
+                    call.reply_model_unavailable(reason)
+                }
+                Err(GenerationError::InvalidOptions(reason)) => {
+                    call.reply_invalid_generation_options(reason)
+                }
+                Err(GenerationError::Failed(reason)) => call.reply_generation_failed(reason),
+            }
+        })
+    }
+
+    fn stream_response(
+        &self,
+        call: &mut dyn Call_StreamResponse,
+        session_id: String,
+        prompt: String,
+        options: GenerationOptions,
+    ) -> varlink::Result<()> {
+        self.rt.block_on(async {
+            let mut tokens = Vec::new();
+            match generate_tokens(&self.state, &mut tokens, session_id, prompt, options).await {
+                Ok(()) => {
+                    if call.wants_more() && tokens.len() > 1 {
+                        call.set_continues(true);
+                        for token in &tokens[..tokens.len() - 1] {
+                            call.reply(token.clone())?;
+                        }
+                        call.set_continues(false);
+                    }
+                    call.reply(tokens.into_iter().last().unwrap_or_default())
+                }
+                Err(GenerationError::SessionNotFound(id)) => call.reply_session_not_found(id),
+                Err(GenerationError::ModelUnavailable(reason)) => {
+                    call.reply_model_unavailable(reason)
+                }
+                Err(GenerationError::InvalidOptions(reason)) => {
+                    call.reply_invalid_generation_options(reason)
+                }
+                Err(GenerationError::Failed(reason)) => call.reply_generation_failed(reason),
+            }
+        })
+    }
+
+    fn respond_guided(
+        &self,
+        call: &mut dyn Call_RespondGuided,
+        session_id: String,
+        prompt: String,
+        fields: Vec<GuidedField>,
+        options: GenerationOptions,
+    ) -> varlink::Result<()> {
+        self.rt.block_on(async {
+            let max_tokens = match validate_options(&options) {
+                Ok(v) => v,
+                Err(reason) => return call.reply_invalid_generation_options(reason),
+            };
+            let schema = match guided_fields_schema(&fields) {
+                Ok(v) => v,
+                Err(reason) => return call.reply_guided_generation_failed(reason),
+            };
+
+            let mut guard = self.state.0.lock().await;
+            let (app_id, use_case, instructions) = match guard.sessions.get(&session_id) {
+                Some(s) => (s.app_id.clone(), s.use_case.clone(), s.instructions.clone()),
+                None => return call.reply_session_not_found(session_id),
+            };
+            let image_ref = match guard.assignments.get(&use_case) {
+                Some(r) => crate::hardware::resolve(r, guard.variant),
+                None => {
+                    return call
+                        .reply_model_unavailable(format!("no model assigned for {use_case}"))
+                }
             };
 
             let _ = guard.permissions.touch(&app_id, &use_case);
@@ -123,27 +237,10 @@ impl VarlinkInterface for InferenceHandler {
                 .get_or_spawn(&use_case, &image_ref, |_| {})
                 .map_err(io_err)?;
 
-            let wants_more = call.wants_more();
-            let mut tokens: Vec<String> = Vec::new();
-
-            container
-                .generate(None, &prompt, 512, |token| {
-                    tokens.push(token);
-                })
-                .map_err(io_err)?;
-
-            if wants_more && tokens.len() > 1 {
-                // Stream all but the last token with continues=true.
-                call.set_continues(true);
-                for token in &tokens[..tokens.len() - 1] {
-                    call.reply(token.clone())?;
-                }
-                call.set_continues(false);
+            match container.generate_structured(Some(&instructions), &prompt, max_tokens, &schema) {
+                Ok(result) => call.reply(result),
+                Err(e) => call.reply_guided_generation_failed(e.to_string()),
             }
-
-            // Final (or only) token — sent without continues.
-            let last = tokens.into_iter().last().unwrap_or_default();
-            call.reply(last)
         })
     }
 
@@ -163,21 +260,23 @@ impl VarlinkInterface for InferenceHandler {
 
             let image_ref = match guard.assignments.get(&use_case) {
                 Some(r) => crate::hardware::resolve(r, guard.variant),
-                None => return call.reply_no_model_assigned(use_case),
+                None => {
+                    return call
+                        .reply_model_unavailable(format!("no model assigned for {use_case}"))
+                }
             };
 
             let _ = guard.permissions.touch(&app_id, &use_case);
-
             let audio_bytes = base64_decode(&audio).map_err(io_err)?;
-
             let container = guard
                 .containers
                 .get_or_spawn(&use_case, &image_ref, |_| {})
                 .map_err(io_err)?;
 
-            let text = container.transcribe(audio_bytes).map_err(io_err)?;
-
-            call.reply(text)
+            match container.transcribe(audio_bytes) {
+                Ok(text) => call.reply(text),
+                Err(e) => call.reply_generation_failed(e.to_string()),
+            }
         })
     }
 
@@ -197,21 +296,23 @@ impl VarlinkInterface for InferenceHandler {
 
             let image_ref = match guard.assignments.get(&use_case) {
                 Some(r) => crate::hardware::resolve(r, guard.variant),
-                None => return call.reply_no_model_assigned(use_case),
+                None => {
+                    return call
+                        .reply_model_unavailable(format!("no model assigned for {use_case}"))
+                }
             };
 
             let _ = guard.permissions.touch(&app_id, &use_case);
-
             let image_bytes = base64_decode(&image).map_err(io_err)?;
-
             let container = guard
                 .containers
                 .get_or_spawn(&use_case, &image_ref, |_| {})
                 .map_err(io_err)?;
 
-            let text = container.describe(image_bytes).map_err(io_err)?;
-
-            call.reply(text)
+            match container.describe(image_bytes) {
+                Ok(text) => call.reply(text),
+                Err(e) => call.reply_generation_failed(e.to_string()),
+            }
         })
     }
 
@@ -228,61 +329,128 @@ impl VarlinkInterface for InferenceHandler {
             call.reply()
         })
     }
+}
 
-    fn generate_structured(
-        &self,
-        call: &mut dyn Call_GenerateStructured,
-        session_id: String,
-        prompt: String,
-        schema: String,
-    ) -> varlink::Result<()> {
-        self.rt.block_on(async {
-            let mut guard = self.state.0.lock().await;
+enum GenerationError {
+    SessionNotFound(String),
+    ModelUnavailable(String),
+    InvalidOptions(String),
+    Failed(String),
+}
 
-            let (app_id, use_case) = match guard.sessions.get(&session_id) {
-                Some(s) => (s.app_id.clone(), s.use_case.clone()),
-                None => return call.reply_session_not_found(session_id),
-            };
+trait TokenSink {
+    fn push_token(&mut self, token: String);
+}
 
-            let image_ref = match guard.assignments.get(&use_case) {
-                Some(r) => crate::hardware::resolve(r, guard.variant),
-                None => return call.reply_no_model_assigned(use_case),
-            };
-
-            let _ = guard.permissions.touch(&app_id, &use_case);
-
-            // Parse the caller-supplied schema string into a JSON value so it
-            // can be forwarded to the container and used for validation.
-            let schema_value: serde_json::Value = match serde_json::from_str(&schema) {
-                Ok(v) => v,
-                Err(e) => {
-                    return call.reply_schema_validation_failed(format!("invalid schema JSON: {e}"))
-                }
-            };
-
-            let container = guard
-                .containers
-                .get_or_spawn(&use_case, &image_ref, |_| {})
-                .map_err(io_err)?;
-
-            match container.generate_structured(None, &prompt, 1024, &schema_value) {
-                Ok(result) => call.reply(result),
-                Err(e) => {
-                    let msg = e.to_string();
-                    // Distinguish validation failures from I/O failures.
-                    if msg.contains("not valid JSON")
-                        || msg.contains("expected ")
-                        || msg.contains("missing required")
-                        || msg.contains("is not in enum")
-                    {
-                        call.reply_schema_validation_failed(msg)
-                    } else {
-                        Err(io_err(msg))
-                    }
-                }
-            }
-        })
+impl TokenSink for String {
+    fn push_token(&mut self, token: String) {
+        self.push_str(&token);
     }
+}
+
+impl TokenSink for Vec<String> {
+    fn push_token(&mut self, token: String) {
+        self.push(token);
+    }
+}
+
+async fn generate_tokens(
+    state: &SharedState,
+    sink: &mut impl TokenSink,
+    session_id: String,
+    prompt: String,
+    options: GenerationOptions,
+) -> Result<(), GenerationError> {
+    let max_tokens = validate_options(&options).map_err(GenerationError::InvalidOptions)?;
+    let mut guard = state.0.lock().await;
+
+    let (app_id, use_case, instructions) = match guard.sessions.get(&session_id) {
+        Some(s) => (s.app_id.clone(), s.use_case.clone(), s.instructions.clone()),
+        None => return Err(GenerationError::SessionNotFound(session_id)),
+    };
+    let image_ref = match guard.assignments.get(&use_case) {
+        Some(r) => crate::hardware::resolve(r, guard.variant),
+        None => {
+            return Err(GenerationError::ModelUnavailable(format!(
+                "no model assigned for {use_case}"
+            )))
+        }
+    };
+
+    let _ = guard.permissions.touch(&app_id, &use_case);
+    let container = guard
+        .containers
+        .get_or_spawn(&use_case, &image_ref, |_| {})
+        .map_err(|e| GenerationError::Failed(e.to_string()))?;
+
+    container
+        .generate(Some(&instructions), &prompt, max_tokens, |token| {
+            sink.push_token(token)
+        })
+        .map_err(|e| GenerationError::Failed(e.to_string()))
+}
+
+fn validate_options(options: &GenerationOptions) -> Result<u32, String> {
+    if options.maximum_response_tokens <= 0 {
+        return Err("maximum_response_tokens must be greater than zero".to_string());
+    }
+    if options.maximum_response_tokens > u32::MAX as i64 {
+        return Err("maximum_response_tokens is too large".to_string());
+    }
+    if !options.temperature.is_finite() || options.temperature < 0.0 {
+        return Err("temperature must be a finite non-negative number".to_string());
+    }
+    if options.sampling_mode.trim().is_empty() {
+        return Err("sampling_mode must not be empty".to_string());
+    }
+    Ok(options.maximum_response_tokens as u32)
+}
+
+fn guided_fields_schema(fields: &[GuidedField]) -> Result<Value, String> {
+    if fields.is_empty() {
+        return Err("at least one guided field is required".to_string());
+    }
+
+    let mut properties = Map::new();
+    let mut required = Vec::new();
+
+    for field in fields {
+        if field.name.trim().is_empty() {
+            return Err("guided field name must not be empty".to_string());
+        }
+        if properties.contains_key(&field.name) {
+            return Err(format!("duplicate guided field '{}'", field.name));
+        }
+
+        let mut schema = match field.kind.as_str() {
+            "string" => json!({ "type": "string" }),
+            "number" => json!({ "type": "number" }),
+            "integer" => json!({ "type": "integer" }),
+            "boolean" => json!({ "type": "boolean" }),
+            "string_array" => json!({ "type": "array", "items": { "type": "string" } }),
+            other => return Err(format!("unsupported guided field kind '{other}'")),
+        };
+
+        if !field.description.trim().is_empty() {
+            if let Some(obj) = schema.as_object_mut() {
+                obj.insert(
+                    "description".to_string(),
+                    Value::String(field.description.clone()),
+                );
+            }
+        }
+        if field.required {
+            required.push(Value::String(field.name.clone()));
+        }
+        properties.insert(field.name.clone(), schema);
+    }
+
+    Ok(json!({
+        "type": "object",
+        "properties": properties,
+        "required": required,
+        "additionalProperties": false
+    }))
 }
 
 fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
