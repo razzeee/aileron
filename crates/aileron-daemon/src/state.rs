@@ -37,6 +37,7 @@ impl SharedState {
         let assignments = Assignments::load()?;
         let mut containers = ContainerPool::new();
         containers.idle_timeout_secs = config.idle_timeout_secs;
+        containers.memory_limit = config.container_memory.clone();
         let variant = crate::hardware::detect();
         Ok(Self(Arc::new(Mutex::new(Inner {
             config,

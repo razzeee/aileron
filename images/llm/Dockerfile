@@ -4,7 +4,7 @@ FROM python:3.12-slim
 # For GPU acceleration use Dockerfile.cuda, Dockerfile.rocm, or Dockerfile.vulkan.
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential cmake \
+        build-essential cmake ninja-build \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir \

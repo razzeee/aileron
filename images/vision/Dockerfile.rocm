@@ -1,0 +1,29 @@
+FROM rocm/dev-ubuntu-22.04:7.2.4-complete
+
+# AMD ROCm build of llama-cpp-python for multimodal vision models.
+# Requires ROCm drivers on the host and device access from the daemon.
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3 python3-pip python3-dev \
+        build-essential cmake git ninja-build \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf python3 /usr/bin/python
+
+ENV CMAKE_ARGS="-DGGML_HIP=on"
+ENV ROCM_PATH=/opt/rocm
+ENV PATH="${ROCM_PATH}/bin:${PATH}"
+
+ARG LLAMA_CPP_PYTHON_REF="b5eefc82e0fd415d5547c81367c29b159c0268d3"
+RUN pip install --no-cache-dir "git+https://github.com/abetlen/llama-cpp-python.git@${LLAMA_CPP_PYTHON_REF}"
+
+COPY download_model.py /download_model.py
+
+ARG MODEL_URL=""
+ARG MMPROJ_URL=""
+RUN python /download_model.py "$MODEL_URL" "$MMPROJ_URL"
+
+COPY entrypoint.py /entrypoint.py
+
+LABEL aileron.use_cases="vision.describe"
+
+ENTRYPOINT ["python", "/entrypoint.py"]

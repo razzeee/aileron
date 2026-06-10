@@ -135,10 +135,10 @@ impl VarlinkInterface for InferenceHandler {
                 }
             };
 
-            guard
-                .containers
-                .get_or_spawn(&use_case, &image_ref, |_| {})
-                .map_err(io_err)?;
+            match guard.containers.get_or_spawn(&use_case, &image_ref, |_| {}) {
+                Ok(_) => {}
+                Err(e) => return call.reply_generation_failed(e.to_string()),
+            }
 
             call.reply()
         })
@@ -268,10 +268,10 @@ impl VarlinkInterface for InferenceHandler {
 
             let _ = guard.permissions.touch(&app_id, &use_case);
             let audio_bytes = base64_decode(&audio).map_err(io_err)?;
-            let container = guard
-                .containers
-                .get_or_spawn(&use_case, &image_ref, |_| {})
-                .map_err(io_err)?;
+            let container = match guard.containers.get_or_spawn(&use_case, &image_ref, |_| {}) {
+                Ok(container) => container,
+                Err(e) => return call.reply_generation_failed(e.to_string()),
+            };
 
             match container.transcribe(audio_bytes) {
                 Ok(text) => call.reply(text),
@@ -304,10 +304,10 @@ impl VarlinkInterface for InferenceHandler {
 
             let _ = guard.permissions.touch(&app_id, &use_case);
             let image_bytes = base64_decode(&image).map_err(io_err)?;
-            let container = guard
-                .containers
-                .get_or_spawn(&use_case, &image_ref, |_| {})
-                .map_err(io_err)?;
+            let container = match guard.containers.get_or_spawn(&use_case, &image_ref, |_| {}) {
+                Ok(container) => container,
+                Err(e) => return call.reply_generation_failed(e.to_string()),
+            };
 
             match container.describe(image_bytes) {
                 Ok(text) => call.reply(text),

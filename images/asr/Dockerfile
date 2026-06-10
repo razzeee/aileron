@@ -12,6 +12,7 @@ RUN pip install --no-cache-dir "pywhispercpp>=1.2.0"
 COPY download_model.py /download_model.py
 
 ARG MODEL_SIZE=base
+ENV MODEL_SIZE=${MODEL_SIZE}
 RUN python /download_model.py "$MODEL_SIZE"
 
 COPY entrypoint.py /entrypoint.py

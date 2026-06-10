@@ -51,6 +51,7 @@ Container images live in `images/`:
 |---|---|
 | `images/llm/` | llama-cpp-python image for text generation and structured output |
 | `images/asr/` | faster-whisper image for audio transcription |
+| `images/vision/` | llama-cpp-python multimodal image for image description |
 
 ## Building
 
@@ -145,97 +146,16 @@ aileron
 
 ## Building container images
 
-Images are built with `podman build` (or `docker build`). Model weights are baked in at build time via `MODEL_URL`, or you can mount a local GGUF file at runtime.
+Images are built with `podman build` or `docker build`. Image-specific platform matrices, build commands, model arguments, and environment variables live next to each image:
 
-### LLM image
+| Image | Details |
+|---|---|
+| `images/llm/` | [LLM image README](images/llm/README.md) |
+| `images/asr/` | [ASR image README](images/asr/README.md) |
+| `images/vision/` | [Vision image README](images/vision/README.md) |
+| `images/stub/` | [Stub image README](images/stub/README.md) |
 
-Four Dockerfiles are provided — pick the one that matches your hardware:
-
-| Dockerfile | Hardware | Notes |
-|---|---|---|
-| `Dockerfile` | CPU (any) | Default, works everywhere |
-| `Dockerfile.cuda` | NVIDIA GPU | Requires `nvidia-container-toolkit` on host |
-| `Dockerfile.rocm` | AMD GPU | Requires ROCm drivers on host |
-| `Dockerfile.vulkan` | Any Vulkan GPU | NVIDIA / AMD / Intel Arc, no proprietary drivers needed |
-
-**Naming convention:** tag images as `<name>:cpu`, `<name>:cuda`, `<name>:rocm`, `<name>:vulkan`.
-When you assign a base ref with no tag (e.g. `aileron/llama3.2-3b-instruct`), the daemon appends
-the detected hardware variant automatically at runtime. Assigning an explicit tag (e.g. `:cpu`) pins it.
-
-```sh
-MODEL_URL="https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF/resolve/main/Llama-3.2-3B-Instruct-Q4_K_M.gguf"
-
-# CPU — works on any machine, no GPU required:
-podman build \
-    --build-arg MODEL_URL="$MODEL_URL" \
-    -t aileron/llama3.2-3b-instruct:cpu \
-    images/llm
-
-# NVIDIA GPU (requires nvidia-container-toolkit on host):
-podman build \
-    --build-arg MODEL_URL="$MODEL_URL" \
-    -f images/llm/Dockerfile.cuda \
-    -t aileron/llama3.2-3b-instruct:cuda \
-    images/llm
-
-# AMD GPU (requires ROCm drivers on host):
-podman build \
-    --build-arg MODEL_URL="$MODEL_URL" \
-    -f images/llm/Dockerfile.rocm \
-    -t aileron/llama3.2-3b-instruct:rocm \
-    images/llm
-
-# Any Vulkan-capable GPU (NVIDIA / AMD / Intel Arc — no proprietary drivers needed):
-podman build \
-    --build-arg MODEL_URL="$MODEL_URL" \
-    -f images/llm/Dockerfile.vulkan \
-    -t aileron/llama3.2-3b-instruct:vulkan \
-    images/llm
-
-# Mount a local GGUF file at runtime instead of baking it in:
-podman build -t aileron/llama3.2-3b-instruct:cpu images/llm
-podman run --rm -i \
-    -v /path/to/model.gguf:/model/model.gguf:ro \
-    aileron/llama3.2-3b-instruct:cpu
-```
-
-After building, assign the base ref (no tag) so the daemon picks the right variant automatically:
-
-```sh
-varlink call "unix:$XDG_RUNTIME_DIR/aileron.socket/aileron.Models.AssignUseCase" \
-    '{"image_ref":"aileron/llama3.2-3b-instruct","use_case":"llm.summarize"}'
-```
-
-The daemon detects your hardware once at startup (logged as `hardware variant: cuda`) and resolves
-`aileron/llama3.2-3b-instruct` → `aileron/llama3.2-3b-instruct:cuda` at container spawn time.
-Override with `AILERON_VARIANT=cpu|cuda|rocm|vulkan` if needed.
-
-Supported environment variables:
-
-| Variable | Default | Description |
-|---|---|---|
-| `MODEL_PATH` | `/model/model.gguf` | Path to the GGUF model file |
-| `N_CTX` | `4096` | Context window size |
-| `N_GPU_LAYERS` | auto | Layers to offload; auto-detected if unset (`-1` = all) |
-| `N_THREADS` | all cores | CPU threads (used when GPU is not available) |
-
-### ASR image
-
-```sh
-podman build \
-    --build-arg MODEL_SIZE=small \
-    -t aileron/whisper-small:latest \
-    images/asr
-```
-
-Supported environment variables:
-
-| Variable | Default | Description |
-|---|---|---|
-| `MODEL_SIZE` | `small` | Whisper model size (tiny/base/small/medium/large-v3) |
-| `MODEL_PATH` | `/model` | Directory for cached model weights |
-| `DEVICE` | `cpu` | Inference device (`cpu` or `cuda`) |
-| `COMPUTE_TYPE` | `int8` | Quantisation type (`int8`, `float16`, `float32`) |
+The daemon can resolve untagged model refs to platform tags such as `:cpu`, `:cuda`, `:rocm`, or `:vulkan`; see [Hardware variant selection](#hardware-variant-selection).
 
 ## End-to-end test with the stub container
 

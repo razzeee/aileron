@@ -1,10 +1,15 @@
 /// aileron-demo — sandboxed GTK4 article summarizer.
 use gtk4::prelude::*;
 use gtk4::{
-    Align, Box, Button, CheckButton, Entry, Label, Orientation, ScrolledWindow, Spinner,
-    TextBuffer, TextView,
+    Align, Box, Button, CheckButton, Entry, FileDialog, Label, Orientation, ScrolledWindow,
+    Spinner, Stack, StackSwitcher, TextBuffer, TextView,
 };
 use libadwaita::{Application, ApplicationWindow, HeaderBar, ToolbarView};
+use std::cell::RefCell;
+use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
+use std::rc::Rc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub fn build_app() -> Application {
     let app = Application::builder()
@@ -19,11 +24,11 @@ pub fn build_app() -> Application {
 }
 
 fn build_window(app: &Application) {
-    let vbox = Box::new(Orientation::Vertical, 12);
-    vbox.set_margin_top(12);
-    vbox.set_margin_bottom(12);
-    vbox.set_margin_start(12);
-    vbox.set_margin_end(12);
+    let text_box = Box::new(Orientation::Vertical, 12);
+    text_box.set_margin_top(12);
+    text_box.set_margin_bottom(12);
+    text_box.set_margin_start(12);
+    text_box.set_margin_end(12);
 
     // URL row
     let url_entry = Entry::builder()
@@ -34,7 +39,7 @@ fn build_window(app: &Application) {
     let url_row = Box::new(Orientation::Horizontal, 8);
     url_row.append(&url_entry);
     url_row.append(&fetch_button);
-    vbox.append(&url_row);
+    text_box.append(&url_row);
 
     // Source text area
     let source_buffer = TextBuffer::new(None);
@@ -45,8 +50,8 @@ fn build_window(app: &Application) {
         .hexpand(true)
         .vexpand(true)
         .build();
-    vbox.append(&Label::builder().label("Article text").xalign(0.0).build());
-    vbox.append(
+    text_box.append(&Label::builder().label("Article text").xalign(0.0).build());
+    text_box.append(
         &ScrolledWindow::builder()
             .child(&source_view)
             .vexpand(true)
@@ -62,13 +67,13 @@ fn build_window(app: &Application) {
     guided_mode.set_group(Some(&streaming_mode));
     mode_row.append(&streaming_mode);
     mode_row.append(&guided_mode);
-    vbox.append(&mode_row);
+    text_box.append(&mode_row);
 
     let summarize_button = Button::builder()
         .label("Summarize")
         .css_classes(vec!["suggested-action"])
         .build();
-    vbox.append(&summarize_button);
+    text_box.append(&summarize_button);
 
     {
         let summarize_button = summarize_button.clone();
@@ -130,9 +135,9 @@ fn build_window(app: &Application) {
         .hexpand(true)
         .vexpand(true)
         .build();
-    vbox.append(&Label::builder().label("Summary").xalign(0.0).build());
-    vbox.append(&status_row);
-    vbox.append(
+    text_box.append(&Label::builder().label("Summary").xalign(0.0).build());
+    text_box.append(&status_row);
+    text_box.append(
         &ScrolledWindow::builder()
             .child(&output_view)
             .min_content_height(240)
@@ -272,17 +277,26 @@ fn build_window(app: &Application) {
                 };
                 if let Err(e) = result {
                     eprintln!("[aileron-demo] summarize error: {e}");
-                    let _ = error_tx.send(DemoEvent::Error(e.to_string()));
+                    let _ = error_tx.send(DemoEvent::Error(friendly_error(&e)));
                 }
             });
         });
     }
 
     // ── Window ────────────────────────────────────────────────────────────────
+    let stack = Stack::new();
+    stack.add_titled(&text_box, Some("text"), "Text");
+    stack.add_titled(&build_speech_page(), Some("speech"), "Speech");
+    stack.add_titled(&build_vision_page(), Some("vision"), "Vision");
+
+    let switcher = StackSwitcher::new();
+    switcher.set_stack(Some(&stack));
+
     let header = HeaderBar::new();
+    header.set_title_widget(Some(&switcher));
     let toolbar_view = ToolbarView::new();
     toolbar_view.add_top_bar(&header);
-    toolbar_view.set_content(Some(&vbox));
+    toolbar_view.set_content(Some(&stack));
 
     let window = ApplicationWindow::builder()
         .application(app)
@@ -293,6 +307,487 @@ fn build_window(app: &Application) {
         .build();
 
     window.present();
+}
+
+struct Recording {
+    child: Child,
+    path: PathBuf,
+}
+
+fn build_speech_page() -> gtk4::Widget {
+    let vbox = Box::new(Orientation::Vertical, 12);
+    vbox.set_margin_top(12);
+    vbox.set_margin_bottom(12);
+    vbox.set_margin_start(12);
+    vbox.set_margin_end(12);
+
+    vbox.append(
+        &Label::builder()
+            .label("Record microphone audio, then send it through the ASR portal path.")
+            .xalign(0.0)
+            .wrap(true)
+            .build(),
+    );
+
+    let button_row = Box::new(Orientation::Horizontal, 8);
+    let record_button = Button::builder()
+        .label("Record")
+        .css_classes(vec!["suggested-action"])
+        .build();
+    let stop_button = Button::with_label("Stop");
+    stop_button.set_sensitive(false);
+    let transcribe_button = Button::with_label("Transcribe Audio");
+    transcribe_button.set_sensitive(false);
+    button_row.append(&record_button);
+    button_row.append(&stop_button);
+    button_row.append(&transcribe_button);
+    vbox.append(&button_row);
+
+    let status_row = Box::new(Orientation::Horizontal, 12);
+    status_row.add_css_class("card");
+    status_row.set_margin_bottom(8);
+    status_row.set_margin_top(4);
+    status_row.set_height_request(72);
+
+    let status_spinner = Spinner::new();
+    status_spinner.set_spinning(false);
+    status_spinner.set_margin_start(14);
+    status_spinner.set_valign(Align::Center);
+    status_row.append(&status_spinner);
+
+    let status_text = Box::new(Orientation::Vertical, 2);
+    status_text.set_valign(Align::Center);
+    status_text.set_margin_top(10);
+    status_text.set_margin_bottom(10);
+    status_text.set_margin_end(14);
+    let status_title = Label::builder()
+        .label("Ready")
+        .xalign(0.0)
+        .css_classes(vec!["heading"])
+        .build();
+    let status_detail = Label::builder()
+        .label("Use Record to capture 16 kHz mono f32 audio with pw-record.")
+        .xalign(0.0)
+        .wrap(true)
+        .build();
+    status_text.append(&status_title);
+    status_text.append(&status_detail);
+    status_row.append(&status_text);
+    vbox.append(&status_row);
+
+    let transcript_buffer = TextBuffer::new(None);
+    let transcript_view = TextView::builder()
+        .buffer(&transcript_buffer)
+        .editable(false)
+        .wrap_mode(gtk4::WrapMode::WordChar)
+        .hexpand(true)
+        .vexpand(true)
+        .build();
+    vbox.append(&Label::builder().label("Transcript").xalign(0.0).build());
+    vbox.append(
+        &ScrolledWindow::builder()
+            .child(&transcript_view)
+            .min_content_height(320)
+            .vexpand(true)
+            .build(),
+    );
+
+    let recording = Rc::new(RefCell::new(None::<Recording>));
+    let last_audio = Rc::new(RefCell::new(None::<PathBuf>));
+
+    {
+        let recording = recording.clone();
+        let last_audio = last_audio.clone();
+        let record_button_for_click = record_button.clone();
+        let record_button = record_button.clone();
+        let stop_button = stop_button.clone();
+        let transcribe_button = transcribe_button.clone();
+        let status_spinner = status_spinner.clone();
+        let status_title = status_title.clone();
+        let status_detail = status_detail.clone();
+        record_button_for_click.connect_clicked(move |_| {
+            if recording.borrow().is_some() {
+                return;
+            }
+
+            let path = temp_audio_path();
+            let child = match Command::new("pw-record")
+                .args([
+                    "--raw",
+                    "--rate",
+                    "16000",
+                    "--channels",
+                    "1",
+                    "--format",
+                    "f32",
+                ])
+                .arg(&path)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                Ok(child) => child,
+                Err(e) => {
+                    status_spinner.stop();
+                    status_title.set_text("Recording unavailable");
+                    status_detail.set_text(&format!("Could not start pw-record: {e}"));
+                    return;
+                }
+            };
+
+            *recording.borrow_mut() = Some(Recording {
+                child,
+                path: path.clone(),
+            });
+            *last_audio.borrow_mut() = None;
+            status_spinner.start();
+            status_title.set_text("Recording microphone");
+            status_detail.set_text("Speak now. Stop when you are ready to transcribe.");
+            record_button.set_sensitive(false);
+            stop_button.set_sensitive(true);
+            transcribe_button.set_sensitive(false);
+        });
+    }
+
+    {
+        let recording = recording.clone();
+        let last_audio = last_audio.clone();
+        let record_button = record_button.clone();
+        let stop_button_for_click = stop_button.clone();
+        let stop_button = stop_button.clone();
+        let transcribe_button = transcribe_button.clone();
+        let status_spinner = status_spinner.clone();
+        let status_title = status_title.clone();
+        let status_detail = status_detail.clone();
+        stop_button_for_click.connect_clicked(move |_| {
+            let Some(mut current) = recording.borrow_mut().take() else {
+                return;
+            };
+
+            let _ = current.child.kill();
+            let _ = current.child.wait();
+            *last_audio.borrow_mut() = Some(current.path);
+            status_spinner.stop();
+            status_title.set_text("Recording saved");
+            status_detail.set_text("Audio is ready. Transcribe it through the portal.");
+            record_button.set_sensitive(true);
+            stop_button.set_sensitive(false);
+            transcribe_button.set_sensitive(true);
+        });
+    }
+
+    {
+        let last_audio = last_audio.clone();
+        let transcript_buffer = transcript_buffer.clone();
+        let transcribe_button_for_click = transcribe_button.clone();
+        let status_spinner = status_spinner.clone();
+        let status_title = status_title.clone();
+        let status_detail = status_detail.clone();
+        transcribe_button.connect_clicked(move |_| {
+            let Some(path) = last_audio.borrow().clone() else {
+                status_title.set_text("No recording");
+                status_detail.set_text("Record audio before transcribing.");
+                return;
+            };
+
+            transcript_buffer.set_text("");
+            transcribe_button_for_click.set_sensitive(false);
+            status_spinner.start();
+            status_title.set_text("Creating ASR session");
+            status_detail.set_text("Opening an asr.transcribe session through the portal...");
+
+            let (tx, rx) = std::sync::mpsc::channel::<SpeechEvent>();
+            let transcript_buffer = transcript_buffer.clone();
+            let transcribe_button = transcribe_button_for_click.clone();
+            let status_spinner = status_spinner.clone();
+            let status_title = status_title.clone();
+            let status_detail = status_detail.clone();
+            glib::timeout_add_local(std::time::Duration::from_millis(16), move || {
+                loop {
+                    match rx.try_recv() {
+                        Ok(SpeechEvent::Phase(phase)) => {
+                            status_title.set_text(phase.title());
+                            status_detail.set_text(phase.detail());
+                            status_spinner.start();
+                        }
+                        Ok(SpeechEvent::Transcript(text)) => {
+                            transcript_buffer.set_text(&text);
+                        }
+                        Ok(SpeechEvent::Error(message)) => {
+                            status_spinner.stop();
+                            status_title.set_text("Transcription failed");
+                            status_detail.set_text(&message);
+                            transcribe_button.set_sensitive(true);
+                            return glib::ControlFlow::Break;
+                        }
+                        Ok(SpeechEvent::Done) => {
+                            status_spinner.stop();
+                            status_title.set_text("Transcript complete");
+                            status_detail.set_text("ASR returned text through the portal.");
+                            transcribe_button.set_sensitive(true);
+                            return glib::ControlFlow::Break;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            status_spinner.stop();
+                            status_title.set_text("Transcription interrupted");
+                            status_detail.set_text("The ASR response channel closed unexpectedly.");
+                            transcribe_button.set_sensitive(true);
+                            return glib::ControlFlow::Break;
+                        }
+                    }
+                }
+                glib::ControlFlow::Continue
+            });
+
+            let error_tx = tx.clone();
+            std::thread::spawn(move || {
+                if let Err(e) = transcribe_recording(&path, tx) {
+                    eprintln!("[aileron-demo] transcribe error: {e}");
+                    let _ = error_tx.send(SpeechEvent::Error(friendly_error(&e)));
+                }
+            });
+        });
+    }
+
+    vbox.upcast()
+}
+
+fn build_vision_page() -> gtk4::Widget {
+    let vbox = Box::new(Orientation::Vertical, 12);
+    vbox.set_margin_top(12);
+    vbox.set_margin_bottom(12);
+    vbox.set_margin_start(12);
+    vbox.set_margin_end(12);
+
+    vbox.append(
+        &Label::builder()
+            .label("Describe an image through the vision portal path. Select a PNG/JPEG file or paste base64 image bytes.")
+            .xalign(0.0)
+            .wrap(true)
+            .build(),
+    );
+
+    let selected_image = Rc::new(RefCell::new(None::<Vec<u8>>));
+
+    let button_row = Box::new(Orientation::Horizontal, 8);
+    let choose_button = Button::with_label("Choose Image");
+    let describe_button = Button::builder()
+        .label("Describe Image")
+        .css_classes(vec!["suggested-action"])
+        .build();
+    button_row.append(&choose_button);
+    button_row.append(&describe_button);
+    vbox.append(&button_row);
+
+    let selected_label = Label::builder()
+        .label("No file selected. Paste base64 below or choose an image.")
+        .xalign(0.0)
+        .wrap(true)
+        .build();
+    vbox.append(&selected_label);
+
+    let paste_buffer = TextBuffer::new(None);
+    let paste_view = TextView::builder()
+        .buffer(&paste_buffer)
+        .editable(true)
+        .wrap_mode(gtk4::WrapMode::Char)
+        .hexpand(true)
+        .vexpand(false)
+        .build();
+    vbox.append(
+        &Label::builder()
+            .label("Pasted base64 image")
+            .xalign(0.0)
+            .build(),
+    );
+    vbox.append(
+        &ScrolledWindow::builder()
+            .child(&paste_view)
+            .min_content_height(120)
+            .build(),
+    );
+
+    let status_row = Box::new(Orientation::Horizontal, 12);
+    status_row.add_css_class("card");
+    status_row.set_margin_bottom(8);
+    status_row.set_margin_top(4);
+    status_row.set_height_request(72);
+
+    let status_spinner = Spinner::new();
+    status_spinner.set_spinning(false);
+    status_spinner.set_margin_start(14);
+    status_spinner.set_valign(Align::Center);
+    status_row.append(&status_spinner);
+
+    let status_text = Box::new(Orientation::Vertical, 2);
+    status_text.set_valign(Align::Center);
+    status_text.set_margin_top(10);
+    status_text.set_margin_bottom(10);
+    status_text.set_margin_end(14);
+    let status_title = Label::builder()
+        .label("Ready")
+        .xalign(0.0)
+        .css_classes(vec!["heading"])
+        .build();
+    let status_detail = Label::builder()
+        .label("Choose or paste an image, then describe it locally.")
+        .xalign(0.0)
+        .wrap(true)
+        .build();
+    status_text.append(&status_title);
+    status_text.append(&status_detail);
+    status_row.append(&status_text);
+    vbox.append(&status_row);
+
+    let description_buffer = TextBuffer::new(None);
+    let description_view = TextView::builder()
+        .buffer(&description_buffer)
+        .editable(false)
+        .wrap_mode(gtk4::WrapMode::WordChar)
+        .hexpand(true)
+        .vexpand(true)
+        .build();
+    vbox.append(&Label::builder().label("Description").xalign(0.0).build());
+    vbox.append(
+        &ScrolledWindow::builder()
+            .child(&description_view)
+            .min_content_height(260)
+            .vexpand(true)
+            .build(),
+    );
+
+    {
+        let selected_image = selected_image.clone();
+        let selected_label = selected_label.clone();
+        let status_title = status_title.clone();
+        let status_detail = status_detail.clone();
+        choose_button.connect_clicked(move |_| {
+            let dialog = FileDialog::builder().title("Choose image").build();
+            let selected_image = selected_image.clone();
+            let selected_label = selected_label.clone();
+            let status_title = status_title.clone();
+            let status_detail = status_detail.clone();
+            dialog.open(
+                None::<&gtk4::Window>,
+                None::<&gio::Cancellable>,
+                move |result| {
+                    let Ok(file) = result else {
+                        return;
+                    };
+                    let Some(path) = file.path() else {
+                        status_title.set_text("Could not read image");
+                        status_detail.set_text("Selected file has no local filesystem path.");
+                        return;
+                    };
+                    match std::fs::read(&path) {
+                        Ok(bytes) => {
+                            *selected_image.borrow_mut() = Some(bytes);
+                            selected_label.set_text(&format!("Selected: {}", path.display()));
+                            status_title.set_text("Image selected");
+                            status_detail.set_text(
+                                "Use Describe Image to send it through the vision portal.",
+                            );
+                        }
+                        Err(e) => {
+                            status_title.set_text("Could not read image");
+                            status_detail.set_text(&e.to_string());
+                        }
+                    }
+                },
+            );
+        });
+    }
+
+    {
+        let selected_image = selected_image.clone();
+        let paste_buffer = paste_buffer.clone();
+        let description_buffer = description_buffer.clone();
+        let describe_button_for_click = describe_button.clone();
+        let status_spinner = status_spinner.clone();
+        let status_title = status_title.clone();
+        let status_detail = status_detail.clone();
+        describe_button.connect_clicked(move |_| {
+            let image_b64 = if let Some(bytes) = selected_image.borrow().clone() {
+                base64_encode(&bytes)
+            } else {
+                let (start, end) = paste_buffer.bounds();
+                paste_buffer
+                    .text(&start, &end, false)
+                    .trim()
+                    .replace(['\n', '\r', ' ', '\t'], "")
+            };
+
+            if image_b64.is_empty() {
+                status_title.set_text("No image input");
+                status_detail.set_text("Choose an image file or paste base64 image bytes first.");
+                return;
+            }
+
+            description_buffer.set_text("");
+            describe_button_for_click.set_sensitive(false);
+            status_spinner.start();
+            status_title.set_text("Creating vision session");
+            status_detail.set_text("Opening a vision.describe session through the portal...");
+
+            let (tx, rx) = std::sync::mpsc::channel::<VisionEvent>();
+            let description_buffer = description_buffer.clone();
+            let describe_button = describe_button_for_click.clone();
+            let status_spinner = status_spinner.clone();
+            let status_title = status_title.clone();
+            let status_detail = status_detail.clone();
+            glib::timeout_add_local(std::time::Duration::from_millis(16), move || {
+                loop {
+                    match rx.try_recv() {
+                        Ok(VisionEvent::Phase(phase)) => {
+                            status_title.set_text(phase.title());
+                            status_detail.set_text(phase.detail());
+                            status_spinner.start();
+                        }
+                        Ok(VisionEvent::Description(text)) => {
+                            description_buffer.set_text(&text);
+                        }
+                        Ok(VisionEvent::Error(message)) => {
+                            status_spinner.stop();
+                            status_title.set_text("Description failed");
+                            status_detail.set_text(&message);
+                            describe_button.set_sensitive(true);
+                            return glib::ControlFlow::Break;
+                        }
+                        Ok(VisionEvent::Done) => {
+                            status_spinner.stop();
+                            status_title.set_text("Description complete");
+                            status_detail
+                                .set_text("Vision returned a description through the portal.");
+                            describe_button.set_sensitive(true);
+                            return glib::ControlFlow::Break;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            status_spinner.stop();
+                            status_title.set_text("Description interrupted");
+                            status_detail
+                                .set_text("The vision response channel closed unexpectedly.");
+                            describe_button.set_sensitive(true);
+                            return glib::ControlFlow::Break;
+                        }
+                    }
+                }
+                glib::ControlFlow::Continue
+            });
+
+            let error_tx = tx.clone();
+            std::thread::spawn(move || {
+                if let Err(e) = describe_image(&image_b64, tx) {
+                    eprintln!("[aileron-demo] describe error: {e}");
+                    let _ = error_tx.send(VisionEvent::Error(friendly_error(&e)));
+                }
+            });
+        });
+    }
+
+    vbox.upcast()
 }
 
 fn fetch_article_text(url: &str) -> anyhow::Result<String> {
@@ -567,6 +1062,123 @@ impl DemoPhase {
     }
 }
 
+enum SpeechEvent {
+    Phase(SpeechPhase),
+    Transcript(String),
+    Error(String),
+    Done,
+}
+
+enum SpeechPhase {
+    CreatingSession,
+    LoadingModel,
+    Transcribing,
+}
+
+impl SpeechPhase {
+    fn title(&self) -> &'static str {
+        match self {
+            SpeechPhase::CreatingSession => "Creating ASR session",
+            SpeechPhase::LoadingModel => "Loading ASR model",
+            SpeechPhase::Transcribing => "Transcribing audio",
+        }
+    }
+
+    fn detail(&self) -> &'static str {
+        match self {
+            SpeechPhase::CreatingSession => {
+                "Opening an asr.transcribe session through the portal..."
+            }
+            SpeechPhase::LoadingModel => "Starting the local ASR container if it is cold...",
+            SpeechPhase::Transcribing => "Sending recorded microphone audio to the ASR model...",
+        }
+    }
+}
+
+enum VisionEvent {
+    Phase(VisionPhase),
+    Description(String),
+    Error(String),
+    Done,
+}
+
+enum VisionPhase {
+    CreatingSession,
+    LoadingModel,
+    Describing,
+}
+
+impl VisionPhase {
+    fn title(&self) -> &'static str {
+        match self {
+            VisionPhase::CreatingSession => "Creating vision session",
+            VisionPhase::LoadingModel => "Loading vision model",
+            VisionPhase::Describing => "Describing image",
+        }
+    }
+
+    fn detail(&self) -> &'static str {
+        match self {
+            VisionPhase::CreatingSession => {
+                "Opening a vision.describe session through the portal..."
+            }
+            VisionPhase::LoadingModel => "Starting the local vision container if it is cold...",
+            VisionPhase::Describing => "Sending image bytes to the vision model...",
+        }
+    }
+}
+
+fn temp_audio_path() -> PathBuf {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or_default();
+    std::env::temp_dir().join(format!("aileron-demo-asr-{now}.f32le"))
+}
+
+fn friendly_error(error: &anyhow::Error) -> String {
+    friendly_error_text(&error.to_string())
+}
+
+fn friendly_error_text(message: &str) -> String {
+    if let Some(start) = message.find("reason: \"") {
+        let rest = &message[start + "reason: \"".len()..];
+        let mut out = String::new();
+        let mut escaped = false;
+        for ch in rest.chars() {
+            if escaped {
+                match ch {
+                    'n' => out.push('\n'),
+                    't' => out.push('\t'),
+                    '\\' => out.push('\\'),
+                    '"' => out.push('"'),
+                    other => out.push(other),
+                }
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                break;
+            } else {
+                out.push(ch);
+            }
+        }
+        if !out.trim().is_empty() {
+            return concise_error(&out);
+        }
+    }
+
+    concise_error(message)
+}
+
+fn concise_error(message: &str) -> String {
+    if message.contains("huggingface.co") && message.contains("ggml-") {
+        return "ASR model is missing from the assigned container image. The container tried to download a Whisper model from Hugging Face, but Aileron starts inference containers with networking disabled. Rebuild or assign an ASR image that has the Whisper model baked into /model.".to_string();
+    }
+
+    message.to_string()
+}
+
 /// Call `StreamResponse` on the portal and forward tokens via `tx`.
 /// Sends `Some(token)` for each token, then `None` when done.
 fn summarize_streaming(text: &str, tx: std::sync::mpsc::Sender<DemoEvent>) -> anyhow::Result<()> {
@@ -612,7 +1224,7 @@ fn summarize_streaming(text: &str, tx: std::sync::mpsc::Sender<DemoEvent>) -> an
     tx.send(DemoEvent::Phase(DemoPhase::WaitingForModel))?;
 
     let prompt = format!(
-        "Summarize the following article in 3-5 sentences:\n\n{}",
+        "Summarize the following article in 3-5 sentences. Return only the summary. Do not repeat or answer the instruction/question:\n\n{}",
         &text[..text.len().min(8192)]
     );
 
@@ -699,4 +1311,99 @@ fn summarize_guided(text: &str, tx: std::sync::mpsc::Sender<DemoEvent>) -> anyho
     let _: () = proxy.call("EndSession", &(&session_id,))?;
     tx.send(DemoEvent::Done)?;
     Ok(())
+}
+
+fn transcribe_recording(
+    path: &PathBuf,
+    tx: std::sync::mpsc::Sender<SpeechEvent>,
+) -> anyhow::Result<()> {
+    use zbus::blocking::Connection;
+
+    const BUS: &str = "org.freedesktop.impl.portal.desktop.aileron";
+    const PATH: &str = "/org/freedesktop/portal/desktop";
+    const IFACE: &str = "org.freedesktop.impl.portal.AI";
+
+    let audio = std::fs::read(path)?;
+    if audio.is_empty() {
+        anyhow::bail!("recording is empty");
+    }
+
+    let conn = Connection::session()?;
+    let proxy = zbus::blocking::Proxy::new(&conn, BUS, PATH, IFACE)?;
+
+    tx.send(SpeechEvent::Phase(SpeechPhase::CreatingSession))?;
+    let session_id: String = proxy.call(
+        "CreateLanguageModelSession",
+        &(
+            "org.aileron.Demo",
+            "asr.transcribe",
+            "Transcribe the provided audio accurately.",
+        ),
+    )?;
+
+    tx.send(SpeechEvent::Phase(SpeechPhase::LoadingModel))?;
+    tx.send(SpeechEvent::Phase(SpeechPhase::Transcribing))?;
+    let audio_b64 = base64_encode(&audio);
+    let transcript: String = proxy.call("Transcribe", &(&session_id, &audio_b64))?;
+    tx.send(SpeechEvent::Transcript(transcript))?;
+
+    let _: () = proxy.call("EndSession", &(&session_id,))?;
+    tx.send(SpeechEvent::Done)?;
+    Ok(())
+}
+
+fn describe_image(image_b64: &str, tx: std::sync::mpsc::Sender<VisionEvent>) -> anyhow::Result<()> {
+    use zbus::blocking::Connection;
+
+    const BUS: &str = "org.freedesktop.impl.portal.desktop.aileron";
+    const PATH: &str = "/org/freedesktop/portal/desktop";
+    const IFACE: &str = "org.freedesktop.impl.portal.AI";
+
+    let conn = Connection::session()?;
+    let proxy = zbus::blocking::Proxy::new(&conn, BUS, PATH, IFACE)?;
+
+    tx.send(VisionEvent::Phase(VisionPhase::CreatingSession))?;
+    let session_id: String = proxy.call(
+        "CreateLanguageModelSession",
+        &(
+            "org.aileron.Demo",
+            "vision.describe",
+            "Describe the provided image clearly and concisely.",
+        ),
+    )?;
+
+    tx.send(VisionEvent::Phase(VisionPhase::LoadingModel))?;
+    tx.send(VisionEvent::Phase(VisionPhase::Describing))?;
+    let description: String = proxy.call("Describe", &(&session_id, &image_b64))?;
+    tx.send(VisionEvent::Description(description))?;
+
+    let _: () = proxy.call("EndSession", &(&session_id,))?;
+    tx.send(VisionEvent::Done)?;
+    Ok(())
+}
+
+fn base64_encode(data: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = *chunk.get(1).unwrap_or(&0);
+        let b2 = *chunk.get(2).unwrap_or(&0);
+
+        out.push(TABLE[(b0 >> 2) as usize] as char);
+        out.push(TABLE[(((b0 & 0b0000_0011) << 4) | (b1 >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[(((b1 & 0b0000_1111) << 2) | (b2 >> 6)) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[(b2 & 0b0011_1111) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+
+    out
 }
