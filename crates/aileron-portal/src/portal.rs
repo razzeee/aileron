@@ -183,17 +183,21 @@ impl AiPortalBackend {
             .more()
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
 
-        let tokens: Vec<String> = iter
-            .map(|r| r.map(|v| v.token))
-            .collect::<std::result::Result<_, _>>()
-            .map_err(|e: aileron_varlink::aileron_Inference::Error| {
-                zbus::fdo::Error::Failed(e.to_string())
-            })?;
+        let mut pending_token: Option<String> = None;
+        for reply in iter {
+            let token = reply
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?
+                .token;
 
-        let total = tokens.len();
-        for (i, token) in tokens.into_iter().enumerate() {
-            let done = i + 1 == total;
-            AiPortalBackend::token_received(&ctxt, &session_id, &token, done)
+            if let Some(previous) = pending_token.replace(token) {
+                AiPortalBackend::token_received(&ctxt, &session_id, &previous, false)
+                    .await
+                    .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            }
+        }
+
+        if let Some(token) = pending_token {
+            AiPortalBackend::token_received(&ctxt, &session_id, &token, true)
                 .await
                 .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         }

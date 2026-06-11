@@ -163,6 +163,7 @@ impl VarlinkInterface for InferenceHandler {
                     call.reply_invalid_generation_options(reason)
                 }
                 Err(GenerationError::Failed(reason)) => call.reply_generation_failed(reason),
+                Err(GenerationError::Reply(e)) => Err(e),
             }
         })
     }
@@ -175,18 +176,8 @@ impl VarlinkInterface for InferenceHandler {
         options: GenerationOptions,
     ) -> varlink::Result<()> {
         self.rt.block_on(async {
-            let mut tokens = Vec::new();
-            match generate_tokens(&self.state, &mut tokens, session_id, prompt, options).await {
-                Ok(()) => {
-                    if call.wants_more() && tokens.len() > 1 {
-                        call.set_continues(true);
-                        for token in &tokens[..tokens.len() - 1] {
-                            call.reply(token.clone())?;
-                        }
-                        call.set_continues(false);
-                    }
-                    call.reply(tokens.into_iter().last().unwrap_or_default())
-                }
+            match stream_tokens(&self.state, call, session_id, prompt, options).await {
+                Ok(()) => Ok(()),
                 Err(GenerationError::SessionNotFound(id)) => call.reply_session_not_found(id),
                 Err(GenerationError::ModelUnavailable(reason)) => {
                     call.reply_model_unavailable(reason)
@@ -195,6 +186,7 @@ impl VarlinkInterface for InferenceHandler {
                     call.reply_invalid_generation_options(reason)
                 }
                 Err(GenerationError::Failed(reason)) => call.reply_generation_failed(reason),
+                Err(GenerationError::Reply(e)) => Err(e),
             }
         })
     }
@@ -331,11 +323,81 @@ impl VarlinkInterface for InferenceHandler {
     }
 }
 
+async fn stream_tokens(
+    state: &SharedState,
+    call: &mut dyn Call_StreamResponse,
+    session_id: String,
+    prompt: String,
+    options: GenerationOptions,
+) -> Result<(), GenerationError> {
+    let max_tokens = validate_options(&options).map_err(GenerationError::InvalidOptions)?;
+    let mut guard = state.0.lock().await;
+
+    let (app_id, use_case, instructions) = match guard.sessions.get(&session_id) {
+        Some(s) => (s.app_id.clone(), s.use_case.clone(), s.instructions.clone()),
+        None => return Err(GenerationError::SessionNotFound(session_id)),
+    };
+    let image_ref = match guard.assignments.get(&use_case) {
+        Some(r) => crate::hardware::resolve(r, guard.variant),
+        None => {
+            return Err(GenerationError::ModelUnavailable(format!(
+                "no model assigned for {use_case}"
+            )))
+        }
+    };
+
+    let _ = guard.permissions.touch(&app_id, &use_case);
+    let container = guard
+        .containers
+        .get_or_spawn(&use_case, &image_ref, |_| {})
+        .map_err(|e| GenerationError::Failed(e.to_string()))?;
+
+    let wants_more = call.wants_more();
+    let mut pending_token: Option<String> = None;
+    let mut reply_error: Option<varlink::Error> = None;
+
+    let result = container.generate(Some(&instructions), &prompt, max_tokens, |token| {
+        if !wants_more {
+            pending_token = Some(token);
+            return;
+        }
+
+        if reply_error.is_some() {
+            return;
+        }
+
+        if let Some(previous) = pending_token.replace(token) {
+            call.set_continues(true);
+            if let Err(e) = call.reply(previous) {
+                reply_error = Some(e);
+            }
+        }
+    });
+
+    if let Some(e) = reply_error {
+        return Err(GenerationError::Reply(e));
+    }
+
+    if let Err(e) = result {
+        if wants_more {
+            call.set_continues(false);
+        }
+        return Err(GenerationError::Failed(e.to_string()));
+    }
+
+    if wants_more {
+        call.set_continues(false);
+    }
+    call.reply(pending_token.unwrap_or_default())
+        .map_err(GenerationError::Reply)
+}
+
 enum GenerationError {
     SessionNotFound(String),
     ModelUnavailable(String),
     InvalidOptions(String),
     Failed(String),
+    Reply(varlink::Error),
 }
 
 trait TokenSink {
