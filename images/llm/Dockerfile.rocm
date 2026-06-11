@@ -7,15 +7,19 @@ FROM rocm/dev-ubuntu-22.04:7.2.4-complete
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3 python3-pip python3-dev \
-        build-essential cmake \
+        build-essential cmake ninja-build \
     && rm -rf /var/lib/apt/lists/* \
     && ln -sf python3 /usr/bin/python
 
-ENV CMAKE_ARGS="-DLLAMA_HIPBLAS=on"
+ARG AMDGPU_TARGETS="gfx1030"
+ENV CMAKE_ARGS="-DGGML_HIP=on -DAMDGPU_TARGETS=${AMDGPU_TARGETS}"
+ENV FORCE_CMAKE=1
+ENV HSA_OVERRIDE_GFX_VERSION=10.3.0
 ENV ROCM_PATH=/opt/rocm
 ENV PATH="${ROCM_PATH}/bin:${PATH}"
 
 RUN pip install --no-cache-dir \
+    --no-binary llama-cpp-python \
     "llama-cpp-python>=0.2.90" \
     jsonschema
 

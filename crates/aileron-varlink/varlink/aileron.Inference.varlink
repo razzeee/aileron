@@ -1,21 +1,42 @@
-# aileron.Inference — text/audio/vision inference sessions
+# aileron.Inference — Foundation Models-style inference sessions
 
 interface aileron.Inference
 
-# Create a session for a given use-case and app_id.
-# Returns a session_id to use in subsequent calls.
-# The daemon checks/prompts permissions at this point.
-method CreateSession(app_id: string, use_case: string) -> (session_id: string)
+type ModelAvailability (
+  is_available: bool,
+  reason: string
+)
 
-# Start a streaming text generation session.
-# use_case: one of llm.summarize, llm.translate, llm.rephrase, llm.classify, llm.extract
-# Returns a stream of token strings.
-method Generate(session_id: string, prompt: string) -> (token: string)
+type GenerationOptions (
+  maximum_response_tokens: int,
+  temperature: float,
+  sampling_mode: string
+)
 
-# Generate text constrained to a JSON Schema.
-# schema: a JSON Schema object serialised as a string (e.g. '{"type":"object","properties":{...}}')
-# Returns a single JSON string that validates against the provided schema.
-method GenerateStructured(session_id: string, prompt: string, schema: string) -> (result: string)
+type GuidedField (
+  name: string,
+  kind: string,
+  description: string,
+  required: bool
+)
+
+# Return whether a language model is assigned and runnable for this use-case.
+method GetLanguageModelAvailability(app_id: string, use_case: string) -> (availability: ModelAvailability)
+
+# Create a language model session with stable system instructions.
+method CreateLanguageModelSession(app_id: string, use_case: string, instructions: string) -> (session_id: string)
+
+# Start the backing container before the first user-visible response.
+method Prewarm(session_id: string, prompt_prefix: string) -> ()
+
+# Generate a complete response.
+method Respond(session_id: string, prompt: string, options: GenerationOptions) -> (content: string)
+
+# Stream response tokens.
+method StreamResponse(session_id: string, prompt: string, options: GenerationOptions) -> (token: string)
+
+# Generate JSON matching field guides converted to a JSON Schema object.
+method RespondGuided(session_id: string, prompt: string, fields: []GuidedField, options: GenerationOptions) -> (content: string)
 
 # Transcribe audio. Session must have been created with use_case: asr.transcribe
 # audio: raw PCM bytes encoded as base64 (16kHz mono f32le)
@@ -25,11 +46,12 @@ method Transcribe(session_id: string, audio: string) -> (text: string)
 # image: PNG or JPEG bytes encoded as base64
 method Describe(session_id: string, image: string) -> (text: string)
 
-# End a session and release the container.
+# End a session. The per-use-case container remains pooled until idle timeout.
 method EndSession(session_id: string) -> ()
 
 error PermissionDenied(app_id: string, use_case: string)
 error SessionNotFound(session_id: string)
-error NoModelAssigned(use_case: string)
-# Returned when GenerateStructured produces output that does not validate against the schema.
-error SchemaValidationFailed(reason: string)
+error ModelUnavailable(reason: string)
+error InvalidGenerationOptions(reason: string)
+error GuidedGenerationFailed(reason: string)
+error GenerationFailed(reason: string)

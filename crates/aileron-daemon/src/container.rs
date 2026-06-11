@@ -71,31 +71,23 @@ impl Container {
     ///   --cap-drop=all       drops every Linux capability
     ///   --security-opt=no-new-privileges  belt-and-suspenders with the kernel
     ///   --pids-limit=256     limits fork bombs
-    ///   --memory=4g          caps RAM usage
+    ///   --memory=<limit>     caps RAM usage
     pub fn spawn(
         image_ref: &str,
+        memory_limit: &str,
         mut on_status: impl FnMut(String) + Send + 'static,
     ) -> Result<Self> {
         info!("spawning container for {}", image_ref);
+        let args = podman_run_args(image_ref, memory_limit);
         let mut child = std::process::Command::new("podman")
-            .args([
-                "run", "--rm", "-i",
-                "--network=none",
-                "--read-only",
-                "--tmpfs=/tmp:rw,noexec,nosuid,size=256m",
-                "--cap-drop=all",
-                "--security-opt=no-new-privileges",
-                "--pids-limit=256",
-                "--memory=4g",
-                image_ref,
-            ])
+            .args(&args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .with_context(|| format!("failed to spawn podman for {}", image_ref))?;
 
-        let stdin  = child.stdin.take().expect("piped stdin");
+        let stdin = child.stdin.take().expect("piped stdin");
         let stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
         let stderr = BufReader::new(child.stderr.take().expect("piped stderr"));
 
@@ -104,10 +96,15 @@ impl Container {
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
         thread::spawn(move || {
             let mut signalled = false;
+            let mut recent = std::collections::VecDeque::with_capacity(8);
             for line in stderr.lines() {
                 match line {
                     Ok(l) => {
                         info!("[container stderr] {}", l);
+                        if recent.len() == 8 {
+                            recent.pop_front();
+                        }
+                        recent.push_back(l.clone());
                         let lower = l.to_lowercase();
                         if !signalled && lower.contains("ready") {
                             let _ = ready_tx.send(Ok(()));
@@ -127,7 +124,13 @@ impl Container {
             }
             // If stderr closed without a ready line, signal an error.
             if !signalled {
-                let _ = ready_tx.send(Err("container exited before ready".to_string()));
+                let detail = recent.into_iter().collect::<Vec<_>>().join(" | ");
+                let reason = if detail.is_empty() {
+                    "container exited before ready".to_string()
+                } else {
+                    format!("container exited before ready: {detail}")
+                };
+                let _ = ready_tx.send(Err(reason));
             }
         });
 
@@ -135,7 +138,7 @@ impl Container {
         match ready_rx.recv() {
             Ok(Ok(())) => info!("container ready: {}", image_ref),
             Ok(Err(e)) => bail!("container failed to start: {}", e),
-            Err(_)     => bail!("container stderr thread dropped before ready"),
+            Err(_) => bail!("container stderr thread dropped before ready"),
         }
 
         Ok(Self {
@@ -257,7 +260,7 @@ impl Container {
             system: None,
             prompt: None,
             max_tokens: None,
-            audio: Some(audio),
+            audio: Some(base64_encode(&audio)),
             image: None,
             response_format: None,
         };
@@ -278,7 +281,7 @@ impl Container {
             prompt: None,
             max_tokens: None,
             audio: None,
-            image: Some(image),
+            image: Some(base64_encode(&image)),
             response_format: None,
         };
         let line = serde_json::to_string(&req)? + "\n";
@@ -300,6 +303,10 @@ impl Container {
             if resp.id != id {
                 continue;
             }
+            if let Some(error) = resp.error {
+                let reason = resp.reason.unwrap_or(error);
+                bail!("container returned error: {reason}");
+            }
             if let Some(token) = resp.token {
                 result.push_str(&token);
             }
@@ -309,6 +316,49 @@ impl Container {
         }
         Ok(result)
     }
+}
+
+fn podman_run_args(image_ref: &str, memory_limit: &str) -> Vec<String> {
+    let mut args = vec![
+        "run".to_string(),
+        "--rm".to_string(),
+        "-i".to_string(),
+        "--network=none".to_string(),
+        "--read-only".to_string(),
+        "--tmpfs=/tmp:rw,noexec,nosuid,size=256m".to_string(),
+        "--cap-drop=all".to_string(),
+        "--security-opt=no-new-privileges".to_string(),
+        "--pids-limit=256".to_string(),
+        format!("--memory={memory_limit}"),
+    ];
+
+    if image_ref_uses_tag(image_ref, "cuda") {
+        args.push("--device=nvidia.com/gpu=all".to_string());
+    } else if image_ref_uses_tag(image_ref, "rocm") {
+        args.extend([
+            "--device=/dev/kfd".to_string(),
+            "--device=/dev/dri".to_string(),
+            "--group-add=keep-groups".to_string(),
+            "--ipc=host".to_string(),
+            "--env=HSA_OVERRIDE_GFX_VERSION=10.3.0".to_string(),
+        ]);
+    } else if image_ref_uses_tag(image_ref, "vulkan") {
+        args.extend([
+            "--device=/dev/dri".to_string(),
+            "--group-add=keep-groups".to_string(),
+        ]);
+    }
+
+    args.push(image_ref.to_string());
+    args
+}
+
+fn image_ref_uses_tag(image_ref: &str, tag: &str) -> bool {
+    image_ref
+        .rsplit_once('/')
+        .map_or(image_ref, |(_, after_slash)| after_slash)
+        .rsplit_once(':')
+        .is_some_and(|(_, image_tag)| image_tag == tag)
 }
 
 // ── Schema validation ─────────────────────────────────────────────────────────
@@ -465,6 +515,32 @@ fn value_type_name(v: &Value) -> &'static str {
     }
 }
 
+fn base64_encode(data: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = *chunk.get(1).unwrap_or(&0);
+        let b2 = *chunk.get(2).unwrap_or(&0);
+
+        out.push(TABLE[(b0 >> 2) as usize] as char);
+        out.push(TABLE[(((b0 & 0b0000_0011) << 4) | (b1 >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[(((b1 & 0b0000_1111) << 2) | (b2 >> 6)) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[(b2 & 0b0011_1111) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+
+    out
+}
+
 // ── Pool ──────────────────────────────────────────────────────────────────────
 
 /// Pool of running containers, keyed by use-case.
@@ -472,6 +548,8 @@ pub struct ContainerPool {
     containers: HashMap<String, Container>,
     /// Idle timeout in seconds (default 300 = 5 min).
     pub idle_timeout_secs: u64,
+    /// Podman memory limit applied to each model container.
+    pub memory_limit: String,
 }
 
 impl ContainerPool {
@@ -479,6 +557,7 @@ impl ContainerPool {
         Self {
             containers: HashMap::new(),
             idle_timeout_secs: 300,
+            memory_limit: "8g".to_string(),
         }
     }
 
@@ -491,8 +570,20 @@ impl ContainerPool {
         image_ref: &str,
         on_status: impl FnMut(String) + Send + 'static,
     ) -> Result<&mut Container> {
+        if self
+            .containers
+            .get(use_case)
+            .is_some_and(|container| container.image_ref != image_ref)
+        {
+            info!(
+                "replacing container for use-case {} with image {}",
+                use_case, image_ref
+            );
+            self.containers.remove(use_case);
+        }
+
         if !self.containers.contains_key(use_case) {
-            let c = Container::spawn(image_ref, on_status)?;
+            let c = Container::spawn(image_ref, &self.memory_limit, on_status)?;
             self.containers.insert(use_case.to_string(), c);
         }
         Ok(self.containers.get_mut(use_case).unwrap())
@@ -544,9 +635,9 @@ struct ContainerRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    audio: Option<Vec<u8>>,
+    audio: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    image: Option<Vec<u8>>,
+    image: Option<String>,
     /// Present only for `generate_structured` requests.
     #[serde(skip_serializing_if = "Option::is_none")]
     response_format: Option<ResponseFormat>,
@@ -566,5 +657,75 @@ struct ContainerResponse {
     token: Option<String>,
     /// Present in structured output responses (the full JSON string).
     result: Option<String>,
+    error: Option<String>,
+    reason: Option<String>,
     done: Option<bool>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn podman_args_expose_rocm_devices_for_rocm_tag() {
+        let args = podman_run_args("localhost/aileron/summarize:rocm", "8g");
+
+        assert!(args.contains(&"--device=/dev/kfd".to_string()));
+        assert!(args.contains(&"--device=/dev/dri".to_string()));
+        assert!(args.contains(&"--group-add=keep-groups".to_string()));
+        assert!(args.contains(&"--ipc=host".to_string()));
+        assert!(args.contains(&"--env=HSA_OVERRIDE_GFX_VERSION=10.3.0".to_string()));
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("localhost/aileron/summarize:rocm")
+        );
+    }
+
+    #[test]
+    fn podman_args_expose_cuda_device_for_cuda_tag() {
+        let args = podman_run_args("localhost/aileron/summarize:cuda", "8g");
+
+        assert!(args.contains(&"--device=nvidia.com/gpu=all".to_string()));
+        assert!(!args.contains(&"--device=/dev/kfd".to_string()));
+        assert!(!args.contains(&"--device=/dev/dri".to_string()));
+        assert!(!args.contains(&"--ipc=host".to_string()));
+        assert!(!args.contains(&"--env=HSA_OVERRIDE_GFX_VERSION=10.3.0".to_string()));
+        assert!(!args.contains(&"--group-add=keep-groups".to_string()));
+    }
+
+    #[test]
+    fn podman_args_expose_vulkan_device_for_vulkan_tag() {
+        let args = podman_run_args("localhost/aileron/summarize:vulkan", "8g");
+
+        assert!(args.contains(&"--device=/dev/dri".to_string()));
+        assert!(args.contains(&"--group-add=keep-groups".to_string()));
+        assert!(!args.contains(&"--device=/dev/kfd".to_string()));
+        assert!(!args.contains(&"--device=nvidia.com/gpu=all".to_string()));
+        assert!(!args.contains(&"--ipc=host".to_string()));
+        assert!(!args.contains(&"--env=HSA_OVERRIDE_GFX_VERSION=10.3.0".to_string()));
+    }
+
+    #[test]
+    fn podman_args_do_not_expose_gpu_devices_for_cpu_tag() {
+        let args = podman_run_args("localhost/aileron/summarize:cpu", "8g");
+
+        assert!(!args.contains(&"--device=/dev/kfd".to_string()));
+        assert!(!args.contains(&"--device=/dev/dri".to_string()));
+        assert!(!args.contains(&"--device=nvidia.com/gpu=all".to_string()));
+        assert!(!args.contains(&"--ipc=host".to_string()));
+        assert!(!args.contains(&"--env=HSA_OVERRIDE_GFX_VERSION=10.3.0".to_string()));
+        assert!(!args.contains(&"--group-add=keep-groups".to_string()));
+    }
+
+    #[test]
+    fn rocm_tag_detection_ignores_registry_port() {
+        assert!(image_ref_uses_tag(
+            "localhost:5000/aileron/summarize:rocm",
+            "rocm"
+        ));
+        assert!(!image_ref_uses_tag(
+            "localhost:5000/aileron/summarize",
+            "rocm"
+        ));
+    }
 }

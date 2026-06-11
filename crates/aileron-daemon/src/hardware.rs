@@ -11,7 +11,6 @@
 ///   3. ROCm  — `rocm-smi` reports a GPU
 ///   4. Vulkan — `vulkaninfo` reports a device
 ///   5. CPU   — fallback
-
 use tracing::info;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,9 +24,9 @@ pub enum Variant {
 impl Variant {
     pub fn as_tag(&self) -> &'static str {
         match self {
-            Variant::Cpu    => "cpu",
-            Variant::Cuda   => "cuda",
-            Variant::Rocm   => "rocm",
+            Variant::Cpu => "cpu",
+            Variant::Cuda => "cuda",
+            Variant::Rocm => "rocm",
             Variant::Vulkan => "vulkan",
         }
     }
@@ -40,12 +39,15 @@ pub fn detect() -> Variant {
     // Explicit override.
     if let Ok(v) = std::env::var("AILERON_VARIANT") {
         let variant = match v.to_lowercase().as_str() {
-            "cuda"   => Variant::Cuda,
-            "rocm"   => Variant::Rocm,
+            "cuda" => Variant::Cuda,
+            "rocm" => Variant::Rocm,
             "vulkan" => Variant::Vulkan,
-            _        => Variant::Cpu,
+            _ => Variant::Cpu,
         };
-        info!("hardware variant: {} (AILERON_VARIANT override)", variant.as_tag());
+        info!(
+            "hardware variant: {} (AILERON_VARIANT override)",
+            variant.as_tag()
+        );
         return variant;
     }
 

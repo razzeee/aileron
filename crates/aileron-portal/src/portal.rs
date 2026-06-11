@@ -1,8 +1,10 @@
 /// D-Bus portal backend for `org.freedesktop.impl.portal.AI`.
 use anyhow::Result;
-use std::collections::HashSet;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use tracing::info;
+use zbus::zvariant::Type;
 use zbus::{connection, interface, object_server::SignalContext};
 
 pub async fn run() -> Result<()> {
@@ -16,127 +18,194 @@ pub async fn run() -> Result<()> {
         .await?;
 
     info!("D-Bus connection established; serving portal interface");
-    let _ = conn; // keep alive
+    let _ = conn;
     std::future::pending::<()>().await;
     Ok(())
 }
 
-/// Use-cases whose containers are already warm (model fully loaded).
 #[derive(Default)]
 struct AiPortalBackend {
     warm: Mutex<HashSet<String>>,
+    session_use_cases: Mutex<HashMap<String, String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+struct ModelAvailabilityDbus {
+    is_available: bool,
+    reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+struct GenerationOptionsDbus {
+    maximum_response_tokens: i64,
+    temperature: f64,
+    sampling_mode: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+struct GuidedFieldDbus {
+    name: String,
+    kind: String,
+    description: String,
+    required: bool,
 }
 
 #[interface(name = "org.freedesktop.impl.portal.AI")]
 impl AiPortalBackend {
-    async fn create_session(
+    async fn get_language_model_availability(
         &self,
         app_id: &str,
         use_case: &str,
-        #[zbus(signal_context)] ctxt: SignalContext<'_>,
+    ) -> zbus::fdo::Result<ModelAvailabilityDbus> {
+        use aileron_varlink::aileron_Inference::VarlinkClientInterface;
+
+        let conn =
+            aileron_ipc::client::connect().map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn);
+        let reply = client
+            .get_language_model_availability(app_id.to_string(), use_case.to_string())
+            .call()
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+
+        Ok(ModelAvailabilityDbus {
+            is_available: reply.availability.is_available,
+            reason: reply.availability.reason,
+        })
+    }
+
+    async fn create_language_model_session(
+        &self,
+        app_id: &str,
+        use_case: &str,
+        instructions: &str,
     ) -> zbus::fdo::Result<String> {
         use aileron_varlink::aileron_Inference::VarlinkClientInterface;
 
-        // If the container is already warm, skip the more/loading dance and
-        // call directly — CreateSession returns immediately.
-        let already_warm = self.warm.lock().unwrap().contains(use_case);
-
         let conn =
             aileron_ipc::client::connect().map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn);
+        let reply = client
+            .create_language_model_session(
+                app_id.to_string(),
+                use_case.to_string(),
+                instructions.to_string(),
+            )
+            .call()
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
 
-        if already_warm {
-            let reply = client
-                .create_session(app_id.to_string(), use_case.to_string())
-                .call()
-                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-            return Ok(reply.session_id);
-        }
-
-        // Cold start — use more() to receive status lines during model load.
-        let mut call = client.create_session(app_id.to_string(), use_case.to_string());
-        let iter = call.more().map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-
-        let mut session_id = String::new();
-        for reply in iter {
-            let r = reply.map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-            if r.session_id.starts_with("status:") {
-                let msg = r.session_id.trim_start_matches("status:").to_string();
-                AiPortalBackend::model_loading(&ctxt, &msg)
-                    .await
-                    .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-            } else {
-                session_id = r.session_id;
-            }
-        }
-
-        // Mark this use-case as warm for future calls.
-        self.warm.lock().unwrap().insert(use_case.to_string());
-
-        Ok(session_id)
+        self.session_use_cases
+            .lock()
+            .unwrap()
+            .insert(reply.session_id.clone(), use_case.to_string());
+        Ok(reply.session_id)
     }
 
-    /// Fired during `CreateSession` while the model container is loading.
-    /// `message` is a human-readable status line from the container (e.g.
-    /// "[aileron-llm] loading /model/model.gguf").
-    #[zbus(signal)]
-    async fn model_loading(ctxt: &SignalContext<'_>, message: &str) -> zbus::Result<()>;
-
-    /// Non-streaming Generate — returns the full concatenated text.
-    async fn generate(&self, session_id: &str, prompt: &str) -> zbus::fdo::Result<String> {
-        use aileron_varlink::aileron_Inference::VarlinkClientInterface;
-
-        let conn =
-            aileron_ipc::client::connect().map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-        let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn);
-        let mut call = client.generate(session_id.to_string(), prompt.to_string());
-        let iter = call.more().map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-        let mut result = String::new();
-        for reply in iter {
-            result.push_str(&reply.map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?.token);
-        }
-        Ok(result)
-    }
-
-    /// Streaming Generate — returns immediately, then fires `TokenReceived`
-    /// signals as tokens arrive from the daemon.
-    async fn generate_stream(
+    async fn prewarm(
         &self,
         session_id: &str,
-        prompt: &str,
+        prompt_prefix: &str,
         #[zbus(signal_context)] ctxt: SignalContext<'_>,
     ) -> zbus::fdo::Result<()> {
         use aileron_varlink::aileron_Inference::VarlinkClientInterface;
 
-        let session_id = session_id.to_string();
-        let prompt = prompt.to_string();
+        AiPortalBackend::model_loading(&ctxt, "starting model")
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
 
         let conn =
             aileron_ipc::client::connect().map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn);
-        let mut call = client.generate(session_id.clone(), prompt);
-        let iter = call.more().map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        client
+            .prewarm(session_id.to_string(), prompt_prefix.to_string())
+            .call()
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
 
-        // Collect all tokens (varlink iterator is synchronous/blocking).
-        let tokens: Vec<String> = iter
-            .map(|r| r.map(|v| v.token))
-            .collect::<std::result::Result<_, _>>()
-            .map_err(|e: aileron_varlink::aileron_Inference::Error| {
-                zbus::fdo::Error::Failed(e.to_string())
-            })?;
+        if let Some(use_case) = self
+            .session_use_cases
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .cloned()
+        {
+            self.warm.lock().unwrap().insert(use_case);
+        }
+        Ok(())
+    }
 
-        let total = tokens.len();
-        for (i, token) in tokens.into_iter().enumerate() {
-            let done = i + 1 == total;
-            AiPortalBackend::token_received(&ctxt, &session_id, &token, done)
+    #[zbus(signal)]
+    async fn model_loading(ctxt: &SignalContext<'_>, message: &str) -> zbus::Result<()>;
+
+    async fn respond(
+        &self,
+        session_id: &str,
+        prompt: &str,
+        options: GenerationOptionsDbus,
+        #[zbus(signal_context)] ctxt: SignalContext<'_>,
+    ) -> zbus::fdo::Result<String> {
+        use aileron_varlink::aileron_Inference::VarlinkClientInterface;
+
+        self.emit_loading_if_cold(session_id, &ctxt).await?;
+        let conn =
+            aileron_ipc::client::connect().map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn);
+        let reply = client
+            .respond(
+                session_id.to_string(),
+                prompt.to_string(),
+                options.into_varlink(),
+            )
+            .call()
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        self.mark_warm(session_id);
+        Ok(reply.content)
+    }
+
+    async fn stream_response(
+        &self,
+        session_id: &str,
+        prompt: &str,
+        options: GenerationOptionsDbus,
+        #[zbus(signal_context)] ctxt: SignalContext<'_>,
+    ) -> zbus::fdo::Result<()> {
+        use aileron_varlink::aileron_Inference::VarlinkClientInterface;
+
+        self.emit_loading_if_cold(session_id, &ctxt).await?;
+        let session_id = session_id.to_string();
+        let conn =
+            aileron_ipc::client::connect().map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn);
+        let mut call = client.stream_response(
+            session_id.clone(),
+            prompt.to_string(),
+            options.into_varlink(),
+        );
+        let iter = call
+            .more()
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+
+        let mut pending_token: Option<String> = None;
+        for reply in iter {
+            let token = reply
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?
+                .token;
+
+            if let Some(previous) = pending_token.replace(token) {
+                AiPortalBackend::token_received(&ctxt, &session_id, &previous, false)
+                    .await
+                    .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            }
+        }
+
+        if let Some(token) = pending_token {
+            AiPortalBackend::token_received(&ctxt, &session_id, &token, true)
                 .await
                 .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         }
 
+        self.mark_warm(&session_id);
         Ok(())
     }
 
-    /// Signal emitted once per token during `GenerateStream`.
     #[zbus(signal)]
     async fn token_received(
         ctxt: &SignalContext<'_>,
@@ -145,7 +214,36 @@ impl AiPortalBackend {
         done: bool,
     ) -> zbus::Result<()>;
 
-    /// `audio_b64`: raw PCM bytes encoded as base64 (16 kHz mono f32le).
+    async fn respond_guided(
+        &self,
+        session_id: &str,
+        prompt: &str,
+        fields: Vec<GuidedFieldDbus>,
+        options: GenerationOptionsDbus,
+        #[zbus(signal_context)] ctxt: SignalContext<'_>,
+    ) -> zbus::fdo::Result<String> {
+        use aileron_varlink::aileron_Inference::VarlinkClientInterface;
+
+        self.emit_loading_if_cold(session_id, &ctxt).await?;
+        let conn =
+            aileron_ipc::client::connect().map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn);
+        let reply = client
+            .respond_guided(
+                session_id.to_string(),
+                prompt.to_string(),
+                fields
+                    .into_iter()
+                    .map(GuidedFieldDbus::into_varlink)
+                    .collect(),
+                options.into_varlink(),
+            )
+            .call()
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        self.mark_warm(session_id);
+        Ok(reply.content)
+    }
+
     async fn transcribe(&self, session_id: &str, audio_b64: &str) -> zbus::fdo::Result<String> {
         use aileron_varlink::aileron_Inference::VarlinkClientInterface;
 
@@ -159,7 +257,6 @@ impl AiPortalBackend {
         Ok(reply.text)
     }
 
-    /// `image_b64`: PNG or JPEG bytes encoded as base64.
     async fn describe(&self, session_id: &str, image_b64: &str) -> zbus::fdo::Result<String> {
         use aileron_varlink::aileron_Inference::VarlinkClientInterface;
 
@@ -183,30 +280,64 @@ impl AiPortalBackend {
             .end_session(session_id.to_string())
             .call()
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        self.session_use_cases.lock().unwrap().remove(session_id);
+        Ok(())
+    }
+}
+
+impl AiPortalBackend {
+    async fn emit_loading_if_cold(
+        &self,
+        session_id: &str,
+        ctxt: &SignalContext<'_>,
+    ) -> zbus::fdo::Result<()> {
+        let use_case = self
+            .session_use_cases
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .cloned();
+        let is_warm = use_case
+            .as_ref()
+            .is_some_and(|u| self.warm.lock().unwrap().contains(u));
+        if !is_warm {
+            AiPortalBackend::model_loading(ctxt, "starting model")
+                .await
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        }
         Ok(())
     }
 
-    /// `schema`: JSON Schema object serialised as a string.
-    /// Returns a JSON string that validates against the schema.
-    async fn generate_structured(
-        &self,
-        session_id: &str,
-        prompt: &str,
-        schema: &str,
-    ) -> zbus::fdo::Result<String> {
-        use aileron_varlink::aileron_Inference::VarlinkClientInterface;
+    fn mark_warm(&self, session_id: &str) {
+        if let Some(use_case) = self
+            .session_use_cases
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .cloned()
+        {
+            self.warm.lock().unwrap().insert(use_case);
+        }
+    }
+}
 
-        let conn =
-            aileron_ipc::client::connect().map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-        let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn);
-        let reply = client
-            .generate_structured(
-                session_id.to_string(),
-                prompt.to_string(),
-                schema.to_string(),
-            )
-            .call()
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-        Ok(reply.result)
+impl GenerationOptionsDbus {
+    fn into_varlink(self) -> aileron_varlink::aileron_Inference::GenerationOptions {
+        aileron_varlink::aileron_Inference::GenerationOptions {
+            maximum_response_tokens: self.maximum_response_tokens,
+            temperature: self.temperature,
+            sampling_mode: self.sampling_mode,
+        }
+    }
+}
+
+impl GuidedFieldDbus {
+    fn into_varlink(self) -> aileron_varlink::aileron_Inference::GuidedField {
+        aileron_varlink::aileron_Inference::GuidedField {
+            name: self.name,
+            kind: self.kind,
+            description: self.description,
+            required: self.required,
+        }
     }
 }

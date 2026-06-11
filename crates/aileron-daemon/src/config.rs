@@ -17,4 +17,8 @@ pub struct Config {
     /// Container idle timeout in seconds before it is terminated.
     #[arg(long, env = "AILERON_IDLE_TIMEOUT_SECS", default_value_t = 300)]
     pub idle_timeout_secs: u64,
+
+    /// Memory limit passed to each model container.
+    #[arg(long, env = "AILERON_CONTAINER_MEMORY", default_value = "8g")]
+    pub container_memory: String,
 }

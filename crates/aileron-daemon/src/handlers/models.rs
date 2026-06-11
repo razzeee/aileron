@@ -92,7 +92,10 @@ impl VarlinkInterface for ModelsHandler {
                 match guard.assignments.get(&use_case) {
                     None => {
                         // Unassigned — assign automatically.
-                        if let Err(e) = guard.assignments.assign(use_case.clone(), image_ref.clone()) {
+                        if let Err(e) = guard
+                            .assignments
+                            .assign(use_case.clone(), image_ref.clone())
+                        {
                             tracing::warn!("auto-assign {use_case} failed: {e}");
                         } else {
                             auto_assigned.push(use_case);
@@ -196,7 +199,12 @@ fn deserialize_created<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String,
 /// Returns a list of use-case tokens, or an empty vec if the label is absent.
 async fn read_use_case_label(image_ref: &str) -> Vec<String> {
     let output = tokio::process::Command::new("podman")
-        .args(["inspect", "--format", "{{index .Labels \"aileron.use_cases\"}}", image_ref])
+        .args([
+            "inspect",
+            "--format",
+            "{{index .Labels \"aileron.use_cases\"}}",
+            image_ref,
+        ])
         .output()
         .await;
 

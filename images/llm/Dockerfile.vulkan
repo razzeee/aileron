@@ -6,7 +6,7 @@ FROM python:3.12-slim
 # The entrypoint auto-detects the GPU at runtime via vulkaninfo.
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential cmake \
+        build-essential cmake ninja-build \
         libvulkan-dev vulkan-tools \
         libvulkan1 mesa-vulkan-drivers \
     && rm -rf /var/lib/apt/lists/*
