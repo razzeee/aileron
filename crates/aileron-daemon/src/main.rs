@@ -7,7 +7,9 @@ mod config;
 mod container;
 mod handlers;
 mod hardware;
+mod manifests;
 mod permissions;
+mod profiles;
 mod service;
 mod state;
 

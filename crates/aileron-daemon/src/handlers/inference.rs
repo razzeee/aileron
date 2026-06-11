@@ -1,15 +1,15 @@
 /// Varlink handler for `aileron.Inference`.
 use serde_json::{json, Map, Value};
+use std::path::PathBuf;
 use uuid::Uuid;
 
 use crate::state::SharedState;
 #[allow(unused_imports)]
 // VarlinkCallError is a supertrait; its methods reach us via Call_* dyn objects.
 use aileron_varlink::aileron_Inference::{
-    Call_CreateLanguageModelSession, Call_Describe, Call_EndSession,
-    Call_GetLanguageModelAvailability, Call_Prewarm, Call_Respond, Call_RespondGuided,
-    Call_StreamResponse, Call_Transcribe, GenerationOptions, GuidedField, ModelAvailability,
-    VarlinkCallError, VarlinkInterface,
+    Call_CreateSession, Call_Describe, Call_EndSession, Call_GetUseCaseAvailability, Call_Prewarm,
+    Call_Respond, Call_RespondGuided, Call_StreamResponse, Call_Transcribe, GenerationOptions,
+    GuidedField, ModelAvailability, VarlinkCallError, VarlinkInterface,
 };
 
 pub struct InferenceHandler {
@@ -28,25 +28,55 @@ fn io_err(_msg: impl std::fmt::Display) -> varlink::Error {
 }
 
 impl VarlinkInterface for InferenceHandler {
-    fn get_language_model_availability(
+    fn get_use_case_availability(
         &self,
-        call: &mut dyn Call_GetLanguageModelAvailability,
+        call: &mut dyn Call_GetUseCaseAvailability,
         _app_id: String,
         use_case: String,
     ) -> varlink::Result<()> {
         self.rt.block_on(async {
-            let image_ref = {
+            let (image_ref, artifact_path) = {
                 let guard = self.state.0.lock().await;
-                match guard.assignments.get(&use_case) {
-                    Some(r) => crate::hardware::resolve(r, guard.variant),
+                let profile_id = match guard.assignments.get(&use_case) {
+                    Some(profile_id) => profile_id,
                     None => {
                         return call.reply(ModelAvailability {
                             is_available: false,
-                            reason: format!("no model assigned for {use_case}"),
+                            reason: format!("no profile assigned for {use_case}"),
                         })
                     }
-                }
+                };
+                let profile = match guard.profiles.get(profile_id) {
+                    Some(profile) => profile,
+                    None => {
+                        return call.reply(ModelAvailability {
+                            is_available: false,
+                            reason: format!("assigned profile {profile_id} is not installed"),
+                        })
+                    }
+                };
+                let image_ref = match resolve_runtime_image(&guard, profile) {
+                    Some(image_ref) => image_ref.to_string(),
+                    None => {
+                        return call.reply(ModelAvailability {
+                            is_available: false,
+                            reason: format!(
+                                "runtime {} does not support {}",
+                                profile.runtime_id,
+                                guard.variant.as_tag()
+                            ),
+                        })
+                    }
+                };
+                (image_ref, profile.artifact_path.clone())
             };
+
+            if !artifact_path.exists() {
+                return call.reply(ModelAvailability {
+                    is_available: false,
+                    reason: format!("artifact path {} is missing", artifact_path.display()),
+                });
+            }
 
             let status = tokio::process::Command::new("podman")
                 .args(["image", "exists", &image_ref])
@@ -59,15 +89,15 @@ impl VarlinkInterface for InferenceHandler {
                 reason: if status.success() {
                     "available".to_string()
                 } else {
-                    format!("assigned image {image_ref} is not present locally")
+                    format!("runtime image {image_ref} is not present locally")
                 },
             })
         })
     }
 
-    fn create_language_model_session(
+    fn create_session(
         &self,
-        call: &mut dyn Call_CreateLanguageModelSession,
+        call: &mut dyn Call_CreateSession,
         app_id: String,
         use_case: String,
         instructions: String,
@@ -98,8 +128,17 @@ impl VarlinkInterface for InferenceHandler {
                 }
             }
 
-            if guard.assignments.get(&use_case).is_none() {
-                return call.reply_model_unavailable(format!("no model assigned for {use_case}"));
+            let profile_id = match guard.assignments.get(&use_case) {
+                Some(profile_id) => profile_id.to_string(),
+                None => {
+                    return call
+                        .reply_model_unavailable(format!("no profile assigned for {use_case}"))
+                }
+            };
+            if guard.profiles.get(&profile_id).is_none() {
+                return call.reply_model_unavailable(format!(
+                    "assigned profile {profile_id} is not installed"
+                ));
             }
 
             let session_id = Uuid::new_v4().to_string();
@@ -107,6 +146,7 @@ impl VarlinkInterface for InferenceHandler {
                 session_id: session_id.clone(),
                 app_id,
                 use_case,
+                profile_id,
                 instructions,
                 started_at: chrono::Utc::now(),
             };
@@ -123,19 +163,18 @@ impl VarlinkInterface for InferenceHandler {
     ) -> varlink::Result<()> {
         self.rt.block_on(async {
             let mut guard = self.state.0.lock().await;
-            let use_case = match guard.sessions.get(&session_id) {
-                Some(s) => s.use_case.clone(),
+            let (profile_id, image_ref, artifact_path) = match guard.sessions.get(&session_id) {
+                Some(s) => match profile_runtime(&guard, &s.profile_id) {
+                    Ok(resolved) => resolved,
+                    Err(reason) => return call.reply_model_unavailable(reason),
+                },
                 None => return call.reply_session_not_found(session_id),
             };
-            let image_ref = match guard.assignments.get(&use_case) {
-                Some(r) => crate::hardware::resolve(r, guard.variant),
-                None => {
-                    return call
-                        .reply_model_unavailable(format!("no model assigned for {use_case}"))
-                }
-            };
 
-            match guard.containers.get_or_spawn(&use_case, &image_ref, |_| {}) {
+            match guard
+                .containers
+                .get_or_spawn(&profile_id, &image_ref, &artifact_path, |_| {})
+            {
                 Ok(_) => {}
                 Err(e) => return call.reply_generation_failed(e.to_string()),
             }
@@ -210,23 +249,31 @@ impl VarlinkInterface for InferenceHandler {
             };
 
             let mut guard = self.state.0.lock().await;
-            let (app_id, use_case, instructions) = match guard.sessions.get(&session_id) {
-                Some(s) => (s.app_id.clone(), s.use_case.clone(), s.instructions.clone()),
-                None => return call.reply_session_not_found(session_id),
-            };
-            let image_ref = match guard.assignments.get(&use_case) {
-                Some(r) => crate::hardware::resolve(r, guard.variant),
-                None => {
-                    return call
-                        .reply_model_unavailable(format!("no model assigned for {use_case}"))
-                }
-            };
+            let (app_id, use_case, profile_id, image_ref, artifact_path, instructions) =
+                match guard.sessions.get(&session_id) {
+                    Some(s) => {
+                        let (profile_id, image_ref, artifact_path) =
+                            match profile_runtime(&guard, &s.profile_id) {
+                                Ok(resolved) => resolved,
+                                Err(reason) => return call.reply_model_unavailable(reason),
+                            };
+                        (
+                            s.app_id.clone(),
+                            s.use_case.clone(),
+                            profile_id,
+                            image_ref,
+                            artifact_path,
+                            s.instructions.clone(),
+                        )
+                    }
+                    None => return call.reply_session_not_found(session_id),
+                };
 
             let _ = guard.permissions.touch(&app_id, &use_case);
 
             let container = guard
                 .containers
-                .get_or_spawn(&use_case, &image_ref, |_| {})
+                .get_or_spawn(&profile_id, &image_ref, &artifact_path, |_| {})
                 .map_err(io_err)?;
 
             match container.generate_structured(Some(&instructions), &prompt, max_tokens, &schema) {
@@ -245,25 +292,35 @@ impl VarlinkInterface for InferenceHandler {
         self.rt.block_on(async {
             let mut guard = self.state.0.lock().await;
 
-            let (app_id, use_case) = match guard.sessions.get(&session_id) {
-                Some(s) => (s.app_id.clone(), s.use_case.clone()),
-                None => return call.reply_session_not_found(session_id),
-            };
-
-            let image_ref = match guard.assignments.get(&use_case) {
-                Some(r) => crate::hardware::resolve(r, guard.variant),
-                None => {
-                    return call
-                        .reply_model_unavailable(format!("no model assigned for {use_case}"))
-                }
-            };
+            let (app_id, use_case, profile_id, image_ref, artifact_path) =
+                match guard.sessions.get(&session_id) {
+                    Some(s) => {
+                        let (profile_id, image_ref, artifact_path) =
+                            match profile_runtime(&guard, &s.profile_id) {
+                                Ok(resolved) => resolved,
+                                Err(reason) => return call.reply_model_unavailable(reason),
+                            };
+                        (
+                            s.app_id.clone(),
+                            s.use_case.clone(),
+                            profile_id,
+                            image_ref,
+                            artifact_path,
+                        )
+                    }
+                    None => return call.reply_session_not_found(session_id),
+                };
 
             let _ = guard.permissions.touch(&app_id, &use_case);
             let audio_bytes = base64_decode(&audio).map_err(io_err)?;
-            let container = match guard.containers.get_or_spawn(&use_case, &image_ref, |_| {}) {
-                Ok(container) => container,
-                Err(e) => return call.reply_generation_failed(e.to_string()),
-            };
+            let container =
+                match guard
+                    .containers
+                    .get_or_spawn(&profile_id, &image_ref, &artifact_path, |_| {})
+                {
+                    Ok(container) => container,
+                    Err(e) => return call.reply_generation_failed(e.to_string()),
+                };
 
             match container.transcribe(audio_bytes) {
                 Ok(text) => call.reply(text),
@@ -281,25 +338,35 @@ impl VarlinkInterface for InferenceHandler {
         self.rt.block_on(async {
             let mut guard = self.state.0.lock().await;
 
-            let (app_id, use_case) = match guard.sessions.get(&session_id) {
-                Some(s) => (s.app_id.clone(), s.use_case.clone()),
-                None => return call.reply_session_not_found(session_id),
-            };
-
-            let image_ref = match guard.assignments.get(&use_case) {
-                Some(r) => crate::hardware::resolve(r, guard.variant),
-                None => {
-                    return call
-                        .reply_model_unavailable(format!("no model assigned for {use_case}"))
-                }
-            };
+            let (app_id, use_case, profile_id, image_ref, artifact_path) =
+                match guard.sessions.get(&session_id) {
+                    Some(s) => {
+                        let (profile_id, image_ref, artifact_path) =
+                            match profile_runtime(&guard, &s.profile_id) {
+                                Ok(resolved) => resolved,
+                                Err(reason) => return call.reply_model_unavailable(reason),
+                            };
+                        (
+                            s.app_id.clone(),
+                            s.use_case.clone(),
+                            profile_id,
+                            image_ref,
+                            artifact_path,
+                        )
+                    }
+                    None => return call.reply_session_not_found(session_id),
+                };
 
             let _ = guard.permissions.touch(&app_id, &use_case);
             let image_bytes = base64_decode(&image).map_err(io_err)?;
-            let container = match guard.containers.get_or_spawn(&use_case, &image_ref, |_| {}) {
-                Ok(container) => container,
-                Err(e) => return call.reply_generation_failed(e.to_string()),
-            };
+            let container =
+                match guard
+                    .containers
+                    .get_or_spawn(&profile_id, &image_ref, &artifact_path, |_| {})
+                {
+                    Ok(container) => container,
+                    Err(e) => return call.reply_generation_failed(e.to_string()),
+                };
 
             match container.describe(image_bytes) {
                 Ok(text) => call.reply(text),
@@ -333,23 +400,27 @@ async fn stream_tokens(
     let max_tokens = validate_options(&options).map_err(GenerationError::InvalidOptions)?;
     let mut guard = state.0.lock().await;
 
-    let (app_id, use_case, instructions) = match guard.sessions.get(&session_id) {
-        Some(s) => (s.app_id.clone(), s.use_case.clone(), s.instructions.clone()),
-        None => return Err(GenerationError::SessionNotFound(session_id)),
-    };
-    let image_ref = match guard.assignments.get(&use_case) {
-        Some(r) => crate::hardware::resolve(r, guard.variant),
-        None => {
-            return Err(GenerationError::ModelUnavailable(format!(
-                "no model assigned for {use_case}"
-            )))
-        }
-    };
+    let (app_id, use_case, profile_id, image_ref, artifact_path, instructions) =
+        match guard.sessions.get(&session_id) {
+            Some(s) => {
+                let (profile_id, image_ref, artifact_path) = profile_runtime(&guard, &s.profile_id)
+                    .map_err(GenerationError::ModelUnavailable)?;
+                (
+                    s.app_id.clone(),
+                    s.use_case.clone(),
+                    profile_id,
+                    image_ref,
+                    artifact_path,
+                    s.instructions.clone(),
+                )
+            }
+            None => return Err(GenerationError::SessionNotFound(session_id)),
+        };
 
     let _ = guard.permissions.touch(&app_id, &use_case);
     let container = guard
         .containers
-        .get_or_spawn(&use_case, &image_ref, |_| {})
+        .get_or_spawn(&profile_id, &image_ref, &artifact_path, |_| {})
         .map_err(|e| GenerationError::Failed(e.to_string()))?;
 
     let wants_more = call.wants_more();
@@ -426,23 +497,27 @@ async fn generate_tokens(
     let max_tokens = validate_options(&options).map_err(GenerationError::InvalidOptions)?;
     let mut guard = state.0.lock().await;
 
-    let (app_id, use_case, instructions) = match guard.sessions.get(&session_id) {
-        Some(s) => (s.app_id.clone(), s.use_case.clone(), s.instructions.clone()),
-        None => return Err(GenerationError::SessionNotFound(session_id)),
-    };
-    let image_ref = match guard.assignments.get(&use_case) {
-        Some(r) => crate::hardware::resolve(r, guard.variant),
-        None => {
-            return Err(GenerationError::ModelUnavailable(format!(
-                "no model assigned for {use_case}"
-            )))
-        }
-    };
+    let (app_id, use_case, profile_id, image_ref, artifact_path, instructions) =
+        match guard.sessions.get(&session_id) {
+            Some(s) => {
+                let (profile_id, image_ref, artifact_path) = profile_runtime(&guard, &s.profile_id)
+                    .map_err(GenerationError::ModelUnavailable)?;
+                (
+                    s.app_id.clone(),
+                    s.use_case.clone(),
+                    profile_id,
+                    image_ref,
+                    artifact_path,
+                    s.instructions.clone(),
+                )
+            }
+            None => return Err(GenerationError::SessionNotFound(session_id)),
+        };
 
     let _ = guard.permissions.touch(&app_id, &use_case);
     let container = guard
         .containers
-        .get_or_spawn(&use_case, &image_ref, |_| {})
+        .get_or_spawn(&profile_id, &image_ref, &artifact_path, |_| {})
         .map_err(|e| GenerationError::Failed(e.to_string()))?;
 
     container
@@ -450,6 +525,46 @@ async fn generate_tokens(
             sink.push_token(token)
         })
         .map_err(|e| GenerationError::Failed(e.to_string()))
+}
+
+fn profile_runtime(
+    guard: &crate::state::Inner,
+    profile_id: &str,
+) -> Result<(String, String, PathBuf), String> {
+    let profile = guard
+        .profiles
+        .get(profile_id)
+        .ok_or_else(|| format!("assigned profile {profile_id} is not installed"))?;
+    let image_ref = resolve_runtime_image(guard, profile)
+        .ok_or_else(|| {
+            format!(
+                "runtime {} does not support {}",
+                profile.runtime_id,
+                guard.variant.as_tag()
+            )
+        })?
+        .to_string();
+    if !profile.artifact_path.exists() {
+        return Err(format!(
+            "artifact path {} is missing",
+            profile.artifact_path.display()
+        ));
+    }
+    Ok((
+        profile.profile_id.clone(),
+        image_ref,
+        profile.artifact_path.clone(),
+    ))
+}
+
+fn resolve_runtime_image<'a>(
+    guard: &'a crate::state::Inner,
+    profile: &'a crate::profiles::Profile,
+) -> Option<&'a str> {
+    guard
+        .runtimes
+        .resolve(&profile.runtime_id, guard.variant)
+        .or_else(|| profile.runtime_image_for(guard.variant))
 }
 
 fn validate_options(options: &GenerationOptions) -> Result<u32, String> {

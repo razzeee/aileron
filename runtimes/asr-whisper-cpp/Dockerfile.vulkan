@@ -12,13 +12,8 @@ ENV CMAKE_ARGS="-DWHISPER_VULKAN=on"
 
 RUN pip install --no-cache-dir "pywhispercpp>=1.2.0"
 
-COPY download_model.py /download_model.py
-
-ARG MODEL_SIZE=base
-RUN python /download_model.py "$MODEL_SIZE"
-
 COPY entrypoint.py /entrypoint.py
 
-LABEL aileron.use_cases="asr.transcribe"
+LABEL aileron.runtime_id="asr-whisper-cpp"
 
 ENTRYPOINT ["python", "/entrypoint.py"]

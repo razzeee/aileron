@@ -6,12 +6,13 @@ type SessionInfo (
     session_id: string,
     app_id: string,
     use_case: string,
+    profile_id: string,
     started_at: string
 )
 
 method ListActive() -> (sessions: []SessionInfo)
 
-# Kill a running session (terminates the container if no other sessions use it).
+# Kill a running session (terminates the container if no other sessions use its profile).
 method KillSession(session_id: string) -> ()
 
 error SessionNotFound(session_id: string)

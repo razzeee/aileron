@@ -170,7 +170,7 @@ def handle_generate_structured(llm: Llama, req: dict) -> None:
         if schema:
             jsonschema_validate(instance=parsed, schema=schema)
     except (json.JSONDecodeError, ValidationError) as e:
-        send({"id": req_id, "error": "schema_validation_failed", "reason": str(e)})
+        send({"id": req_id, "error": "schema_validation_failed", "reason": str(e), "done": True})
         return
 
     send({"id": req_id, "result": result_text, "done": True})

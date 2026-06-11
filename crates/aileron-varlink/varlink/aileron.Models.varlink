@@ -1,45 +1,79 @@
-# aileron.Models — OCI model management
+# aileron.Models — installed profile and model artifact management
 
 interface aileron.Models
 
-type ModelInfo (
-    image_ref: string,
-    use_cases: []string,
-    size_bytes: int,
-    pulled_at: string
+type RuntimeImage (
+    variant: string,
+    image_ref: string
 )
 
-method List() -> (models: []ModelInfo)
+type ProfileInfo (
+    profile_id: string,
+    model_id: string,
+    runtime_id: string,
+    artifact_path: string,
+    # Runtime images available to this profile. Manifest-installed profiles resolve
+    # these from runtime manifests; imported profiles carry their own refs.
+    runtime_images: []RuntimeImage,
+    use_cases: []string,
+    assigned_use_cases: []string,
+    installed_at: string
+)
 
-type PullProgress (
-    image_ref: string,
+type RuntimeManifestInfo (
+    runtime_id: string,
+    variants: []string
+)
+
+method List() -> (profiles: []ProfileInfo)
+
+method ListRuntimeManifests() -> (runtimes: []RuntimeManifestInfo)
+
+type InstallProgress (
+    profile_id: string,
     bytes_pulled: int,
     total_bytes: int,
     done: bool
 )
 
-# A use-case that is already assigned to a different image.
-# Returned in the final PullProgress reply (done: true) when a conflict exists.
+# A use-case that is already assigned to a different profile.
+# Returned in the final install/import reply (done: true) when a conflict exists.
 type UseCaseConflict (
     use_case: string,
-    current_image: string,
-    new_image: string
+    current_profile: string,
+    new_profile: string
 )
 
-# Streams progress events. The final reply (done: true) includes:
-#   auto_assigned  — use-cases that were assigned automatically (previously unoccupied)
-#   conflicts      — use-cases already assigned to a different image; user must resolve
-method Pull(image_ref: string) -> (
-    progress: PullProgress,
+# Install a packaged model manifest and pull the runtime image selected from the
+# matching runtime manifest for this host variant.
+method InstallManifest(profile_id: string) -> (
+    progress: InstallProgress,
     auto_assigned: []string,
     conflicts: []UseCaseConflict
 )
 
-method Delete(image_ref: string) -> ()
+# Install a profile from user-provided artifact URLs and a runtime already known
+# through the runtime manifest.
+method InstallUrlProfile(
+    runtime_id: string,
+    url: string,
+    sha256: string,
+    use_cases: []string
+) -> (
+    progress: InstallProgress,
+    auto_assigned: []string,
+    conflicts: []UseCaseConflict
+)
 
-# Assign a use-case token to a pulled image.
-# Only one image may be assigned per use-case at a time; replaces any existing assignment.
-method AssignUseCase(image_ref: string, use_case: string) -> ()
+# Register an existing local artifact directory as a profile. runtime_images is
+# only needed for ad-hoc imports; packaged manifests resolve images from the
+# runtime manifest by runtime_id.
+method DeleteProfile(profile_id: string, force: bool) -> ()
 
-error ImageNotFound(image_ref: string)
-error PullFailed(image_ref: string, reason: string)
+# Assign a use-case token to an installed profile.
+# Only one profile may be assigned per use-case at a time; replaces any existing assignment.
+method AssignUseCase(profile_id: string, use_case: string) -> ()
+
+error ProfileNotFound(profile_id: string)
+error ProfileInUse(profile_id: string)
+error InstallFailed(profile_id: string, reason: string)

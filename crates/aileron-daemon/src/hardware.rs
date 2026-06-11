@@ -111,20 +111,3 @@ fn has_vulkan() -> bool {
         .map(|out| out.contains("deviceName") || out.contains("deviceType"))
         .unwrap_or(false)
 }
-
-/// Given a stored image ref, append the detected variant tag if the ref has
-/// no explicit tag already.
-///
-/// Examples:
-///   `aileron/llama3.2-3b`         + cuda  → `aileron/llama3.2-3b:cuda`
-///   `aileron/llama3.2-3b:latest`  + cuda  → `aileron/llama3.2-3b:latest`  (unchanged)
-///   `localhost/aileron/stub:latest`        → unchanged (has tag)
-pub fn resolve(image_ref: &str, variant: Variant) -> String {
-    // If the ref already has an explicit tag (contains ':' after the last '/')
-    // leave it untouched.
-    let after_slash = image_ref.rsplit('/').next().unwrap_or(image_ref);
-    if after_slash.contains(':') {
-        return image_ref.to_string();
-    }
-    format!("{}:{}", image_ref, variant.as_tag())
-}

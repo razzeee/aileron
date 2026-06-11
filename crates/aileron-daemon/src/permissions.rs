@@ -19,10 +19,12 @@ pub struct PermissionStore(pub HashMap<String, PermissionEntry>);
 
 impl PermissionStore {
     fn path() -> PathBuf {
-        let data_home = std::env::var("XDG_DATA_HOME").unwrap_or_else(|_| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-            format!("{}/.local/share", home)
-        });
+        let data_home = std::env::var("AILERON_DATA_HOME")
+            .or_else(|_| std::env::var("XDG_DATA_HOME"))
+            .unwrap_or_else(|_| {
+                let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+                format!("{}/.local/share", home)
+            });
         PathBuf::from(data_home)
             .join("aileron")
             .join("permissions.json")

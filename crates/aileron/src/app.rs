@@ -1,5 +1,4 @@
 use gtk4::prelude::*;
-use libadwaita::prelude::*;
 use libadwaita::{Application, ApplicationWindow, HeaderBar, ToolbarView, ViewStack, ViewSwitcher};
 
 use crate::pages::{activity_page, models_page, permissions_page};
@@ -20,7 +19,7 @@ fn build_window(app: &Application) {
     // AdwViewStack provides the per-page title/icon metadata that AdwViewSwitcher needs.
     let stack = ViewStack::new();
 
-    let models_page = stack.add_titled(&models_page::build(), Some("models"), "Models");
+    let models_page = stack.add_titled(&models_page::build(), Some("profiles"), "Profiles");
     models_page.set_icon_name(Some("drive-harddisk-symbolic"));
 
     let perms_page = stack.add_titled(
