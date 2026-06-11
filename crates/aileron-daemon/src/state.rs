@@ -7,13 +7,16 @@ use crate::assignments::Assignments;
 use crate::config::Config;
 use crate::container::ContainerPool;
 use crate::hardware::Variant;
+use crate::manifests::RuntimeManifestStore;
 use crate::permissions::PermissionStore;
+use crate::profiles::ProfileStore;
 
 #[derive(Debug, Clone)]
 pub struct Session {
     pub session_id: String,
     pub app_id: String,
     pub use_case: String,
+    pub profile_id: String,
     pub instructions: String,
     pub started_at: chrono::DateTime<chrono::Utc>,
 }
@@ -22,6 +25,8 @@ pub struct Inner {
     pub config: Config,
     pub permissions: PermissionStore,
     pub assignments: Assignments,
+    pub profiles: ProfileStore,
+    pub runtimes: RuntimeManifestStore,
     pub containers: ContainerPool,
     pub sessions: HashMap<String, Session>,
     /// Best available hardware variant, detected once at startup.
@@ -35,6 +40,8 @@ impl SharedState {
     pub async fn load(config: Config) -> anyhow::Result<Self> {
         let permissions = PermissionStore::load()?;
         let assignments = Assignments::load()?;
+        let profiles = ProfileStore::load()?;
+        let runtimes = RuntimeManifestStore::load()?;
         let mut containers = ContainerPool::new();
         containers.idle_timeout_secs = config.idle_timeout_secs;
         containers.memory_limit = config.container_memory.clone();
@@ -43,6 +50,8 @@ impl SharedState {
             config,
             permissions,
             assignments,
+            profiles,
+            runtimes,
             containers,
             sessions: HashMap::new(),
             variant,

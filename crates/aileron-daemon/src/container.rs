@@ -34,6 +34,7 @@
 ///   {"id":"<uuid>","token":"A cat sitting...","done":true}
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Stdio};
 use std::thread;
 
@@ -47,6 +48,8 @@ use uuid::Uuid;
 pub struct Container {
     #[allow(dead_code)]
     pub image_ref: String,
+    #[allow(dead_code)]
+    pub artifact_path: PathBuf,
     /// Kept alive to prevent the container process from being killed on drop.
     #[allow(dead_code)]
     child: Child,
@@ -74,11 +77,12 @@ impl Container {
     ///   --memory=<limit>     caps RAM usage
     pub fn spawn(
         image_ref: &str,
+        artifact_path: &Path,
         memory_limit: &str,
         mut on_status: impl FnMut(String) + Send + 'static,
     ) -> Result<Self> {
         info!("spawning container for {}", image_ref);
-        let args = podman_run_args(image_ref, memory_limit);
+        let args = podman_run_args(image_ref, artifact_path, memory_limit);
         let mut child = std::process::Command::new("podman")
             .args(&args)
             .stdin(Stdio::piped())
@@ -143,6 +147,7 @@ impl Container {
 
         Ok(Self {
             image_ref: image_ref.to_string(),
+            artifact_path: artifact_path.to_path_buf(),
             child,
             stdin,
             stdout,
@@ -240,13 +245,8 @@ impl Container {
             if resp.id != id {
                 continue;
             }
-            if let Some(result) = resp.result {
-                // Validate the returned JSON against the schema.
-                validate_json_schema(&result, schema)?;
+            if let Some(result) = structured_response_result(resp, schema)? {
                 return Ok(result);
-            }
-            if resp.done.unwrap_or(false) {
-                bail!("container sent done without a result field");
             }
         }
     }
@@ -318,7 +318,22 @@ impl Container {
     }
 }
 
-fn podman_run_args(image_ref: &str, memory_limit: &str) -> Vec<String> {
+fn structured_response_result(resp: ContainerResponse, schema: &Value) -> Result<Option<String>> {
+    if let Some(error) = resp.error {
+        let reason = resp.reason.unwrap_or(error);
+        bail!("container returned error: {reason}");
+    }
+    if let Some(result) = resp.result {
+        validate_json_schema(&result, schema)?;
+        return Ok(Some(result));
+    }
+    if resp.done.unwrap_or(false) {
+        bail!("container sent done without a result field");
+    }
+    Ok(None)
+}
+
+fn podman_run_args(image_ref: &str, artifact_path: &Path, memory_limit: &str) -> Vec<String> {
     let mut args = vec![
         "run".to_string(),
         "--rm".to_string(),
@@ -330,6 +345,7 @@ fn podman_run_args(image_ref: &str, memory_limit: &str) -> Vec<String> {
         "--security-opt=no-new-privileges".to_string(),
         "--pids-limit=256".to_string(),
         format!("--memory={memory_limit}"),
+        format!("--volume={}:/model:ro,z", artifact_path.display()),
     ];
 
     if image_ref_uses_tag(image_ref, "cuda") {
@@ -543,7 +559,7 @@ fn base64_encode(data: &[u8]) -> String {
 
 // ── Pool ──────────────────────────────────────────────────────────────────────
 
-/// Pool of running containers, keyed by use-case.
+/// Pool of running containers, keyed by profile ID.
 pub struct ContainerPool {
     containers: HashMap<String, Container>,
     /// Idle timeout in seconds (default 300 = 5 min).
@@ -561,38 +577,37 @@ impl ContainerPool {
         }
     }
 
-    /// Get or spawn a container for a use-case + image ref pair.
+    /// Get or spawn a container for a profile + runtime image + artifact path.
     /// `on_status` receives human-readable loading messages while the container
     /// starts up (only called on a cold start, not for warm containers).
     pub fn get_or_spawn(
         &mut self,
-        use_case: &str,
+        profile_id: &str,
         image_ref: &str,
+        artifact_path: &Path,
         on_status: impl FnMut(String) + Send + 'static,
     ) -> Result<&mut Container> {
-        if self
-            .containers
-            .get(use_case)
-            .is_some_and(|container| container.image_ref != image_ref)
-        {
+        if self.containers.get(profile_id).is_some_and(|container| {
+            container.image_ref != image_ref || container.artifact_path != artifact_path
+        }) {
             info!(
-                "replacing container for use-case {} with image {}",
-                use_case, image_ref
+                "replacing container for profile {} with runtime image {}",
+                profile_id, image_ref
             );
-            self.containers.remove(use_case);
+            self.containers.remove(profile_id);
         }
 
-        if !self.containers.contains_key(use_case) {
-            let c = Container::spawn(image_ref, &self.memory_limit, on_status)?;
-            self.containers.insert(use_case.to_string(), c);
+        if !self.containers.contains_key(profile_id) {
+            let c = Container::spawn(image_ref, artifact_path, &self.memory_limit, on_status)?;
+            self.containers.insert(profile_id.to_string(), c);
         }
-        Ok(self.containers.get_mut(use_case).unwrap())
+        Ok(self.containers.get_mut(profile_id).unwrap())
     }
 
-    /// Kill and remove the container for a use-case.
-    pub fn kill(&mut self, use_case: &str) {
-        if self.containers.remove(use_case).is_some() {
-            info!("terminated container for use-case {}", use_case);
+    /// Kill and remove the container for a profile.
+    pub fn kill(&mut self, profile_id: &str) {
+        if self.containers.remove(profile_id).is_some() {
+            info!("terminated container for profile {}", profile_id);
         }
     }
 
@@ -616,7 +631,7 @@ impl ContainerPool {
             .map(|(k, _)| k.clone())
             .collect();
         for k in idle {
-            warn!("evicting idle container for use-case {}", k);
+            warn!("evicting idle container for profile {}", k);
             self.containers.remove(&k);
         }
     }
@@ -668,7 +683,11 @@ mod tests {
 
     #[test]
     fn podman_args_expose_rocm_devices_for_rocm_tag() {
-        let args = podman_run_args("localhost/aileron/summarize:rocm", "8g");
+        let args = podman_run_args(
+            "localhost/aileron/summarize:rocm",
+            Path::new("/models/foo"),
+            "8g",
+        );
 
         assert!(args.contains(&"--device=/dev/kfd".to_string()));
         assert!(args.contains(&"--device=/dev/dri".to_string()));
@@ -683,7 +702,11 @@ mod tests {
 
     #[test]
     fn podman_args_expose_cuda_device_for_cuda_tag() {
-        let args = podman_run_args("localhost/aileron/summarize:cuda", "8g");
+        let args = podman_run_args(
+            "localhost/aileron/summarize:cuda",
+            Path::new("/models/foo"),
+            "8g",
+        );
 
         assert!(args.contains(&"--device=nvidia.com/gpu=all".to_string()));
         assert!(!args.contains(&"--device=/dev/kfd".to_string()));
@@ -695,7 +718,11 @@ mod tests {
 
     #[test]
     fn podman_args_expose_vulkan_device_for_vulkan_tag() {
-        let args = podman_run_args("localhost/aileron/summarize:vulkan", "8g");
+        let args = podman_run_args(
+            "localhost/aileron/summarize:vulkan",
+            Path::new("/models/foo"),
+            "8g",
+        );
 
         assert!(args.contains(&"--device=/dev/dri".to_string()));
         assert!(args.contains(&"--group-add=keep-groups".to_string()));
@@ -707,7 +734,11 @@ mod tests {
 
     #[test]
     fn podman_args_do_not_expose_gpu_devices_for_cpu_tag() {
-        let args = podman_run_args("localhost/aileron/summarize:cpu", "8g");
+        let args = podman_run_args(
+            "localhost/aileron/summarize:cpu",
+            Path::new("/models/foo"),
+            "8g",
+        );
 
         assert!(!args.contains(&"--device=/dev/kfd".to_string()));
         assert!(!args.contains(&"--device=/dev/dri".to_string()));
@@ -715,6 +746,47 @@ mod tests {
         assert!(!args.contains(&"--ipc=host".to_string()));
         assert!(!args.contains(&"--env=HSA_OVERRIDE_GFX_VERSION=10.3.0".to_string()));
         assert!(!args.contains(&"--group-add=keep-groups".to_string()));
+    }
+
+    #[test]
+    fn structured_response_error_returns_immediately() {
+        let resp = ContainerResponse {
+            id: "request-1".to_string(),
+            token: None,
+            result: None,
+            error: Some("schema_validation_failed".to_string()),
+            reason: Some("expected object".to_string()),
+            done: None,
+        };
+
+        let err = structured_response_result(resp, &serde_json::json!({}))
+            .expect_err("structured error response should fail");
+
+        assert!(err.to_string().contains("expected object"));
+    }
+
+    #[test]
+    fn structured_response_validates_result() {
+        let resp = ContainerResponse {
+            id: "request-1".to_string(),
+            token: None,
+            result: Some(r#"{"name":"Ada"}"#.to_string()),
+            error: None,
+            reason: None,
+            done: Some(true),
+        };
+        let schema = serde_json::json!({
+            "type": "object",
+            "required": ["name"],
+            "properties": {
+                "name": { "type": "string" }
+            }
+        });
+
+        let result = structured_response_result(resp, &schema)
+            .expect("valid structured response should succeed");
+
+        assert_eq!(result.as_deref(), Some(r#"{"name":"Ada"}"#));
     }
 
     #[test]

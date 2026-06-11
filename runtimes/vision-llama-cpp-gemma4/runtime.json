@@ -1,0 +1,9 @@
+{
+  "runtime_id": "vision-llama-cpp-gemma4",
+  "capabilities": ["describe"],
+  "variants": ["cpu", "cuda", "rocm", "vulkan"],
+  "artifact_layout": {
+    "model": "/model/model.gguf",
+    "mmproj": "/model/mmproj.gguf"
+  }
+}

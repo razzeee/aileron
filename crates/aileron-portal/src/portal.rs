@@ -52,7 +52,7 @@ struct GuidedFieldDbus {
 
 #[interface(name = "org.freedesktop.impl.portal.AI")]
 impl AiPortalBackend {
-    async fn get_language_model_availability(
+    async fn get_use_case_availability(
         &self,
         app_id: &str,
         use_case: &str,
@@ -63,7 +63,7 @@ impl AiPortalBackend {
             aileron_ipc::client::connect().map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn);
         let reply = client
-            .get_language_model_availability(app_id.to_string(), use_case.to_string())
+            .get_use_case_availability(app_id.to_string(), use_case.to_string())
             .call()
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
 
@@ -73,7 +73,7 @@ impl AiPortalBackend {
         })
     }
 
-    async fn create_language_model_session(
+    async fn create_session(
         &self,
         app_id: &str,
         use_case: &str,
@@ -85,7 +85,7 @@ impl AiPortalBackend {
             aileron_ipc::client::connect().map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn);
         let reply = client
-            .create_language_model_session(
+            .create_session(
                 app_id.to_string(),
                 use_case.to_string(),
                 instructions.to_string(),

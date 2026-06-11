@@ -1,4 +1,4 @@
-/// Use-case → OCI image reference assignments.
+/// Use-case -> installed profile assignments.
 ///
 /// Persisted at `$XDG_DATA_HOME/aileron/assignments.json`.
 use std::collections::HashMap;
@@ -12,10 +12,12 @@ pub struct Assignments(pub HashMap<String, String>);
 
 impl Assignments {
     fn path() -> PathBuf {
-        let data_home = std::env::var("XDG_DATA_HOME").unwrap_or_else(|_| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-            format!("{}/.local/share", home)
-        });
+        let data_home = std::env::var("AILERON_DATA_HOME")
+            .or_else(|_| std::env::var("XDG_DATA_HOME"))
+            .unwrap_or_else(|_| {
+                let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+                format!("{}/.local/share", home)
+            });
         PathBuf::from(data_home)
             .join("aileron")
             .join("assignments.json")
@@ -37,14 +39,14 @@ impl Assignments {
         Ok(())
     }
 
-    /// Return the OCI image ref assigned to a use-case, if any.
+    /// Return the profile assigned to a use-case, if any.
     pub fn get(&self, use_case: &str) -> Option<&str> {
         self.0.get(use_case).map(|s| s.as_str())
     }
 
-    /// Assign (or replace) the OCI image ref for a use-case.
-    pub fn assign(&mut self, use_case: String, image_ref: String) -> Result<()> {
-        self.0.insert(use_case, image_ref);
+    /// Assign (or replace) the profile for a use-case.
+    pub fn assign(&mut self, use_case: String, profile_id: String) -> Result<()> {
+        self.0.insert(use_case, profile_id);
         self.save()
     }
 
@@ -53,9 +55,9 @@ impl Assignments {
         &self.0
     }
 
-    /// Remove all assignments for a given image ref (called on image delete).
-    pub fn remove_image(&mut self, image_ref: &str) -> Result<()> {
-        self.0.retain(|_, v| v != image_ref);
+    /// Remove all assignments for a given profile.
+    pub fn remove_profile(&mut self, profile_id: &str) -> Result<()> {
+        self.0.retain(|_, v| v != profile_id);
         self.save()
     }
 }

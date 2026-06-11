@@ -27,8 +27,7 @@ import wave
 
 from pywhispercpp.model import Model
 
-MODEL_SIZE = os.environ.get("MODEL_SIZE", "base")
-MODEL_DIR  = os.environ.get("MODEL_DIR", "/model")
+MODEL_PATH = os.environ.get("MODEL_PATH", "/model/model.bin")
 
 
 def detect_device() -> str:
@@ -67,9 +66,9 @@ def detect_device() -> str:
 
 def load_model() -> Model:
     device = detect_device()
-    sys.stderr.write(f"[aileron-asr] loading whisper model: {MODEL_SIZE} (device={device})\n")
+    sys.stderr.write(f"[aileron-asr] loading whisper model: {MODEL_PATH} (device={device})\n")
     sys.stderr.flush()
-    return Model(MODEL_SIZE, models_dir=MODEL_DIR)
+    return Model(MODEL_PATH)
 
 
 def send(obj: dict) -> None:

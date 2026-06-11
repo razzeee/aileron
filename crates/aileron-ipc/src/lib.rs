@@ -12,13 +12,17 @@ pub mod server;
 pub use error::IpcError;
 
 /// Resolve the Varlink socket path from the environment.
-/// Falls back to `/run/user/<uid>/aileron.socket` if `XDG_RUNTIME_DIR` is not set.
+/// `AILERON_RUNTIME_DIR` overrides only Aileron's socket location; this is
+/// useful for tests that must keep the desktop's real `XDG_RUNTIME_DIR`.
+/// Falls back to `/run/user/<uid>/aileron.socket` if neither is set.
 pub fn socket_path() -> String {
-    let runtime_dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| {
-        // Best-effort fallback: use UID from the process.
-        let uid = unsafe { libc_uid() };
-        format!("/run/user/{}", uid)
-    });
+    let runtime_dir = std::env::var("AILERON_RUNTIME_DIR")
+        .or_else(|_| std::env::var("XDG_RUNTIME_DIR"))
+        .unwrap_or_else(|_| {
+            // Best-effort fallback: use UID from the process.
+            let uid = unsafe { libc_uid() };
+            format!("/run/user/{}", uid)
+        });
     format!("{}/aileron.socket", runtime_dir)
 }
 

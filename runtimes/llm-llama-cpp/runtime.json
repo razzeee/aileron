@@ -1,0 +1,8 @@
+{
+  "runtime_id": "llm-llama-cpp",
+  "capabilities": ["generate", "generate_structured"],
+  "variants": ["cpu", "cuda", "rocm", "vulkan"],
+  "artifact_layout": {
+    "model": "/model/model.gguf"
+  }
+}

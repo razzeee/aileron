@@ -1212,7 +1212,7 @@ fn summarize_streaming(text: &str, tx: std::sync::mpsc::Sender<DemoEvent>) -> an
 
     tx.send(DemoEvent::Phase(DemoPhase::CreatingSession))?;
     let session_id: String = proxy.call(
-        "CreateLanguageModelSession",
+        "CreateSession",
         &(
             "org.aileron.Demo",
             "llm.summarize",
@@ -1265,7 +1265,7 @@ fn summarize_guided(text: &str, tx: std::sync::mpsc::Sender<DemoEvent>) -> anyho
 
     tx.send(DemoEvent::Phase(DemoPhase::CreatingSession))?;
     let session_id: String = proxy.call(
-        "CreateLanguageModelSession",
+        "CreateSession",
         &(
             "org.aileron.Demo",
             "llm.summarize",
@@ -1333,7 +1333,7 @@ fn transcribe_recording(
 
     tx.send(SpeechEvent::Phase(SpeechPhase::CreatingSession))?;
     let session_id: String = proxy.call(
-        "CreateLanguageModelSession",
+        "CreateSession",
         &(
             "org.aileron.Demo",
             "asr.transcribe",
@@ -1364,7 +1364,7 @@ fn describe_image(image_b64: &str, tx: std::sync::mpsc::Sender<VisionEvent>) -> 
 
     tx.send(VisionEvent::Phase(VisionPhase::CreatingSession))?;
     let session_id: String = proxy.call(
-        "CreateLanguageModelSession",
+        "CreateSession",
         &(
             "org.aileron.Demo",
             "vision.describe",

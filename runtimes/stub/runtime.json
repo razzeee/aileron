@@ -1,0 +1,6 @@
+{
+  "runtime_id": "stub",
+  "capabilities": ["generate", "generate_structured", "transcribe", "describe"],
+  "variants": ["cpu"],
+  "artifact_layout": {}
+}

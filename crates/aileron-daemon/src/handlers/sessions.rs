@@ -28,6 +28,7 @@ impl VarlinkInterface for SessionsHandler {
                     session_id: s.session_id.clone(),
                     app_id: s.app_id.clone(),
                     use_case: s.use_case.clone(),
+                    profile_id: s.profile_id.clone(),
                     started_at: s.started_at.to_rfc3339(),
                 })
                 .collect();
@@ -46,12 +47,12 @@ impl VarlinkInterface for SessionsHandler {
                 Some(s) => s,
                 None => return call.reply_session_not_found(session_id),
             };
-            let use_case_still_used = guard
+            let profile_still_used = guard
                 .sessions
                 .values()
-                .any(|s| s.use_case == session.use_case);
-            if !use_case_still_used {
-                guard.containers.kill(&session.use_case);
+                .any(|s| s.profile_id == session.profile_id);
+            if !profile_still_used {
+                guard.containers.kill(&session.profile_id);
             }
             call.reply()
         })

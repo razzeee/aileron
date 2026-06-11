@@ -1,4 +1,5 @@
 /// Permissions page — per-app, per-use-case toggles with last-used timestamps.
+use chrono::{DateTime, Local, TimeZone};
 use gtk4::prelude::*;
 use gtk4::{Button, ListBox, ScrolledWindow};
 use libadwaita::prelude::*;
@@ -66,7 +67,11 @@ fn refresh_permissions(list_box: &ListBox) {
                     .active(perm.allowed)
                     .build();
                 let subtitle = match &perm.last_used {
-                    Some(lu) => format!("{} — last used: {}", perm.app_id, lu),
+                    Some(lu) => format!(
+                        "{} — last used (local): {}",
+                        perm.app_id,
+                        format_local_time(lu)
+                    ),
                     None => perm.app_id.clone(),
                 };
                 row.set_subtitle(&subtitle);
@@ -91,5 +96,44 @@ fn refresh_permissions(list_box: &ListBox) {
             row.set_title(&format!("Error: {e}"));
             list_box.append(&row);
         }
+    }
+}
+
+fn format_local_time(timestamp: &str) -> String {
+    format_time_in(timestamp, &Local).unwrap_or_else(|| timestamp.to_string())
+}
+
+fn format_time_in<Tz>(timestamp: &str, timezone: &Tz) -> Option<String>
+where
+    Tz: TimeZone,
+    Tz::Offset: std::fmt::Display,
+{
+    DateTime::parse_from_rfc3339(timestamp)
+        .map(|dt| {
+            dt.with_timezone(timezone)
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string()
+        })
+        .ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::FixedOffset;
+
+    #[test]
+    fn formats_rfc3339_timestamp_in_requested_timezone() {
+        let timezone = FixedOffset::east_opt(2 * 60 * 60).unwrap();
+
+        assert_eq!(
+            format_time_in("2026-06-11T22:39:36Z", &timezone).as_deref(),
+            Some("2026-06-12 00:39:36")
+        );
+    }
+
+    #[test]
+    fn preserves_unparseable_timestamps() {
+        assert_eq!(format_local_time("not a timestamp"), "not a timestamp");
     }
 }

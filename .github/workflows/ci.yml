@@ -123,7 +123,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Build stub image
-        run: podman build -t aileron/stub:ci images/stub/
+        run: podman build -t aileron/stub:ci runtimes/stub/
 
       - name: Protocol smoke test — generate
         run: |
