@@ -46,6 +46,7 @@ podman build \
     --build-arg APT_PACKAGES="python3 python3-pip python3-dev build-essential cmake git ninja-build" \
     --build-arg CMAKE_ARGS="-DGGML_CUDA=on" \
     --build-arg CUDA_DOCKER_ARCH=all \
+    --build-arg LDFLAGS="-L/usr/local/cuda/lib64/stubs -Wl,-rpath-link,/usr/local/cuda/lib64/stubs" \
     --build-arg RUNTIME_ID=vision-llama-cpp-gemma4 \
     --build-arg ENTRYPOINT_PATH=runtimes/vision-llama-cpp-gemma4/entrypoint.py \
     --build-arg INSTALL_SOURCE=git \

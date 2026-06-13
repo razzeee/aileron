@@ -12,11 +12,13 @@ ARG CMAKE_ARGS=""
 ARG CUDA_DOCKER_ARCH=""
 ARG FORCE_CMAKE=""
 ARG HSA_OVERRIDE_GFX_VERSION=""
+ARG LDFLAGS=""
 ARG ROCM_PATH="/opt/rocm"
 
 ENV CMAKE_ARGS="${CMAKE_ARGS}"
 ENV CUDA_DOCKER_ARCH="${CUDA_DOCKER_ARCH}"
 ENV FORCE_CMAKE="${FORCE_CMAKE}"
+ENV LDFLAGS="${LDFLAGS}"
 ENV PIP_BREAK_SYSTEM_PACKAGES=1
 ENV ROCM_PATH="${ROCM_PATH}"
 ENV PATH="${ROCM_PATH}/bin:${PATH}"
@@ -24,7 +26,10 @@ ENV HSA_OVERRIDE_GFX_VERSION="${HSA_OVERRIDE_GFX_VERSION}"
 
 RUN apt-get update && apt-get install -y --no-install-recommends ${APT_PACKAGES} \
     && rm -rf /var/lib/apt/lists/* \
-    && (command -v python >/dev/null || ln -sf python3 /usr/bin/python)
+    && (command -v python >/dev/null || ln -sf python3 /usr/bin/python) \
+    && if [ -f /usr/local/cuda/lib64/stubs/libcuda.so ] && [ ! -e /usr/local/cuda/lib64/stubs/libcuda.so.1 ]; then \
+        ln -s libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1; \
+    fi
 
 RUN if [ "$INSTALL_SOURCE" = "git" ]; then \
         python -m pip install --no-cache-dir ${PIP_INSTALL_ARGS} \
