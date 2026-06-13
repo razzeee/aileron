@@ -29,13 +29,14 @@ method CreateSession(app_id: string, use_case: string, instructions: string) -> 
 # Start the backing container before the first user-visible response.
 method Prewarm(session_id: string, prompt_prefix: string) -> ()
 
-# Generate a complete response.
+# Generate a complete response. Session must have been created with an llm.* use_case.
 method Respond(session_id: string, prompt: string, options: GenerationOptions) -> (content: string)
 
-# Stream response tokens.
+# Stream response tokens. Session must have been created with an llm.* use_case.
 method StreamResponse(session_id: string, prompt: string, options: GenerationOptions) -> (token: string)
 
 # Generate JSON matching field guides converted to a JSON Schema object.
+# Session must have been created with an llm.* use_case.
 method RespondGuided(session_id: string, prompt: string, fields: []GuidedField, options: GenerationOptions) -> (content: string)
 
 # Transcribe audio. Session must have been created with use_case: asr.transcribe

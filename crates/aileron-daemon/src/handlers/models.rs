@@ -16,6 +16,7 @@ const USE_CASES: &[&str] = &[
     "llm.rephrase",
     "llm.classify",
     "llm.extract",
+    "llm.analyze",
     "asr.transcribe",
     "vision.describe",
     "vision.segment",
@@ -88,7 +89,7 @@ impl VarlinkInterface for ModelsHandler {
             let path = match crate::manifests::find_model_manifest(&profile_id) {
                 Ok(Some(path)) => path,
                 Ok(None) => {
-                    return call.reply_install_failed(profile_id, "manifest not found".to_string())
+                    return call.reply_install_failed(profile_id, "manifest not found".to_string());
                 }
                 Err(e) => return call.reply_install_failed(profile_id, e.to_string()),
             };

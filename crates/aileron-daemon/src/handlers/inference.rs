@@ -1,5 +1,5 @@
 /// Varlink handler for `aileron.Inference`.
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use std::path::PathBuf;
 use uuid::Uuid;
 
@@ -43,7 +43,7 @@ impl VarlinkInterface for InferenceHandler {
                         return call.reply(ModelAvailability {
                             is_available: false,
                             reason: format!("no profile assigned for {use_case}"),
-                        })
+                        });
                     }
                 };
                 let profile = match guard.profiles.get(profile_id) {
@@ -52,7 +52,7 @@ impl VarlinkInterface for InferenceHandler {
                         return call.reply(ModelAvailability {
                             is_available: false,
                             reason: format!("assigned profile {profile_id} is not installed"),
-                        })
+                        });
                     }
                 };
                 let image_ref = match resolve_runtime_image(&guard, profile) {
@@ -65,7 +65,7 @@ impl VarlinkInterface for InferenceHandler {
                                 profile.runtime_id,
                                 guard.variant.as_tag()
                             ),
-                        })
+                        });
                     }
                 };
                 (image_ref, profile.artifact_path.clone())
@@ -132,7 +132,7 @@ impl VarlinkInterface for InferenceHandler {
                 Some(profile_id) => profile_id.to_string(),
                 None => {
                     return call
-                        .reply_model_unavailable(format!("no profile assigned for {use_case}"))
+                        .reply_model_unavailable(format!("no profile assigned for {use_case}"));
                 }
             };
             if guard.profiles.get(&profile_id).is_none() {
@@ -252,6 +252,9 @@ impl VarlinkInterface for InferenceHandler {
             let (app_id, use_case, profile_id, image_ref, artifact_path, instructions) =
                 match guard.sessions.get(&session_id) {
                     Some(s) => {
+                        if let Err(reason) = ensure_llm_use_case(&s.use_case) {
+                            return call.reply_model_unavailable(reason);
+                        }
                         let (profile_id, image_ref, artifact_path) =
                             match profile_runtime(&guard, &s.profile_id) {
                                 Ok(resolved) => resolved,
@@ -295,6 +298,11 @@ impl VarlinkInterface for InferenceHandler {
             let (app_id, use_case, profile_id, image_ref, artifact_path) =
                 match guard.sessions.get(&session_id) {
                     Some(s) => {
+                        if let Err(reason) =
+                            ensure_exact_use_case(&s.use_case, "asr.transcribe", "Transcribe")
+                        {
+                            return call.reply_model_unavailable(reason);
+                        }
                         let (profile_id, image_ref, artifact_path) =
                             match profile_runtime(&guard, &s.profile_id) {
                                 Ok(resolved) => resolved,
@@ -341,6 +349,9 @@ impl VarlinkInterface for InferenceHandler {
             let (app_id, use_case, profile_id, image_ref, artifact_path) =
                 match guard.sessions.get(&session_id) {
                     Some(s) => {
+                        if let Err(reason) = ensure_vision_use_case(&s.use_case) {
+                            return call.reply_model_unavailable(reason);
+                        }
                         let (profile_id, image_ref, artifact_path) =
                             match profile_runtime(&guard, &s.profile_id) {
                                 Ok(resolved) => resolved,
@@ -403,6 +414,7 @@ async fn stream_tokens(
     let (app_id, use_case, profile_id, image_ref, artifact_path, instructions) =
         match guard.sessions.get(&session_id) {
             Some(s) => {
+                ensure_llm_use_case(&s.use_case).map_err(GenerationError::ModelUnavailable)?;
                 let (profile_id, image_ref, artifact_path) = profile_runtime(&guard, &s.profile_id)
                     .map_err(GenerationError::ModelUnavailable)?;
                 (
@@ -500,6 +512,7 @@ async fn generate_tokens(
     let (app_id, use_case, profile_id, image_ref, artifact_path, instructions) =
         match guard.sessions.get(&session_id) {
             Some(s) => {
+                ensure_llm_use_case(&s.use_case).map_err(GenerationError::ModelUnavailable)?;
                 let (profile_id, image_ref, artifact_path) = profile_runtime(&guard, &s.profile_id)
                     .map_err(GenerationError::ModelUnavailable)?;
                 (
@@ -581,6 +594,36 @@ fn validate_options(options: &GenerationOptions) -> Result<u32, String> {
         return Err("sampling_mode must not be empty".to_string());
     }
     Ok(options.maximum_response_tokens as u32)
+}
+
+fn ensure_llm_use_case(use_case: &str) -> Result<(), String> {
+    if use_case.starts_with("llm.") {
+        Ok(())
+    } else {
+        Err(format!(
+            "text generation requires an llm.* use-case, got {use_case}"
+        ))
+    }
+}
+
+fn ensure_exact_use_case(use_case: &str, expected: &str, method: &str) -> Result<(), String> {
+    if use_case == expected {
+        Ok(())
+    } else {
+        Err(format!(
+            "{method} requires use-case {expected}, got {use_case}"
+        ))
+    }
+}
+
+fn ensure_vision_use_case(use_case: &str) -> Result<(), String> {
+    if matches!(use_case, "vision.describe" | "vision.segment") {
+        Ok(())
+    } else {
+        Err(format!(
+            "Describe requires use-case vision.describe or vision.segment, got {use_case}"
+        ))
+    }
 }
 
 fn guided_fields_schema(fields: &[GuidedField]) -> Result<Value, String> {

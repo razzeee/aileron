@@ -169,7 +169,7 @@ Model manifests live under `models/` and reference a reusable runtime by ID:
   "profile_id": "llama3.2-3b-instruct-q4",
   "model_id": "llama3.2-3b-instruct-q4",
   "runtime_id": "llm-llama-cpp",
-  "use_cases": ["llm.summarize", "llm.translate"],
+  "use_cases": ["llm.summarize", "llm.translate", "llm.analyze"],
   "artifacts": [
     {
       "url": "https://huggingface.co/.../resolve/main/model.gguf",
@@ -211,7 +211,7 @@ cat > manifests/runtimes/stub.json <<'JSON'
 {"runtime_id":"stub","images":{"cpu":"localhost/aileron/stub:cpu"}}
 JSON
 cat > manifests/models/stub.json <<'JSON'
-{"profile_id":"stub","model_id":"stub","runtime_id":"stub","use_cases":["llm.summarize","asr.transcribe","vision.describe"],"artifacts":[]}
+{"profile_id":"stub","model_id":"stub","runtime_id":"stub","use_cases":["llm.summarize","llm.analyze","asr.transcribe","vision.describe"],"artifacts":[]}
 JSON
 
 # 4. Start the daemon in allow-all mode (skips permission checks)
@@ -250,7 +250,7 @@ Install the `varlink` CLI with: `cargo install varlink-cli`
 aileron
 ```
 
-In the **Models** page, click **Add Profile...**, choose one of the available runtime IDs, and provide the model file URL, SHA-256, and use-cases. Aileron derives the filename, model ID, and profile ID. Installed profiles can then be assigned to use-case tokens.
+In the **Models** page, click **Add Profile...**, choose one of the available runtime IDs, and provide the model file URL, SHA-256, and use-cases. Aileron derives the filename, model ID, and profile ID. Installed profiles can then be assigned to use-case tokens. Assign the same LLM profile to multiple LLM task tokens when one model backs several operations, for example `llm.summarize` for free-text summaries and `llm.analyze` for guided structured analysis.
 
 ### 2. Grant permission to an app
 
@@ -274,6 +274,10 @@ Paste or fetch an article URL, then click **Summarize**. Tokens stream into the 
 
 ## Use-case tokens
 
+Use-case tokens are the daemon's routing and policy keys. A token maps to one assigned profile, permissions are granted per app and token, and warm containers are pooled per profile. Assigning the same profile to multiple tokens is valid.
+
+Use-cases describe the task intent and modality; methods describe the operation shape. `Respond` and `RespondGuided` are text-generation operations for `llm.*` sessions. `Transcribe` is for `asr.transcribe`; `Describe` is for `vision.describe` and `vision.segment`. There is intentionally no separate `llm.guided` token: guided generation is an output constraint for a real LLM task use-case, not a task intent of its own. Use `llm.analyze` when one guided response combines multiple analytical intents, such as summary, extraction, and classification fields.
+
 | Token | Task | Backend |
 |---|---|---|
 | `llm.summarize` | Summarize text | llama.cpp |
@@ -281,6 +285,7 @@ Paste or fetch an article URL, then click **Summarize**. Tokens stream into the 
 | `llm.rephrase` | Rewrite / simplify text | llama.cpp |
 | `llm.classify` | Classify / tag text | llama.cpp |
 | `llm.extract` | Extract structured data | llama.cpp |
+| `llm.analyze` | Derive mixed structured insights from text | llama.cpp |
 | `asr.transcribe` | Transcribe audio (16 kHz mono f32le, base64) | whisper.cpp |
 | `vision.describe` | Describe image contents (PNG/JPEG, base64) | llava / llama.cpp |
 | `vision.segment` | Identify objects in image | llama.cpp multimodal |
@@ -363,7 +368,7 @@ The portal does not talk to containers directly. It translates D-Bus calls into 
 | `Prewarm` | `session_id: s, prompt_prefix: s` | `()` | Starts the backing container before the first response |
 | `Respond` | `session_id: s, prompt: s, options: (xds)` | `content: s` | Returns full generated text |
 | `StreamResponse` | `session_id: s, prompt: s, options: (xds)` | `()` | Emits `TokenReceived` signals; final token has `done=true` |
-| `RespondGuided` | `session_id: s, prompt: s, fields: a(sssb), options: (xds)` | `content: s` | Returns JSON matching guided fields |
+| `RespondGuided` | `session_id: s, prompt: s, fields: a(sssb), options: (xds)` | `content: s` | LLM sessions only; returns JSON matching guided output fields |
 | `Transcribe` | `session_id: s, audio_b64: s` | `text: s` | 16 kHz mono f32le PCM, base64 |
 | `Describe` | `session_id: s, image_b64: s` | `text: s` | PNG or JPEG, base64 |
 | `EndSession` | `session_id: s` | `()` | |
@@ -485,6 +490,7 @@ The daemon sends a `response_format` object containing the caller's JSON Schema.
 - The portal emits `ModelLoading("starting model")` before cold text-generation calls that may start a container.
 - One container runs per profile, shared across all sessions bound to that profile.
 - `EndSession` removes the session, but the per-profile container remains pooled until idle timeout.
+- `KillSession` removes the session and stops the profile container if no other active session uses it.
 - Idle containers are terminated after 5 minutes by default (configurable via `--idle-timeout-secs`).
 - A crash in the container kills only that container, not the daemon.
 

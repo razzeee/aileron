@@ -1268,7 +1268,7 @@ fn summarize_guided(text: &str, tx: std::sync::mpsc::Sender<DemoEvent>) -> anyho
         "CreateSession",
         &(
             "org.aileron.Demo",
-            "llm.summarize",
+            "llm.analyze",
             "You extract concise, factual summary data as valid JSON.",
         ),
     )?;

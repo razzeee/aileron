@@ -81,7 +81,7 @@ A model manifest points at this runtime and provides the model file URL/checksum
   "profile_id": "llama3.2-3b-instruct-q4",
   "model_id": "llama3.2-3b-instruct-q4",
   "runtime_id": "llm-llama-cpp",
-  "use_cases": ["llm.summarize", "llm.translate", "llm.extract"],
+  "use_cases": ["llm.summarize", "llm.translate", "llm.extract", "llm.analyze"],
   "artifacts": [
     {
       "url": "https://huggingface.co/.../resolve/main/model.gguf",
@@ -100,7 +100,7 @@ For ad-hoc GGUF models, use the management UI's **Add Profile...** action, or ca
 
 ```sh
 varlink call "unix:$XDG_RUNTIME_DIR/aileron.socket/aileron.Models.InstallUrlProfile" \
-    '{"runtime_id":"llm-llama-cpp","url":"https://huggingface.co/.../resolve/main/model.gguf","sha256":"...","use_cases":["llm.summarize"]}'
+    '{"runtime_id":"llm-llama-cpp","url":"https://huggingface.co/.../resolve/main/model.gguf","sha256":"...","use_cases":["llm.summarize","llm.analyze"]}'
 ```
 
 Aileron derives the filename, model ID, and profile ID from the URL and checksum.

@@ -13,6 +13,7 @@ const USE_CASES: &[&str] = &[
     "llm.rephrase",
     "llm.classify",
     "llm.extract",
+    "llm.analyze",
     "asr.transcribe",
     "vision.describe",
     "vision.segment",
