@@ -1,5 +1,5 @@
 /// Varlink handler for `aileron.Inference`.
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 use std::path::PathBuf;
 use uuid::Uuid;
 

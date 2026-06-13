@@ -1,8 +1,7 @@
 /// Profiles page — list installed profiles, add profiles, assign use-cases, delete.
 use gtk4::prelude::*;
 use gtk4::{
-    Box, Button, CheckButton, ComboBoxText, Entry, Grid, Label, ListBox, Orientation, ProgressBar,
-    ScrolledWindow,
+    Box, Button, CheckButton, Entry, Grid, Label, ListBox, Orientation, ProgressBar, ScrolledWindow,
 };
 use libadwaita::prelude::*;
 use libadwaita::{ActionRow, AlertDialog, PreferencesGroup, PreferencesPage};
@@ -121,12 +120,12 @@ fn show_url_install_dialog(
     let runtime_label = Label::new(Some("Runtime"));
     runtime_label.set_halign(gtk4::Align::Start);
     runtime_label.add_css_class("heading");
-    let runtime_id = ComboBoxText::new();
-    for runtime in &runtimes {
-        runtime_id.append_text(runtime);
-    }
-    if !runtimes.is_empty() {
-        runtime_id.set_active(Some(0));
+    let runtime_id = Entry::builder()
+        .placeholder_text("llm-llama-cpp")
+        .hexpand(true)
+        .build();
+    if let Some(runtime) = runtimes.first() {
+        runtime_id.set_text(runtime);
     }
     runtime_row.append(&runtime_label);
     runtime_row.append(&runtime_id);
@@ -186,10 +185,7 @@ fn show_url_install_dialog(
             return;
         }
         let request = UrlInstallRequest {
-            runtime_id: runtime_id
-                .active_text()
-                .map(|s| s.to_string())
-                .unwrap_or_default(),
+            runtime_id: runtime_id.text().trim().to_string(),
             url: url.text().trim().to_string(),
             sha256: sha256.text().trim().to_string(),
             use_cases: selected_use_cases(&use_case_checks),
@@ -500,7 +496,7 @@ fn refresh_model_list(list_box: &ListBox) {
                 assign_btn.connect_clicked(move |btn| {
                     let dialog = AlertDialog::builder()
                         .heading("Assign use-cases")
-                        .body(&format!("Select use-cases for:\n{}", profile_id_assign))
+                        .body(format!("Select use-cases for:\n{}", profile_id_assign))
                         .build();
                     dialog.add_response("cancel", "Cancel");
                     dialog.add_response("assign", "Assign");
@@ -622,7 +618,7 @@ fn show_pull_result_dialog(
     vbox.set_margin_top(12);
     for c in &conflicts {
         let row_label = Label::builder()
-            .label(&format!(
+            .label(format!(
                 "<b>{}</b>\n<small>{} → {}</small>",
                 c.use_case, c.current_profile, c.new_profile
             ))
