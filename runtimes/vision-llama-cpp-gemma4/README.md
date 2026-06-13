@@ -16,14 +16,14 @@ Run all commands below from the repository root.
 
 ## Platforms
 
-Four Dockerfiles are provided:
+One shared llama.cpp Dockerfile builds all accelerator variants with build args:
 
-| Dockerfile | Variant | Hardware | Notes |
+| Variant | Base/build args | Hardware | Notes |
 |---|---|---|---|
-| `Dockerfile` | `cpu` | CPU | Default, works everywhere |
-| `Dockerfile.cuda` | `cuda` | NVIDIA GPU | Requires NVIDIA container support on host |
-| `Dockerfile.rocm` | `rocm` | AMD GPU | Requires ROCm devices on host |
-| `Dockerfile.vulkan` | `vulkan` | Vulkan GPU | NVIDIA / AMD / Intel Arc |
+| `cpu` | default | CPU | Default, works everywhere |
+| `cuda` | `BASE_IMAGE=nvidia/cuda:13.3.0-devel-ubuntu24.04`, `CMAKE_ARGS=-DGGML_CUDA=on` | NVIDIA GPU | Requires NVIDIA container support on host |
+| `rocm` | `BASE_IMAGE=rocm/dev-ubuntu-22.04:7.2.4-complete`, `CMAKE_ARGS=-DGGML_HIP=on` | AMD GPU | Requires ROCm devices on host |
+| `vulkan` | `CMAKE_ARGS=-DGGML_VULKAN=on` plus Vulkan packages | Vulkan GPU | NVIDIA / AMD / Intel Arc |
 
 Tag images by runtime and variant. The daemon does not infer image tags from model profiles; it resolves `runtime_id + detected variant` through runtime manifests.
 
@@ -32,26 +32,48 @@ Tag images by runtime and variant. The daemon does not infer image tags from mod
 ```sh
 # CPU
 podman build \
+    -f runtimes/llama-cpp.Dockerfile \
+    --build-arg RUNTIME_ID=vision-llama-cpp-gemma4 \
+    --build-arg ENTRYPOINT_PATH=runtimes/vision-llama-cpp-gemma4/entrypoint.py \
+    --build-arg INSTALL_SOURCE=git \
     -t docker.io/example/aileron-runtime-vision-llama-cpp-gemma4:cpu \
-    runtimes/vision-llama-cpp-gemma4
+    .
 
 # NVIDIA CUDA
 podman build \
-    -f runtimes/vision-llama-cpp-gemma4/Dockerfile.cuda \
+    -f runtimes/llama-cpp.Dockerfile \
+    --build-arg BASE_IMAGE=nvidia/cuda:13.3.0-devel-ubuntu24.04 \
+    --build-arg APT_PACKAGES="python3 python3-pip python3-dev build-essential cmake git ninja-build" \
+    --build-arg CMAKE_ARGS="-DGGML_CUDA=on" \
+    --build-arg CUDA_DOCKER_ARCH=all \
+    --build-arg RUNTIME_ID=vision-llama-cpp-gemma4 \
+    --build-arg ENTRYPOINT_PATH=runtimes/vision-llama-cpp-gemma4/entrypoint.py \
+    --build-arg INSTALL_SOURCE=git \
     -t docker.io/example/aileron-runtime-vision-llama-cpp-gemma4:cuda \
-    runtimes/vision-llama-cpp-gemma4
+    .
 
 # AMD ROCm
 podman build \
-    -f runtimes/vision-llama-cpp-gemma4/Dockerfile.rocm \
+    -f runtimes/llama-cpp.Dockerfile \
+    --build-arg BASE_IMAGE=rocm/dev-ubuntu-22.04:7.2.4-complete \
+    --build-arg APT_PACKAGES="python3 python3-pip python3-dev build-essential cmake git ninja-build" \
+    --build-arg CMAKE_ARGS="-DGGML_HIP=on" \
+    --build-arg RUNTIME_ID=vision-llama-cpp-gemma4 \
+    --build-arg ENTRYPOINT_PATH=runtimes/vision-llama-cpp-gemma4/entrypoint.py \
+    --build-arg INSTALL_SOURCE=git \
     -t docker.io/example/aileron-runtime-vision-llama-cpp-gemma4:rocm \
-    runtimes/vision-llama-cpp-gemma4
+    .
 
 # Vulkan
 podman build \
-    -f runtimes/vision-llama-cpp-gemma4/Dockerfile.vulkan \
+    -f runtimes/llama-cpp.Dockerfile \
+    --build-arg APT_PACKAGES="build-essential cmake git ninja-build libvulkan-dev vulkan-tools libvulkan1 mesa-vulkan-drivers" \
+    --build-arg CMAKE_ARGS="-DGGML_VULKAN=on" \
+    --build-arg RUNTIME_ID=vision-llama-cpp-gemma4 \
+    --build-arg ENTRYPOINT_PATH=runtimes/vision-llama-cpp-gemma4/entrypoint.py \
+    --build-arg INSTALL_SOURCE=git \
     -t docker.io/example/aileron-runtime-vision-llama-cpp-gemma4:vulkan \
-    runtimes/vision-llama-cpp-gemma4
+    .
 ```
 
 ## Runtime Manifest

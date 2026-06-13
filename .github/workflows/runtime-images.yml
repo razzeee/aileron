@@ -1,0 +1,192 @@
+name: Runtime Images
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - ".github/workflows/runtime-images.yml"
+      - "runtimes/_llama_cpp_common/**"
+      - "runtimes/llama-cpp.Dockerfile"
+      - "runtimes/llm-llama-cpp/**"
+      - "runtimes/vision-llama-cpp-gemma4/**"
+      - "runtimes/asr-whisper-cpp/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  llama-cpp:
+    name: ${{ matrix.runtime_id }} ${{ matrix.variant }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runtime_id: llm-llama-cpp
+            image_name: aileron-runtime-llm-llama-cpp
+            variant: cpu
+            build_args: |
+              RUNTIME_ID=llm-llama-cpp
+              ENTRYPOINT_PATH=runtimes/llm-llama-cpp/entrypoint.py
+              EXTRA_PIP_PACKAGES=jsonschema
+          - runtime_id: llm-llama-cpp
+            image_name: aileron-runtime-llm-llama-cpp
+            variant: cuda
+            build_args: |
+              BASE_IMAGE=nvidia/cuda:13.3.0-devel-ubuntu24.04
+              APT_PACKAGES=python3 python3-pip python3-dev build-essential cmake git ninja-build
+              CMAKE_ARGS=-DGGML_CUDA=on
+              CUDA_DOCKER_ARCH=all
+              RUNTIME_ID=llm-llama-cpp
+              ENTRYPOINT_PATH=runtimes/llm-llama-cpp/entrypoint.py
+              EXTRA_PIP_PACKAGES=jsonschema
+          - runtime_id: llm-llama-cpp
+            image_name: aileron-runtime-llm-llama-cpp
+            variant: rocm
+            build_args: |
+              BASE_IMAGE=rocm/dev-ubuntu-22.04:7.2.4-complete
+              APT_PACKAGES=python3 python3-pip python3-dev build-essential cmake git ninja-build
+              CMAKE_ARGS=-DGGML_HIP=on -DAMDGPU_TARGETS=gfx1030
+              FORCE_CMAKE=1
+              HSA_OVERRIDE_GFX_VERSION=10.3.0
+              PIP_INSTALL_ARGS=--no-binary llama-cpp-python
+              RUNTIME_ID=llm-llama-cpp
+              ENTRYPOINT_PATH=runtimes/llm-llama-cpp/entrypoint.py
+              EXTRA_PIP_PACKAGES=jsonschema
+          - runtime_id: llm-llama-cpp
+            image_name: aileron-runtime-llm-llama-cpp
+            variant: vulkan
+            build_args: |
+              APT_PACKAGES=build-essential cmake git ninja-build libvulkan-dev vulkan-tools libvulkan1 mesa-vulkan-drivers
+              CMAKE_ARGS=-DGGML_VULKAN=on
+              RUNTIME_ID=llm-llama-cpp
+              ENTRYPOINT_PATH=runtimes/llm-llama-cpp/entrypoint.py
+              EXTRA_PIP_PACKAGES=jsonschema
+          - runtime_id: vision-llama-cpp-gemma4
+            image_name: aileron-runtime-vision-llama-cpp-gemma4
+            variant: cpu
+            build_args: |
+              RUNTIME_ID=vision-llama-cpp-gemma4
+              ENTRYPOINT_PATH=runtimes/vision-llama-cpp-gemma4/entrypoint.py
+              INSTALL_SOURCE=git
+          - runtime_id: vision-llama-cpp-gemma4
+            image_name: aileron-runtime-vision-llama-cpp-gemma4
+            variant: cuda
+            build_args: |
+              BASE_IMAGE=nvidia/cuda:13.3.0-devel-ubuntu24.04
+              APT_PACKAGES=python3 python3-pip python3-dev build-essential cmake git ninja-build
+              CMAKE_ARGS=-DGGML_CUDA=on
+              CUDA_DOCKER_ARCH=all
+              RUNTIME_ID=vision-llama-cpp-gemma4
+              ENTRYPOINT_PATH=runtimes/vision-llama-cpp-gemma4/entrypoint.py
+              INSTALL_SOURCE=git
+          - runtime_id: vision-llama-cpp-gemma4
+            image_name: aileron-runtime-vision-llama-cpp-gemma4
+            variant: rocm
+            build_args: |
+              BASE_IMAGE=rocm/dev-ubuntu-22.04:7.2.4-complete
+              APT_PACKAGES=python3 python3-pip python3-dev build-essential cmake git ninja-build
+              CMAKE_ARGS=-DGGML_HIP=on
+              RUNTIME_ID=vision-llama-cpp-gemma4
+              ENTRYPOINT_PATH=runtimes/vision-llama-cpp-gemma4/entrypoint.py
+              INSTALL_SOURCE=git
+          - runtime_id: vision-llama-cpp-gemma4
+            image_name: aileron-runtime-vision-llama-cpp-gemma4
+            variant: vulkan
+            build_args: |
+              APT_PACKAGES=build-essential cmake git ninja-build libvulkan-dev vulkan-tools libvulkan1 mesa-vulkan-drivers
+              CMAKE_ARGS=-DGGML_VULKAN=on
+              RUNTIME_ID=vision-llama-cpp-gemma4
+              ENTRYPOINT_PATH=runtimes/vision-llama-cpp-gemma4/entrypoint.py
+              INSTALL_SOURCE=git
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute image namespace
+        run: echo "IMAGE_NAMESPACE=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_ENV"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: runtimes/llama-cpp.Dockerfile
+          push: true
+          build-args: ${{ matrix.build_args }}
+          tags: |
+            ghcr.io/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image_name }}:${{ matrix.variant }}
+            ghcr.io/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image_name }}:${{ github.sha }}-${{ matrix.variant }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.title=${{ matrix.image_name }}
+            org.opencontainers.image.version=${{ matrix.variant }}
+          cache-from: type=gha,scope=${{ matrix.image_name }}-${{ matrix.variant }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image_name }}-${{ matrix.variant }}
+
+  other-runtimes:
+    name: ${{ matrix.runtime_id }} ${{ matrix.variant }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runtime_id: asr-whisper-cpp
+            image_name: aileron-runtime-asr-whisper-cpp
+            variant: cpu
+            context: runtimes/asr-whisper-cpp
+            file: runtimes/asr-whisper-cpp/Dockerfile
+          - runtime_id: asr-whisper-cpp
+            image_name: aileron-runtime-asr-whisper-cpp
+            variant: cuda
+            context: runtimes/asr-whisper-cpp
+            file: runtimes/asr-whisper-cpp/Dockerfile.cuda
+          - runtime_id: asr-whisper-cpp
+            image_name: aileron-runtime-asr-whisper-cpp
+            variant: vulkan
+            context: runtimes/asr-whisper-cpp
+            file: runtimes/asr-whisper-cpp/Dockerfile.vulkan
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute image namespace
+        run: echo "IMAGE_NAMESPACE=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_ENV"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.file }}
+          push: true
+          tags: |
+            ghcr.io/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image_name }}:${{ matrix.variant }}
+            ghcr.io/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image_name }}:${{ github.sha }}-${{ matrix.variant }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.title=${{ matrix.image_name }}
+            org.opencontainers.image.version=${{ matrix.variant }}
+          cache-from: type=gha,scope=${{ matrix.image_name }}-${{ matrix.variant }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image_name }}-${{ matrix.variant }}

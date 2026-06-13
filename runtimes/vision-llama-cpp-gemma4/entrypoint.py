@@ -9,15 +9,17 @@ Supported request types:
 """
 
 import base64
-import json
 import os
-import shutil
-import subprocess
 import sys
-import traceback
 
 from llama_cpp import Llama
 from llama_cpp.llama_chat_format import Gemma4ChatHandler
+
+COMMON_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "_llama_cpp_common"))
+if os.path.isdir(COMMON_DIR):
+    sys.path.insert(0, COMMON_DIR)
+
+from aileron_runtime_common import load_llama, send, serve_requests
 
 MODEL_PATH = os.environ.get("MODEL_PATH", "/model/model.gguf")
 MMPROJ_PATH = os.environ.get("MMPROJ_PATH", "/model/mmproj.gguf")
@@ -28,82 +30,18 @@ DEFAULT_PROMPT = os.environ.get(
     "VISION_PROMPT",
     "Describe this image clearly and concisely. Include visible objects, people, text, and relevant context.",
 )
-
-
-def detect_gpu_layers() -> int:
-    explicit = os.environ.get("N_GPU_LAYERS")
-    if explicit is not None:
-        layers = int(explicit)
-        sys.stderr.write(f"[aileron-vision] N_GPU_LAYERS={layers} (explicit)\n")
-        return layers
-
-    if shutil.which("nvidia-smi"):
-        try:
-            out = subprocess.check_output(
-                ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
-                stderr=subprocess.DEVNULL,
-            ).decode().strip()
-            if out:
-                sys.stderr.write(f"[aileron-vision] CUDA GPU detected: {out.splitlines()[0]}\n")
-                return -1
-        except Exception:
-            pass
-
-    if shutil.which("rocm-smi"):
-        try:
-            out = subprocess.check_output(
-                ["rocm-smi", "--showproductname"],
-                stderr=subprocess.DEVNULL,
-            ).decode()
-            if "GPU" in out or "Radeon" in out or "gfx" in out.lower():
-                sys.stderr.write("[aileron-vision] ROCm GPU detected\n")
-                return -1
-        except Exception:
-            pass
-
-    if shutil.which("vulkaninfo"):
-        try:
-            out = subprocess.check_output(
-                ["vulkaninfo", "--summary"],
-                stderr=subprocess.DEVNULL,
-            ).decode()
-            if "deviceName" in out or "deviceType" in out:
-                for line in out.splitlines():
-                    if "deviceName" in line:
-                        name = line.split("=")[-1].strip()
-                        sys.stderr.write(f"[aileron-vision] Vulkan device detected: {name}\n")
-                        break
-                return -1
-        except Exception:
-            pass
-
-    sys.stderr.write(f"[aileron-vision] no GPU detected - using CPU ({N_THREADS} threads)\n")
-    return 0
-
-
 def load_model() -> Llama:
-    n_gpu_layers = detect_gpu_layers()
-    sys.stderr.write(
-        f"[aileron-vision] loading {MODEL_PATH} with {MMPROJ_PATH} "
-        f"(ctx={N_CTX}, chat_format=gemma4, gpu_layers={n_gpu_layers})\n"
-    )
-    sys.stderr.flush()
-    return Llama(
+    return load_llama(
+        log_prefix="aileron-vision",
         model_path=MODEL_PATH,
+        loading_suffix=f"with {MMPROJ_PATH} (chat_format=gemma4)",
         chat_handler=Gemma4ChatHandler(
             clip_model_path=MMPROJ_PATH,
             verbose=False,
         ),
         n_ctx=N_CTX,
-        n_gpu_layers=n_gpu_layers,
         n_threads=N_THREADS,
-        verbose=False,
     )
-
-
-def send(obj: dict) -> None:
-    sys.stdout.write(json.dumps(obj) + "\n")
-    sys.stdout.flush()
 
 
 def image_to_data_url(value) -> str:
@@ -154,31 +92,12 @@ def handle_describe(llm: Llama, req: dict) -> None:
 
 def main() -> None:
     llm = load_model()
-    sys.stderr.write("[aileron-vision] ready\n")
-    sys.stderr.flush()
-
-    for raw_line in sys.stdin:
-        line = raw_line.strip()
-        if not line:
-            continue
-        try:
-            req = json.loads(line)
-        except json.JSONDecodeError as e:
-            sys.stderr.write(f"[aileron-vision] bad request JSON: {e}\n")
-            sys.stderr.flush()
-            continue
-
-        req_type = req.get("type", "")
-        req_id = req.get("id", "unknown")
-        try:
-            if req_type == "describe":
-                handle_describe(llm, req)
-            else:
-                send({"id": req_id, "error": "unsupported_type", "reason": req_type, "done": True})
-        except Exception:
-            sys.stderr.write(traceback.format_exc())
-            sys.stderr.flush()
-            send({"id": req_id, "error": "internal_error", "done": True})
+    serve_requests(
+        llm=llm,
+        handlers={"describe": handle_describe},
+        log_prefix="aileron-vision",
+        unsupported_done=True,
+    )
 
 
 if __name__ == "__main__":
