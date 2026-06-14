@@ -180,6 +180,15 @@ jobs:
           cache-from: type=gha,scope=${{ matrix.image_name }}-${{ matrix.variant }}
           cache-to: type=gha,mode=max,scope=${{ matrix.image_name }}-${{ matrix.variant }}
 
+      - name: Scan image for vulnerabilities
+        uses: aquasecurity/trivy-action@0.33.1
+        with:
+          image-ref: ghcr.io/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image_name }}:${{ github.sha }}-${{ matrix.variant }}
+          format: table
+          vuln-type: os,library
+          severity: CRITICAL,HIGH
+          exit-code: 1
+
   other-runtimes:
     name: ${{ matrix.runtime_id }} ${{ matrix.variant }}
     runs-on: ubuntu-24.04
@@ -253,3 +262,12 @@ jobs:
             org.opencontainers.image.licenses=GPL-3.0-or-later
           cache-from: type=gha,scope=${{ matrix.image_name }}-${{ matrix.variant }}
           cache-to: type=gha,mode=max,scope=${{ matrix.image_name }}-${{ matrix.variant }}
+
+      - name: Scan image for vulnerabilities
+        uses: aquasecurity/trivy-action@0.33.1
+        with:
+          image-ref: ghcr.io/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image_name }}:${{ github.sha }}-${{ matrix.variant }}
+          format: table
+          vuln-type: os,library
+          severity: CRITICAL,HIGH
+          exit-code: 1
