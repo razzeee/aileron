@@ -1,0 +1,9 @@
+{
+  "runtime_id": "vision-llama-cpp-gemma4",
+  "images": {
+    "cpu": "ghcr.io/razzeee/aileron-runtime-vision-llama-cpp-gemma4:cpu",
+    "cuda": "ghcr.io/razzeee/aileron-runtime-vision-llama-cpp-gemma4:cuda",
+    "rocm": "ghcr.io/razzeee/aileron-runtime-vision-llama-cpp-gemma4:rocm",
+    "vulkan": "ghcr.io/razzeee/aileron-runtime-vision-llama-cpp-gemma4:vulkan"
+  }
+}

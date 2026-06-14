@@ -30,6 +30,7 @@ jobs:
             variant: cpu
             build_args: |
               RUNTIME_ID=llm-llama-cpp
+              RUNTIME_VARIANT=cpu
               ENTRYPOINT_PATH=runtimes/llm-llama-cpp/entrypoint.py
               EXTRA_PIP_PACKAGES=jsonschema
           - runtime_id: llm-llama-cpp
@@ -42,6 +43,7 @@ jobs:
               CUDA_DOCKER_ARCH=all
               LDFLAGS=-L/usr/local/cuda/lib64/stubs -Wl,-rpath-link,/usr/local/cuda/lib64/stubs
               RUNTIME_ID=llm-llama-cpp
+              RUNTIME_VARIANT=cuda
               ENTRYPOINT_PATH=runtimes/llm-llama-cpp/entrypoint.py
               EXTRA_PIP_PACKAGES=jsonschema
           - runtime_id: llm-llama-cpp
@@ -55,6 +57,7 @@ jobs:
               HSA_OVERRIDE_GFX_VERSION=10.3.0
               PIP_INSTALL_ARGS=--no-binary llama-cpp-python
               RUNTIME_ID=llm-llama-cpp
+              RUNTIME_VARIANT=rocm
               ENTRYPOINT_PATH=runtimes/llm-llama-cpp/entrypoint.py
               EXTRA_PIP_PACKAGES=jsonschema
           - runtime_id: llm-llama-cpp
@@ -64,6 +67,7 @@ jobs:
               APT_PACKAGES=build-essential cmake git ninja-build libvulkan-dev glslc glslang-tools spirv-headers vulkan-tools libvulkan1 mesa-vulkan-drivers
               CMAKE_ARGS=-DGGML_VULKAN=on
               RUNTIME_ID=llm-llama-cpp
+              RUNTIME_VARIANT=vulkan
               ENTRYPOINT_PATH=runtimes/llm-llama-cpp/entrypoint.py
               EXTRA_PIP_PACKAGES=jsonschema
           - runtime_id: vision-llama-cpp-gemma4
@@ -71,6 +75,7 @@ jobs:
             variant: cpu
             build_args: |
               RUNTIME_ID=vision-llama-cpp-gemma4
+              RUNTIME_VARIANT=cpu
               ENTRYPOINT_PATH=runtimes/vision-llama-cpp-gemma4/entrypoint.py
               INSTALL_SOURCE=git
           - runtime_id: vision-llama-cpp-gemma4
@@ -83,6 +88,7 @@ jobs:
               CUDA_DOCKER_ARCH=all
               LDFLAGS=-L/usr/local/cuda/lib64/stubs -Wl,-rpath-link,/usr/local/cuda/lib64/stubs
               RUNTIME_ID=vision-llama-cpp-gemma4
+              RUNTIME_VARIANT=cuda
               ENTRYPOINT_PATH=runtimes/vision-llama-cpp-gemma4/entrypoint.py
               INSTALL_SOURCE=git
           - runtime_id: vision-llama-cpp-gemma4
@@ -96,6 +102,7 @@ jobs:
               HSA_OVERRIDE_GFX_VERSION=10.3.0
               PIP_INSTALL_ARGS=--no-binary llama-cpp-python
               RUNTIME_ID=vision-llama-cpp-gemma4
+              RUNTIME_VARIANT=rocm
               ENTRYPOINT_PATH=runtimes/vision-llama-cpp-gemma4/entrypoint.py
               INSTALL_SOURCE=git
           - runtime_id: vision-llama-cpp-gemma4
@@ -105,6 +112,7 @@ jobs:
               APT_PACKAGES=build-essential cmake git ninja-build libvulkan-dev glslc glslang-tools spirv-headers vulkan-tools libvulkan1 mesa-vulkan-drivers
               CMAKE_ARGS=-DGGML_VULKAN=on
               RUNTIME_ID=vision-llama-cpp-gemma4
+              RUNTIME_VARIANT=vulkan
               ENTRYPOINT_PATH=runtimes/vision-llama-cpp-gemma4/entrypoint.py
               INSTALL_SOURCE=git
 
