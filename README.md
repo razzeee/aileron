@@ -1,5 +1,7 @@
 # Aileron
 
+> **Status:** Aileron is in very early development. Nobody should rely on it or use it for real work yet.
+
 We all have reasons to be tired of AI. But NPUs are already shipping in most new PCs, and Linux should have a safe, boring way for apps to use that local compute for things that matter: accessibility, translation, transcription, summarization, and assistive workflows that should not require sending private data to a cloud service.
 
 Aileron is a system-level local AI API for Linux — the missing counterpart to Apple's FoundationModels framework. It provides sandboxed applications with access to on-device inference through [xdg-desktop-portal](https://github.com/flatpak/xdg-desktop-portal), with no network exposure, no shared REST server, and no inference engine code running in the host session. Everything runs locally; no cloud dependency, ever.
