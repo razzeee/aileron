@@ -113,7 +113,7 @@ fn render_runtime_images(
             }
             let active_runtime_downloads = installs
                 .into_iter()
-                .filter(|install| is_active_runtime_download(install))
+                .filter(is_active_runtime_download)
                 .map(|install| {
                     (
                         runtime_download_image_ref(&install.profile_id).to_string(),
