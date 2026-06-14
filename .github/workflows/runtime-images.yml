@@ -27,6 +27,8 @@ jobs:
         include:
           - runtime_id: llm-llama-cpp
             image_name: aileron-runtime-llm-llama-cpp
+            description: Aileron llama.cpp runtime for local text generation.
+            documentation_path: runtimes/llm-llama-cpp/README.md
             variant: cpu
             build_args: |
               RUNTIME_ID=llm-llama-cpp
@@ -35,6 +37,8 @@ jobs:
               EXTRA_PIP_PACKAGES=jsonschema
           - runtime_id: llm-llama-cpp
             image_name: aileron-runtime-llm-llama-cpp
+            description: Aileron llama.cpp runtime for local text generation.
+            documentation_path: runtimes/llm-llama-cpp/README.md
             variant: cuda
             build_args: |
               BASE_IMAGE=nvidia/cuda:13.3.0-devel-ubuntu24.04
@@ -48,6 +52,8 @@ jobs:
               EXTRA_PIP_PACKAGES=jsonschema
           - runtime_id: llm-llama-cpp
             image_name: aileron-runtime-llm-llama-cpp
+            description: Aileron llama.cpp runtime for local text generation.
+            documentation_path: runtimes/llm-llama-cpp/README.md
             variant: rocm
             build_args: |
               BASE_IMAGE=rocm/dev-ubuntu-22.04:7.2.4
@@ -62,6 +68,8 @@ jobs:
               EXTRA_PIP_PACKAGES=jsonschema
           - runtime_id: llm-llama-cpp
             image_name: aileron-runtime-llm-llama-cpp
+            description: Aileron llama.cpp runtime for local text generation.
+            documentation_path: runtimes/llm-llama-cpp/README.md
             variant: vulkan
             build_args: |
               APT_PACKAGES=build-essential cmake git ninja-build libvulkan-dev glslc glslang-tools spirv-headers vulkan-tools libvulkan1 mesa-vulkan-drivers
@@ -72,6 +80,8 @@ jobs:
               EXTRA_PIP_PACKAGES=jsonschema
           - runtime_id: vision-llama-cpp-gemma4
             image_name: aileron-runtime-vision-llama-cpp-gemma4
+            description: Aileron Gemma 4 vision runtime using llama.cpp.
+            documentation_path: runtimes/vision-llama-cpp-gemma4/README.md
             variant: cpu
             build_args: |
               RUNTIME_ID=vision-llama-cpp-gemma4
@@ -80,6 +90,8 @@ jobs:
               INSTALL_SOURCE=git
           - runtime_id: vision-llama-cpp-gemma4
             image_name: aileron-runtime-vision-llama-cpp-gemma4
+            description: Aileron Gemma 4 vision runtime using llama.cpp.
+            documentation_path: runtimes/vision-llama-cpp-gemma4/README.md
             variant: cuda
             build_args: |
               BASE_IMAGE=nvidia/cuda:13.3.0-devel-ubuntu24.04
@@ -93,6 +105,8 @@ jobs:
               INSTALL_SOURCE=git
           - runtime_id: vision-llama-cpp-gemma4
             image_name: aileron-runtime-vision-llama-cpp-gemma4
+            description: Aileron Gemma 4 vision runtime using llama.cpp.
+            documentation_path: runtimes/vision-llama-cpp-gemma4/README.md
             variant: rocm
             build_args: |
               BASE_IMAGE=rocm/dev-ubuntu-22.04:7.2.4
@@ -107,6 +121,8 @@ jobs:
               INSTALL_SOURCE=git
           - runtime_id: vision-llama-cpp-gemma4
             image_name: aileron-runtime-vision-llama-cpp-gemma4
+            description: Aileron Gemma 4 vision runtime using llama.cpp.
+            documentation_path: runtimes/vision-llama-cpp-gemma4/README.md
             variant: vulkan
             build_args: |
               APT_PACKAGES=build-essential cmake git ninja-build libvulkan-dev glslc glslang-tools spirv-headers vulkan-tools libvulkan1 mesa-vulkan-drivers
@@ -147,6 +163,8 @@ jobs:
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.title=${{ matrix.image_name }}
             org.opencontainers.image.version=${{ matrix.variant }}
+            org.opencontainers.image.description=${{ matrix.description }}
+            org.opencontainers.image.documentation=${{ github.server_url }}/${{ github.repository }}/blob/${{ github.ref_name }}/${{ matrix.documentation_path }}
           cache-from: type=gha,scope=${{ matrix.image_name }}-${{ matrix.variant }}
           cache-to: type=gha,mode=max,scope=${{ matrix.image_name }}-${{ matrix.variant }}
 
@@ -159,21 +177,29 @@ jobs:
         include:
           - runtime_id: asr-whisper-cpp
             image_name: aileron-runtime-asr-whisper-cpp
+            description: Aileron Whisper.cpp runtime for local speech transcription.
+            documentation_path: runtimes/asr-whisper-cpp/README.md
             variant: cpu
             context: runtimes/asr-whisper-cpp
             file: runtimes/asr-whisper-cpp/Dockerfile
           - runtime_id: asr-whisper-cpp
             image_name: aileron-runtime-asr-whisper-cpp
+            description: Aileron Whisper.cpp runtime for local speech transcription.
+            documentation_path: runtimes/asr-whisper-cpp/README.md
             variant: cuda
             context: runtimes/asr-whisper-cpp
             file: runtimes/asr-whisper-cpp/Dockerfile.cuda
           - runtime_id: asr-whisper-cpp
             image_name: aileron-runtime-asr-whisper-cpp
+            description: Aileron Whisper.cpp runtime for local speech transcription.
+            documentation_path: runtimes/asr-whisper-cpp/README.md
             variant: vulkan
             context: runtimes/asr-whisper-cpp
             file: runtimes/asr-whisper-cpp/Dockerfile.vulkan
           - runtime_id: stub
             image_name: aileron-runtime-stub
+            description: Aileron stub runtime for development and protocol testing.
+            documentation_path: runtimes/stub/README.md
             variant: cpu
             context: runtimes/stub
             file: runtimes/stub/Dockerfile
@@ -207,5 +233,7 @@ jobs:
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.title=${{ matrix.image_name }}
             org.opencontainers.image.version=${{ matrix.variant }}
+            org.opencontainers.image.description=${{ matrix.description }}
+            org.opencontainers.image.documentation=${{ github.server_url }}/${{ github.repository }}/blob/${{ github.ref_name }}/${{ matrix.documentation_path }}
           cache-from: type=gha,scope=${{ matrix.image_name }}-${{ matrix.variant }}
           cache-to: type=gha,mode=max,scope=${{ matrix.image_name }}-${{ matrix.variant }}

@@ -56,7 +56,7 @@ pub fn detect() -> Variant {
         return Variant::Cuda;
     }
     if has_rocm() {
-        info!("hardware variant: rocm (rocm-smi detected GPU)");
+        info!("hardware variant: rocm (ROCm detected)");
         return Variant::Rocm;
     }
     if has_vulkan() {
@@ -98,16 +98,91 @@ fn has_cuda() -> bool {
 }
 
 fn has_rocm() -> bool {
-    run("rocm-smi", &["--showproductname"])
-        .map(|out| {
-            let lower = out.to_lowercase();
-            lower.contains("gpu") || lower.contains("radeon") || lower.contains("gfx")
-        })
-        .unwrap_or(false)
+    has_rocm_device_node()
+        || run("rocm-smi", &["--showproductname"])
+            .map(|out| {
+                let lower = out.to_lowercase();
+                lower.contains("gpu") || lower.contains("radeon") || lower.contains("gfx")
+            })
+            .unwrap_or(false)
+}
+
+#[cfg(target_os = "linux")]
+fn has_rocm_device_node() -> bool {
+    std::path::Path::new("/dev/kfd").exists()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn has_rocm_device_node() -> bool {
+    false
 }
 
 fn has_vulkan() -> bool {
-    run("vulkaninfo", &["--summary"])
-        .map(|out| out.contains("deviceName") || out.contains("deviceType"))
-        .unwrap_or(false)
+    has_dri_render_node()
+        || run("vulkaninfo", &["--summary"])
+            .map(|out| out.contains("deviceName") || out.contains("deviceType"))
+            .unwrap_or(false)
+}
+
+#[cfg(target_os = "linux")]
+fn has_dri_render_node() -> bool {
+    has_dri_render_node_in(std::path::Path::new("/dev/dri"))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn has_dri_render_node() -> bool {
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn has_dri_render_node_in(dir: &std::path::Path) -> bool {
+    std::fs::read_dir(dir)
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.filter_map(Result::ok))
+        .any(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with("renderD"))
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(target_os = "linux")]
+    use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn detects_dri_render_node_for_vulkan() {
+        let temp = test_dir("detects_dri_render_node_for_vulkan");
+        std::fs::create_dir_all(&temp).expect("tempdir");
+        std::fs::File::create(temp.join("renderD128")).expect("render node fixture");
+
+        assert!(has_dri_render_node_in(&temp));
+
+        std::fs::remove_dir_all(temp).expect("cleanup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ignores_non_render_dri_entries() {
+        let temp = test_dir("ignores_non_render_dri_entries");
+        std::fs::create_dir_all(&temp).expect("tempdir");
+        std::fs::File::create(temp.join("card0")).expect("card fixture");
+
+        assert!(!has_dri_render_node_in(&temp));
+
+        std::fs::remove_dir_all(temp).expect("cleanup");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn test_dir(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "aileron-{name}-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ))
+    }
 }
