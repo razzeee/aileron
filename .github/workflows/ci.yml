@@ -86,6 +86,7 @@ jobs:
             git \
             gtk4-devel \
             libadwaita-devel \
+            openssl-devel \
             pkgconf-pkg-config \
             tar \
             xz
