@@ -515,6 +515,8 @@ fn podman_run_args(
 
     if image_ref_uses_tag(image_ref, "cuda") {
         args.push("--device=nvidia.com/gpu=all".to_string());
+        args.push("--env=N_GPU_LAYERS=-1".to_string());
+        args.push("--env=AILERON_DEVICE=cuda".to_string());
     } else if image_ref_uses_tag(image_ref, "rocm") {
         args.extend([
             "--device=/dev/kfd".to_string(),
@@ -522,11 +524,15 @@ fn podman_run_args(
             "--group-add=keep-groups".to_string(),
             "--ipc=host".to_string(),
             "--env=HSA_OVERRIDE_GFX_VERSION=10.3.0".to_string(),
+            "--env=N_GPU_LAYERS=-1".to_string(),
+            "--env=AILERON_DEVICE=rocm".to_string(),
         ]);
     } else if image_ref_uses_tag(image_ref, "vulkan") {
         args.extend([
             "--device=/dev/dri".to_string(),
             "--group-add=keep-groups".to_string(),
+            "--env=N_GPU_LAYERS=-1".to_string(),
+            "--env=AILERON_DEVICE=vulkan".to_string(),
         ]);
     }
 
@@ -879,6 +885,8 @@ mod tests {
         assert!(args.contains(&"--group-add=keep-groups".to_string()));
         assert!(args.contains(&"--ipc=host".to_string()));
         assert!(args.contains(&"--env=HSA_OVERRIDE_GFX_VERSION=10.3.0".to_string()));
+        assert!(args.contains(&"--env=N_GPU_LAYERS=-1".to_string()));
+        assert!(args.contains(&"--env=AILERON_DEVICE=rocm".to_string()));
         assert_eq!(
             args.last().map(String::as_str),
             Some("localhost/aileron/summarize:rocm")
@@ -900,6 +908,8 @@ mod tests {
         assert!(!args.contains(&"--ipc=host".to_string()));
         assert!(!args.contains(&"--env=HSA_OVERRIDE_GFX_VERSION=10.3.0".to_string()));
         assert!(!args.contains(&"--group-add=keep-groups".to_string()));
+        assert!(args.contains(&"--env=N_GPU_LAYERS=-1".to_string()));
+        assert!(args.contains(&"--env=AILERON_DEVICE=cuda".to_string()));
     }
 
     #[test]
@@ -917,6 +927,8 @@ mod tests {
         assert!(!args.contains(&"--device=nvidia.com/gpu=all".to_string()));
         assert!(!args.contains(&"--ipc=host".to_string()));
         assert!(!args.contains(&"--env=HSA_OVERRIDE_GFX_VERSION=10.3.0".to_string()));
+        assert!(args.contains(&"--env=N_GPU_LAYERS=-1".to_string()));
+        assert!(args.contains(&"--env=AILERON_DEVICE=vulkan".to_string()));
     }
 
     #[test]
@@ -934,6 +946,12 @@ mod tests {
         assert!(!args.contains(&"--ipc=host".to_string()));
         assert!(!args.contains(&"--env=HSA_OVERRIDE_GFX_VERSION=10.3.0".to_string()));
         assert!(!args.contains(&"--group-add=keep-groups".to_string()));
+        assert!(!args.contains(&"--env=N_GPU_LAYERS=-1".to_string()));
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg.starts_with("--env=AILERON_DEVICE="))
+        );
     }
 
     #[test]
@@ -952,6 +970,40 @@ mod tests {
         assert_eq!(
             args.last().map(String::as_str),
             Some("localhost/aileron/vision:cpu")
+        );
+    }
+
+    #[test]
+    fn runtime_options_can_override_accelerator_defaults() {
+        let mut runtime_options = HashMap::new();
+        runtime_options.insert("N_GPU_LAYERS".to_string(), "16".to_string());
+        runtime_options.insert("AILERON_DEVICE".to_string(), "cpu".to_string());
+
+        let args = podman_run_args(
+            "localhost/aileron/llm:cuda",
+            Path::new("/models/foo"),
+            &runtime_options,
+            "8g",
+        );
+
+        let n_gpu_layers: Vec<_> = args
+            .iter()
+            .filter(|arg| arg.starts_with("--env=N_GPU_LAYERS="))
+            .map(String::as_str)
+            .collect();
+        let devices: Vec<_> = args
+            .iter()
+            .filter(|arg| arg.starts_with("--env=AILERON_DEVICE="))
+            .map(String::as_str)
+            .collect();
+
+        assert_eq!(
+            n_gpu_layers,
+            ["--env=N_GPU_LAYERS=-1", "--env=N_GPU_LAYERS=16"]
+        );
+        assert_eq!(
+            devices,
+            ["--env=AILERON_DEVICE=cuda", "--env=AILERON_DEVICE=cpu"]
         );
     }
 
