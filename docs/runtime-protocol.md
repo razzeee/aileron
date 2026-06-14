@@ -102,11 +102,12 @@ Request:
 {
   "id": "request-id",
   "type": "transcribe",
-  "audio": "base64-encoded-audio"
+  "audio": "base64-encoded-audio",
+  "language_hint": "en"
 }
 ```
 
-Audio is raw PCM bytes encoded as base64. The current portal-facing API documents 16 kHz mono `f32le` input.
+Audio is raw PCM bytes encoded as base64. The current portal-facing API documents 16 kHz mono `f32le` input. `language_hint` is optional and omitted when the caller leaves the hint unspecified.
 
 Response uses the same token stream shape as text generation:
 

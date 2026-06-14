@@ -94,6 +94,7 @@ def pcm_f32le_to_wav(raw_bytes: bytes, sample_rate: int = 16000) -> str:
 def handle_transcribe(model: Model, req: dict) -> None:
     req_id    = req["id"]
     audio_b64 = req.get("audio", "")
+    language_hint = req.get("language_hint", "")
 
     try:
         raw_pcm = base64.b64decode(audio_b64)
@@ -103,7 +104,7 @@ def handle_transcribe(model: Model, req: dict) -> None:
 
     wav_path = pcm_f32le_to_wav(raw_pcm)
     try:
-        segments = model.transcribe(wav_path)
+        segments = model.transcribe(wav_path, language=language_hint or None)
         for seg in segments:
             text = seg.text if hasattr(seg, "text") else str(seg)
             send({"id": req_id, "token": text})

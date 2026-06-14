@@ -1232,7 +1232,7 @@ fn summarize_streaming(text: &str, tx: std::sync::mpsc::Sender<DemoEvent>) -> an
     let mut token_iter = sig_proxy.receive_signal("TokenReceived")?;
 
     // StreamResponse returns immediately; tokens arrive as D-Bus signals.
-    let options = (512_i64, 0.7_f64, "default");
+    let options = (512_i64, 0.7_f64, "default", "", "");
     tx.send(DemoEvent::Phase(DemoPhase::RequestingStream))?;
     let _: () = proxy.call("StreamResponse", &(&session_id, &prompt, options))?;
 
@@ -1297,7 +1297,7 @@ fn summarize_guided(text: &str, tx: std::sync::mpsc::Sender<DemoEvent>) -> anyho
             true,
         ),
     ];
-    let options = (512_i64, 0.2_f64, "default");
+    let options = (512_i64, 0.2_f64, "default", "", "");
 
     tx.send(DemoEvent::Phase(DemoPhase::WaitingForModel))?;
     tx.send(DemoEvent::Phase(DemoPhase::RequestingGuided))?;
@@ -1344,7 +1344,7 @@ fn transcribe_recording(
     tx.send(SpeechEvent::Phase(SpeechPhase::LoadingModel))?;
     tx.send(SpeechEvent::Phase(SpeechPhase::Transcribing))?;
     let audio_b64 = base64_encode(&audio);
-    let transcript: String = proxy.call("Transcribe", &(&session_id, &audio_b64))?;
+    let transcript: String = proxy.call("Transcribe", &(&session_id, &audio_b64, ""))?;
     tx.send(SpeechEvent::Transcript(transcript))?;
 
     let _: () = proxy.call("EndSession", &(&session_id,))?;

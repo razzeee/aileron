@@ -319,7 +319,7 @@ Create sessions, generate text, get structured JSON output, transcribe audio, de
 
 ```varlink
 type ModelAvailability (is_available: bool, reason: string)
-type GenerationOptions (maximum_response_tokens: int, temperature: float, sampling_mode: string)
+type GenerationOptions (maximum_response_tokens: int, temperature: float, sampling_mode: string, source_language_hint: string, target_language_hint: string)
 type GuidedField (name: string, kind: string, description: string, required: bool)
 
 method GetUseCaseAvailability(app_id: string, use_case: string) -> (availability: ModelAvailability)
@@ -328,14 +328,14 @@ method Prewarm(session_id: string, prompt_prefix: string) -> ()
 method Respond(session_id: string, prompt: string, options: GenerationOptions) -> (content: string)
 method StreamResponse(session_id: string, prompt: string, options: GenerationOptions) -> (token: string)
 method RespondGuided(session_id: string, prompt: string, fields: []GuidedField, options: GenerationOptions) -> (content: string)
-method Transcribe(session_id: string, audio: string) -> (text: string)
+method Transcribe(session_id: string, audio: string, language_hint: string) -> (text: string)
 method Describe(session_id: string, image: string) -> (text: string)
 method EndSession(session_id: string) -> ()
 ```
 
 `instructions` are stored on the session and forwarded to text containers as the container `system` prompt. `audio` is raw 16 kHz mono f32le PCM bytes encoded as base64. `image` is PNG or JPEG bytes encoded as base64.
 
-`GenerationOptions.maximum_response_tokens` must be greater than zero and fit in `u32`. `temperature` must be finite and non-negative. `sampling_mode` must be non-empty; today the daemon validates it but only forwards `maximum_response_tokens` to containers as `max_tokens`.
+`GenerationOptions.maximum_response_tokens` must be greater than zero and fit in `u32`. `temperature` must be finite and non-negative. `sampling_mode` must be non-empty. `source_language_hint` and `target_language_hint` are optional strings for `llm.translate`; pass empty strings when unspecified. Today the daemon validates sampling fields, forwards `maximum_response_tokens` to containers as `max_tokens`, and folds translation hints into the session instructions for `llm.translate`.
 
 `GuidedField.kind` supports `string`, `number`, `integer`, `boolean`, and `string_array`. The daemon converts guided fields into a JSON Schema object with `additionalProperties: false`, sends it to the container as `response_format.schema`, then validates the returned JSON before replying.
 
@@ -385,14 +385,14 @@ The portal does not talk to containers directly. It translates D-Bus calls into 
 | `GetUseCaseAvailability` | `app_id: s, use_case: s` | `(is_available: b, reason: s)` | Checks whether an assigned profile has local artifacts and a runtime image |
 | `CreateSession` | `app_id: s, use_case: s, instructions: s` | `session_id: s` | Creates a session bound to the assigned profile; does not start the container by itself |
 | `Prewarm` | `session_id: s, prompt_prefix: s` | `()` | Starts the backing container before the first response |
-| `Respond` | `session_id: s, prompt: s, options: (xds)` | `content: s` | Returns full generated text |
-| `StreamResponse` | `session_id: s, prompt: s, options: (xds)` | `()` | Emits `TokenReceived` signals; final token has `done=true` |
-| `RespondGuided` | `session_id: s, prompt: s, fields: a(sssb), options: (xds)` | `content: s` | LLM sessions only; returns JSON matching guided output fields |
-| `Transcribe` | `session_id: s, audio_b64: s` | `text: s` | 16 kHz mono f32le PCM, base64 |
+| `Respond` | `session_id: s, prompt: s, options: (xdsss)` | `content: s` | Returns full generated text |
+| `StreamResponse` | `session_id: s, prompt: s, options: (xdsss)` | `()` | Emits `TokenReceived` signals; final token has `done=true` |
+| `RespondGuided` | `session_id: s, prompt: s, fields: a(sssb), options: (xdsss)` | `content: s` | LLM sessions only; returns JSON matching guided output fields |
+| `Transcribe` | `session_id: s, audio_b64: s, language_hint: s` | `text: s` | 16 kHz mono f32le PCM, base64; empty hint means auto-detect/no hint |
 | `Describe` | `session_id: s, image_b64: s` | `text: s` | PNG or JPEG, base64 |
 | `EndSession` | `session_id: s` | `()` | |
 
-`options: (xds)` is `GenerationOptions`: `maximum_response_tokens` as int64, `temperature` as float64, and `sampling_mode` as string. `fields: a(sssb)` is an array of `GuidedField`: name, kind, description, required.
+`options: (xdsss)` is `GenerationOptions`: `maximum_response_tokens` as int64, `temperature` as float64, `sampling_mode` as string, `source_language_hint` as string, and `target_language_hint` as string. Empty language hints mean unspecified. The language hints only affect `llm.translate`. `fields: a(sssb)` is an array of `GuidedField`: name, kind, description, required.
 
 ### Signals
 
@@ -438,6 +438,7 @@ Each OCI image implements a simple newline-delimited JSON protocol over stdin/st
 | `prompt` | string | `generate`, `generate_structured`, optionally `describe` | User prompt or image prompt |
 | `max_tokens` | number | `generate`, `generate_structured`, optionally `describe` | Derived from `GenerationOptions.maximum_response_tokens` for text requests |
 | `audio` | string | `transcribe` | Base64-encoded raw PCM bytes, 16 kHz mono f32le |
+| `language_hint` | string | `transcribe` | Optional spoken language hint; omitted when unspecified |
 | `image` | string | `describe` | Base64-encoded PNG or JPEG bytes |
 | `response_format` | object | `generate_structured` | `{ "type": "json_schema", "schema": ... }` |
 

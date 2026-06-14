@@ -40,6 +40,8 @@ struct GenerationOptionsDbus {
     maximum_response_tokens: i64,
     temperature: f64,
     sampling_mode: String,
+    source_language_hint: String,
+    target_language_hint: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -244,14 +246,23 @@ impl AiPortalBackend {
         Ok(reply.content)
     }
 
-    async fn transcribe(&self, session_id: &str, audio_b64: &str) -> zbus::fdo::Result<String> {
+    async fn transcribe(
+        &self,
+        session_id: &str,
+        audio_b64: &str,
+        language_hint: &str,
+    ) -> zbus::fdo::Result<String> {
         use aileron_varlink::aileron_Inference::VarlinkClientInterface;
 
         let conn =
             aileron_ipc::client::connect().map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn);
         let reply = client
-            .transcribe(session_id.to_string(), audio_b64.to_string())
+            .transcribe(
+                session_id.to_string(),
+                audio_b64.to_string(),
+                language_hint.to_string(),
+            )
             .call()
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         Ok(reply.text)
@@ -327,6 +338,8 @@ impl GenerationOptionsDbus {
             maximum_response_tokens: self.maximum_response_tokens,
             temperature: self.temperature,
             sampling_mode: self.sampling_mode,
+            source_language_hint: self.source_language_hint,
+            target_language_hint: self.target_language_hint,
         }
     }
 }
