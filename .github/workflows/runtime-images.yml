@@ -155,7 +155,7 @@ jobs:
               EXTRA_PIP_PACKAGES=jsonschema
 
     steps:
-      - uses: actions/checkout@v6.0.3
+      - uses: actions/checkout@v6
 
       - name: Compute image namespace
         run: echo "IMAGE_NAMESPACE=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_ENV"
@@ -240,7 +240,7 @@ jobs:
             context: runtimes/stub
             file: runtimes/stub/Dockerfile
     steps:
-      - uses: actions/checkout@v6.0.3
+      - uses: actions/checkout@v6
 
       - name: Compute image namespace
         run: echo "IMAGE_NAMESPACE=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_ENV"
