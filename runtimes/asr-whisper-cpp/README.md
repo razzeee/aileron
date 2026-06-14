@@ -101,5 +101,6 @@ Aileron derives the filename, model ID, and profile ID from the URL and checksum
 
 | Variable | Default | Description |
 |---|---|---|
-| `MODEL_DIR` | `/model` | Directory containing the mounted Whisper artifact |
+| `MODEL_PATH` | `/model/model.bin` | Path to the mounted Whisper artifact |
 | `AILERON_DEVICE` | auto | Override device detection inside the runtime (`cpu`, `cuda`, or `vulkan`) |
+| `N_THREADS` | host CPU count | Number of CPU threads passed to whisper.cpp |

@@ -7,27 +7,26 @@ Reads newline-delimited JSON requests from stdin, writes responses to stdout.
 Supported request types:
   transcribe  – transcribe base64-encoded raw PCM (16 kHz mono f32le)
 
-GPU auto-detection order (highest priority first):
-  1. N_GPU_LAYERS env var set explicitly → use as-is
-  2. CUDA device present                → offload all layers
-  3. Vulkan device present              → offload all layers
-  4. No accelerator found               → CPU only
+Device auto-detection order (highest priority first):
+  1. AILERON_DEVICE env var set explicitly → use as-is
+  2. CUDA device present                   → enable whisper.cpp GPU context
+  3. Vulkan device present                 → enable whisper.cpp GPU context
+  4. No accelerator found                  → CPU only
 """
 
 import base64
 import json
 import os
 import shutil
-import struct
 import subprocess
 import sys
-import tempfile
 import traceback
-import wave
 
+import numpy as np
 from pywhispercpp.model import Model
 
 MODEL_PATH = os.environ.get("MODEL_PATH", "/model/model.bin")
+N_THREADS = int(os.environ.get("N_THREADS", str(os.cpu_count() or 4)))
 
 
 def detect_device() -> str:
@@ -60,15 +59,36 @@ def detect_device() -> str:
         except Exception:
             pass
 
+    if has_dri_render_node():
+        sys.stderr.write("[aileron-asr] Vulkan render node detected\n")
+        return "vulkan"
+
     sys.stderr.write("[aileron-asr] no GPU detected — using CPU\n")
     return "cpu"
 
 
+def has_dri_render_node() -> bool:
+    dri_dir = "/dev/dri"
+    try:
+        return any(name.startswith("renderD") for name in os.listdir(dri_dir))
+    except OSError:
+        return False
+
+
 def load_model() -> Model:
     device = detect_device()
-    sys.stderr.write(f"[aileron-asr] loading whisper model: {MODEL_PATH} (device={device})\n")
+    use_gpu = device != "cpu"
+    sys.stderr.write(
+        f"[aileron-asr] loading whisper model: {MODEL_PATH} "
+        f"(device={device}, use_gpu={use_gpu}, threads={N_THREADS})\n"
+    )
     sys.stderr.flush()
-    return Model(MODEL_PATH)
+    return Model(
+        MODEL_PATH,
+        n_threads=N_THREADS,
+        context_params={"use_gpu": use_gpu},
+        print_progress=False,
+    )
 
 
 def send(obj: dict) -> None:
@@ -76,19 +96,11 @@ def send(obj: dict) -> None:
     sys.stdout.flush()
 
 
-def pcm_f32le_to_wav(raw_bytes: bytes, sample_rate: int = 16000) -> str:
-    """Wrap raw f32le PCM in a WAV container that whisper.cpp can read."""
-    num_frames = len(raw_bytes) // 4
-    samples = struct.unpack(f"{num_frames}f", raw_bytes)
-    int16_samples = [max(-32768, min(32767, int(s * 32767))) for s in samples]
-
-    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-    with wave.open(tmp.name, "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(sample_rate)
-        wf.writeframes(struct.pack(f"{num_frames}h", *int16_samples))
-    return tmp.name
+def decode_pcm_f32le(raw_bytes: bytes) -> np.ndarray:
+    """Decode raw 16 kHz mono f32le PCM for pywhispercpp without temp WAV I/O."""
+    if len(raw_bytes) % 4 != 0:
+        raise ValueError("audio byte length is not a multiple of f32 sample size")
+    return np.frombuffer(raw_bytes, dtype=np.float32).copy()
 
 
 def handle_transcribe(model: Model, req: dict) -> None:
@@ -102,15 +114,15 @@ def handle_transcribe(model: Model, req: dict) -> None:
         send({"id": req_id, "error": "invalid_audio", "reason": str(e)})
         return
 
-    wav_path = pcm_f32le_to_wav(raw_pcm)
     try:
-        segments = model.transcribe(wav_path, language=language_hint or None)
+        audio = decode_pcm_f32le(raw_pcm)
+        segments = model.transcribe(audio, language=language_hint or None)
         for seg in segments:
             text = seg.text if hasattr(seg, "text") else str(seg)
             send({"id": req_id, "token": text})
         send({"id": req_id, "done": True})
-    finally:
-        os.unlink(wav_path)
+    except ValueError as e:
+        send({"id": req_id, "error": "invalid_audio", "reason": str(e)})
 
 
 def main() -> None:
