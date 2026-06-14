@@ -1,0 +1,41 @@
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "dependencies"
+      - "github-actions"
+
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "dependencies"
+      - "rust"
+
+  - package-ecosystem: "docker"
+    directory: "/runtimes"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "dependencies"
+      - "container-images"
+
+  - package-ecosystem: "docker"
+    directory: "/runtimes/asr-whisper-cpp"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "dependencies"
+      - "container-images"
+
+  - package-ecosystem: "docker"
+    directory: "/runtimes/stub"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "dependencies"
+      - "container-images"
