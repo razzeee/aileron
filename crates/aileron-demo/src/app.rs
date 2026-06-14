@@ -744,7 +744,11 @@ fn append_chat_bubble(chat_box: &Box, role: &str, content: &str) {
     let is_assistant = role == "assistant";
     let row = Box::new(Orientation::Horizontal, 0);
     row.set_hexpand(true);
-    row.set_halign(if is_assistant { Align::Start } else { Align::End });
+    row.set_halign(if is_assistant {
+        Align::Start
+    } else {
+        Align::End
+    });
     row.set_margin_top(2);
     row.set_margin_bottom(2);
 
