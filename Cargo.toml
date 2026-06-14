@@ -33,7 +33,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 varlink           = "13"
 varlink_generator = "13"
 
-zbus   = { version = "4", features = ["tokio"] }
+zbus   = { version = "5", features = ["tokio"] }
 gtk4       = { version = "0.11", features = ["v4_12"] }
 libadwaita = { version = "0.9", features = ["v1_9"] }
 glib       = "0.22"
