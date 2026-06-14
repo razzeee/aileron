@@ -2,6 +2,7 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::process::Command;
 use std::sync::Mutex;
 use tracing::info;
 use zbus::zvariant::Type;
@@ -102,14 +103,34 @@ impl AiPortalBackend {
         let conn =
             aileron_ipc::client::connect().map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn);
-        let reply = client
+        let reply = match client
             .create_session(
                 app_id.to_string(),
                 use_case.to_string(),
                 instructions.to_string(),
             )
             .call()
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        {
+            Ok(reply) => reply,
+            Err(e) if is_permission_denied(&e) => {
+                if !prompt_permission(app_id, use_case)? {
+                    set_permission(app_id, use_case, false)?;
+                    return Err(zbus::fdo::Error::AccessDenied(format!(
+                        "Permission denied for {app_id} / {use_case}"
+                    )));
+                }
+                set_permission(app_id, use_case, true)?;
+                client
+                    .create_session(
+                        app_id.to_string(),
+                        use_case.to_string(),
+                        instructions.to_string(),
+                    )
+                    .call()
+                    .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?
+            }
+            Err(e) => return Err(zbus::fdo::Error::Failed(e.to_string())),
+        };
 
         self.session_use_cases
             .lock()
@@ -415,6 +436,54 @@ impl AiPortalBackend {
         self.session_use_cases.lock().unwrap().remove(session_id);
         Ok(())
     }
+}
+
+fn is_permission_denied(error: &impl std::fmt::Display) -> bool {
+    error.to_string().contains("PermissionDenied")
+}
+
+fn set_permission(app_id: &str, use_case: &str, allowed: bool) -> zbus::fdo::Result<()> {
+    use aileron_varlink::aileron_Permissions::VarlinkClientInterface;
+
+    let conn =
+        aileron_ipc::client::connect().map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+    let mut client = aileron_varlink::aileron_Permissions::VarlinkClient::new(conn);
+    client
+        .set_app_permission(app_id.to_string(), use_case.to_string(), allowed)
+        .call()
+        .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+    Ok(())
+}
+
+fn prompt_permission(app_id: &str, use_case: &str) -> zbus::fdo::Result<bool> {
+    let text = format!(
+        "Allow {app_id} to use local AI for {use_case}?\n\nAileron will process this request locally using the assigned model."
+    );
+
+    if let Ok(status) = Command::new("zenity")
+        .args([
+            "--question",
+            "--title=Aileron Permission Request",
+            "--ok-label=Allow",
+            "--cancel-label=Deny",
+            "--text",
+            &text,
+        ])
+        .status()
+    {
+        return Ok(status.success());
+    }
+
+    if let Ok(status) = Command::new("kdialog")
+        .args(["--title", "Aileron Permission Request", "--yesno", &text])
+        .status()
+    {
+        return Ok(status.success());
+    }
+
+    Err(zbus::fdo::Error::Failed(
+        "No permission prompt helper found; install zenity or kdialog, grant permission in the Aileron Permissions page, or start the daemon with AILERON_AUTO_GRANT=true for development".to_string(),
+    ))
 }
 
 impl AiPortalBackend {
