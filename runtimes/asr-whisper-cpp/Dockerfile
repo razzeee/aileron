@@ -11,6 +11,8 @@ RUN pip install --no-cache-dir "pywhispercpp>=1.2.0"
 
 COPY entrypoint.py /entrypoint.py
 
-LABEL aileron.runtime_id="asr-whisper-cpp"
+LABEL org.aileron.runtime="true" \
+      org.aileron.runtime_id="asr-whisper-cpp" \
+      org.aileron.variant="cpu"
 
 ENTRYPOINT ["python", "/entrypoint.py"]

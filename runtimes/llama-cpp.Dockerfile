@@ -2,6 +2,7 @@ ARG BASE_IMAGE="python:3.12-slim"
 FROM ${BASE_IMAGE}
 
 ARG RUNTIME_ID
+ARG RUNTIME_VARIANT="cpu"
 ARG ENTRYPOINT_PATH
 ARG INSTALL_SOURCE="pypi"
 ARG LLAMA_CPP_PYTHON_REF="b5eefc82e0fd415d5547c81367c29b159c0268d3"
@@ -44,6 +45,8 @@ RUN if [ "$INSTALL_SOURCE" = "git" ]; then \
 COPY runtimes/_llama_cpp_common/aileron_runtime_common.py /aileron_runtime_common.py
 COPY ${ENTRYPOINT_PATH} /entrypoint.py
 
-LABEL aileron.runtime_id="${RUNTIME_ID}"
+LABEL org.aileron.runtime="true" \
+      org.aileron.runtime_id="${RUNTIME_ID}" \
+      org.aileron.variant="${RUNTIME_VARIANT}"
 
 ENTRYPOINT ["python", "/entrypoint.py"]
