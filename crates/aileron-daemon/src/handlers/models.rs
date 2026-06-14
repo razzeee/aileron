@@ -203,12 +203,7 @@ impl VarlinkInterface for ModelsHandler {
                         .iter()
                         .map(|(profile_id, install)| (profile_id, install)),
                 )
-                .chain(
-                    guard
-                        .runtime_downloads
-                        .iter()
-                        .map(|(image_ref, install)| (image_ref, install)),
-                )
+                .chain(guard.runtime_downloads.iter())
                 .chain(
                     guard
                         .recent_runtime_downloads

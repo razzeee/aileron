@@ -68,13 +68,29 @@ jobs:
           -- -D warnings
 
   # ── GTK crates ──────────────────────────────────────────────────────────────
-  # Installs libgtk-4-dev and libadwaita-1-dev, then checks and clips the UI
-  # binaries.  Tests are skipped here because they require a running display.
+  # Runs inside Fedora because Ubuntu 24.04 only ships libadwaita 1.5, while the
+  # UI uses newer libadwaita APIs. Tests are skipped because they need a display.
   gtk:
     name: GTK — check / clippy
     runs-on: ubuntu-24.04
+    container: fedora:latest
 
     steps:
+      - name: Install Fedora build deps
+        run: |
+          dnf install -y \
+            ca-certificates \
+            curl \
+            dbus-devel \
+            gcc \
+            git \
+            gtk4-devel \
+            libadwaita-devel \
+            openssl-devel \
+            pkgconf-pkg-config \
+            tar \
+            xz
+
       - uses: actions/checkout@v4
 
       - name: Install Rust stable
@@ -90,17 +106,8 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: gtk-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: gtk-${{ runner.os }}-
-
-      - name: Install GTK system deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libgtk-4-dev \
-            libadwaita-1-dev \
-            libdbus-1-dev \
-            pkg-config
+          key: gtk-fedora-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: gtk-fedora-${{ runner.os }}-
 
       - name: cargo check (all crates)
         run: cargo check --workspace
