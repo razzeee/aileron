@@ -181,7 +181,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=${{ matrix.image_name }}-${{ matrix.variant }}
 
       - name: Scan image for vulnerabilities
-        uses: aquasecurity/trivy-action@v0.33.1
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: ghcr.io/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image_name }}:${{ github.sha }}-${{ matrix.variant }}
           format: table
@@ -264,7 +264,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=${{ matrix.image_name }}-${{ matrix.variant }}
 
       - name: Scan image for vulnerabilities
-        uses: aquasecurity/trivy-action@v0.33.1
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: ghcr.io/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image_name }}:${{ github.sha }}-${{ matrix.variant }}
           format: table
