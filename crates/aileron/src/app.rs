@@ -1,7 +1,7 @@
 use gtk4::prelude::*;
 use libadwaita::{Application, ApplicationWindow, HeaderBar, ToolbarView, ViewStack, ViewSwitcher};
 
-use crate::pages::{activity_page, models_page, permissions_page};
+use crate::pages::{activity_page, models_page, permissions_page, runtimes_page};
 
 pub fn build_app() -> Application {
     let app = Application::builder()
@@ -28,6 +28,9 @@ fn build_window(app: &Application) {
         "Permissions",
     );
     perms_page.set_icon_name(Some("system-lock-screen-symbolic"));
+
+    let runtimes_page = stack.add_titled(&runtimes_page::build(), Some("runtimes"), "Runtimes");
+    runtimes_page.set_icon_name(Some("package-x-generic-symbolic"));
 
     let activity_page = stack.add_titled(&activity_page::build(), Some("activity"), "Activity");
     activity_page.set_icon_name(Some("emblem-synchronizing-symbolic"));
