@@ -32,6 +32,12 @@
 ///   {"id":"<uuid>","type":"describe","image":"<base64 PNG/JPEG>"}
 /// Response (same as generate):
 ///   {"id":"<uuid>","token":"A cat sitting...","done":true}
+///
+/// ### Image segmentation
+/// Request:
+///   {"id":"<uuid>","type":"segment","image":"<base64 PNG/JPEG>"}
+/// Response (single line, no streaming):
+///   {"id":"<uuid>","result":"{\"segments\":[...]}","done":true}
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -64,6 +70,16 @@ pub struct Container {
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct VisionSegment {
+    pub label: String,
+    pub confidence: f64,
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
 }
 
 impl Container {
@@ -366,6 +382,44 @@ impl Container {
         self.read_text_response(&id)
     }
 
+    /// Send a vision segment request and return normalized object boxes.
+    pub fn segment(&mut self, image: Vec<u8>) -> Result<Vec<VisionSegment>> {
+        let id = Uuid::new_v4().to_string();
+        let schema = vision_segment_schema();
+        let req = ContainerRequest {
+            id: id.clone(),
+            r#type: "segment".to_string(),
+            system: None,
+            prompt: None,
+            messages: None,
+            max_tokens: None,
+            audio: None,
+            image: Some(base64_encode(&image)),
+            language_hint: None,
+            response_format: None,
+        };
+        let line = serde_json::to_string(&req)? + "\n";
+        self.stdin.write_all(line.as_bytes())?;
+        self.stdin.flush()?;
+        self.last_used = std::time::Instant::now();
+
+        loop {
+            let mut buf = String::new();
+            let n = self.stdout.read_line(&mut buf)?;
+            if n == 0 {
+                bail!("container stdout closed unexpectedly");
+            }
+            let resp: ContainerResponse = serde_json::from_str(buf.trim())?;
+            if resp.id != id {
+                continue;
+            }
+            if let Some(result) = structured_response_result(resp, &schema)? {
+                let value: VisionSegmentResult = serde_json::from_str(&result)?;
+                return Ok(value.segments);
+            }
+        }
+    }
+
     fn read_text_response(&mut self, id: &str) -> Result<String> {
         let mut result = String::new();
         loop {
@@ -406,6 +460,37 @@ fn structured_response_result(resp: ContainerResponse, schema: &Value) -> Result
         bail!("container sent done without a result field");
     }
     Ok(None)
+}
+
+#[derive(Deserialize)]
+struct VisionSegmentResult {
+    segments: Vec<VisionSegment>,
+}
+
+fn vision_segment_schema() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "required": ["segments"],
+        "additionalProperties": false,
+        "properties": {
+            "segments": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["label", "confidence", "x", "y", "width", "height"],
+                    "additionalProperties": false,
+                    "properties": {
+                        "label": { "type": "string" },
+                        "confidence": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+                        "x": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+                        "y": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+                        "width": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+                        "height": { "type": "number", "minimum": 0.0, "maximum": 1.0 }
+                    }
+                }
+            }
+        }
+    })
 }
 
 fn podman_run_args(
@@ -965,6 +1050,11 @@ mod tests {
             .describe(Vec::new())
             .expect("describe through container wrapper");
         assert!(!description.is_empty());
+
+        let segments = container
+            .segment(Vec::new())
+            .expect("segment through container wrapper");
+        assert!(!segments.is_empty());
 
         let _ = std::fs::remove_dir_all(&artifact_path);
     }

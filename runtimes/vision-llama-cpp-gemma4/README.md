@@ -1,6 +1,6 @@
 # Vision Runtime
 
-This runtime runs llama.cpp through `llama-cpp-python` and implements both text generation and `vision.describe` for a multimodal Gemma GGUF model mounted at `/model/model.gguf` plus a matching projection file mounted at `/model/mmproj.gguf`.
+This runtime runs llama.cpp through `llama-cpp-python` and implements text generation, `vision.describe`, and `vision.segment` for a multimodal Gemma GGUF model mounted at `/model/model.gguf` plus a matching projection file mounted at `/model/mmproj.gguf`.
 
 Model weights are not baked into the image. A model manifest downloads and verifies both artifacts, then references this runtime by `runtime_id`.
 
@@ -36,6 +36,7 @@ podman build \
     --build-arg RUNTIME_ID=vision-llama-cpp-gemma4 \
     --build-arg ENTRYPOINT_PATH=runtimes/vision-llama-cpp-gemma4/entrypoint.py \
     --build-arg INSTALL_SOURCE=git \
+    --build-arg EXTRA_PIP_PACKAGES=jsonschema \
     -t docker.io/example/aileron-runtime-vision-llama-cpp-gemma4:cpu \
     .
 
@@ -50,6 +51,7 @@ podman build \
     --build-arg RUNTIME_ID=vision-llama-cpp-gemma4 \
     --build-arg ENTRYPOINT_PATH=runtimes/vision-llama-cpp-gemma4/entrypoint.py \
     --build-arg INSTALL_SOURCE=git \
+    --build-arg EXTRA_PIP_PACKAGES=jsonschema \
     -t docker.io/example/aileron-runtime-vision-llama-cpp-gemma4:cuda \
     .
 
@@ -62,6 +64,7 @@ podman build \
     --build-arg RUNTIME_ID=vision-llama-cpp-gemma4 \
     --build-arg ENTRYPOINT_PATH=runtimes/vision-llama-cpp-gemma4/entrypoint.py \
     --build-arg INSTALL_SOURCE=git \
+    --build-arg EXTRA_PIP_PACKAGES=jsonschema \
     -t docker.io/example/aileron-runtime-vision-llama-cpp-gemma4:rocm \
     .
 
@@ -73,6 +76,7 @@ podman build \
     --build-arg RUNTIME_ID=vision-llama-cpp-gemma4 \
     --build-arg ENTRYPOINT_PATH=runtimes/vision-llama-cpp-gemma4/entrypoint.py \
     --build-arg INSTALL_SOURCE=git \
+    --build-arg EXTRA_PIP_PACKAGES=jsonschema \
     -t docker.io/example/aileron-runtime-vision-llama-cpp-gemma4:vulkan \
     .
 ```
@@ -104,7 +108,7 @@ A model profile points at this runtime and provides both artifact URLs/checksums
   "profile_id": "gemma-4-e4b-it-qat",
   "model_id": "gemma-4-e4b-it-qat",
   "runtime_id": "vision-llama-cpp-gemma4",
-  "use_cases": ["llm.summarize", "vision.describe"],
+  "use_cases": ["llm.summarize", "vision.describe", "vision.segment"],
   "artifacts": [
     {
       "role": "model",
@@ -137,6 +141,7 @@ This runtime needs both `model.gguf` and `mmproj.gguf`, so install it through a 
 | `MODEL_PATH` | `/model/model.gguf` | Path to the mounted multimodal GGUF model file |
 | `MMPROJ_PATH` | `/model/mmproj.gguf` | Path to the mounted projection GGUF file |
 | `VISION_PROMPT` | built-in concise description prompt | Prompt used for `describe` requests |
+| `VISION_SEGMENT_PROMPT` | built-in object box prompt | Prompt used for `segment` requests |
 | `N_CTX` | `4096` | Context window size |
 | `N_GPU_LAYERS` | auto | Layers to offload; auto-detected if unset (`-1` = all) |
 | `N_THREADS` | all cores | CPU threads used when GPU is not available |

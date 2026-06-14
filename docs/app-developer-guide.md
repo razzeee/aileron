@@ -81,7 +81,7 @@ This is appropriate for extraction, classification, and form-filling workflows. 
 
 Use `asr.transcribe` for speech-to-text. Audio is passed as base64-encoded raw PCM bytes through the portal-facing API. `Transcribe` also accepts an optional `language_hint` string; pass an empty string to let the runtime auto-detect or use its default behavior.
 
-Use `vision.describe` for image description. Images are passed as base64-encoded PNG or JPEG bytes.
+Use `vision.describe` for image description. Use `vision.segment` to identify visible objects with normalized rectangular boxes. Images are passed as base64-encoded PNG or JPEG bytes.
 
 Large media inputs can be expensive. Prefer user-initiated actions, visible progress, and cancellation-friendly UI.
 

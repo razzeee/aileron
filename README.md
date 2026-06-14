@@ -295,7 +295,7 @@ Paste or fetch an article URL, then click **Summarize**. Tokens stream into the 
 
 Use-case tokens are the daemon's routing and policy keys. A token maps to one assigned profile, permissions are granted per app and token, and warm containers are pooled per profile. Assigning the same profile to multiple tokens is valid.
 
-Use-cases describe the task intent and modality; methods describe the operation shape. `Respond` and `RespondGuided` are text-generation operations for `llm.*` sessions. `Transcribe` is for `asr.transcribe`; `Describe` is for `vision.describe` and `vision.segment`. There is intentionally no separate `llm.guided` token: guided generation is an output constraint for a real LLM task use-case, not a task intent of its own. Use `llm.analyze` when one guided response combines multiple analytical intents, such as summary, extraction, and classification fields.
+Use-cases describe the task intent and modality; methods describe the operation shape. `Respond` and `RespondGuided` are text-generation operations for `llm.*` sessions. `Transcribe` is for `asr.transcribe`, `Describe` is for `vision.describe`, and `Segment` is for `vision.segment`. There is intentionally no separate `llm.guided` token: guided generation is an output constraint for a real LLM task use-case, not a task intent of its own. Use `llm.analyze` when one guided response combines multiple analytical intents, such as summary, extraction, and classification fields.
 
 | Token | Task | Backend |
 |---|---|---|
@@ -321,6 +321,7 @@ Create sessions, generate text, get structured JSON output, transcribe audio, de
 type ModelAvailability (is_available: bool, reason: string)
 type GenerationOptions (maximum_response_tokens: int, temperature: float, sampling_mode: string, source_language_hint: string, target_language_hint: string)
 type GuidedField (name: string, kind: string, description: string, required: bool)
+type VisionSegment (label: string, confidence: float, x: float, y: float, width: float, height: float)
 
 method GetUseCaseAvailability(app_id: string, use_case: string) -> (availability: ModelAvailability)
 method CreateSession(app_id: string, use_case: string, instructions: string) -> (session_id: string)
@@ -330,10 +331,11 @@ method StreamResponse(session_id: string, prompt: string, options: GenerationOpt
 method RespondGuided(session_id: string, prompt: string, fields: []GuidedField, options: GenerationOptions) -> (content: string)
 method Transcribe(session_id: string, audio: string, language_hint: string) -> (text: string)
 method Describe(session_id: string, image: string) -> (text: string)
+method Segment(session_id: string, image: string) -> (segments: []VisionSegment)
 method EndSession(session_id: string) -> ()
 ```
 
-`instructions` are stored on the session and forwarded to text containers as the container `system` prompt. `audio` is raw 16 kHz mono f32le PCM bytes encoded as base64. `image` is PNG or JPEG bytes encoded as base64.
+`instructions` are stored on the session and forwarded to text containers as the container `system` prompt. `audio` is raw 16 kHz mono f32le PCM bytes encoded as base64. `image` is PNG or JPEG bytes encoded as base64. `VisionSegment` coordinates are normalized `0.0..1.0` rectangles relative to image dimensions.
 
 `GenerationOptions.maximum_response_tokens` must be greater than zero and fit in `u32`. `temperature` must be finite and non-negative. `sampling_mode` must be non-empty. `source_language_hint` and `target_language_hint` are optional strings for `llm.translate`; pass empty strings when unspecified. Today the daemon validates sampling fields, forwards `maximum_response_tokens` to containers as `max_tokens`, and folds translation hints into the session instructions for `llm.translate`.
 
@@ -392,6 +394,7 @@ The portal does not talk to containers directly. It translates D-Bus calls into 
 | `RespondGuided` | `session_id: s, prompt: s, fields: a(sssb), options: (xdsss)` | `content: s` | LLM sessions only; returns JSON matching guided output fields |
 | `Transcribe` | `session_id: s, audio_b64: s, language_hint: s` | `text: s` | 16 kHz mono f32le PCM, base64; empty hint means auto-detect/no hint |
 | `Describe` | `session_id: s, image_b64: s` | `text: s` | PNG or JPEG, base64 |
+| `Segment` | `session_id: s, image_b64: s` | `segments: []VisionSegment` | PNG or JPEG, base64; normalized boxes |
 | `EndSession` | `session_id: s` | `()` | |
 
 These are D-Bus signatures: parentheses define a struct, and `a(...)` means an array of structs. `options: (xdsss)` is `GenerationOptions`: `maximum_response_tokens` as int64, `temperature` as float64, `sampling_mode` as string, `source_language_hint` as string, and `target_language_hint` as string. Empty language hints mean unspecified. The language hints only affect `llm.translate`. `messages: a(ss)` is an array of `ChatMessage` structs: role, content. `fields: a(sssb)` is an array of `GuidedField` structs: name, kind, description, required.
@@ -503,6 +506,16 @@ The daemon sends a `response_format` object containing the caller's JSON Schema.
 
 // response (streamed)
 {"id": "uuid", "token": "A cat", "done": true}
+```
+
+### Image segmentation
+
+```jsonc
+// request
+{"id": "uuid", "type": "segment", "image": "<base64 PNG or JPEG>"}
+
+// response (single line)
+{"id": "uuid", "result": "{\"segments\":[{\"label\":\"cat\",\"confidence\":0.82,\"x\":0.1,\"y\":0.2,\"width\":0.5,\"height\":0.4}]}", "done": true}
 ```
 
 ## Container lifecycle

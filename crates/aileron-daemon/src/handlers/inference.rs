@@ -9,9 +9,9 @@ use crate::state::SharedState;
 // VarlinkCallError is a supertrait; its methods reach us via Call_* dyn objects.
 use aileron_varlink::aileron_Inference::{
     Call_Chat, Call_CreateSession, Call_Describe, Call_EndSession, Call_GetUseCaseAvailability,
-    Call_Prewarm, Call_Respond, Call_RespondGuided, Call_StreamChat, Call_StreamResponse,
-    Call_Transcribe, ChatMessage, GenerationOptions, GuidedField, ModelAvailability,
-    VarlinkCallError, VarlinkInterface,
+    Call_Prewarm, Call_Respond, Call_RespondGuided, Call_Segment, Call_StreamChat,
+    Call_StreamResponse, Call_Transcribe, ChatMessage, GenerationOptions, GuidedField,
+    ModelAvailability, VarlinkCallError, VarlinkInterface, VisionSegment,
 };
 
 pub struct InferenceHandler {
@@ -124,6 +124,9 @@ impl VarlinkInterface for InferenceHandler {
                                 tracing::warn!("failed to persist auto-grant: {e}");
                             }
                         } else {
+                            if let Err(e) = guard.permissions.deny_if_missing(&app_id, &use_case) {
+                                tracing::warn!("failed to persist denied permission: {e}");
+                            }
                             return call.reply_permission_denied(app_id, use_case);
                         }
                     }
@@ -422,7 +425,9 @@ impl VarlinkInterface for InferenceHandler {
             let (app_id, use_case, profile_id, image_ref, artifact_path, runtime_options) =
                 match guard.sessions.get(&session_id) {
                     Some(s) => {
-                        if let Err(reason) = ensure_vision_use_case(&s.use_case) {
+                        if let Err(reason) =
+                            ensure_exact_use_case(&s.use_case, "vision.describe", "Describe")
+                        {
                             return call.reply_model_unavailable(reason);
                         }
                         let (profile_id, image_ref, artifact_path, runtime_options) =
@@ -457,6 +462,72 @@ impl VarlinkInterface for InferenceHandler {
 
             match container.describe(image_bytes) {
                 Ok(text) => call.reply(text),
+                Err(e) => call.reply_generation_failed(e.to_string()),
+            }
+        })
+    }
+
+    fn segment(
+        &self,
+        call: &mut dyn Call_Segment,
+        session_id: String,
+        image: String,
+    ) -> varlink::Result<()> {
+        self.rt.block_on(async {
+            let mut guard = self.state.0.lock().await;
+
+            let (app_id, use_case, profile_id, image_ref, artifact_path, runtime_options) =
+                match guard.sessions.get(&session_id) {
+                    Some(s) => {
+                        if let Err(reason) =
+                            ensure_exact_use_case(&s.use_case, "vision.segment", "Segment")
+                        {
+                            return call.reply_model_unavailable(reason);
+                        }
+                        let (profile_id, image_ref, artifact_path, runtime_options) =
+                            match profile_runtime(&guard, &s.profile_id) {
+                                Ok(resolved) => resolved,
+                                Err(reason) => return call.reply_model_unavailable(reason),
+                            };
+                        (
+                            s.app_id.clone(),
+                            s.use_case.clone(),
+                            profile_id,
+                            image_ref,
+                            artifact_path,
+                            runtime_options,
+                        )
+                    }
+                    None => return call.reply_session_not_found(session_id),
+                };
+
+            let _ = guard.permissions.touch(&app_id, &use_case);
+            let image_bytes = base64_decode(&image).map_err(io_err)?;
+            let container = match guard.containers.get_or_spawn(
+                &profile_id,
+                &image_ref,
+                &artifact_path,
+                &runtime_options,
+                |_| {},
+            ) {
+                Ok(container) => container,
+                Err(e) => return call.reply_generation_failed(e.to_string()),
+            };
+
+            match container.segment(image_bytes) {
+                Ok(segments) => call.reply(
+                    segments
+                        .into_iter()
+                        .map(|segment| VisionSegment {
+                            label: segment.label,
+                            confidence: segment.confidence,
+                            x: segment.x,
+                            y: segment.y,
+                            width: segment.width,
+                            height: segment.height,
+                        })
+                        .collect(),
+                ),
                 Err(e) => call.reply_generation_failed(e.to_string()),
             }
         })
@@ -909,16 +980,6 @@ fn ensure_exact_use_case(use_case: &str, expected: &str, method: &str) -> Result
     } else {
         Err(format!(
             "{method} requires use-case {expected}, got {use_case}"
-        ))
-    }
-}
-
-fn ensure_vision_use_case(use_case: &str) -> Result<(), String> {
-    if matches!(use_case, "vision.describe" | "vision.segment") {
-        Ok(())
-    } else {
-        Err(format!(
-            "Describe requires use-case vision.describe or vision.segment, got {use_case}"
         ))
     }
 }

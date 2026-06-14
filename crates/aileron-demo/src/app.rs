@@ -2,14 +2,19 @@
 use gtk4::prelude::*;
 use gtk4::{
     Align, Box, Button, CheckButton, Entry, FileDialog, Label, Orientation, ScrolledWindow,
-    Spinner, Stack, StackSwitcher, TextBuffer, TextView,
+    Spinner, TextBuffer, TextView,
 };
-use libadwaita::{Application, ApplicationWindow, HeaderBar, ToolbarView};
+use libadwaita::{
+    Application, ApplicationWindow, HeaderBar, OverlaySplitView, ToolbarView, ViewStack,
+    ViewSwitcherSidebar,
+};
+use serde::Deserialize;
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use zbus::zvariant::Type;
 
 pub fn build_app() -> Application {
     let app = Application::builder()
@@ -61,12 +66,24 @@ fn build_window(app: &Application) {
     // Mode switch + action button
     let mode_row = Box::new(Orientation::Horizontal, 8);
     mode_row.append(&Label::builder().label("Mode").xalign(0.0).build());
-    let streaming_mode = CheckButton::with_label("Streaming Summary");
-    streaming_mode.set_active(true);
-    let guided_mode = CheckButton::with_label("Guided JSON");
-    guided_mode.set_group(Some(&streaming_mode));
-    mode_row.append(&streaming_mode);
-    mode_row.append(&guided_mode);
+    let summarize_mode = CheckButton::with_label("Summarize");
+    summarize_mode.set_active(true);
+    let translate_mode = CheckButton::with_label("Translate");
+    translate_mode.set_group(Some(&summarize_mode));
+    let rephrase_mode = CheckButton::with_label("Rephrase");
+    rephrase_mode.set_group(Some(&summarize_mode));
+    let classify_mode = CheckButton::with_label("Classify");
+    classify_mode.set_group(Some(&summarize_mode));
+    let extract_mode = CheckButton::with_label("Extract JSON");
+    extract_mode.set_group(Some(&summarize_mode));
+    let analyze_mode = CheckButton::with_label("Analyze");
+    analyze_mode.set_group(Some(&summarize_mode));
+    mode_row.append(&summarize_mode);
+    mode_row.append(&translate_mode);
+    mode_row.append(&rephrase_mode);
+    mode_row.append(&classify_mode);
+    mode_row.append(&extract_mode);
+    mode_row.append(&analyze_mode);
     text_box.append(&mode_row);
 
     let summarize_button = Button::builder()
@@ -77,7 +94,7 @@ fn build_window(app: &Application) {
 
     {
         let summarize_button = summarize_button.clone();
-        streaming_mode.connect_toggled(move |button| {
+        summarize_mode.connect_toggled(move |button| {
             if button.is_active() {
                 summarize_button.set_label("Summarize");
             }
@@ -86,9 +103,45 @@ fn build_window(app: &Application) {
 
     {
         let summarize_button = summarize_button.clone();
-        guided_mode.connect_toggled(move |button| {
+        translate_mode.connect_toggled(move |button| {
             if button.is_active() {
-                summarize_button.set_label("Generate Guided JSON");
+                summarize_button.set_label("Translate");
+            }
+        });
+    }
+
+    {
+        let summarize_button = summarize_button.clone();
+        rephrase_mode.connect_toggled(move |button| {
+            if button.is_active() {
+                summarize_button.set_label("Rephrase");
+            }
+        });
+    }
+
+    {
+        let summarize_button = summarize_button.clone();
+        classify_mode.connect_toggled(move |button| {
+            if button.is_active() {
+                summarize_button.set_label("Classify");
+            }
+        });
+    }
+
+    {
+        let summarize_button = summarize_button.clone();
+        extract_mode.connect_toggled(move |button| {
+            if button.is_active() {
+                summarize_button.set_label("Extract JSON");
+            }
+        });
+    }
+
+    {
+        let summarize_button = summarize_button.clone();
+        analyze_mode.connect_toggled(move |button| {
+            if button.is_active() {
+                summarize_button.set_label("Analyze");
             }
         });
     }
@@ -120,7 +173,7 @@ fn build_window(app: &Application) {
         .css_classes(vec!["heading"])
         .build();
     let status_detail = Label::builder()
-        .label("Paste article text, then summarize it locally.")
+        .label("Paste text, then run a local LLM task.")
         .xalign(0.0)
         .wrap(true)
         .build();
@@ -135,7 +188,7 @@ fn build_window(app: &Application) {
         .hexpand(true)
         .vexpand(true)
         .build();
-    text_box.append(&Label::builder().label("Summary").xalign(0.0).build());
+    text_box.append(&Label::builder().label("Output").xalign(0.0).build());
     text_box.append(&status_row);
     text_box.append(
         &ScrolledWindow::builder()
@@ -178,17 +231,29 @@ fn build_window(app: &Application) {
         let status_spinner = status_spinner.clone();
         let status_title = status_title.clone();
         let status_detail = status_detail.clone();
-        let guided_mode = guided_mode.clone();
+        let translate_mode = translate_mode.clone();
+        let rephrase_mode = rephrase_mode.clone();
+        let classify_mode = classify_mode.clone();
+        let extract_mode = extract_mode.clone();
+        let analyze_mode = analyze_mode.clone();
         summarize_button.connect_clicked(move |_| {
             let (start, end) = source_buffer.bounds();
             let text = source_buffer.text(&start, &end, false).to_string();
             if text.trim().is_empty() {
                 return;
             }
-            let mode = if guided_mode.is_active() {
-                DemoMode::Guided
+            let mode = if translate_mode.is_active() {
+                DemoMode::Translate
+            } else if rephrase_mode.is_active() {
+                DemoMode::Rephrase
+            } else if classify_mode.is_active() {
+                DemoMode::Classify
+            } else if extract_mode.is_active() {
+                DemoMode::Extract
+            } else if analyze_mode.is_active() {
+                DemoMode::Analyze
             } else {
-                DemoMode::Streaming
+                DemoMode::Summarize
             };
             output_buffer.set_text("");
             summarize_button_for_click.set_sensitive(false);
@@ -237,9 +302,15 @@ fn build_window(app: &Application) {
                                 .set_text("Guided generation returned schema-checked JSON.");
                             output_buffer_clone.set_text(&content);
                         }
+                        Ok(DemoEvent::Text(content)) => {
+                            saw_token = true;
+                            status_title.set_text("Response received");
+                            status_detail.set_text("The local model returned a complete response.");
+                            output_buffer_clone.set_text(&content);
+                        }
                         Ok(DemoEvent::Error(message)) => {
                             status_spinner.stop();
-                            status_title.set_text("Summary failed");
+                            status_title.set_text("Task failed");
                             status_detail.set_text(&message);
                             summarize_button.set_sensitive(true);
                             summarize_button.set_label(mode.ready_label());
@@ -247,8 +318,8 @@ fn build_window(app: &Application) {
                         }
                         Ok(DemoEvent::Done) => {
                             status_spinner.stop();
-                            if !saw_token && matches!(mode, DemoMode::Streaming) {
-                                status_title.set_text("Summary failed");
+                            if !saw_token && matches!(mode, DemoMode::Summarize) {
+                                status_title.set_text("Task failed");
                                 status_detail.set_text(
                                     "The local model completed without returning any text.",
                                 );
@@ -281,11 +352,15 @@ fn build_window(app: &Application) {
             let error_tx = tx.clone();
             std::thread::spawn(move || {
                 let result = match mode {
-                    DemoMode::Streaming => summarize_streaming(&text, tx),
-                    DemoMode::Guided => summarize_guided(&text, tx),
+                    DemoMode::Summarize => summarize_streaming(&text, tx),
+                    DemoMode::Extract => extract_guided(&text, tx),
+                    DemoMode::Classify => classify_guided(&text, tx),
+                    DemoMode::Translate | DemoMode::Rephrase | DemoMode::Analyze => {
+                        respond_text_task(mode, &text, tx)
+                    }
                 };
                 if let Err(e) = result {
-                    eprintln!("[aileron-demo] summarize error: {e}");
+                    eprintln!("[aileron-demo] text task error: {e}");
                     let _ = error_tx.send(DemoEvent::Error(friendly_error(&e)));
                 }
             });
@@ -293,30 +368,54 @@ fn build_window(app: &Application) {
     }
 
     // ── Window ────────────────────────────────────────────────────────────────
-    let stack = Stack::new();
-    stack.add_titled(&text_box, Some("text"), "Text");
-    stack.add_titled(&build_chat_page(), Some("chat"), "Chat");
-    stack.add_titled(&build_speech_page(), Some("speech"), "Speech");
-    stack.add_titled(&build_vision_page(), Some("vision"), "Vision");
+    let stack = ViewStack::new();
+    let (chat_page, chat_entry) = build_chat_page();
+    let text_page = stack.add_titled(&text_box, Some("text"), "Text Tasks");
+    text_page.set_icon_name(Some("text-x-generic-symbolic"));
+    let chat_page_meta = stack.add_titled(&chat_page, Some("chat"), "Chat");
+    chat_page_meta.set_icon_name(Some("user-available-symbolic"));
+    let speech_page = stack.add_titled(&build_speech_page(), Some("speech"), "Speech");
+    speech_page.set_icon_name(Some("audio-input-microphone-symbolic"));
+    let vision_page = stack.add_titled(&build_vision_page(), Some("vision"), "Vision");
+    vision_page.set_icon_name(Some("image-x-generic-symbolic"));
+    stack.set_visible_child_name("chat");
 
-    let switcher = StackSwitcher::new();
-    switcher.set_stack(Some(&stack));
+    let sidebar = ViewSwitcherSidebar::builder().stack(&stack).build();
+
+    let content = OverlaySplitView::new();
+    content.set_sidebar(Some(&sidebar));
+    content.set_content(Some(&stack));
+    content.set_min_sidebar_width(150.0);
+    content.set_max_sidebar_width(180.0);
+    content.set_show_sidebar(true);
 
     let header = HeaderBar::new();
-    header.set_title_widget(Some(&switcher));
+    let sidebar_toggle = Button::builder()
+        .icon_name("sidebar-show-symbolic")
+        .tooltip_text("Toggle Sidebar")
+        .build();
+    {
+        let content = content.clone();
+        sidebar_toggle.connect_clicked(move |_| {
+            content.set_show_sidebar(!content.shows_sidebar());
+        });
+    }
+    header.pack_start(&sidebar_toggle);
+    header.set_title_widget(Some(&Label::new(Some("Aileron Demo"))));
     let toolbar_view = ToolbarView::new();
     toolbar_view.add_top_bar(&header);
-    toolbar_view.set_content(Some(&stack));
+    toolbar_view.set_content(Some(&content));
 
     let window = ApplicationWindow::builder()
         .application(app)
-        .title("Aileron Demo — Article Summarizer")
-        .default_width(700)
+        .title("Aileron Demo")
+        .default_width(860)
         .default_height(700)
         .content(&toolbar_view)
         .build();
 
     window.present();
+    chat_entry.grab_focus();
 }
 
 #[derive(Clone)]
@@ -325,7 +424,7 @@ struct ChatMessage {
     content: String,
 }
 
-fn build_chat_page() -> gtk4::Widget {
+fn build_chat_page() -> (gtk4::Widget, Entry) {
     let vbox = Box::new(Orientation::Vertical, 12);
     vbox.set_margin_top(12);
     vbox.set_margin_bottom(12);
@@ -515,6 +614,15 @@ fn build_chat_page() -> gtk4::Widget {
     }
 
     {
+        let send_button = send_button.clone();
+        input_entry.connect_activate(move |_| {
+            if send_button.is_sensitive() {
+                send_button.emit_clicked();
+            }
+        });
+    }
+
+    {
         let history = history.clone();
         let session_id = session_id.clone();
         let chat_buffer = chat_buffer.clone();
@@ -536,7 +644,7 @@ fn build_chat_page() -> gtk4::Widget {
         });
     }
 
-    vbox.upcast()
+    (vbox.upcast(), input_entry)
 }
 
 fn render_chat(buffer: &TextBuffer, history: &[ChatMessage], pending_assistant: Option<&str>) {
@@ -830,8 +938,10 @@ fn build_vision_page() -> gtk4::Widget {
         .label("Describe Image")
         .css_classes(vec!["suggested-action"])
         .build();
+    let segment_button = Button::with_label("Segment Objects");
     button_row.append(&choose_button);
     button_row.append(&describe_button);
+    button_row.append(&segment_button);
     vbox.append(&button_row);
 
     let selected_label = Label::builder()
@@ -906,7 +1016,24 @@ fn build_vision_page() -> gtk4::Widget {
     vbox.append(
         &ScrolledWindow::builder()
             .child(&description_view)
-            .min_content_height(260)
+            .min_content_height(160)
+            .vexpand(true)
+            .build(),
+    );
+
+    let segments_buffer = TextBuffer::new(None);
+    let segments_view = TextView::builder()
+        .buffer(&segments_buffer)
+        .editable(false)
+        .wrap_mode(gtk4::WrapMode::WordChar)
+        .hexpand(true)
+        .vexpand(true)
+        .build();
+    vbox.append(&Label::builder().label("Segments").xalign(0.0).build());
+    vbox.append(
+        &ScrolledWindow::builder()
+            .child(&segments_view)
+            .min_content_height(140)
             .vexpand(true)
             .build(),
     );
@@ -940,7 +1067,7 @@ fn build_vision_page() -> gtk4::Widget {
                             selected_label.set_text(&format!("Selected: {}", path.display()));
                             status_title.set_text("Image selected");
                             status_detail.set_text(
-                                "Use Describe Image to send it through the vision portal.",
+                                "Use Describe Image or Segment Objects to send it through the vision portal.",
                             );
                         }
                         Err(e) => {
@@ -958,6 +1085,7 @@ fn build_vision_page() -> gtk4::Widget {
         let paste_buffer = paste_buffer.clone();
         let description_buffer = description_buffer.clone();
         let describe_button_for_click = describe_button.clone();
+        let segment_button_for_click = segment_button.clone();
         let status_spinner = status_spinner.clone();
         let status_title = status_title.clone();
         let status_detail = status_detail.clone();
@@ -980,6 +1108,7 @@ fn build_vision_page() -> gtk4::Widget {
 
             description_buffer.set_text("");
             describe_button_for_click.set_sensitive(false);
+            segment_button_for_click.set_sensitive(false);
             status_spinner.start();
             status_title.set_text("Creating vision session");
             status_detail.set_text("Opening a vision.describe session through the portal...");
@@ -987,6 +1116,7 @@ fn build_vision_page() -> gtk4::Widget {
             let (tx, rx) = std::sync::mpsc::channel::<VisionEvent>();
             let description_buffer = description_buffer.clone();
             let describe_button = describe_button_for_click.clone();
+            let segment_button = segment_button_for_click.clone();
             let status_spinner = status_spinner.clone();
             let status_title = status_title.clone();
             let status_detail = status_detail.clone();
@@ -1001,11 +1131,13 @@ fn build_vision_page() -> gtk4::Widget {
                         Ok(VisionEvent::Description(text)) => {
                             description_buffer.set_text(&text);
                         }
+                        Ok(VisionEvent::Segments(_)) => {}
                         Ok(VisionEvent::Error(message)) => {
                             status_spinner.stop();
                             status_title.set_text("Description failed");
                             status_detail.set_text(&message);
                             describe_button.set_sensitive(true);
+                            segment_button.set_sensitive(true);
                             return glib::ControlFlow::Break;
                         }
                         Ok(VisionEvent::Done) => {
@@ -1014,6 +1146,7 @@ fn build_vision_page() -> gtk4::Widget {
                             status_detail
                                 .set_text("Vision returned a description through the portal.");
                             describe_button.set_sensitive(true);
+                            segment_button.set_sensitive(true);
                             return glib::ControlFlow::Break;
                         }
                         Err(std::sync::mpsc::TryRecvError::Empty) => break,
@@ -1023,6 +1156,7 @@ fn build_vision_page() -> gtk4::Widget {
                             status_detail
                                 .set_text("The vision response channel closed unexpectedly.");
                             describe_button.set_sensitive(true);
+                            segment_button.set_sensitive(true);
                             return glib::ControlFlow::Break;
                         }
                     }
@@ -1034,6 +1168,99 @@ fn build_vision_page() -> gtk4::Widget {
             std::thread::spawn(move || {
                 if let Err(e) = describe_image(&image_b64, tx) {
                     eprintln!("[aileron-demo] describe error: {e}");
+                    let _ = error_tx.send(VisionEvent::Error(friendly_error(&e)));
+                }
+            });
+        });
+    }
+
+    {
+        let selected_image = selected_image.clone();
+        let paste_buffer = paste_buffer.clone();
+        let segments_buffer = segments_buffer.clone();
+        let describe_button_for_click = describe_button.clone();
+        let segment_button_for_click = segment_button.clone();
+        let status_spinner = status_spinner.clone();
+        let status_title = status_title.clone();
+        let status_detail = status_detail.clone();
+        segment_button.connect_clicked(move |_| {
+            let image_b64 = if let Some(bytes) = selected_image.borrow().clone() {
+                base64_encode(&bytes)
+            } else {
+                let (start, end) = paste_buffer.bounds();
+                paste_buffer
+                    .text(&start, &end, false)
+                    .trim()
+                    .replace(['\n', '\r', ' ', '\t'], "")
+            };
+
+            if image_b64.is_empty() {
+                status_title.set_text("No image input");
+                status_detail.set_text("Choose an image file or paste base64 image bytes first.");
+                return;
+            }
+
+            segments_buffer.set_text("");
+            describe_button_for_click.set_sensitive(false);
+            segment_button_for_click.set_sensitive(false);
+            status_spinner.start();
+            status_title.set_text("Creating vision session");
+            status_detail.set_text("Opening a vision.segment session through the portal...");
+
+            let (tx, rx) = std::sync::mpsc::channel::<VisionEvent>();
+            let segments_buffer = segments_buffer.clone();
+            let describe_button = describe_button_for_click.clone();
+            let segment_button = segment_button_for_click.clone();
+            let status_spinner = status_spinner.clone();
+            let status_title = status_title.clone();
+            let status_detail = status_detail.clone();
+            glib::timeout_add_local(std::time::Duration::from_millis(16), move || {
+                loop {
+                    match rx.try_recv() {
+                        Ok(VisionEvent::Phase(phase)) => {
+                            status_title.set_text(phase.title());
+                            status_detail.set_text(phase.detail());
+                            status_spinner.start();
+                        }
+                        Ok(VisionEvent::Description(_)) => {}
+                        Ok(VisionEvent::Segments(segments)) => {
+                            segments_buffer.set_text(&format_segments(&segments));
+                        }
+                        Ok(VisionEvent::Error(message)) => {
+                            status_spinner.stop();
+                            status_title.set_text("Segmentation failed");
+                            status_detail.set_text(&message);
+                            describe_button.set_sensitive(true);
+                            segment_button.set_sensitive(true);
+                            return glib::ControlFlow::Break;
+                        }
+                        Ok(VisionEvent::Done) => {
+                            status_spinner.stop();
+                            status_title.set_text("Segmentation complete");
+                            status_detail.set_text("Vision returned normalized object boxes.");
+                            describe_button.set_sensitive(true);
+                            segment_button.set_sensitive(true);
+                            return glib::ControlFlow::Break;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            status_spinner.stop();
+                            status_title.set_text("Segmentation interrupted");
+                            status_detail
+                                .set_text("The vision response channel closed unexpectedly.");
+                            describe_button.set_sensitive(true);
+                            segment_button.set_sensitive(true);
+                            return glib::ControlFlow::Break;
+                        }
+                    }
+                }
+                glib::ControlFlow::Continue
+            });
+
+            let error_tx = tx.clone();
+            std::thread::spawn(move || {
+                if let Err(e) = segment_image(&image_b64, tx) {
+                    eprintln!("[aileron-demo] segment error: {e}");
                     let _ = error_tx.send(VisionEvent::Error(friendly_error(&e)));
                 }
             });
@@ -1228,6 +1455,7 @@ enum DemoEvent {
     Status(String),
     Token(String),
     Json(String),
+    Text(String),
     Error(String),
     Done,
 }
@@ -1241,52 +1469,125 @@ enum ChatEvent {
 
 #[derive(Clone, Copy)]
 enum DemoMode {
-    Streaming,
-    Guided,
+    Summarize,
+    Translate,
+    Rephrase,
+    Classify,
+    Extract,
+    Analyze,
 }
 
 impl DemoMode {
     fn ready_label(&self) -> &'static str {
         match self {
-            DemoMode::Streaming => "Summarize",
-            DemoMode::Guided => "Generate Guided JSON",
+            DemoMode::Summarize => "Summarize",
+            DemoMode::Translate => "Translate",
+            DemoMode::Rephrase => "Rephrase",
+            DemoMode::Classify => "Classify",
+            DemoMode::Extract => "Extract JSON",
+            DemoMode::Analyze => "Analyze",
         }
     }
 
     fn busy_label(&self) -> &'static str {
         match self {
-            DemoMode::Streaming => "Summarizing...",
-            DemoMode::Guided => "Generating JSON...",
+            DemoMode::Summarize => "Summarizing...",
+            DemoMode::Translate => "Translating...",
+            DemoMode::Rephrase => "Rephrasing...",
+            DemoMode::Classify => "Classifying...",
+            DemoMode::Extract => "Extracting JSON...",
+            DemoMode::Analyze => "Analyzing...",
         }
     }
 
     fn initial_title(&self) -> &'static str {
         match self {
-            DemoMode::Streaming => "Creating session",
-            DemoMode::Guided => "Creating guided session",
+            DemoMode::Summarize => "Creating summary session",
+            DemoMode::Translate => "Creating translation session",
+            DemoMode::Rephrase => "Creating rephrase session",
+            DemoMode::Classify => "Creating classification session",
+            DemoMode::Extract => "Creating extraction session",
+            DemoMode::Analyze => "Creating analysis session",
         }
     }
 
     fn initial_detail(&self) -> &'static str {
         match self {
-            DemoMode::Streaming => "Asking the portal to open a language model session...",
-            DemoMode::Guided => "Preparing a session for schema-guided output...",
+            DemoMode::Summarize => "Opening an llm.summarize session through the portal...",
+            DemoMode::Translate => "Opening an llm.translate session through the portal...",
+            DemoMode::Rephrase => "Opening an llm.rephrase session through the portal...",
+            DemoMode::Classify => "Opening an llm.classify session through the portal...",
+            DemoMode::Extract => "Opening an llm.extract session through the portal...",
+            DemoMode::Analyze => "Opening an llm.analyze session through the portal...",
         }
     }
 
     fn complete_title(&self) -> &'static str {
         match self {
-            DemoMode::Streaming => "Summary complete",
-            DemoMode::Guided => "Guided JSON complete",
+            DemoMode::Summarize => "Summary complete",
+            DemoMode::Translate => "Translation complete",
+            DemoMode::Rephrase => "Rephrase complete",
+            DemoMode::Classify => "Classification complete",
+            DemoMode::Extract => "Extract JSON complete",
+            DemoMode::Analyze => "Analysis complete",
         }
     }
 
     fn complete_detail(&self) -> &'static str {
         match self {
-            DemoMode::Streaming => "The local model finished streaming its response.",
-            DemoMode::Guided => {
+            DemoMode::Summarize => "The local model finished streaming its response.",
+            DemoMode::Translate | DemoMode::Rephrase | DemoMode::Analyze => {
+                "The local model returned the task result through Respond."
+            }
+            DemoMode::Classify | DemoMode::Extract => {
                 "The daemon validated the model output against the generated schema."
             }
+        }
+    }
+
+    fn use_case(&self) -> &'static str {
+        match self {
+            DemoMode::Summarize => "llm.summarize",
+            DemoMode::Translate => "llm.translate",
+            DemoMode::Rephrase => "llm.rephrase",
+            DemoMode::Classify => "llm.classify",
+            DemoMode::Extract => "llm.extract",
+            DemoMode::Analyze => "llm.analyze",
+        }
+    }
+
+    fn instructions(&self) -> &'static str {
+        match self {
+            DemoMode::Summarize => "You summarize user-provided text clearly and concisely.",
+            DemoMode::Translate => "You translate text accurately while preserving meaning.",
+            DemoMode::Rephrase => "You rewrite text clearly while preserving meaning.",
+            DemoMode::Classify => "You classify text into concise, useful categories.",
+            DemoMode::Extract => "You extract concise, factual summary data as valid JSON.",
+            DemoMode::Analyze => "You analyze text carefully and explain the important findings.",
+        }
+    }
+
+    fn prompt(&self, text: &str) -> String {
+        let trimmed = &text[..text.len().min(8192)];
+        match self {
+            DemoMode::Summarize => format!(
+                "Summarize the following article in 3-5 sentences. Return only the summary. Do not repeat or answer the instruction/question:\n\n{trimmed}"
+            ),
+            DemoMode::Translate => format!(
+                "Translate the following text into Spanish. Preserve names, numbers, formatting intent, and tone. Return only the translation:\n\n{trimmed}"
+            ),
+            DemoMode::Rephrase => format!(
+                "Rephrase the following text to be clearer and more direct. Preserve the original meaning and important details. Return only the rewritten text:\n\n{trimmed}"
+            ),
+            DemoMode::Classify => format!(
+                "Classify the following text by topic and intent. Choose concise labels and include a short rationale:\n\n{trimmed}"
+            ),
+            DemoMode::Extract => format!(
+                "Summarize this article as structured data. Keep the summary short, include 3-5 key points, and set confidence from 0 to 100:\n\n{trimmed}"
+            ),
+            DemoMode::Analyze => format!(
+                "Analyze the following text. Identify the main claim, supporting evidence, assumptions, and any risks or open questions. Keep the answer concise:\n\n{trimmed}"
+            ),
         }
     }
 }
@@ -1296,6 +1597,7 @@ enum DemoPhase {
     WaitingForModel,
     RequestingStream,
     RequestingGuided,
+    RequestingResponse,
 }
 
 impl DemoPhase {
@@ -1305,6 +1607,7 @@ impl DemoPhase {
             DemoPhase::WaitingForModel => "Loading model",
             DemoPhase::RequestingStream => "Starting response",
             DemoPhase::RequestingGuided => "Requesting guided JSON",
+            DemoPhase::RequestingResponse => "Requesting response",
         }
     }
 
@@ -1314,6 +1617,7 @@ impl DemoPhase {
             DemoPhase::WaitingForModel => "Starting the local container if the model is cold...",
             DemoPhase::RequestingStream => "Sending the prompt and waiting for the first token...",
             DemoPhase::RequestingGuided => "Sending field guides and waiting for validated JSON...",
+            DemoPhase::RequestingResponse => "Sending the prompt and waiting for the result...",
         }
     }
 
@@ -1358,6 +1662,7 @@ impl SpeechPhase {
 enum VisionEvent {
     Phase(VisionPhase),
     Description(String),
+    Segments(Vec<VisionSegmentDbus>),
     Error(String),
     Done,
 }
@@ -1366,6 +1671,7 @@ enum VisionPhase {
     CreatingSession,
     LoadingModel,
     Describing,
+    Segmenting,
 }
 
 impl VisionPhase {
@@ -1374,18 +1680,28 @@ impl VisionPhase {
             VisionPhase::CreatingSession => "Creating vision session",
             VisionPhase::LoadingModel => "Loading vision model",
             VisionPhase::Describing => "Describing image",
+            VisionPhase::Segmenting => "Segmenting image",
         }
     }
 
     fn detail(&self) -> &'static str {
         match self {
-            VisionPhase::CreatingSession => {
-                "Opening a vision.describe session through the portal..."
-            }
+            VisionPhase::CreatingSession => "Opening a vision session through the portal...",
             VisionPhase::LoadingModel => "Starting the local vision container if it is cold...",
             VisionPhase::Describing => "Sending image bytes to the vision model...",
+            VisionPhase::Segmenting => "Asking the vision model for normalized object boxes...",
         }
     }
+}
+
+#[derive(Debug, Clone, Deserialize, Type)]
+struct VisionSegmentDbus {
+    label: String,
+    confidence: f64,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
 }
 
 fn temp_audio_path() -> PathBuf {
@@ -1496,18 +1812,15 @@ fn summarize_streaming(text: &str, tx: std::sync::mpsc::Sender<DemoEvent>) -> an
         "CreateSession",
         &(
             "org.aileron.Demo",
-            "llm.summarize",
-            "You summarize user-provided text clearly and concisely.",
+            DemoMode::Summarize.use_case(),
+            DemoMode::Summarize.instructions(),
         ),
     )?;
 
     drop(loading_thread);
     tx.send(DemoEvent::Phase(DemoPhase::WaitingForModel))?;
 
-    let prompt = format!(
-        "Summarize the following article in 3-5 sentences. Return only the summary. Do not repeat or answer the instruction/question:\n\n{}",
-        &text[..text.len().min(8192)]
-    );
+    let prompt = DemoMode::Summarize.prompt(text);
 
     // Subscribe to TokenReceived on the signal connection.
     let mut token_iter = sig_proxy.receive_signal("TokenReceived")?;
@@ -1534,7 +1847,7 @@ fn summarize_streaming(text: &str, tx: std::sync::mpsc::Sender<DemoEvent>) -> an
     Ok(())
 }
 
-fn summarize_guided(text: &str, tx: std::sync::mpsc::Sender<DemoEvent>) -> anyhow::Result<()> {
+fn extract_guided(text: &str, tx: std::sync::mpsc::Sender<DemoEvent>) -> anyhow::Result<()> {
     use zbus::blocking::Connection;
 
     const BUS: &str = "org.freedesktop.impl.portal.desktop.aileron";
@@ -1549,15 +1862,12 @@ fn summarize_guided(text: &str, tx: std::sync::mpsc::Sender<DemoEvent>) -> anyho
         "CreateSession",
         &(
             "org.aileron.Demo",
-            "llm.analyze",
-            "You extract concise, factual summary data as valid JSON.",
+            DemoMode::Extract.use_case(),
+            DemoMode::Extract.instructions(),
         ),
     )?;
 
-    let prompt = format!(
-        "Summarize this article as structured data. Keep the summary short, include 3-5 key points, and set confidence from 0 to 100:\n\n{}",
-        &text[..text.len().min(8192)]
-    );
+    let prompt = DemoMode::Extract.prompt(text);
     let fields = vec![
         (
             "summary".to_string(),
@@ -1588,6 +1898,110 @@ fn summarize_guided(text: &str, tx: std::sync::mpsc::Sender<DemoEvent>) -> anyho
         .and_then(|value| serde_json::to_string_pretty(&value).ok())
         .unwrap_or(content);
     tx.send(DemoEvent::Json(pretty))?;
+
+    let _: () = proxy.call("EndSession", &(&session_id,))?;
+    tx.send(DemoEvent::Done)?;
+    Ok(())
+}
+
+fn classify_guided(text: &str, tx: std::sync::mpsc::Sender<DemoEvent>) -> anyhow::Result<()> {
+    use zbus::blocking::Connection;
+
+    const BUS: &str = "org.freedesktop.impl.portal.desktop.aileron";
+    const PATH: &str = "/org/freedesktop/portal/desktop";
+    const IFACE: &str = "org.freedesktop.impl.portal.AI";
+
+    let conn = Connection::session()?;
+    let proxy = zbus::blocking::Proxy::new(&conn, BUS, PATH, IFACE)?;
+
+    tx.send(DemoEvent::Phase(DemoPhase::CreatingSession))?;
+    let session_id: String = proxy.call(
+        "CreateSession",
+        &(
+            "org.aileron.Demo",
+            DemoMode::Classify.use_case(),
+            DemoMode::Classify.instructions(),
+        ),
+    )?;
+
+    let fields = vec![
+        (
+            "topic".to_string(),
+            "string".to_string(),
+            "A concise topic label for the text".to_string(),
+            true,
+        ),
+        (
+            "intent".to_string(),
+            "string".to_string(),
+            "The likely intent, such as news, opinion, request, warning, or promotion".to_string(),
+            true,
+        ),
+        (
+            "rationale".to_string(),
+            "string".to_string(),
+            "One sentence explaining why the labels fit".to_string(),
+            true,
+        ),
+        (
+            "confidence".to_string(),
+            "integer".to_string(),
+            "Confidence score from 0 to 100".to_string(),
+            true,
+        ),
+    ];
+    let options = (512_i64, 0.2_f64, "default", "", "");
+
+    tx.send(DemoEvent::Phase(DemoPhase::WaitingForModel))?;
+    tx.send(DemoEvent::Phase(DemoPhase::RequestingGuided))?;
+    let content: String = proxy.call(
+        "RespondGuided",
+        &(
+            &session_id,
+            &DemoMode::Classify.prompt(text),
+            fields,
+            options,
+        ),
+    )?;
+    let pretty = serde_json::from_str::<serde_json::Value>(&content)
+        .ok()
+        .and_then(|value| serde_json::to_string_pretty(&value).ok())
+        .unwrap_or(content);
+    tx.send(DemoEvent::Json(pretty))?;
+
+    let _: () = proxy.call("EndSession", &(&session_id,))?;
+    tx.send(DemoEvent::Done)?;
+    Ok(())
+}
+
+fn respond_text_task(
+    mode: DemoMode,
+    text: &str,
+    tx: std::sync::mpsc::Sender<DemoEvent>,
+) -> anyhow::Result<()> {
+    use zbus::blocking::Connection;
+
+    const BUS: &str = "org.freedesktop.impl.portal.desktop.aileron";
+    const PATH: &str = "/org/freedesktop/portal/desktop";
+    const IFACE: &str = "org.freedesktop.impl.portal.AI";
+
+    let conn = Connection::session()?;
+    let proxy = zbus::blocking::Proxy::new(&conn, BUS, PATH, IFACE)?;
+
+    tx.send(DemoEvent::Phase(DemoPhase::CreatingSession))?;
+    let session_id: String = proxy.call(
+        "CreateSession",
+        &("org.aileron.Demo", mode.use_case(), mode.instructions()),
+    )?;
+
+    tx.send(DemoEvent::Phase(DemoPhase::WaitingForModel))?;
+    tx.send(DemoEvent::Phase(DemoPhase::RequestingResponse))?;
+    let options = match mode {
+        DemoMode::Translate => (512_i64, 0.3_f64, "default", "", "Spanish"),
+        _ => (512_i64, 0.5_f64, "default", "", ""),
+    };
+    let content: String = proxy.call("Respond", &(&session_id, &mode.prompt(text), options))?;
+    tx.send(DemoEvent::Text(content))?;
 
     let _: () = proxy.call("EndSession", &(&session_id,))?;
     tx.send(DemoEvent::Done)?;
@@ -1731,6 +2145,60 @@ fn describe_image(image_b64: &str, tx: std::sync::mpsc::Sender<VisionEvent>) -> 
     let _: () = proxy.call("EndSession", &(&session_id,))?;
     tx.send(VisionEvent::Done)?;
     Ok(())
+}
+
+fn segment_image(image_b64: &str, tx: std::sync::mpsc::Sender<VisionEvent>) -> anyhow::Result<()> {
+    use zbus::blocking::Connection;
+
+    const BUS: &str = "org.freedesktop.impl.portal.desktop.aileron";
+    const PATH: &str = "/org/freedesktop/portal/desktop";
+    const IFACE: &str = "org.freedesktop.impl.portal.AI";
+
+    let conn = Connection::session()?;
+    let proxy = zbus::blocking::Proxy::new(&conn, BUS, PATH, IFACE)?;
+
+    tx.send(VisionEvent::Phase(VisionPhase::CreatingSession))?;
+    let session_id: String = proxy.call(
+        "CreateSession",
+        &(
+            "org.aileron.Demo",
+            "vision.segment",
+            "Identify visible objects and return normalized rectangular boxes.",
+        ),
+    )?;
+
+    tx.send(VisionEvent::Phase(VisionPhase::LoadingModel))?;
+    tx.send(VisionEvent::Phase(VisionPhase::Segmenting))?;
+    let segments: Vec<VisionSegmentDbus> = proxy.call("Segment", &(&session_id, &image_b64))?;
+    tx.send(VisionEvent::Segments(segments))?;
+
+    let _: () = proxy.call("EndSession", &(&session_id,))?;
+    tx.send(VisionEvent::Done)?;
+    Ok(())
+}
+
+fn format_segments(segments: &[VisionSegmentDbus]) -> String {
+    if segments.is_empty() {
+        return "No objects returned.".to_string();
+    }
+
+    segments
+        .iter()
+        .enumerate()
+        .map(|(idx, segment)| {
+            format!(
+                "{}. {} ({:.0}%) x={:.3}, y={:.3}, w={:.3}, h={:.3}",
+                idx + 1,
+                segment.label,
+                segment.confidence * 100.0,
+                segment.x,
+                segment.y,
+                segment.width,
+                segment.height
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn base64_encode(data: &[u8]) -> String {

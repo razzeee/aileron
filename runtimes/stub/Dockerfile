@@ -1,4 +1,4 @@
-FROM python:3.13-slim
+FROM python:3.14-slim
 COPY entrypoint.py /entrypoint.py
 LABEL org.aileron.runtime="true" \
       org.aileron.runtime_id="stub" \

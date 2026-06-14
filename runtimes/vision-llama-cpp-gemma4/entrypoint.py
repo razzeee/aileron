@@ -18,6 +18,8 @@ import sys
 
 from llama_cpp import Llama
 from llama_cpp.llama_chat_format import Gemma4ChatHandler
+from jsonschema import ValidationError
+from jsonschema import validate as jsonschema_validate
 
 COMMON_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "_llama_cpp_common"))
 if os.path.isdir(COMMON_DIR):
@@ -35,6 +37,34 @@ DEFAULT_PROMPT = os.environ.get(
     "VISION_PROMPT",
     "Describe this image clearly and concisely. Include visible objects, people, text, and relevant context.",
 )
+SEGMENT_PROMPT = os.environ.get(
+    "VISION_SEGMENT_PROMPT",
+    "Identify the main visible objects in this image. Return only JSON matching the schema. "
+    "Use normalized bounding boxes where x and y are the top-left corner and width and height are relative to the image size.",
+)
+SEGMENT_SCHEMA = {
+    "type": "object",
+    "required": ["segments"],
+    "additionalProperties": False,
+    "properties": {
+        "segments": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["label", "confidence", "x", "y", "width", "height"],
+                "additionalProperties": False,
+                "properties": {
+                    "label": {"type": "string"},
+                    "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                    "x": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                    "y": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                    "width": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                    "height": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                },
+            },
+        },
+    },
+}
 DEFAULT_SYSTEM = (
     "You are a helpful assistant. "
     "Always respond in the same language as the user's message. "
@@ -135,9 +165,6 @@ def handle_generate_structured(llm: Llama, req: dict) -> None:
     )["choices"][0]["message"]["content"].strip()
 
     try:
-        from jsonschema import ValidationError
-        from jsonschema import validate as jsonschema_validate
-
         parsed = json.loads(result_text)
         if schema:
             jsonschema_validate(instance=parsed, schema=schema)
@@ -194,6 +221,49 @@ def handle_describe(llm: Llama, req: dict) -> None:
     send({"id": req_id, "token": text, "done": True})
 
 
+def handle_segment(llm: Llama, req: dict) -> None:
+    req_id = req["id"]
+    prompt = req.get("prompt") or SEGMENT_PROMPT
+
+    try:
+        image_url = image_to_data_url(req.get("image"))
+    except Exception as e:
+        send({"id": req_id, "error": "invalid_image", "reason": str(e), "done": True})
+        return
+
+    try:
+        from llama_cpp import LlamaGrammar
+
+        grammar = LlamaGrammar.from_json_schema(json.dumps(SEGMENT_SCHEMA))
+    except Exception:
+        grammar = None
+
+    response = llm.create_chat_completion(
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": image_url}},
+                ],
+            }
+        ],
+        max_tokens=int(req.get("max_tokens", 1024)),
+        grammar=grammar,
+        stream=False,
+    )
+    result_text = response["choices"][0]["message"]["content"].strip()
+
+    try:
+        parsed = json.loads(result_text)
+        jsonschema_validate(instance=parsed, schema=SEGMENT_SCHEMA)
+    except (json.JSONDecodeError, ValidationError) as e:
+        send({"id": req_id, "error": "schema_validation_failed", "reason": str(e), "done": True})
+        return
+
+    send({"id": req_id, "result": json.dumps(parsed, separators=(",", ":")), "done": True})
+
+
 def main() -> None:
     llm = load_model()
     serve_requests(
@@ -203,6 +273,7 @@ def main() -> None:
             "chat": handle_chat,
             "generate_structured": handle_generate_structured,
             "describe": handle_describe,
+            "segment": handle_segment,
         },
         log_prefix="aileron-vision",
         unsupported_done=False,

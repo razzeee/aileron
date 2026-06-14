@@ -53,10 +53,6 @@ pub fn build(runtime_images_changed: Rc<dyn Fn()>) -> gtk4::Widget {
     installed_page.set_hexpand(true);
     installed_page.set_vexpand(true);
     set_tab_content_margins(&installed_page);
-    let downloads_page = Box::new(Orientation::Vertical, 12);
-    downloads_page.set_hexpand(true);
-    downloads_page.set_vexpand(true);
-    set_tab_content_margins(&downloads_page);
 
     // ── Installed profiles group ──────────────────────────────────────────────
     let models_group = PreferencesGroup::new();
@@ -93,12 +89,6 @@ pub fn build(runtime_images_changed: Rc<dyn Fn()>) -> gtk4::Widget {
     library_box.set_selection_mode(gtk4::SelectionMode::None);
     library_box.add_css_class("boxed-list");
 
-    let downloads_group = PreferencesGroup::new();
-    downloads_group.set_title("Downloads");
-    downloads_group.set_description(Some(
-        "Active profile installs and model artifact downloads.",
-    ));
-
     let downloads_box = ListBox::new();
     downloads_box.set_selection_mode(gtk4::SelectionMode::None);
     downloads_box.add_css_class("boxed-list");
@@ -116,12 +106,6 @@ pub fn build(runtime_images_changed: Rc<dyn Fn()>) -> gtk4::Widget {
         let lists = lists.clone();
         stack.connect_visible_child_name_notify(move |stack| {
             match stack.visible_child_name().as_deref() {
-                Some("downloads") => {
-                    refresh_downloads_list(&lists);
-                    if has_active_installs() {
-                        start_install_poll(&lists);
-                    }
-                }
                 Some("installed") => refresh_model_list(&lists),
                 Some("profile-library") => refresh_library_list(&lists),
                 Some("tasks") => refresh_readiness_list(&lists),
@@ -165,15 +149,6 @@ pub fn build(runtime_images_changed: Rc<dyn Fn()>) -> gtk4::Widget {
     models_group.add(&scroll);
     installed_page.append(&models_group);
 
-    let downloads_scroll = ScrolledWindow::builder()
-        .hexpand(true)
-        .vexpand(true)
-        .hscrollbar_policy(gtk4::PolicyType::Never)
-        .child(&downloads_box)
-        .build();
-    downloads_group.add(&downloads_scroll);
-    downloads_page.append(&downloads_group);
-
     refresh_readiness_list(&lists);
     refresh_downloads_list(&lists);
     if has_active_installs() {
@@ -183,7 +158,6 @@ pub fn build(runtime_images_changed: Rc<dyn Fn()>) -> gtk4::Widget {
     stack.add_titled(&tasks_page, Some("tasks"), "Tasks");
     stack.add_titled(&library_page, Some("profile-library"), "Profile Library");
     stack.add_titled(&installed_page, Some("installed"), "Installed");
-    stack.add_titled(&downloads_page, Some("downloads"), "Downloads");
 
     let tasks_button = nav_button("Tasks", "tasks", &stack, None);
     tasks_button.set_active(true);
@@ -197,8 +171,6 @@ pub fn build(runtime_images_changed: Rc<dyn Fn()>) -> gtk4::Widget {
     nav.append(&library_button);
     let installed_button = nav_button("Installed", "installed", &stack, Some(&tasks_button));
     nav.append(&installed_button);
-    let downloads_button = nav_button("Downloads", "downloads", &stack, Some(&tasks_button));
-    nav.append(&downloads_button);
 
     root.upcast()
 }

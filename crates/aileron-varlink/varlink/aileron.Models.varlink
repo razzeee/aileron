@@ -33,7 +33,9 @@ type OciRuntimeImage (
     variant: string,
     size_bytes: int,
     in_use: bool,
-    used_by_profiles: []string
+    used_by_profiles: []string,
+    update_available: bool,
+    update_status: string
 )
 
 type RuntimeImageCleanupError (
@@ -72,6 +74,8 @@ method ListRuntimeManifests() -> (runtimes: []RuntimeManifestInfo)
 method ListRuntimeImages() -> (images: []OciRuntimeImage)
 
 method RemoveRuntimeImage(image_id: string) -> ()
+
+method UpdateRuntimeImage(image_ref: string) -> ()
 
 method PruneUnusedRuntimeImages() -> (
     removed: []string,
