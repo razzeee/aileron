@@ -6,6 +6,7 @@ Reads newline-delimited JSON requests from stdin, writes responses to stdout.
 
 Supported request types:
   generate  - stream text tokens using the multimodal model as a text LLM
+  chat  - stream text tokens from explicit chat messages
   generate_structured - return a JSON result constrained to a schema
   describe  - describe a PNG/JPEG image using a llama.cpp multimodal model
 """
@@ -58,24 +59,53 @@ def load_model() -> Llama:
     )
 
 
+def stream_chat_or_fallback(llm: Llama, req_id: str, messages: list[dict], max_tokens: int) -> None:
+    emitted = False
+    for chunk in llm.create_chat_completion(
+        messages=messages,
+        max_tokens=max_tokens,
+        stream=True,
+    ):
+        choice = chunk.get("choices", [{}])[0]
+        delta = choice.get("delta", {})
+        token = delta.get("content", "") or choice.get("text", "")
+        if token:
+            emitted = True
+            send({"id": req_id, "token": token})
+
+    if not emitted:
+        reply = llm.create_chat_completion(
+            messages=messages,
+            max_tokens=max_tokens,
+            stream=False,
+        )
+        token = reply["choices"][0].get("message", {}).get("content", "")
+        if token:
+            send({"id": req_id, "token": token})
+
+
 def handle_generate(llm: Llama, req: dict) -> None:
     req_id = req["id"]
     prompt = req.get("prompt", "")
     max_tokens = int(req.get("max_tokens", 512))
     system = req.get("system", DEFAULT_SYSTEM)
 
-    for chunk in llm.create_chat_completion(
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": prompt},
-        ],
-        max_tokens=max_tokens,
-        stream=True,
-    ):
-        delta = chunk["choices"][0].get("delta", {})
-        token = delta.get("content", "")
-        if token:
-            send({"id": req_id, "token": token})
+    stream_chat_or_fallback(llm, req_id, [
+        {"role": "system", "content": system},
+        {"role": "user", "content": prompt},
+    ], max_tokens)
+
+    send({"id": req_id, "done": True})
+
+
+def handle_chat(llm: Llama, req: dict) -> None:
+    req_id = req["id"]
+    max_tokens = int(req.get("max_tokens", 512))
+    system = req.get("system", DEFAULT_SYSTEM)
+    messages = [{"role": "system", "content": system}]
+    messages.extend(req.get("messages", []))
+
+    stream_chat_or_fallback(llm, req_id, messages, max_tokens)
 
     send({"id": req_id, "done": True})
 
@@ -170,6 +200,7 @@ def main() -> None:
         llm=llm,
         handlers={
             "generate": handle_generate,
+            "chat": handle_chat,
             "generate_structured": handle_generate_structured,
             "describe": handle_describe,
         },

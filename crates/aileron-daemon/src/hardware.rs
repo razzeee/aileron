@@ -30,6 +30,15 @@ impl Variant {
             Variant::Vulkan => "vulkan",
         }
     }
+
+    pub fn fallback_tags(&self) -> &'static [&'static str] {
+        match self {
+            Variant::Cpu => &["cpu"],
+            Variant::Cuda => &["cuda", "vulkan", "cpu"],
+            Variant::Rocm => &["rocm", "vulkan", "cpu"],
+            Variant::Vulkan => &["vulkan", "cpu"],
+        }
+    }
 }
 
 /// Run the hardware probe and return the best variant.

@@ -17,6 +17,7 @@ type ProfileInfo (
     runtime_images: []RuntimeImage,
     use_cases: []string,
     assigned_use_cases: []string,
+    size_bytes: int,
     installed_at: string
 )
 

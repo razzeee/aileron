@@ -4,7 +4,7 @@
   "runtime_id": "llm-llama-cpp",
   "tier": "large",
   "min_ram_gb": 8.0,
-  "use_cases": ["llm.summarize", "llm.rephrase", "llm.classify", "llm.extract", "llm.analyze"],
+  "use_cases": ["llm.summarize", "llm.chat", "llm.rephrase", "llm.classify", "llm.extract", "llm.analyze"],
   "artifacts": [
     {
       "role": "model",

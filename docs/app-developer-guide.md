@@ -32,6 +32,7 @@ Current tokens:
 - `llm.classify`
 - `llm.extract`
 - `llm.analyze`
+- `llm.chat`
 - `asr.transcribe`
 - `vision.describe`
 - `vision.segment`
@@ -46,7 +47,7 @@ Avoid treating model names as application requirements. A user may satisfy `llm.
 4. Send task input through the appropriate method.
 5. End the session when the user-visible task is complete.
 
-For chat-like features, keep instructions in the session and send only user turns as prompts. For one-shot features such as "summarize this article", a short-lived session is usually enough.
+For chat features, keep stable instructions in the session and send the explicit message list with `Chat` or `StreamChat`. The app owns conversation history and can trim it to fit its UI or context policy. For one-shot features such as "summarize this article", a short-lived session with `Respond` or `StreamResponse` is usually enough.
 
 ## Text Generation
 
@@ -61,6 +62,12 @@ Summarize the article below in three bullet points. Preserve important names and
 ```
 
 Prefer explicit output constraints over relying on a specific model's behavior.
+
+## Chat
+
+Use `llm.chat` with `Chat` for a full assistant turn or `StreamChat` for token streaming. The message list is stateless: include the prior turns the model should consider on every call.
+
+Messages accept `user` and `assistant` roles. Keep system or developer instructions in `CreateSession.instructions` instead of adding them to the message list.
 
 For `llm.translate`, `GenerationOptions` includes optional `source_language_hint` and `target_language_hint` strings. Pass empty strings when the app does not know one side. These are hints, not strict locale settings; apps should still make the requested translation clear in the prompt.
 

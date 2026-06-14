@@ -7,6 +7,7 @@
   "min_ram_gb": 2.0,
   "use_cases": [
     "llm.summarize",
+    "llm.chat",
     "llm.rephrase",
     "llm.classify",
     "llm.extract"

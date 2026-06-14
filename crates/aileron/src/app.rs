@@ -1,3 +1,5 @@
+use std::rc::Rc;
+
 use gtk4::prelude::*;
 use libadwaita::{Application, ApplicationWindow, HeaderBar, ToolbarView, ViewStack, ViewSwitcher};
 
@@ -19,7 +21,17 @@ fn build_window(app: &Application) {
     // AdwViewStack provides the per-page title/icon metadata that AdwViewSwitcher needs.
     let stack = ViewStack::new();
 
-    let models_page = stack.add_titled(&models_page::build(), Some("profiles"), "Profiles");
+    let runtimes_view = runtimes_page::build();
+    let refresh_runtimes = {
+        let runtimes_view = runtimes_view.clone();
+        Rc::new(move || runtimes_view.refresh())
+    };
+
+    let models_page = stack.add_titled(
+        &models_page::build(refresh_runtimes.clone()),
+        Some("profiles"),
+        "Profiles",
+    );
     models_page.set_icon_name(Some("drive-harddisk-symbolic"));
 
     let perms_page = stack.add_titled(
@@ -29,11 +41,17 @@ fn build_window(app: &Application) {
     );
     perms_page.set_icon_name(Some("system-lock-screen-symbolic"));
 
-    let runtimes_page = stack.add_titled(&runtimes_page::build(), Some("runtimes"), "Runtimes");
+    let runtimes_page = stack.add_titled(&runtimes_view.widget, Some("runtimes"), "Runtimes");
     runtimes_page.set_icon_name(Some("package-x-generic-symbolic"));
 
     let activity_page = stack.add_titled(&activity_page::build(), Some("activity"), "Activity");
     activity_page.set_icon_name(Some("emblem-synchronizing-symbolic"));
+
+    stack.connect_visible_child_name_notify(move |stack| {
+        if stack.visible_child_name().as_deref() == Some("runtimes") {
+            refresh_runtimes();
+        }
+    });
 
     // The switcher sits in the header bar.
     let switcher = ViewSwitcher::builder()

@@ -4,7 +4,19 @@ use gtk4::{Button, ListBox, ScrolledWindow};
 use libadwaita::prelude::*;
 use libadwaita::{ActionRow, PreferencesGroup, PreferencesPage};
 
-pub fn build() -> gtk4::Widget {
+#[derive(Clone)]
+pub struct RuntimeImagesView {
+    pub widget: gtk4::Widget,
+    list_box: ListBox,
+}
+
+impl RuntimeImagesView {
+    pub fn refresh(&self) {
+        refresh_runtime_images(&self.list_box);
+    }
+}
+
+pub fn build() -> RuntimeImagesView {
     let page = PreferencesPage::new();
 
     let group = PreferencesGroup::new();
@@ -46,7 +58,10 @@ pub fn build() -> gtk4::Widget {
 
     refresh_runtime_images(&list_box);
     page.add(&group);
-    page.upcast()
+    RuntimeImagesView {
+        widget: page.upcast(),
+        list_box,
+    }
 }
 
 fn refresh_runtime_images(list_box: &ListBox) {

@@ -6,6 +6,7 @@
   "min_ram_gb": 6.0,
   "use_cases": [
     "llm.summarize",
+    "llm.chat",
     "llm.translate",
     "llm.rephrase",
     "llm.classify",

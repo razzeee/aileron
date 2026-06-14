@@ -19,12 +19,13 @@ const USE_CASES: &[&str] = &[
     "llm.classify",
     "llm.extract",
     "llm.analyze",
+    "llm.chat",
     "asr.transcribe",
     "vision.describe",
     "vision.segment",
 ];
 
-pub fn build() -> gtk4::Widget {
+pub fn build(runtime_images_changed: Rc<dyn Fn()>) -> gtk4::Widget {
     let root = Box::new(Orientation::Vertical, 12);
     root.set_margin_top(12);
     root.set_margin_bottom(12);
@@ -108,6 +109,7 @@ pub fn build() -> gtk4::Widget {
         library: library_box.clone(),
         downloads: downloads_box.clone(),
         install_poll_active: Rc::new(Cell::new(false)),
+        runtime_images_changed,
     };
 
     {
@@ -228,6 +230,7 @@ struct ModelLists {
     library: ListBox,
     downloads: ListBox,
     install_poll_active: Rc<Cell<bool>>,
+    runtime_images_changed: Rc<dyn Fn()>,
 }
 
 fn set_tab_content_margins(page: &Box) {
@@ -671,6 +674,30 @@ fn format_size(gb: f64) -> String {
     }
 }
 
+fn format_profile_size(bytes: i64) -> String {
+    if bytes <= 0 {
+        return "unknown size".to_string();
+    }
+
+    let bytes = bytes as f64;
+    let kib = bytes / 1024.0;
+    if kib < 1.0 {
+        return format!("{} B", bytes as i64);
+    }
+
+    let mib = kib / 1024.0;
+    if mib < 1.0 {
+        return format!("{kib:.0} KB");
+    }
+
+    let gib = mib / 1024.0;
+    if gib < 1.0 {
+        return format!("{mib:.0} MB");
+    }
+
+    format!("{gib:.1} GB")
+}
+
 fn assignment_count(use_cases: &[String]) -> String {
     match use_cases.len() {
         0 => "Unassigned".to_string(),
@@ -724,6 +751,14 @@ mod tests {
     fn formats_small_profile_sizes_as_mb() {
         assert_eq!(format_size(0.0177), "18 MB");
         assert_eq!(format_size(1.88), "1.9 GB");
+    }
+
+    #[test]
+    fn formats_installed_profile_sizes_from_bytes() {
+        assert_eq!(format_profile_size(0), "unknown size");
+        assert_eq!(format_profile_size(512), "512 B");
+        assert_eq!(format_profile_size(18 * 1024 * 1024), "18 MB");
+        assert_eq!(format_profile_size(2 * 1024 * 1024 * 1024), "2.0 GB");
     }
 
     #[test]
@@ -1074,6 +1109,7 @@ fn refresh_model_page(lists: &ModelLists) {
     refresh_library_list(lists);
     refresh_model_list(lists);
     refresh_downloads_list(lists);
+    (lists.runtime_images_changed)();
 }
 
 fn start_install_poll(lists: &ModelLists) {
@@ -1831,10 +1867,11 @@ fn refresh_model_list(lists: &ModelLists) {
                 row.set_title(&model.profile_id);
                 let availability = profile_availability(&model.assigned_use_cases);
                 row.set_subtitle(&format!(
-                    "{} · {} · {}",
+                    "{} · {} · {} · {}",
                     availability,
                     model_kind(&model.runtime_id),
-                    assignment_count(&model.assigned_use_cases)
+                    assignment_count(&model.assigned_use_cases),
+                    format_profile_size(model.size_bytes)
                 ));
 
                 let details_btn = Button::with_label("Details");

@@ -8,9 +8,10 @@ use crate::state::SharedState;
 #[allow(unused_imports)]
 // VarlinkCallError is a supertrait; its methods reach us via Call_* dyn objects.
 use aileron_varlink::aileron_Inference::{
-    Call_CreateSession, Call_Describe, Call_EndSession, Call_GetUseCaseAvailability, Call_Prewarm,
-    Call_Respond, Call_RespondGuided, Call_StreamResponse, Call_Transcribe, GenerationOptions,
-    GuidedField, ModelAvailability, VarlinkCallError, VarlinkInterface,
+    Call_Chat, Call_CreateSession, Call_Describe, Call_EndSession, Call_GetUseCaseAvailability,
+    Call_Prewarm, Call_Respond, Call_RespondGuided, Call_StreamChat, Call_StreamResponse,
+    Call_Transcribe, ChatMessage, GenerationOptions, GuidedField, ModelAvailability,
+    VarlinkCallError, VarlinkInterface,
 };
 
 pub struct InferenceHandler {
@@ -235,6 +236,55 @@ impl VarlinkInterface for InferenceHandler {
         })
     }
 
+    fn chat(
+        &self,
+        call: &mut dyn Call_Chat,
+        session_id: String,
+        messages: Vec<ChatMessage>,
+        options: GenerationOptions,
+    ) -> varlink::Result<()> {
+        self.rt.block_on(async {
+            let mut content = String::new();
+            match generate_chat_tokens(&self.state, &mut content, session_id, messages, options)
+                .await
+            {
+                Ok(()) => call.reply(content),
+                Err(GenerationError::SessionNotFound(id)) => call.reply_session_not_found(id),
+                Err(GenerationError::ModelUnavailable(reason)) => {
+                    call.reply_model_unavailable(reason)
+                }
+                Err(GenerationError::InvalidOptions(reason)) => {
+                    call.reply_invalid_generation_options(reason)
+                }
+                Err(GenerationError::Failed(reason)) => call.reply_generation_failed(reason),
+                Err(GenerationError::Reply(e)) => Err(e),
+            }
+        })
+    }
+
+    fn stream_chat(
+        &self,
+        call: &mut dyn Call_StreamChat,
+        session_id: String,
+        messages: Vec<ChatMessage>,
+        options: GenerationOptions,
+    ) -> varlink::Result<()> {
+        self.rt.block_on(async {
+            match stream_chat_tokens(&self.state, call, session_id, messages, options).await {
+                Ok(()) => Ok(()),
+                Err(GenerationError::SessionNotFound(id)) => call.reply_session_not_found(id),
+                Err(GenerationError::ModelUnavailable(reason)) => {
+                    call.reply_model_unavailable(reason)
+                }
+                Err(GenerationError::InvalidOptions(reason)) => {
+                    call.reply_invalid_generation_options(reason)
+                }
+                Err(GenerationError::Failed(reason)) => call.reply_generation_failed(reason),
+                Err(GenerationError::Reply(e)) => Err(e),
+            }
+        })
+    }
+
     fn respond_guided(
         &self,
         call: &mut dyn Call_RespondGuided,
@@ -427,6 +477,99 @@ impl VarlinkInterface for InferenceHandler {
     }
 }
 
+async fn stream_chat_tokens(
+    state: &SharedState,
+    call: &mut dyn Call_StreamChat,
+    session_id: String,
+    messages: Vec<ChatMessage>,
+    options: GenerationOptions,
+) -> Result<(), GenerationError> {
+    let max_tokens = validate_options(&options).map_err(GenerationError::InvalidOptions)?;
+    let messages = runtime_chat_messages(messages).map_err(GenerationError::InvalidOptions)?;
+    let mut guard = state.0.lock().await;
+
+    let (app_id, use_case, profile_id, image_ref, artifact_path, runtime_options, instructions) =
+        match guard.sessions.get(&session_id) {
+            Some(s) => {
+                ensure_exact_use_case(&s.use_case, "llm.chat", "Chat")
+                    .map_err(GenerationError::ModelUnavailable)?;
+                let (profile_id, image_ref, artifact_path, runtime_options) =
+                    profile_runtime(&guard, &s.profile_id)
+                        .map_err(GenerationError::ModelUnavailable)?;
+                (
+                    s.app_id.clone(),
+                    s.use_case.clone(),
+                    profile_id,
+                    image_ref,
+                    artifact_path,
+                    runtime_options,
+                    s.instructions.clone(),
+                )
+            }
+            None => return Err(GenerationError::SessionNotFound(session_id)),
+        };
+
+    let _ = guard.permissions.touch(&app_id, &use_case);
+    let container = guard
+        .containers
+        .get_or_spawn(
+            &profile_id,
+            &image_ref,
+            &artifact_path,
+            &runtime_options,
+            |_| {},
+        )
+        .map_err(|e| GenerationError::Failed(e.to_string()))?;
+
+    let wants_more = call.wants_more();
+    let mut pending_token: Option<String> = None;
+    let mut reply_error: Option<varlink::Error> = None;
+    let mut saw_token = false;
+
+    let result = container.chat(Some(&instructions), &messages, max_tokens, |token| {
+        if !token.is_empty() {
+            saw_token = true;
+        }
+        if !wants_more {
+            pending_token = Some(token);
+            return;
+        }
+
+        if reply_error.is_some() {
+            return;
+        }
+
+        if let Some(previous) = pending_token.replace(token) {
+            call.set_continues(true);
+            if let Err(e) = call.reply(previous) {
+                reply_error = Some(e);
+            }
+        }
+    });
+
+    if let Some(e) = reply_error {
+        return Err(GenerationError::Reply(e));
+    }
+
+    if let Err(e) = result {
+        if wants_more {
+            call.set_continues(false);
+        }
+        return Err(GenerationError::Failed(e.to_string()));
+    }
+    if !saw_token {
+        return Err(GenerationError::Failed(
+            "model returned no output".to_string(),
+        ));
+    }
+
+    if wants_more {
+        call.set_continues(false);
+    }
+    call.reply(pending_token.unwrap_or_default())
+        .map_err(GenerationError::Reply)
+}
+
 async fn stream_tokens(
     state: &SharedState,
     call: &mut dyn Call_StreamResponse,
@@ -472,9 +615,13 @@ async fn stream_tokens(
     let wants_more = call.wants_more();
     let mut pending_token: Option<String> = None;
     let mut reply_error: Option<varlink::Error> = None;
+    let mut saw_token = false;
 
     let instructions = apply_translation_hints(&use_case, instructions, &options);
     let result = container.generate(Some(&instructions), &prompt, max_tokens, |token| {
+        if !token.is_empty() {
+            saw_token = true;
+        }
         if !wants_more {
             pending_token = Some(token);
             return;
@@ -501,6 +648,11 @@ async fn stream_tokens(
             call.set_continues(false);
         }
         return Err(GenerationError::Failed(e.to_string()));
+    }
+    if !saw_token {
+        return Err(GenerationError::Failed(
+            "model returned no output".to_string(),
+        ));
     }
 
     if wants_more {
@@ -582,6 +734,85 @@ async fn generate_tokens(
             sink.push_token(token)
         })
         .map_err(|e| GenerationError::Failed(e.to_string()))
+}
+
+async fn generate_chat_tokens(
+    state: &SharedState,
+    sink: &mut impl TokenSink,
+    session_id: String,
+    messages: Vec<ChatMessage>,
+    options: GenerationOptions,
+) -> Result<(), GenerationError> {
+    let max_tokens = validate_options(&options).map_err(GenerationError::InvalidOptions)?;
+    let messages = runtime_chat_messages(messages).map_err(GenerationError::InvalidOptions)?;
+    let mut guard = state.0.lock().await;
+
+    let (app_id, use_case, profile_id, image_ref, artifact_path, runtime_options, instructions) =
+        match guard.sessions.get(&session_id) {
+            Some(s) => {
+                ensure_exact_use_case(&s.use_case, "llm.chat", "Chat")
+                    .map_err(GenerationError::ModelUnavailable)?;
+                let (profile_id, image_ref, artifact_path, runtime_options) =
+                    profile_runtime(&guard, &s.profile_id)
+                        .map_err(GenerationError::ModelUnavailable)?;
+                (
+                    s.app_id.clone(),
+                    s.use_case.clone(),
+                    profile_id,
+                    image_ref,
+                    artifact_path,
+                    runtime_options,
+                    s.instructions.clone(),
+                )
+            }
+            None => return Err(GenerationError::SessionNotFound(session_id)),
+        };
+
+    let _ = guard.permissions.touch(&app_id, &use_case);
+    let container = guard
+        .containers
+        .get_or_spawn(
+            &profile_id,
+            &image_ref,
+            &artifact_path,
+            &runtime_options,
+            |_| {},
+        )
+        .map_err(|e| GenerationError::Failed(e.to_string()))?;
+
+    container
+        .chat(Some(&instructions), &messages, max_tokens, |token| {
+            sink.push_token(token)
+        })
+        .map_err(|e| GenerationError::Failed(e.to_string()))
+}
+
+fn runtime_chat_messages(
+    messages: Vec<ChatMessage>,
+) -> Result<Vec<crate::container::ChatMessage>, String> {
+    if messages.is_empty() {
+        return Err("messages must not be empty".to_string());
+    }
+
+    messages
+        .into_iter()
+        .map(|message| {
+            let role = message.role.trim();
+            if !matches!(role, "user" | "assistant") {
+                return Err(format!(
+                    "chat message role must be 'user' or 'assistant', got '{}'",
+                    message.role
+                ));
+            }
+            if message.content.trim().is_empty() {
+                return Err("chat message content must not be empty".to_string());
+            }
+            Ok(crate::container::ChatMessage {
+                role: role.to_string(),
+                content: message.content,
+            })
+        })
+        .collect()
 }
 
 fn apply_translation_hints(

@@ -1,6 +1,6 @@
 /// Varlink handler for `aileron.Models`.
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::manifests::{self, ManifestArtifact, ModelManifest};
 use crate::profiles::{ArtifactHash, Profile};
@@ -64,6 +64,7 @@ impl VarlinkInterface for ModelsHandler {
                             .collect(),
                         use_cases: profile.use_cases.clone(),
                         assigned_use_cases,
+                        size_bytes: profile_artifact_size_bytes(&profile.artifact_path),
                         installed_at: profile.installed_at.clone(),
                     }
                 })
@@ -542,7 +543,7 @@ fn use_case_fit_scores(
 
 fn fit_category(use_case: &str) -> Option<&'static str> {
     match use_case {
-        "llm.summarize" | "llm.translate" | "llm.rephrase" => Some("Chat"),
+        "llm.summarize" | "llm.translate" | "llm.rephrase" | "llm.chat" => Some("Chat"),
         "llm.analyze" => Some("Reasoning"),
         "llm.classify" | "llm.extract" => Some("General"),
         "vision.describe" | "vision.segment" => Some("Multimodal"),
@@ -594,13 +595,9 @@ async fn runtime_image_usage(state: &SharedState) -> RuntimeImageUsage {
     let guard = state.0.lock().await;
     let mut profiles_by_ref: HashMap<String, Vec<String>> = HashMap::new();
     for profile in guard.profiles.all() {
-        let mut images = guard.runtimes.images_for(&profile.runtime_id);
-        if images.is_empty() {
-            images = profile.runtime_images.clone();
-        }
-        for image in images {
+        if let Some(image_ref) = resolve_runtime_image(&guard, profile) {
             profiles_by_ref
-                .entry(image.image_ref)
+                .entry(image_ref.to_string())
                 .or_default()
                 .push(profile.profile_id.clone());
         }
@@ -709,6 +706,27 @@ fn image_size_bytes(value: &serde_json::Value) -> i64 {
                 .or_else(|| size.as_u64().map(|size| size as i64))
         })
         .unwrap_or(0)
+}
+
+fn profile_artifact_size_bytes(path: &Path) -> i64 {
+    directory_size_bytes(path).unwrap_or(0).min(i64::MAX as u64) as i64
+}
+
+fn directory_size_bytes(path: &Path) -> std::io::Result<u64> {
+    let metadata = std::fs::metadata(path)?;
+    if metadata.is_file() {
+        return Ok(metadata.len());
+    }
+    if !metadata.is_dir() {
+        return Ok(0);
+    }
+
+    let mut total = 0u64;
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        total = total.saturating_add(directory_size_bytes(&entry.path()).unwrap_or(0));
+    }
+    Ok(total)
 }
 
 async fn remove_aileron_runtime_image(
@@ -1214,6 +1232,50 @@ mod tests {
             "registry.example/aileron-runtime-asr:cuda"
         );
         assert_eq!(parsed.size_bytes, 5678);
+    }
+
+    #[test]
+    fn sums_profile_artifact_directory_size() {
+        let root =
+            std::env::temp_dir().join(format!("aileron-profile-size-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir(&root).expect("temp dir");
+        let nested = root.join("nested");
+        std::fs::create_dir(&nested).expect("nested dir");
+        std::fs::write(root.join("model.gguf"), vec![0; 7]).expect("model file");
+        std::fs::write(nested.join("projector.gguf"), vec![0; 5]).expect("projector file");
+
+        assert_eq!(profile_artifact_size_bytes(&root), 12);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn usage_marks_only_resolved_runtime_image() {
+        let usage = RuntimeImageUsage {
+            profiles_by_ref: HashMap::from([(
+                "example/asr:vulkan".to_string(),
+                vec!["whisper".to_string()],
+            )]),
+        };
+        let cpu = PodmanRuntimeImage {
+            image_id: "cpu".to_string(),
+            image_ref: "example/asr:cpu".to_string(),
+            names: vec!["example/asr:cpu".to_string()],
+            runtime_id: "asr-whisper-cpp".to_string(),
+            variant: "cpu".to_string(),
+            size_bytes: 1,
+        };
+        let vulkan = PodmanRuntimeImage {
+            image_id: "vulkan".to_string(),
+            image_ref: "example/asr:vulkan".to_string(),
+            names: vec!["example/asr:vulkan".to_string()],
+            runtime_id: "asr-whisper-cpp".to_string(),
+            variant: "vulkan".to_string(),
+            size_bytes: 1,
+        };
+
+        assert!(usage.used_by(&cpu).is_empty());
+        assert_eq!(usage.used_by(&vulkan), vec!["whisper".to_string()]);
     }
 
     #[test]

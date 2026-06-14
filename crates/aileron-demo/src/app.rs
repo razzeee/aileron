@@ -247,6 +247,15 @@ fn build_window(app: &Application) {
                         }
                         Ok(DemoEvent::Done) => {
                             status_spinner.stop();
+                            if !saw_token && matches!(mode, DemoMode::Streaming) {
+                                status_title.set_text("Summary failed");
+                                status_detail.set_text(
+                                    "The local model completed without returning any text.",
+                                );
+                                summarize_button.set_sensitive(true);
+                                summarize_button.set_label(mode.ready_label());
+                                return glib::ControlFlow::Break;
+                            }
                             status_title.set_text(mode.complete_title());
                             status_detail.set_text(mode.complete_detail());
                             summarize_button.set_sensitive(true);
@@ -286,6 +295,7 @@ fn build_window(app: &Application) {
     // ── Window ────────────────────────────────────────────────────────────────
     let stack = Stack::new();
     stack.add_titled(&text_box, Some("text"), "Text");
+    stack.add_titled(&build_chat_page(), Some("chat"), "Chat");
     stack.add_titled(&build_speech_page(), Some("speech"), "Speech");
     stack.add_titled(&build_vision_page(), Some("vision"), "Vision");
 
@@ -307,6 +317,249 @@ fn build_window(app: &Application) {
         .build();
 
     window.present();
+}
+
+#[derive(Clone)]
+struct ChatMessage {
+    role: String,
+    content: String,
+}
+
+fn build_chat_page() -> gtk4::Widget {
+    let vbox = Box::new(Orientation::Vertical, 12);
+    vbox.set_margin_top(12);
+    vbox.set_margin_bottom(12);
+    vbox.set_margin_start(12);
+    vbox.set_margin_end(12);
+
+    vbox.append(
+        &Label::builder()
+            .label("Send a multi-turn local chat through the stateless llm.chat API.")
+            .xalign(0.0)
+            .wrap(true)
+            .build(),
+    );
+
+    let status_row = Box::new(Orientation::Horizontal, 12);
+    status_row.add_css_class("card");
+    status_row.set_height_request(72);
+
+    let status_spinner = Spinner::new();
+    status_spinner.set_spinning(false);
+    status_spinner.set_margin_start(14);
+    status_spinner.set_valign(Align::Center);
+    status_row.append(&status_spinner);
+
+    let status_text = Box::new(Orientation::Vertical, 2);
+    status_text.set_valign(Align::Center);
+    status_text.set_margin_top(10);
+    status_text.set_margin_bottom(10);
+    status_text.set_margin_end(14);
+    let status_title = Label::builder()
+        .label("Ready")
+        .xalign(0.0)
+        .css_classes(vec!["heading"])
+        .build();
+    let status_detail = Label::builder()
+        .label("Ask a question. The app sends the full message list each turn.")
+        .xalign(0.0)
+        .wrap(true)
+        .build();
+    status_text.append(&status_title);
+    status_text.append(&status_detail);
+    status_row.append(&status_text);
+    vbox.append(&status_row);
+
+    let chat_buffer = TextBuffer::new(None);
+    let chat_view = TextView::builder()
+        .buffer(&chat_buffer)
+        .editable(false)
+        .wrap_mode(gtk4::WrapMode::WordChar)
+        .hexpand(true)
+        .vexpand(true)
+        .build();
+    vbox.append(
+        &ScrolledWindow::builder()
+            .child(&chat_view)
+            .min_content_height(360)
+            .vexpand(true)
+            .build(),
+    );
+
+    let input_row = Box::new(Orientation::Horizontal, 8);
+    let input_entry = Entry::builder()
+        .placeholder_text("Ask the local model...")
+        .hexpand(true)
+        .build();
+    let send_button = Button::builder()
+        .label("Send")
+        .css_classes(vec!["suggested-action"])
+        .build();
+    let clear_button = Button::with_label("Clear Chat");
+    input_row.append(&input_entry);
+    input_row.append(&send_button);
+    input_row.append(&clear_button);
+    vbox.append(&input_row);
+
+    let history = Rc::new(RefCell::new(Vec::<ChatMessage>::new()));
+    let session_id = Rc::new(RefCell::new(None::<String>));
+
+    {
+        let history = history.clone();
+        let session_id = session_id.clone();
+        let input_entry = input_entry.clone();
+        let send_button_for_click = send_button.clone();
+        let send_button = send_button.clone();
+        let clear_button = clear_button.clone();
+        let chat_buffer = chat_buffer.clone();
+        let status_spinner = status_spinner.clone();
+        let status_title = status_title.clone();
+        let status_detail = status_detail.clone();
+        send_button_for_click.connect_clicked(move |_| {
+            let text = input_entry.text().trim().to_string();
+            if text.is_empty() {
+                return;
+            }
+
+            input_entry.set_text("");
+            send_button.set_sensitive(false);
+            clear_button.set_sensitive(false);
+            status_spinner.start();
+            status_title.set_text("Starting chat turn");
+            status_detail.set_text("Sending message history through StreamChat...");
+
+            history.borrow_mut().push(ChatMessage {
+                role: "user".to_string(),
+                content: text,
+            });
+            render_chat(&chat_buffer, &history.borrow(), None);
+
+            let messages = history.borrow().clone();
+            let existing_session = session_id.borrow().clone();
+            let (tx, rx) = std::sync::mpsc::channel::<ChatEvent>();
+
+            let history_for_rx = history.clone();
+            let session_for_rx = session_id.clone();
+            let chat_buffer_for_rx = chat_buffer.clone();
+            let send_button_for_rx = send_button.clone();
+            let clear_button_for_rx = clear_button.clone();
+            let status_spinner_for_rx = status_spinner.clone();
+            let status_title_for_rx = status_title.clone();
+            let status_detail_for_rx = status_detail.clone();
+            let mut assistant_text = String::new();
+            glib::timeout_add_local(std::time::Duration::from_millis(16), move || {
+                loop {
+                    match rx.try_recv() {
+                        Ok(ChatEvent::SessionCreated(id)) => {
+                            *session_for_rx.borrow_mut() = Some(id);
+                            status_title_for_rx.set_text("Chat session ready");
+                            status_detail_for_rx.set_text("The llm.chat session is active.");
+                        }
+                        Ok(ChatEvent::Token(token)) => {
+                            assistant_text.push_str(&token);
+                            status_title_for_rx.set_text("Streaming response");
+                            status_detail_for_rx.set_text("Appending chat tokens as they arrive.");
+                            render_chat(
+                                &chat_buffer_for_rx,
+                                &history_for_rx.borrow(),
+                                Some(&assistant_text),
+                            );
+                        }
+                        Ok(ChatEvent::Error(message)) => {
+                            status_spinner_for_rx.stop();
+                            status_title_for_rx.set_text("Chat failed");
+                            status_detail_for_rx.set_text(&message);
+                            send_button_for_rx.set_sensitive(true);
+                            clear_button_for_rx.set_sensitive(true);
+                            return glib::ControlFlow::Break;
+                        }
+                        Ok(ChatEvent::Done) => {
+                            if !assistant_text.trim().is_empty() {
+                                history_for_rx.borrow_mut().push(ChatMessage {
+                                    role: "assistant".to_string(),
+                                    content: assistant_text.clone(),
+                                });
+                            }
+                            render_chat(&chat_buffer_for_rx, &history_for_rx.borrow(), None);
+                            status_spinner_for_rx.stop();
+                            status_title_for_rx.set_text("Response complete");
+                            status_detail_for_rx
+                                .set_text("The app kept history locally and sent it explicitly.");
+                            send_button_for_rx.set_sensitive(true);
+                            clear_button_for_rx.set_sensitive(true);
+                            return glib::ControlFlow::Break;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            status_spinner_for_rx.stop();
+                            status_title_for_rx.set_text("Chat interrupted");
+                            status_detail_for_rx
+                                .set_text("The chat response channel closed unexpectedly.");
+                            send_button_for_rx.set_sensitive(true);
+                            clear_button_for_rx.set_sensitive(true);
+                            return glib::ControlFlow::Break;
+                        }
+                    }
+                }
+                glib::ControlFlow::Continue
+            });
+
+            let error_tx = tx.clone();
+            std::thread::spawn(move || {
+                if let Err(e) = chat_stream(existing_session, messages, tx) {
+                    eprintln!("[aileron-demo] chat error: {e}");
+                    let _ = error_tx.send(ChatEvent::Error(friendly_error(&e)));
+                }
+            });
+        });
+    }
+
+    {
+        let history = history.clone();
+        let session_id = session_id.clone();
+        let chat_buffer = chat_buffer.clone();
+        let status_spinner = status_spinner.clone();
+        let status_title = status_title.clone();
+        let status_detail = status_detail.clone();
+        clear_button.connect_clicked(move |_| {
+            if let Some(id) = session_id.borrow_mut().take() {
+                std::thread::spawn(move || {
+                    let _ = end_chat_session(&id);
+                });
+            }
+            history.borrow_mut().clear();
+            render_chat(&chat_buffer, &history.borrow(), None);
+            status_spinner.stop();
+            status_title.set_text("Ready");
+            status_detail
+                .set_text("Chat cleared. The next message creates a fresh llm.chat session.");
+        });
+    }
+
+    vbox.upcast()
+}
+
+fn render_chat(buffer: &TextBuffer, history: &[ChatMessage], pending_assistant: Option<&str>) {
+    let mut text = String::new();
+    if history.is_empty() && pending_assistant.is_none() {
+        text.push_str("No messages yet.\n");
+    }
+    for message in history {
+        let label = if message.role == "assistant" {
+            "Assistant"
+        } else {
+            "User"
+        };
+        text.push_str(label);
+        text.push_str(":\n");
+        text.push_str(&message.content);
+        text.push_str("\n\n");
+    }
+    if let Some(content) = pending_assistant {
+        text.push_str("Assistant:\n");
+        text.push_str(content);
+    }
+    buffer.set_text(&text);
 }
 
 struct Recording {
@@ -979,6 +1232,13 @@ enum DemoEvent {
     Done,
 }
 
+enum ChatEvent {
+    SessionCreated(String),
+    Token(String),
+    Error(String),
+    Done,
+}
+
 #[derive(Clone, Copy)]
 enum DemoMode {
     Streaming,
@@ -1331,6 +1591,76 @@ fn summarize_guided(text: &str, tx: std::sync::mpsc::Sender<DemoEvent>) -> anyho
 
     let _: () = proxy.call("EndSession", &(&session_id,))?;
     tx.send(DemoEvent::Done)?;
+    Ok(())
+}
+
+fn chat_stream(
+    existing_session: Option<String>,
+    messages: Vec<ChatMessage>,
+    tx: std::sync::mpsc::Sender<ChatEvent>,
+) -> anyhow::Result<()> {
+    use zbus::blocking::Connection;
+
+    const BUS: &str = "org.freedesktop.impl.portal.desktop.aileron";
+    const PATH: &str = "/org/freedesktop/portal/desktop";
+    const IFACE: &str = "org.freedesktop.impl.portal.AI";
+
+    let call_conn = Connection::session()?;
+    let signal_conn = Connection::session()?;
+
+    let proxy = zbus::blocking::Proxy::new(&call_conn, BUS, PATH, IFACE)?;
+    let sig_proxy = zbus::blocking::Proxy::new(&signal_conn, BUS, PATH, IFACE)?;
+
+    let session_id = match existing_session {
+        Some(id) => id,
+        None => {
+            let id: String = proxy.call(
+                "CreateSession",
+                &(
+                    "org.aileron.Demo",
+                    "llm.chat",
+                    "You are a helpful local assistant. Be concise, accurate, and conversational.",
+                ),
+            )?;
+            tx.send(ChatEvent::SessionCreated(id.clone()))?;
+            id
+        }
+    };
+
+    let mut token_iter = sig_proxy.receive_signal("TokenReceived")?;
+    let dbus_messages: Vec<(String, String)> = messages
+        .into_iter()
+        .map(|message| (message.role, message.content))
+        .collect();
+    let options = (512_i64, 0.7_f64, "default", "", "");
+    let _: () = proxy.call("StreamChat", &(&session_id, dbus_messages, options))?;
+
+    for msg in &mut token_iter {
+        let body = msg.body();
+        let (sig_session, token, done): (String, String, bool) = body.deserialize()?;
+        if sig_session != session_id {
+            continue;
+        }
+        tx.send(ChatEvent::Token(token))?;
+        if done {
+            break;
+        }
+    }
+
+    tx.send(ChatEvent::Done)?;
+    Ok(())
+}
+
+fn end_chat_session(session_id: &str) -> anyhow::Result<()> {
+    use zbus::blocking::Connection;
+
+    const BUS: &str = "org.freedesktop.impl.portal.desktop.aileron";
+    const PATH: &str = "/org/freedesktop/portal/desktop";
+    const IFACE: &str = "org.freedesktop.impl.portal.AI";
+
+    let conn = Connection::session()?;
+    let proxy = zbus::blocking::Proxy::new(&conn, BUS, PATH, IFACE)?;
+    let _: () = proxy.call("EndSession", &(session_id,))?;
     Ok(())
 }
 

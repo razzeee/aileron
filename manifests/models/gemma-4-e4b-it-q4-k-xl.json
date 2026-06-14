@@ -9,6 +9,7 @@
   "tier": "balanced",
   "use_cases": [
     "llm.summarize",
+    "llm.chat",
     "llm.translate",
     "llm.rephrase",
     "llm.classify",

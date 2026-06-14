@@ -96,18 +96,12 @@ impl ProfileStore {
 
 impl Profile {
     pub fn runtime_image_for(&self, detected: Variant) -> Option<&str> {
-        let detected_tag = detected.as_tag();
-        self.runtime_images
-            .iter()
-            .find(|img| img.variant == detected_tag)
-            .or_else(|| {
-                if detected == Variant::Cpu {
-                    None
-                } else {
-                    self.runtime_images.iter().find(|img| img.variant == "cpu")
-                }
-            })
-            .map(|img| img.image_ref.as_str())
+        detected.fallback_tags().iter().find_map(|variant| {
+            self.runtime_images
+                .iter()
+                .find(|img| img.variant == *variant)
+                .map(|img| img.image_ref.as_str())
+        })
     }
 }
 
@@ -150,4 +144,46 @@ fn validate_profile(profile: &Profile) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn profile_with_runtime_images(runtime_images: Vec<RuntimeImage>) -> Profile {
+        Profile {
+            profile_id: "profile".to_string(),
+            model_id: "model".to_string(),
+            runtime_id: "runtime".to_string(),
+            runtime_options: HashMap::new(),
+            artifact_path: PathBuf::from("/tmp/model"),
+            runtime_images,
+            use_cases: vec!["asr.transcribe".to_string()],
+            artifact_hashes: Vec::new(),
+            installed_at: "2026-06-14T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn runtime_image_for_prefers_vulkan_before_cpu_for_accelerators() {
+        let profile = profile_with_runtime_images(vec![
+            RuntimeImage {
+                variant: "cpu".to_string(),
+                image_ref: "example/asr:cpu".to_string(),
+            },
+            RuntimeImage {
+                variant: "vulkan".to_string(),
+                image_ref: "example/asr:vulkan".to_string(),
+            },
+        ]);
+
+        assert_eq!(
+            profile.runtime_image_for(Variant::Rocm),
+            Some("example/asr:vulkan")
+        );
+        assert_eq!(
+            profile.runtime_image_for(Variant::Cuda),
+            Some("example/asr:vulkan")
+        );
+    }
 }

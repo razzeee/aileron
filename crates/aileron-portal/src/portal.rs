@@ -45,6 +45,12 @@ struct GenerationOptionsDbus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
+struct ChatMessageDbus {
+    role: String,
+    content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
 struct GuidedFieldDbus {
     name: String,
     kind: String,
@@ -208,6 +214,83 @@ impl AiPortalBackend {
         Ok(())
     }
 
+    async fn chat(
+        &self,
+        session_id: &str,
+        messages: Vec<ChatMessageDbus>,
+        options: GenerationOptionsDbus,
+        #[zbus(signal_context)] ctxt: SignalContext<'_>,
+    ) -> zbus::fdo::Result<String> {
+        use aileron_varlink::aileron_Inference::VarlinkClientInterface;
+
+        self.emit_loading_if_cold(session_id, &ctxt).await?;
+        let conn =
+            aileron_ipc::client::connect().map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn);
+        let reply = client
+            .chat(
+                session_id.to_string(),
+                messages
+                    .into_iter()
+                    .map(ChatMessageDbus::into_varlink)
+                    .collect(),
+                options.into_varlink(),
+            )
+            .call()
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        self.mark_warm(session_id);
+        Ok(reply.content)
+    }
+
+    async fn stream_chat(
+        &self,
+        session_id: &str,
+        messages: Vec<ChatMessageDbus>,
+        options: GenerationOptionsDbus,
+        #[zbus(signal_context)] ctxt: SignalContext<'_>,
+    ) -> zbus::fdo::Result<()> {
+        use aileron_varlink::aileron_Inference::VarlinkClientInterface;
+
+        self.emit_loading_if_cold(session_id, &ctxt).await?;
+        let session_id = session_id.to_string();
+        let conn =
+            aileron_ipc::client::connect().map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn);
+        let mut call = client.stream_chat(
+            session_id.clone(),
+            messages
+                .into_iter()
+                .map(ChatMessageDbus::into_varlink)
+                .collect(),
+            options.into_varlink(),
+        );
+        let iter = call
+            .more()
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+
+        let mut pending_token: Option<String> = None;
+        for reply in iter {
+            let token = reply
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?
+                .token;
+
+            if let Some(previous) = pending_token.replace(token) {
+                AiPortalBackend::token_received(&ctxt, &session_id, &previous, false)
+                    .await
+                    .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            }
+        }
+
+        if let Some(token) = pending_token {
+            AiPortalBackend::token_received(&ctxt, &session_id, &token, true)
+                .await
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        }
+
+        self.mark_warm(&session_id);
+        Ok(())
+    }
+
     #[zbus(signal)]
     async fn token_received(
         ctxt: &SignalContext<'_>,
@@ -340,6 +423,15 @@ impl GenerationOptionsDbus {
             sampling_mode: self.sampling_mode,
             source_language_hint: self.source_language_hint,
             target_language_hint: self.target_language_hint,
+        }
+    }
+}
+
+impl ChatMessageDbus {
+    fn into_varlink(self) -> aileron_varlink::aileron_Inference::ChatMessage {
+        aileron_varlink::aileron_Inference::ChatMessage {
+            role: self.role,
+            content: self.content,
         }
     }
 }

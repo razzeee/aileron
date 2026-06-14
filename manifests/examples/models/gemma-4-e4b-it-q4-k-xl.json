@@ -5,6 +5,7 @@
   "runtime_id": "vision-llama-cpp-gemma4",
   "tier": "large",
   "use_cases": [
+    "llm.chat",
     "vision.describe"
   ],
   "artifacts": [

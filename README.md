@@ -387,19 +387,21 @@ The portal does not talk to containers directly. It translates D-Bus calls into 
 | `Prewarm` | `session_id: s, prompt_prefix: s` | `()` | Starts the backing container before the first response |
 | `Respond` | `session_id: s, prompt: s, options: (xdsss)` | `content: s` | Returns full generated text |
 | `StreamResponse` | `session_id: s, prompt: s, options: (xdsss)` | `()` | Emits `TokenReceived` signals; final token has `done=true` |
+| `Chat` | `session_id: s, messages: a(ss), options: (xdsss)` | `content: s` | Stateless chat; app sends explicit user/assistant history |
+| `StreamChat` | `session_id: s, messages: a(ss), options: (xdsss)` | `()` | Emits `TokenReceived` signals; final token has `done=true` |
 | `RespondGuided` | `session_id: s, prompt: s, fields: a(sssb), options: (xdsss)` | `content: s` | LLM sessions only; returns JSON matching guided output fields |
 | `Transcribe` | `session_id: s, audio_b64: s, language_hint: s` | `text: s` | 16 kHz mono f32le PCM, base64; empty hint means auto-detect/no hint |
 | `Describe` | `session_id: s, image_b64: s` | `text: s` | PNG or JPEG, base64 |
 | `EndSession` | `session_id: s` | `()` | |
 
-These are D-Bus signatures: parentheses define a struct, and `a(...)` means an array of structs. `options: (xdsss)` is `GenerationOptions`: `maximum_response_tokens` as int64, `temperature` as float64, `sampling_mode` as string, `source_language_hint` as string, and `target_language_hint` as string. Empty language hints mean unspecified. The language hints only affect `llm.translate`. `fields: a(sssb)` is an array of `GuidedField` structs: name, kind, description, required.
+These are D-Bus signatures: parentheses define a struct, and `a(...)` means an array of structs. `options: (xdsss)` is `GenerationOptions`: `maximum_response_tokens` as int64, `temperature` as float64, `sampling_mode` as string, `source_language_hint` as string, and `target_language_hint` as string. Empty language hints mean unspecified. The language hints only affect `llm.translate`. `messages: a(ss)` is an array of `ChatMessage` structs: role, content. `fields: a(sssb)` is an array of `GuidedField` structs: name, kind, description, required.
 
 ### Signals
 
 | Signal | Parameters | Fired when |
 |---|---|---|
 | `ModelLoading` | `message: s` | The portal is about to start a cold text-generation container |
-| `TokenReceived` | `session_id: s, token: s, done: b` | Each token during `StreamResponse` |
+| `TokenReceived` | `session_id: s, token: s, done: b` | Each token during `StreamResponse` or `StreamChat` |
 
 D-Bus callers see underlying Varlink failures as `org.freedesktop.DBus.Error.Failed` with the Varlink error text.
 

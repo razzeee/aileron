@@ -104,18 +104,10 @@ impl RuntimeManifestStore {
 
     pub fn resolve(&self, runtime_id: &str, detected: Variant) -> Option<&str> {
         let runtime = self.runtimes.get(runtime_id)?;
-        let detected_tag = detected.as_tag();
-        runtime
-            .images
-            .get(detected_tag)
-            .or_else(|| {
-                if detected == Variant::Cpu {
-                    None
-                } else {
-                    runtime.images.get("cpu")
-                }
-            })
-            .map(String::as_str)
+        detected
+            .fallback_tags()
+            .iter()
+            .find_map(|variant| runtime.images.get(*variant).map(String::as_str))
     }
 
     pub fn images_for(&self, runtime_id: &str) -> Vec<RuntimeImage> {
@@ -307,6 +299,7 @@ pub const SUPPORTED_USE_CASES: &[&str] = &[
     "llm.classify",
     "llm.extract",
     "llm.analyze",
+    "llm.chat",
     "asr.transcribe",
     "vision.describe",
     "vision.segment",
@@ -408,6 +401,29 @@ mod tests {
         assert_eq!(
             manifests.resolve("llm-llama-cpp", Variant::Vulkan),
             Some("example/llm:cpu")
+        );
+    }
+
+    #[test]
+    fn resolves_accelerator_variant_with_vulkan_fallback() {
+        let runtime = RuntimeManifest {
+            runtime_id: "asr-whisper-cpp".to_string(),
+            images: HashMap::from([
+                ("cpu".to_string(), "example/asr:cpu".to_string()),
+                ("vulkan".to_string(), "example/asr:vulkan".to_string()),
+            ]),
+        };
+        let manifests = RuntimeManifestStore {
+            runtimes: HashMap::from([("asr-whisper-cpp".to_string(), runtime)]),
+        };
+
+        assert_eq!(
+            manifests.resolve("asr-whisper-cpp", Variant::Rocm),
+            Some("example/asr:vulkan")
+        );
+        assert_eq!(
+            manifests.resolve("asr-whisper-cpp", Variant::Cuda),
+            Some("example/asr:vulkan")
         );
     }
 
