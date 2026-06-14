@@ -1172,11 +1172,32 @@ fn friendly_error_text(message: &str) -> String {
 }
 
 fn concise_error(message: &str) -> String {
+    if message.contains("org.freedesktop.impl.portal.desktop.aileron")
+        && message.contains("activation request failed: unknown unit")
+    {
+        return "Aileron portal is not installed for D-Bus activation. Install systemd/aileron-portal.service to ~/.config/systemd/user/, run `systemctl --user daemon-reload`, then start `systemctl --user enable --now aileron-portal`.".to_string();
+    }
+
     if message.contains("huggingface.co") && message.contains("ggml-") {
         return "ASR model is missing from the assigned container image. The container tried to download a Whisper model from Hugging Face, but Aileron starts inference containers with networking disabled. Rebuild or assign an ASR image that has the Whisper model baked into /model.".to_string();
     }
 
     message.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::concise_error;
+
+    #[test]
+    fn explains_missing_portal_systemd_unit() {
+        let error = "org.freedesktop.DBus.Error.NameHasNoOwner: Could not activate remote peer 'org.freedesktop.impl.portal.desktop.aileron': activation request failed: unknown unit";
+
+        assert_eq!(
+            concise_error(error),
+            "Aileron portal is not installed for D-Bus activation. Install systemd/aileron-portal.service to ~/.config/systemd/user/, run `systemctl --user daemon-reload`, then start `systemctl --user enable --now aileron-portal`."
+        );
+    }
 }
 
 /// Call `StreamResponse` on the portal and forward tokens via `tx`.
