@@ -1,5 +1,6 @@
-ARG BASE_IMAGE="python:3.12-slim"
-FROM ${BASE_IMAGE}
+ARG BUILDER_IMAGE="python:3.13-slim"
+ARG FINAL_IMAGE="python:3.13-slim"
+FROM ${BUILDER_IMAGE} AS builder
 
 ARG RUNTIME_ID
 ARG RUNTIME_VARIANT="cpu"
@@ -34,14 +35,34 @@ RUN apt-get update && apt-get install -y --no-install-recommends ${APT_PACKAGES}
     fi
 
 RUN if [ "$INSTALL_SOURCE" = "git" ]; then \
-        python -m pip install --no-cache-dir ${PIP_INSTALL_ARGS} \
+        python -m pip install --prefix=/runtime --no-cache-dir ${PIP_INSTALL_ARGS} \
             "git+https://github.com/abetlen/llama-cpp-python.git@${LLAMA_CPP_PYTHON_REF}" \
             ${EXTRA_PIP_PACKAGES}; \
     else \
-        python -m pip install --no-cache-dir ${PIP_INSTALL_ARGS} \
+        python -m pip install --prefix=/runtime --no-cache-dir ${PIP_INSTALL_ARGS} \
             "llama-cpp-python>=0.2.90" \
             ${EXTRA_PIP_PACKAGES}; \
     fi
+
+FROM ${FINAL_IMAGE}
+
+ARG RUNTIME_ID
+ARG RUNTIME_VARIANT="cpu"
+ARG RUNTIME_DESCRIPTION="Aileron llama.cpp runtime for local inference."
+ARG ENTRYPOINT_PATH
+ARG RUNTIME_APT_PACKAGES="libgomp1"
+ARG ROCM_PATH="/opt/rocm"
+ARG HSA_OVERRIDE_GFX_VERSION=""
+
+ENV ROCM_PATH="${ROCM_PATH}"
+ENV PATH="${ROCM_PATH}/bin:${PATH}"
+ENV HSA_OVERRIDE_GFX_VERSION="${HSA_OVERRIDE_GFX_VERSION}"
+
+RUN apt-get update && apt-get install -y --no-install-recommends ${RUNTIME_APT_PACKAGES} \
+    && rm -rf /var/lib/apt/lists/* \
+    && (command -v python >/dev/null || ln -sf python3 /usr/bin/python)
+
+COPY --from=builder /runtime /usr/local
 
 COPY runtimes/_llama_cpp_common/aileron_runtime_common.py /aileron_runtime_common.py
 COPY ${ENTRYPOINT_PATH} /entrypoint.py

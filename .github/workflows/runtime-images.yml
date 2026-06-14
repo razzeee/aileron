@@ -42,7 +42,9 @@ jobs:
             documentation_path: runtimes/llm-llama-cpp/README.md
             variant: cuda
             build_args: |
-              BASE_IMAGE=nvidia/cuda:13.3.0-devel-ubuntu24.04
+              BUILDER_IMAGE=nvidia/cuda:13.3.0-devel-ubuntu24.04
+              FINAL_IMAGE=nvidia/cuda:13.3.0-runtime-ubuntu24.04
+              RUNTIME_APT_PACKAGES=python3 libgomp1
               APT_PACKAGES=python3 python3-pip python3-dev build-essential cmake git ninja-build
               CMAKE_ARGS=-DGGML_CUDA=on
               CUDA_DOCKER_ARCH=all
@@ -58,7 +60,9 @@ jobs:
             documentation_path: runtimes/llm-llama-cpp/README.md
             variant: rocm
             build_args: |
-              BASE_IMAGE=rocm/dev-ubuntu-22.04:7.2.4
+              BUILDER_IMAGE=rocm/dev-ubuntu-22.04:7.2.4
+              FINAL_IMAGE=rocm/dev-ubuntu-22.04:7.2.4
+              RUNTIME_APT_PACKAGES=python3 libgomp1 hipblas-dev rocblas-dev
               APT_PACKAGES=python3 python3-pip python3-dev build-essential cmake git ninja-build hipblas-dev rocblas-dev
               CMAKE_ARGS=-DGGML_HIP=on -DAMDGPU_TARGETS=gfx1030
               FORCE_CMAKE=1
@@ -75,7 +79,8 @@ jobs:
             documentation_path: runtimes/llm-llama-cpp/README.md
             variant: vulkan
             build_args: |
-              APT_PACKAGES=build-essential cmake git ninja-build libvulkan-dev glslc glslang-tools spirv-headers vulkan-tools libvulkan1 mesa-vulkan-drivers
+              APT_PACKAGES=build-essential cmake git ninja-build libvulkan-dev glslc glslang-tools spirv-headers
+              RUNTIME_APT_PACKAGES=libgomp1 libvulkan1 mesa-vulkan-drivers
               CMAKE_ARGS=-DGGML_VULKAN=on
               RUNTIME_ID=llm-llama-cpp
               RUNTIME_VARIANT=vulkan
@@ -99,7 +104,9 @@ jobs:
             documentation_path: runtimes/vision-llama-cpp-gemma4/README.md
             variant: cuda
             build_args: |
-              BASE_IMAGE=nvidia/cuda:13.3.0-devel-ubuntu24.04
+              BUILDER_IMAGE=nvidia/cuda:13.3.0-devel-ubuntu24.04
+              FINAL_IMAGE=nvidia/cuda:13.3.0-runtime-ubuntu24.04
+              RUNTIME_APT_PACKAGES=python3 libgomp1
               APT_PACKAGES=python3 python3-pip python3-dev build-essential cmake git ninja-build
               CMAKE_ARGS=-DGGML_CUDA=on
               CUDA_DOCKER_ARCH=all
@@ -115,7 +122,9 @@ jobs:
             documentation_path: runtimes/vision-llama-cpp-gemma4/README.md
             variant: rocm
             build_args: |
-              BASE_IMAGE=rocm/dev-ubuntu-22.04:7.2.4
+              BUILDER_IMAGE=rocm/dev-ubuntu-22.04:7.2.4
+              FINAL_IMAGE=rocm/dev-ubuntu-22.04:7.2.4
+              RUNTIME_APT_PACKAGES=python3 libgomp1 hipblas-dev rocblas-dev
               APT_PACKAGES=python3 python3-pip python3-dev build-essential cmake git ninja-build hipblas-dev rocblas-dev
               CMAKE_ARGS=-DGGML_HIP=on -DAMDGPU_TARGETS=gfx1030
               FORCE_CMAKE=1
@@ -132,7 +141,8 @@ jobs:
             documentation_path: runtimes/vision-llama-cpp-gemma4/README.md
             variant: vulkan
             build_args: |
-              APT_PACKAGES=build-essential cmake git ninja-build libvulkan-dev glslc glslang-tools spirv-headers vulkan-tools libvulkan1 mesa-vulkan-drivers
+              APT_PACKAGES=build-essential cmake git ninja-build libvulkan-dev glslc glslang-tools spirv-headers
+              RUNTIME_APT_PACKAGES=libgomp1 libvulkan1 mesa-vulkan-drivers
               CMAKE_ARGS=-DGGML_VULKAN=on
               RUNTIME_ID=vision-llama-cpp-gemma4
               RUNTIME_VARIANT=vulkan
@@ -141,23 +151,23 @@ jobs:
               INSTALL_SOURCE=git
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6.0.3
 
       - name: Compute image namespace
         run: echo "IMAGE_NAMESPACE=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_ENV"
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4.1.0
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4.2.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7.2.0
         with:
           context: .
           file: runtimes/llama-cpp.Dockerfile
@@ -175,8 +185,9 @@ jobs:
             org.opencontainers.image.licenses=GPL-3.0-or-later
             org.opencontainers.image.documentation=${{ github.server_url }}/${{ github.repository }}/blob/${{ github.ref_name }}/${{ matrix.documentation_path }}
           annotations: |
-            org.opencontainers.image.description=${{ matrix.description }}
-            org.opencontainers.image.licenses=GPL-3.0-or-later
+            index,manifest:org.opencontainers.image.description=${{ matrix.description }}
+            index,manifest:org.opencontainers.image.licenses=GPL-3.0-or-later
+            index,manifest:org.opencontainers.image.documentation=${{ github.server_url }}/${{ github.repository }}/blob/${{ github.ref_name }}/${{ matrix.documentation_path }}
           cache-from: type=gha,scope=${{ matrix.image_name }}-${{ matrix.variant }}
           cache-to: type=gha,mode=max,scope=${{ matrix.image_name }}-${{ matrix.variant }}
 
@@ -225,23 +236,23 @@ jobs:
             context: runtimes/stub
             file: runtimes/stub/Dockerfile
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6.0.3
 
       - name: Compute image namespace
         run: echo "IMAGE_NAMESPACE=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_ENV"
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4.1.0
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4.2.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7.2.0
         with:
           context: ${{ matrix.context }}
           file: ${{ matrix.file }}
@@ -258,8 +269,9 @@ jobs:
             org.opencontainers.image.licenses=GPL-3.0-or-later
             org.opencontainers.image.documentation=${{ github.server_url }}/${{ github.repository }}/blob/${{ github.ref_name }}/${{ matrix.documentation_path }}
           annotations: |
-            org.opencontainers.image.description=${{ matrix.description }}
-            org.opencontainers.image.licenses=GPL-3.0-or-later
+            index,manifest:org.opencontainers.image.description=${{ matrix.description }}
+            index,manifest:org.opencontainers.image.licenses=GPL-3.0-or-later
+            index,manifest:org.opencontainers.image.documentation=${{ github.server_url }}/${{ github.repository }}/blob/${{ github.ref_name }}/${{ matrix.documentation_path }}
           cache-from: type=gha,scope=${{ matrix.image_name }}-${{ matrix.variant }}
           cache-to: type=gha,mode=max,scope=${{ matrix.image_name }}-${{ matrix.variant }}
 

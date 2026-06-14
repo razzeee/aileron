@@ -1,4 +1,5 @@
-FROM python:3.12-slim
+ARG PYTHON_IMAGE="python:3.13-slim"
+FROM ${PYTHON_IMAGE} AS builder
 
 # CPU-only whisper.cpp build.
 # For GPU acceleration use Dockerfile.cuda.
@@ -7,7 +8,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential cmake \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir "pywhispercpp>=1.2.0"
+RUN python -m pip install --prefix=/runtime --no-cache-dir "pywhispercpp>=1.2.0"
+
+FROM ${PYTHON_IMAGE}
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /runtime /usr/local
 
 COPY entrypoint.py /entrypoint.py
 
