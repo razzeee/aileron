@@ -392,7 +392,7 @@ The portal does not talk to containers directly. It translates D-Bus calls into 
 | `Describe` | `session_id: s, image_b64: s` | `text: s` | PNG or JPEG, base64 |
 | `EndSession` | `session_id: s` | `()` | |
 
-`options: (xdsss)` is `GenerationOptions`: `maximum_response_tokens` as int64, `temperature` as float64, `sampling_mode` as string, `source_language_hint` as string, and `target_language_hint` as string. Empty language hints mean unspecified. The language hints only affect `llm.translate`. `fields: a(sssb)` is an array of `GuidedField`: name, kind, description, required.
+These are D-Bus signatures: parentheses define a struct, and `a(...)` means an array of structs. `options: (xdsss)` is `GenerationOptions`: `maximum_response_tokens` as int64, `temperature` as float64, `sampling_mode` as string, `source_language_hint` as string, and `target_language_hint` as string. Empty language hints mean unspecified. The language hints only affect `llm.translate`. `fields: a(sssb)` is an array of `GuidedField` structs: name, kind, description, required.
 
 ### Signals
 
