@@ -62,6 +62,8 @@ Summarize the article below in three bullet points. Preserve important names and
 
 Prefer explicit output constraints over relying on a specific model's behavior.
 
+For `llm.translate`, `GenerationOptions` includes optional `source_language_hint` and `target_language_hint` strings. Pass empty strings when the app does not know one side. These are hints, not strict locale settings; apps should still make the requested translation clear in the prompt.
+
 ## Guided Output
 
 Use guided generation when the app needs structured data. The portal API accepts field guides and the daemon converts them to a JSON Schema used by the runtime protocol.
@@ -70,7 +72,7 @@ This is appropriate for extraction, classification, and form-filling workflows. 
 
 ## Audio And Vision
 
-Use `asr.transcribe` for speech-to-text. Audio is passed as base64-encoded raw PCM bytes through the portal-facing API.
+Use `asr.transcribe` for speech-to-text. Audio is passed as base64-encoded raw PCM bytes through the portal-facing API. `Transcribe` also accepts an optional `language_hint` string; pass an empty string to let the runtime auto-detect or use its default behavior.
 
 Use `vision.describe` for image description. Images are passed as base64-encoded PNG or JPEG bytes.
 

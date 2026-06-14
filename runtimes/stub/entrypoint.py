@@ -83,7 +83,9 @@ def _stub_object(schema: dict) -> object:
 
 def handle_transcribe(req: dict) -> None:
     req_id = req["id"]
-    send({"id": req_id, "token": "Stub transcription: audio received.", "done": True})
+    language_hint = req.get("language_hint", "")
+    suffix = f" Language hint: {language_hint}." if language_hint else ""
+    send({"id": req_id, "token": f"Stub transcription: audio received.{suffix}", "done": True})
 
 
 def handle_describe(req: dict) -> None:

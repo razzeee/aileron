@@ -23,7 +23,7 @@
 ///
 /// ### Audio transcription
 /// Request:
-///   {"id":"<uuid>","type":"transcribe","audio":"<base64 PCM>"}
+///   {"id":"<uuid>","type":"transcribe","audio":"<base64 PCM>","language_hint":"en"}
 /// Response (streamed tokens, same as generate):
 ///   {"id":"<uuid>","token":"Hello world","done":true}
 ///
@@ -177,6 +177,7 @@ impl Container {
             max_tokens: Some(max_tokens),
             audio: None,
             image: None,
+            language_hint: None,
             response_format: None,
         };
         let line = serde_json::to_string(&req)? + "\n";
@@ -228,6 +229,7 @@ impl Container {
             max_tokens: Some(max_tokens),
             audio: None,
             image: None,
+            language_hint: None,
             response_format: Some(ResponseFormat {
                 r#type: "json_schema".to_string(),
                 schema: schema.clone(),
@@ -256,7 +258,7 @@ impl Container {
     }
 
     /// Send a transcribe request and return the full transcript.
-    pub fn transcribe(&mut self, audio: Vec<u8>) -> Result<String> {
+    pub fn transcribe(&mut self, audio: Vec<u8>, language_hint: Option<&str>) -> Result<String> {
         let id = Uuid::new_v4().to_string();
         let req = ContainerRequest {
             id: id.clone(),
@@ -266,6 +268,9 @@ impl Container {
             max_tokens: None,
             audio: Some(base64_encode(&audio)),
             image: None,
+            language_hint: language_hint
+                .filter(|hint| !hint.is_empty())
+                .map(str::to_string),
             response_format: None,
         };
         let line = serde_json::to_string(&req)? + "\n";
@@ -286,6 +291,7 @@ impl Container {
             max_tokens: None,
             audio: None,
             image: Some(base64_encode(&image)),
+            language_hint: None,
             response_format: None,
         };
         let line = serde_json::to_string(&req)? + "\n";
@@ -677,6 +683,8 @@ struct ContainerRequest {
     audio: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     image: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    language_hint: Option<String>,
     /// Present only for `generate_structured` requests.
     #[serde(skip_serializing_if = "Option::is_none")]
     response_format: Option<ResponseFormat>,
@@ -882,7 +890,7 @@ mod tests {
         assert!(structured_json.get("name").is_some());
 
         let transcript = container
-            .transcribe(Vec::new())
+            .transcribe(Vec::new(), None)
             .expect("transcribe through container wrapper");
         assert!(!transcript.is_empty());
 

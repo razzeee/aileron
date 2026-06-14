@@ -310,6 +310,7 @@ impl VarlinkInterface for InferenceHandler {
         call: &mut dyn Call_Transcribe,
         session_id: String,
         audio: String,
+        language_hint: String,
     ) -> varlink::Result<()> {
         self.rt.block_on(async {
             let mut guard = self.state.0.lock().await;
@@ -352,7 +353,7 @@ impl VarlinkInterface for InferenceHandler {
                 Err(e) => return call.reply_generation_failed(e.to_string()),
             };
 
-            match container.transcribe(audio_bytes) {
+            match container.transcribe(audio_bytes, Some(&language_hint)) {
                 Ok(text) => call.reply(text),
                 Err(e) => call.reply_generation_failed(e.to_string()),
             }
@@ -472,6 +473,7 @@ async fn stream_tokens(
     let mut pending_token: Option<String> = None;
     let mut reply_error: Option<varlink::Error> = None;
 
+    let instructions = apply_translation_hints(&use_case, instructions, &options);
     let result = container.generate(Some(&instructions), &prompt, max_tokens, |token| {
         if !wants_more {
             pending_token = Some(token);
@@ -574,11 +576,33 @@ async fn generate_tokens(
         )
         .map_err(|e| GenerationError::Failed(e.to_string()))?;
 
+    let instructions = apply_translation_hints(&use_case, instructions, &options);
     container
         .generate(Some(&instructions), &prompt, max_tokens, |token| {
             sink.push_token(token)
         })
         .map_err(|e| GenerationError::Failed(e.to_string()))
+}
+
+fn apply_translation_hints(
+    use_case: &str,
+    instructions: String,
+    options: &GenerationOptions,
+) -> String {
+    if use_case != "llm.translate" {
+        return instructions;
+    }
+
+    let source = options.source_language_hint.trim();
+    let target = options.target_language_hint.trim();
+    match (source.is_empty(), target.is_empty()) {
+        (true, true) => instructions,
+        (false, true) => format!("{instructions}\nSource language hint: {source}."),
+        (true, false) => format!("{instructions}\nTarget language hint: {target}."),
+        (false, false) => format!(
+            "{instructions}\nSource language hint: {source}. Target language hint: {target}."
+        ),
+    }
 }
 
 fn profile_runtime(

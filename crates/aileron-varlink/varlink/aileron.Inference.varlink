@@ -10,7 +10,9 @@ type ModelAvailability (
 type GenerationOptions (
   maximum_response_tokens: int,
   temperature: float,
-  sampling_mode: string
+  sampling_mode: string,
+  source_language_hint: string,
+  target_language_hint: string
 )
 
 type GuidedField (
@@ -41,7 +43,8 @@ method RespondGuided(session_id: string, prompt: string, fields: []GuidedField, 
 
 # Transcribe audio. Session must have been created with use_case: asr.transcribe
 # audio: raw PCM bytes encoded as base64 (16kHz mono f32le)
-method Transcribe(session_id: string, audio: string) -> (text: string)
+# language_hint: optional language hint; empty string means auto-detect/no hint
+method Transcribe(session_id: string, audio: string, language_hint: string) -> (text: string)
 
 # Describe an image. Session must have been created with vision.describe or vision.segment
 # image: PNG or JPEG bytes encoded as base64
