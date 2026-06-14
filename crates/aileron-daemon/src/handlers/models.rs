@@ -1438,7 +1438,11 @@ async fn artifacts_match(
             }
             hasher.update(&buffer[..read]);
         }
-        let actual = format!("{:x}", hasher.finalize());
+        let actual = hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
         if actual != artifact.sha256.to_lowercase() {
             return Ok(false);
         }
@@ -1480,7 +1484,11 @@ async fn download_artifacts_to_temp(
         }
 
         file.flush().await?;
-        let actual = format!("{:x}", hasher.finalize());
+        let actual = hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
         if actual != artifact.sha256.to_lowercase() {
             anyhow::bail!(
                 "checksum mismatch for {}: expected {}, got {}",
