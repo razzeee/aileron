@@ -1,0 +1,18 @@
+{
+  "profile_id": "whisper-large-v3-turbo-f16",
+  "model_id": "whisper-large-v3-turbo-f16",
+  "llmfit_model_id": "openai/whisper-large-v3-turbo",
+  "runtime_id": "asr-whisper-cpp",
+  "tier": "large",
+  "min_ram_gb": 3.0,
+  "use_cases": ["asr.transcribe"],
+  "artifacts": [
+    {
+      "role": "model",
+      "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin",
+      "filename": "model.bin",
+      "sha256": "1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69",
+      "size_bytes": 1624555275
+    }
+  ]
+}

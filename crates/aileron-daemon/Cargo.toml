@@ -14,6 +14,7 @@ aileron-ipc     = { workspace = true }
 tokio           = { workspace = true }
 serde           = { workspace = true }
 serde_json      = { workspace = true }
+llmfit-core     = { workspace = true }
 uuid            = { workspace = true }
 anyhow          = { workspace = true }
 thiserror       = { workspace = true }

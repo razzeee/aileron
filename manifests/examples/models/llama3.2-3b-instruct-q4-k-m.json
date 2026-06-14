@@ -1,0 +1,24 @@
+{
+  "profile_id": "llama3.2-3b-instruct-q4-k-m",
+  "model_id": "llama3.2-3b-instruct-q4-k-m",
+  "llmfit_model_id": "meta-llama/Llama-3.2-3B-Instruct",
+  "runtime_id": "llm-llama-cpp",
+  "tier": "balanced",
+  "use_cases": [
+    "llm.summarize",
+    "llm.translate",
+    "llm.rephrase",
+    "llm.classify",
+    "llm.extract",
+    "llm.analyze"
+  ],
+  "artifacts": [
+    {
+      "role": "model",
+      "url": "https://huggingface.co/unsloth/Llama-3.2-3B-Instruct-GGUF/resolve/main/Llama-3.2-3B-Instruct-Q4_K_M.gguf",
+      "filename": "model.gguf",
+      "sha256": "6c99cc00ae910f6a532a80022cb4bc1939094527a089c29294b841c0bd87f74d",
+      "size_bytes": 2019377600
+    }
+  ]
+}

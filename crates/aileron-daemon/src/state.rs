@@ -1,5 +1,5 @@
 /// Shared mutable daemon state, behind a single `Arc<Mutex<…>>`.
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -10,6 +10,21 @@ use crate::hardware::Variant;
 use crate::manifests::RuntimeManifestStore;
 use crate::permissions::PermissionStore;
 use crate::profiles::ProfileStore;
+
+#[derive(Debug, Clone)]
+pub struct InstallRecord {
+    pub bytes_pulled: u64,
+    pub total_bytes: u64,
+    pub status: String,
+    pub cancel_requested: bool,
+    pub samples: VecDeque<InstallSample>,
+}
+
+#[derive(Debug, Clone)]
+pub struct InstallSample {
+    pub at: chrono::DateTime<chrono::Utc>,
+    pub bytes_pulled: u64,
+}
 
 #[derive(Debug, Clone)]
 pub struct Session {
@@ -29,6 +44,8 @@ pub struct Inner {
     pub runtimes: RuntimeManifestStore,
     pub containers: ContainerPool,
     pub sessions: HashMap<String, Session>,
+    pub installing_profiles: HashMap<String, InstallRecord>,
+    pub recent_installs: VecDeque<(String, InstallRecord)>,
     /// Best available hardware variant, detected once at startup.
     pub variant: Variant,
 }
@@ -54,6 +71,8 @@ impl SharedState {
             runtimes,
             containers,
             sessions: HashMap::new(),
+            installing_profiles: HashMap::new(),
+            recent_installs: VecDeque::new(),
             variant,
         }))))
     }

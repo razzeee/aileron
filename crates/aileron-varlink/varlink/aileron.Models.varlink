@@ -25,9 +25,59 @@ type RuntimeManifestInfo (
     variants: []string
 )
 
+type OciRuntimeImage (
+    image_id: string,
+    image_ref: string,
+    runtime_id: string,
+    variant: string,
+    size_bytes: int,
+    in_use: bool,
+    used_by_profiles: []string
+)
+
+type RuntimeImageCleanupError (
+    image_ref: string,
+    reason: string
+)
+
+type UseCaseFitScore (
+    use_case: string,
+    score: float
+)
+
+type CatalogProfileInfo (
+    profile_id: string,
+    model_id: string,
+    llmfit_model_id: string,
+    runtime_id: string,
+    tier: string,
+    disk_size_gb: float,
+    min_ram_gb: float,
+    recommended_ram_gb: float,
+    min_vram_gb: float,
+    fit_score: float,
+    use_case_fit_scores: []UseCaseFitScore,
+    fit_level: string,
+    recommended: bool,
+    installing: bool,
+    recommendation_reason: string,
+    use_cases: []string
+)
+
 method List() -> (profiles: []ProfileInfo)
 
 method ListRuntimeManifests() -> (runtimes: []RuntimeManifestInfo)
+
+method ListRuntimeImages() -> (images: []OciRuntimeImage)
+
+method RemoveRuntimeImage(image_id: string) -> ()
+
+method PruneUnusedRuntimeImages() -> (
+    removed: []string,
+    errors: []RuntimeImageCleanupError
+)
+
+method ListCatalog() -> (profiles: []CatalogProfileInfo)
 
 type InstallProgress (
     profile_id: string,
@@ -35,6 +85,20 @@ type InstallProgress (
     total_bytes: int,
     done: bool
 )
+
+type InstallStatus (
+    profile_id: string,
+    bytes_pulled: int,
+    total_bytes: int,
+    bytes_per_second: int,
+    eta_seconds: int,
+    status: string,
+    cancel_requested: bool
+)
+
+method ListInstalls() -> (installs: []InstallStatus)
+
+method CancelInstall(profile_id: string) -> ()
 
 # A use-case that is already assigned to a different profile.
 # Returned in the final install/import reply (done: true) when a conflict exists.
@@ -58,6 +122,8 @@ method InstallUrlProfile(
     runtime_id: string,
     url: string,
     sha256: string,
+    mmproj_url: string,
+    mmproj_sha256: string,
     use_cases: []string
 ) -> (
     progress: InstallProgress,

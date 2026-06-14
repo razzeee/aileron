@@ -38,7 +38,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Stdio};
 use std::thread;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::{info, warn};
@@ -50,6 +50,8 @@ pub struct Container {
     pub image_ref: String,
     #[allow(dead_code)]
     pub artifact_path: PathBuf,
+    #[allow(dead_code)]
+    runtime_options: HashMap<String, String>,
     /// Kept alive to prevent the container process from being killed on drop.
     #[allow(dead_code)]
     child: Child,
@@ -78,11 +80,12 @@ impl Container {
     pub fn spawn(
         image_ref: &str,
         artifact_path: &Path,
+        runtime_options: &HashMap<String, String>,
         memory_limit: &str,
         mut on_status: impl FnMut(String) + Send + 'static,
     ) -> Result<Self> {
         info!("spawning container for {}", image_ref);
-        let args = podman_run_args(image_ref, artifact_path, memory_limit);
+        let args = podman_run_args(image_ref, artifact_path, runtime_options, memory_limit);
         let mut child = std::process::Command::new("podman")
             .args(&args)
             .stdin(Stdio::piped())
@@ -148,6 +151,7 @@ impl Container {
         Ok(Self {
             image_ref: image_ref.to_string(),
             artifact_path: artifact_path.to_path_buf(),
+            runtime_options: runtime_options.clone(),
             child,
             stdin,
             stdout,
@@ -333,7 +337,12 @@ fn structured_response_result(resp: ContainerResponse, schema: &Value) -> Result
     Ok(None)
 }
 
-fn podman_run_args(image_ref: &str, artifact_path: &Path, memory_limit: &str) -> Vec<String> {
+fn podman_run_args(
+    image_ref: &str,
+    artifact_path: &Path,
+    runtime_options: &HashMap<String, String>,
+    memory_limit: &str,
+) -> Vec<String> {
     let mut args = vec![
         "run".to_string(),
         "--rm".to_string(),
@@ -363,6 +372,12 @@ fn podman_run_args(image_ref: &str, artifact_path: &Path, memory_limit: &str) ->
             "--device=/dev/dri".to_string(),
             "--group-add=keep-groups".to_string(),
         ]);
+    }
+
+    let mut runtime_options: Vec<_> = runtime_options.iter().collect();
+    runtime_options.sort_by(|a, b| a.0.cmp(b.0));
+    for (key, value) in runtime_options {
+        args.push(format!("--env={key}={value}"));
     }
 
     args.push(image_ref.to_string());
@@ -426,12 +441,12 @@ fn validate_value(value: &Value, schema: &Value, path: &str) -> Result<()> {
             }
 
             // additionalProperties: false
-            if schema.get("additionalProperties").and_then(|v| v.as_bool()) == Some(false) {
-                if let Some(props) = schema.get("properties").and_then(|v| v.as_object()) {
-                    for key in obj.keys() {
-                        if !props.contains_key(key) {
-                            bail!("{path}: unexpected additional property '{key}'");
-                        }
+            if schema.get("additionalProperties").and_then(|v| v.as_bool()) == Some(false)
+                && let Some(props) = schema.get("properties").and_then(|v| v.as_object())
+            {
+                for key in obj.keys() {
+                    if !props.contains_key(key) {
+                        bail!("{path}: unexpected additional property '{key}'");
                     }
                 }
             }
@@ -445,30 +460,30 @@ fn validate_value(value: &Value, schema: &Value, path: &str) -> Result<()> {
                     validate_value(item, items_schema, &format!("{path}[{i}]"))?;
                 }
             }
-            if let Some(min) = schema.get("minItems").and_then(|v| v.as_u64()) {
-                if arr.len() < min as usize {
-                    bail!("{path}: array length {} < minItems {min}", arr.len());
-                }
+            if let Some(min) = schema.get("minItems").and_then(|v| v.as_u64())
+                && arr.len() < min as usize
+            {
+                bail!("{path}: array length {} < minItems {min}", arr.len());
             }
-            if let Some(max) = schema.get("maxItems").and_then(|v| v.as_u64()) {
-                if arr.len() > max as usize {
-                    bail!("{path}: array length {} > maxItems {max}", arr.len());
-                }
+            if let Some(max) = schema.get("maxItems").and_then(|v| v.as_u64())
+                && arr.len() > max as usize
+            {
+                bail!("{path}: array length {} > maxItems {max}", arr.len());
             }
         }
         Some("string") => {
             let s = value.as_str().with_context(|| {
                 format!("{path}: expected string, got {}", value_type_name(value))
             })?;
-            if let Some(min) = schema.get("minLength").and_then(|v| v.as_u64()) {
-                if s.len() < min as usize {
-                    bail!("{path}: string length {} < minLength {min}", s.len());
-                }
+            if let Some(min) = schema.get("minLength").and_then(|v| v.as_u64())
+                && s.len() < min as usize
+            {
+                bail!("{path}: string length {} < minLength {min}", s.len());
             }
-            if let Some(max) = schema.get("maxLength").and_then(|v| v.as_u64()) {
-                if s.len() > max as usize {
-                    bail!("{path}: string length {} > maxLength {max}", s.len());
-                }
+            if let Some(max) = schema.get("maxLength").and_then(|v| v.as_u64())
+                && s.len() > max as usize
+            {
+                bail!("{path}: string length {} > maxLength {max}", s.len());
             }
             check_enum(value, schema, path)?;
         }
@@ -479,15 +494,15 @@ fn validate_value(value: &Value, schema: &Value, path: &str) -> Result<()> {
             if schema_type == Some("integer") && value.as_i64().is_none() {
                 bail!("{path}: expected integer, got non-integer number {n}");
             }
-            if let Some(min) = schema.get("minimum").and_then(|v| v.as_f64()) {
-                if n < min {
-                    bail!("{path}: {n} < minimum {min}");
-                }
+            if let Some(min) = schema.get("minimum").and_then(|v| v.as_f64())
+                && n < min
+            {
+                bail!("{path}: {n} < minimum {min}");
             }
-            if let Some(max) = schema.get("maximum").and_then(|v| v.as_f64()) {
-                if n > max {
-                    bail!("{path}: {n} > maximum {max}");
-                }
+            if let Some(max) = schema.get("maximum").and_then(|v| v.as_f64())
+                && n > max
+            {
+                bail!("{path}: {n} > maximum {max}");
             }
             check_enum(value, schema, path)?;
         }
@@ -512,10 +527,10 @@ fn validate_value(value: &Value, schema: &Value, path: &str) -> Result<()> {
 }
 
 fn check_enum(value: &Value, schema: &Value, path: &str) -> Result<()> {
-    if let Some(variants) = schema.get("enum").and_then(|v| v.as_array()) {
-        if !variants.contains(value) {
-            bail!("{path}: value {:?} is not in enum {:?}", value, variants);
-        }
+    if let Some(variants) = schema.get("enum").and_then(|v| v.as_array())
+        && !variants.contains(value)
+    {
+        bail!("{path}: value {:?} is not in enum {:?}", value, variants);
     }
     Ok(())
 }
@@ -585,10 +600,13 @@ impl ContainerPool {
         profile_id: &str,
         image_ref: &str,
         artifact_path: &Path,
+        runtime_options: &HashMap<String, String>,
         on_status: impl FnMut(String) + Send + 'static,
     ) -> Result<&mut Container> {
         if self.containers.get(profile_id).is_some_and(|container| {
-            container.image_ref != image_ref || container.artifact_path != artifact_path
+            container.image_ref != image_ref
+                || container.artifact_path != artifact_path
+                || container.runtime_options != *runtime_options
         }) {
             info!(
                 "replacing container for profile {} with runtime image {}",
@@ -598,7 +616,13 @@ impl ContainerPool {
         }
 
         if !self.containers.contains_key(profile_id) {
-            let c = Container::spawn(image_ref, artifact_path, &self.memory_limit, on_status)?;
+            let c = Container::spawn(
+                image_ref,
+                artifact_path,
+                runtime_options,
+                &self.memory_limit,
+                on_status,
+            )?;
             self.containers.insert(profile_id.to_string(), c);
         }
         Ok(self.containers.get_mut(profile_id).unwrap())
@@ -686,6 +710,7 @@ mod tests {
         let args = podman_run_args(
             "localhost/aileron/summarize:rocm",
             Path::new("/models/foo"),
+            &HashMap::new(),
             "8g",
         );
 
@@ -705,6 +730,7 @@ mod tests {
         let args = podman_run_args(
             "localhost/aileron/summarize:cuda",
             Path::new("/models/foo"),
+            &HashMap::new(),
             "8g",
         );
 
@@ -721,6 +747,7 @@ mod tests {
         let args = podman_run_args(
             "localhost/aileron/summarize:vulkan",
             Path::new("/models/foo"),
+            &HashMap::new(),
             "8g",
         );
 
@@ -737,6 +764,7 @@ mod tests {
         let args = podman_run_args(
             "localhost/aileron/summarize:cpu",
             Path::new("/models/foo"),
+            &HashMap::new(),
             "8g",
         );
 
@@ -746,6 +774,25 @@ mod tests {
         assert!(!args.contains(&"--ipc=host".to_string()));
         assert!(!args.contains(&"--env=HSA_OVERRIDE_GFX_VERSION=10.3.0".to_string()));
         assert!(!args.contains(&"--group-add=keep-groups".to_string()));
+    }
+
+    #[test]
+    fn podman_args_include_runtime_options_as_env() {
+        let mut runtime_options = HashMap::new();
+        runtime_options.insert("VISION_HANDLER".to_string(), "gemma4".to_string());
+
+        let args = podman_run_args(
+            "localhost/aileron/vision:cpu",
+            Path::new("/models/foo"),
+            &runtime_options,
+            "8g",
+        );
+
+        assert!(args.contains(&"--env=VISION_HANDLER=gemma4".to_string()));
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("localhost/aileron/vision:cpu")
+        );
     }
 
     #[test]
@@ -799,5 +846,51 @@ mod tests {
             "localhost:5000/aileron/summarize",
             "rocm"
         ));
+    }
+
+    #[test]
+    #[ignore = "requires a prebuilt stub runtime image and podman"]
+    fn stub_runtime_roundtrip_through_container_wrapper() {
+        let image_ref = std::env::var("AILERON_STUB_IMAGE")
+            .unwrap_or_else(|_| "localhost/aileron/stub:ci".to_string());
+        let artifact_path =
+            std::env::temp_dir().join(format!("aileron-stub-artifacts-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&artifact_path).expect("create temporary artifact directory");
+
+        let mut container =
+            Container::spawn(&image_ref, &artifact_path, &HashMap::new(), "512m", |_| {})
+                .expect("spawn stub runtime");
+
+        let mut generated = String::new();
+        container
+            .generate(None, "hello world", 16, |token| generated.push_str(&token))
+            .expect("generate through container wrapper");
+        assert!(!generated.is_empty());
+
+        let schema = serde_json::json!({
+            "type": "object",
+            "required": ["name"],
+            "properties": {
+                "name": { "type": "string" }
+            }
+        });
+        let structured = container
+            .generate_structured(None, "extract", 64, &schema)
+            .expect("generate structured through container wrapper");
+        let structured_json: serde_json::Value =
+            serde_json::from_str(&structured).expect("structured result is JSON");
+        assert!(structured_json.get("name").is_some());
+
+        let transcript = container
+            .transcribe(Vec::new())
+            .expect("transcribe through container wrapper");
+        assert!(!transcript.is_empty());
+
+        let description = container
+            .describe(Vec::new())
+            .expect("describe through container wrapper");
+        assert!(!description.is_empty());
+
+        let _ = std::fs::remove_dir_all(&artifact_path);
     }
 }

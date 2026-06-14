@@ -1,0 +1,24 @@
+{
+  "profile_id": "mistral-7b-v0.2-iq3-s",
+  "model_id": "mistral-7b-v0.2-iq3-s",
+  "runtime_id": "llm-llama-cpp",
+  "tier": "balanced",
+  "min_ram_gb": 6.0,
+  "use_cases": [
+    "llm.summarize",
+    "llm.translate",
+    "llm.rephrase",
+    "llm.classify",
+    "llm.extract",
+    "llm.analyze"
+  ],
+  "artifacts": [
+    {
+      "role": "model",
+      "url": "https://huggingface.co/ggml-org/models-moved/resolve/main/mistral-7b-v0.2-iq3_s-imat.gguf",
+      "filename": "model.gguf",
+      "sha256": "b30bb276df8debca77c077b9d65b0b7fa0717740de6312e38840974cddd8813b",
+      "size_bytes": 3182393056
+    }
+  ]
+}

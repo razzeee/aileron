@@ -68,6 +68,25 @@ pub fn detect() -> Variant {
     Variant::Cpu
 }
 
+pub fn total_memory_gb() -> Option<f64> {
+    #[cfg(target_os = "linux")]
+    {
+        let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+        for line in meminfo.lines() {
+            if let Some(rest) = line.strip_prefix("MemTotal:") {
+                let kb = rest.split_whitespace().next()?.parse::<f64>().ok()?;
+                return Some(kb / 1024.0 / 1024.0);
+            }
+        }
+        None
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
 fn run(cmd: &str, args: &[&str]) -> Option<String> {
     which(cmd)?;
     std::process::Command::new(cmd)

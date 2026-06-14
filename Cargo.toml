@@ -1,5 +1,5 @@
 [workspace]
-resolver = "2"
+resolver = "3"
 members = [
     "crates/aileron-varlink",
     "crates/aileron-ipc",
@@ -11,7 +11,7 @@ members = [
 
 [workspace.package]
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 license = "GPL-3.0-or-later"
 authors = ["Aileron contributors"]
 
@@ -22,6 +22,7 @@ aileron-ipc     = { path = "crates/aileron-ipc" }
 tokio    = { version = "1", features = ["full"] }
 serde    = { version = "1", features = ["derive"] }
 serde_json = "1"
+llmfit-core = "0.9.31"
 uuid     = { version = "1", features = ["v4"] }
 anyhow   = "1"
 thiserror = "1"

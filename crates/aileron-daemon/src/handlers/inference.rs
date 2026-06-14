@@ -1,5 +1,6 @@
 /// Varlink handler for `aileron.Inference`.
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use uuid::Uuid;
 
@@ -163,18 +164,22 @@ impl VarlinkInterface for InferenceHandler {
     ) -> varlink::Result<()> {
         self.rt.block_on(async {
             let mut guard = self.state.0.lock().await;
-            let (profile_id, image_ref, artifact_path) = match guard.sessions.get(&session_id) {
-                Some(s) => match profile_runtime(&guard, &s.profile_id) {
-                    Ok(resolved) => resolved,
-                    Err(reason) => return call.reply_model_unavailable(reason),
-                },
-                None => return call.reply_session_not_found(session_id),
-            };
+            let (profile_id, image_ref, artifact_path, runtime_options) =
+                match guard.sessions.get(&session_id) {
+                    Some(s) => match profile_runtime(&guard, &s.profile_id) {
+                        Ok(resolved) => resolved,
+                        Err(reason) => return call.reply_model_unavailable(reason),
+                    },
+                    None => return call.reply_session_not_found(session_id),
+                };
 
-            match guard
-                .containers
-                .get_or_spawn(&profile_id, &image_ref, &artifact_path, |_| {})
-            {
+            match guard.containers.get_or_spawn(
+                &profile_id,
+                &image_ref,
+                &artifact_path,
+                &runtime_options,
+                |_| {},
+            ) {
                 Ok(_) => {}
                 Err(e) => return call.reply_generation_failed(e.to_string()),
             }
@@ -249,34 +254,48 @@ impl VarlinkInterface for InferenceHandler {
             };
 
             let mut guard = self.state.0.lock().await;
-            let (app_id, use_case, profile_id, image_ref, artifact_path, instructions) =
-                match guard.sessions.get(&session_id) {
-                    Some(s) => {
-                        if let Err(reason) = ensure_llm_use_case(&s.use_case) {
-                            return call.reply_model_unavailable(reason);
-                        }
-                        let (profile_id, image_ref, artifact_path) =
-                            match profile_runtime(&guard, &s.profile_id) {
-                                Ok(resolved) => resolved,
-                                Err(reason) => return call.reply_model_unavailable(reason),
-                            };
-                        (
-                            s.app_id.clone(),
-                            s.use_case.clone(),
-                            profile_id,
-                            image_ref,
-                            artifact_path,
-                            s.instructions.clone(),
-                        )
+            let (
+                app_id,
+                use_case,
+                profile_id,
+                image_ref,
+                artifact_path,
+                runtime_options,
+                instructions,
+            ) = match guard.sessions.get(&session_id) {
+                Some(s) => {
+                    if let Err(reason) = ensure_llm_use_case(&s.use_case) {
+                        return call.reply_model_unavailable(reason);
                     }
-                    None => return call.reply_session_not_found(session_id),
-                };
+                    let (profile_id, image_ref, artifact_path, runtime_options) =
+                        match profile_runtime(&guard, &s.profile_id) {
+                            Ok(resolved) => resolved,
+                            Err(reason) => return call.reply_model_unavailable(reason),
+                        };
+                    (
+                        s.app_id.clone(),
+                        s.use_case.clone(),
+                        profile_id,
+                        image_ref,
+                        artifact_path,
+                        runtime_options,
+                        s.instructions.clone(),
+                    )
+                }
+                None => return call.reply_session_not_found(session_id),
+            };
 
             let _ = guard.permissions.touch(&app_id, &use_case);
 
             let container = guard
                 .containers
-                .get_or_spawn(&profile_id, &image_ref, &artifact_path, |_| {})
+                .get_or_spawn(
+                    &profile_id,
+                    &image_ref,
+                    &artifact_path,
+                    &runtime_options,
+                    |_| {},
+                )
                 .map_err(io_err)?;
 
             match container.generate_structured(Some(&instructions), &prompt, max_tokens, &schema) {
@@ -295,7 +314,7 @@ impl VarlinkInterface for InferenceHandler {
         self.rt.block_on(async {
             let mut guard = self.state.0.lock().await;
 
-            let (app_id, use_case, profile_id, image_ref, artifact_path) =
+            let (app_id, use_case, profile_id, image_ref, artifact_path, runtime_options) =
                 match guard.sessions.get(&session_id) {
                     Some(s) => {
                         if let Err(reason) =
@@ -303,7 +322,7 @@ impl VarlinkInterface for InferenceHandler {
                         {
                             return call.reply_model_unavailable(reason);
                         }
-                        let (profile_id, image_ref, artifact_path) =
+                        let (profile_id, image_ref, artifact_path, runtime_options) =
                             match profile_runtime(&guard, &s.profile_id) {
                                 Ok(resolved) => resolved,
                                 Err(reason) => return call.reply_model_unavailable(reason),
@@ -314,6 +333,7 @@ impl VarlinkInterface for InferenceHandler {
                             profile_id,
                             image_ref,
                             artifact_path,
+                            runtime_options,
                         )
                     }
                     None => return call.reply_session_not_found(session_id),
@@ -321,14 +341,16 @@ impl VarlinkInterface for InferenceHandler {
 
             let _ = guard.permissions.touch(&app_id, &use_case);
             let audio_bytes = base64_decode(&audio).map_err(io_err)?;
-            let container =
-                match guard
-                    .containers
-                    .get_or_spawn(&profile_id, &image_ref, &artifact_path, |_| {})
-                {
-                    Ok(container) => container,
-                    Err(e) => return call.reply_generation_failed(e.to_string()),
-                };
+            let container = match guard.containers.get_or_spawn(
+                &profile_id,
+                &image_ref,
+                &artifact_path,
+                &runtime_options,
+                |_| {},
+            ) {
+                Ok(container) => container,
+                Err(e) => return call.reply_generation_failed(e.to_string()),
+            };
 
             match container.transcribe(audio_bytes) {
                 Ok(text) => call.reply(text),
@@ -346,13 +368,13 @@ impl VarlinkInterface for InferenceHandler {
         self.rt.block_on(async {
             let mut guard = self.state.0.lock().await;
 
-            let (app_id, use_case, profile_id, image_ref, artifact_path) =
+            let (app_id, use_case, profile_id, image_ref, artifact_path, runtime_options) =
                 match guard.sessions.get(&session_id) {
                     Some(s) => {
                         if let Err(reason) = ensure_vision_use_case(&s.use_case) {
                             return call.reply_model_unavailable(reason);
                         }
-                        let (profile_id, image_ref, artifact_path) =
+                        let (profile_id, image_ref, artifact_path, runtime_options) =
                             match profile_runtime(&guard, &s.profile_id) {
                                 Ok(resolved) => resolved,
                                 Err(reason) => return call.reply_model_unavailable(reason),
@@ -363,6 +385,7 @@ impl VarlinkInterface for InferenceHandler {
                             profile_id,
                             image_ref,
                             artifact_path,
+                            runtime_options,
                         )
                     }
                     None => return call.reply_session_not_found(session_id),
@@ -370,14 +393,16 @@ impl VarlinkInterface for InferenceHandler {
 
             let _ = guard.permissions.touch(&app_id, &use_case);
             let image_bytes = base64_decode(&image).map_err(io_err)?;
-            let container =
-                match guard
-                    .containers
-                    .get_or_spawn(&profile_id, &image_ref, &artifact_path, |_| {})
-                {
-                    Ok(container) => container,
-                    Err(e) => return call.reply_generation_failed(e.to_string()),
-                };
+            let container = match guard.containers.get_or_spawn(
+                &profile_id,
+                &image_ref,
+                &artifact_path,
+                &runtime_options,
+                |_| {},
+            ) {
+                Ok(container) => container,
+                Err(e) => return call.reply_generation_failed(e.to_string()),
+            };
 
             match container.describe(image_bytes) {
                 Ok(text) => call.reply(text),
@@ -411,18 +436,20 @@ async fn stream_tokens(
     let max_tokens = validate_options(&options).map_err(GenerationError::InvalidOptions)?;
     let mut guard = state.0.lock().await;
 
-    let (app_id, use_case, profile_id, image_ref, artifact_path, instructions) =
+    let (app_id, use_case, profile_id, image_ref, artifact_path, runtime_options, instructions) =
         match guard.sessions.get(&session_id) {
             Some(s) => {
                 ensure_llm_use_case(&s.use_case).map_err(GenerationError::ModelUnavailable)?;
-                let (profile_id, image_ref, artifact_path) = profile_runtime(&guard, &s.profile_id)
-                    .map_err(GenerationError::ModelUnavailable)?;
+                let (profile_id, image_ref, artifact_path, runtime_options) =
+                    profile_runtime(&guard, &s.profile_id)
+                        .map_err(GenerationError::ModelUnavailable)?;
                 (
                     s.app_id.clone(),
                     s.use_case.clone(),
                     profile_id,
                     image_ref,
                     artifact_path,
+                    runtime_options,
                     s.instructions.clone(),
                 )
             }
@@ -432,7 +459,13 @@ async fn stream_tokens(
     let _ = guard.permissions.touch(&app_id, &use_case);
     let container = guard
         .containers
-        .get_or_spawn(&profile_id, &image_ref, &artifact_path, |_| {})
+        .get_or_spawn(
+            &profile_id,
+            &image_ref,
+            &artifact_path,
+            &runtime_options,
+            |_| {},
+        )
         .map_err(|e| GenerationError::Failed(e.to_string()))?;
 
     let wants_more = call.wants_more();
@@ -509,18 +542,20 @@ async fn generate_tokens(
     let max_tokens = validate_options(&options).map_err(GenerationError::InvalidOptions)?;
     let mut guard = state.0.lock().await;
 
-    let (app_id, use_case, profile_id, image_ref, artifact_path, instructions) =
+    let (app_id, use_case, profile_id, image_ref, artifact_path, runtime_options, instructions) =
         match guard.sessions.get(&session_id) {
             Some(s) => {
                 ensure_llm_use_case(&s.use_case).map_err(GenerationError::ModelUnavailable)?;
-                let (profile_id, image_ref, artifact_path) = profile_runtime(&guard, &s.profile_id)
-                    .map_err(GenerationError::ModelUnavailable)?;
+                let (profile_id, image_ref, artifact_path, runtime_options) =
+                    profile_runtime(&guard, &s.profile_id)
+                        .map_err(GenerationError::ModelUnavailable)?;
                 (
                     s.app_id.clone(),
                     s.use_case.clone(),
                     profile_id,
                     image_ref,
                     artifact_path,
+                    runtime_options,
                     s.instructions.clone(),
                 )
             }
@@ -530,7 +565,13 @@ async fn generate_tokens(
     let _ = guard.permissions.touch(&app_id, &use_case);
     let container = guard
         .containers
-        .get_or_spawn(&profile_id, &image_ref, &artifact_path, |_| {})
+        .get_or_spawn(
+            &profile_id,
+            &image_ref,
+            &artifact_path,
+            &runtime_options,
+            |_| {},
+        )
         .map_err(|e| GenerationError::Failed(e.to_string()))?;
 
     container
@@ -543,7 +584,7 @@ async fn generate_tokens(
 fn profile_runtime(
     guard: &crate::state::Inner,
     profile_id: &str,
-) -> Result<(String, String, PathBuf), String> {
+) -> Result<(String, String, PathBuf, HashMap<String, String>), String> {
     let profile = guard
         .profiles
         .get(profile_id)
@@ -567,6 +608,7 @@ fn profile_runtime(
         profile.profile_id.clone(),
         image_ref,
         profile.artifact_path.clone(),
+        profile.runtime_options.clone(),
     ))
 }
 
@@ -651,13 +693,13 @@ fn guided_fields_schema(fields: &[GuidedField]) -> Result<Value, String> {
             other => return Err(format!("unsupported guided field kind '{other}'")),
         };
 
-        if !field.description.trim().is_empty() {
-            if let Some(obj) = schema.as_object_mut() {
-                obj.insert(
-                    "description".to_string(),
-                    Value::String(field.description.clone()),
-                );
-            }
+        if !field.description.trim().is_empty()
+            && let Some(obj) = schema.as_object_mut()
+        {
+            obj.insert(
+                "description".to_string(),
+                Value::String(field.description.clone()),
+            );
         }
         if field.required {
             required.push(Value::String(field.name.clone()));

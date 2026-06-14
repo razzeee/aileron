@@ -7,6 +7,7 @@ mod config;
 mod container;
 mod handlers;
 mod hardware;
+mod llmfit_metadata;
 mod manifests;
 mod permissions;
 mod profiles;

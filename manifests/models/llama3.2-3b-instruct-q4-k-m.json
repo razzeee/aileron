@@ -1,0 +1,24 @@
+{
+  "profile_id": "llama3.2-3b-instruct-q4-k-m",
+  "model_id": "llama3.2-3b-instruct-q4-k-m",
+  "llmfit_model_id": "meta-llama/Llama-3.2-3B-Instruct",
+  "runtime_id": "llm-llama-cpp",
+  "tier": "small",
+  "use_cases": [
+    "llm.summarize",
+    "llm.translate",
+    "llm.rephrase",
+    "llm.classify",
+    "llm.extract",
+    "llm.analyze"
+  ],
+  "artifacts": [
+    {
+      "role": "model",
+      "url": "https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF/resolve/main/Llama-3.2-3B-Instruct-Q4_K_M.gguf",
+      "filename": "model.gguf",
+      "sha256": "42e64ea673cdfe2512e48df7e7e616ff61a52164dc41e18a9945ca200825a83c",
+      "size_bytes": 2019397536
+    }
+  ]
+}

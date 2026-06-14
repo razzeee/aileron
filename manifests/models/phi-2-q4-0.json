@@ -1,0 +1,23 @@
+{
+  "profile_id": "phi-2-q4-0",
+  "model_id": "phi-2-q4-0",
+  "runtime_id": "llm-llama-cpp",
+  "tier": "small",
+  "min_ram_gb": 4.0,
+  "use_cases": [
+    "llm.summarize",
+    "llm.rephrase",
+    "llm.classify",
+    "llm.extract",
+    "llm.analyze"
+  ],
+  "artifacts": [
+    {
+      "role": "model",
+      "url": "https://huggingface.co/ggml-org/models-moved/resolve/main/phi-2/ggml-model-q4_0.gguf",
+      "filename": "model.gguf",
+      "sha256": "fd506d24a4bee6997a566b02b65715af5cadb433c6a3a47a74b467badc5727ca",
+      "size_bytes": 1602461536
+    }
+  ]
+}

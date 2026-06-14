@@ -31,10 +31,10 @@ pub fn varlink_address() -> String {
     format!("unix:{}", socket_path())
 }
 
-extern "C" {
+unsafe extern "C" {
     fn getuid() -> u32;
 }
 
 unsafe fn libc_uid() -> u32 {
-    getuid()
+    unsafe { getuid() }
 }

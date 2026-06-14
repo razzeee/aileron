@@ -1,0 +1,17 @@
+{
+  "profile_id": "whisper-base-q8-0",
+  "model_id": "whisper-base-q8-0",
+  "runtime_id": "asr-whisper-cpp",
+  "tier": "small",
+  "min_ram_gb": 1.0,
+  "use_cases": ["asr.transcribe"],
+  "artifacts": [
+    {
+      "role": "model",
+      "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base-q8_0.bin",
+      "filename": "model.bin",
+      "sha256": "c577b9a86e7e048a0b7eada054f4dd79a56bbfa911fbdacf900ac5b567cbb7d9",
+      "size_bytes": 81768585
+    }
+  ]
+}

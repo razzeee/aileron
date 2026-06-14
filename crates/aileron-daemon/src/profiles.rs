@@ -2,7 +2,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::hardware::Variant;
@@ -15,6 +15,8 @@ pub struct RuntimeImage {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArtifactHash {
+    #[serde(default)]
+    pub role: String,
     pub filename: String,
     pub sha256: String,
 }
@@ -24,6 +26,8 @@ pub struct Profile {
     pub profile_id: String,
     pub model_id: String,
     pub runtime_id: String,
+    #[serde(default)]
+    pub runtime_options: HashMap<String, String>,
     pub artifact_path: PathBuf,
     #[serde(default)]
     pub runtime_images: Vec<RuntimeImage>,
