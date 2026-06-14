@@ -1194,32 +1194,29 @@ fn render_readiness_list(
         .collect();
 
     for &use_case in USE_CASES {
-        let row = ActionRow::new();
-        row.set_title(use_case);
-
         if let Some(profile) = profiles
             .iter()
             .find(|profile| profile.assigned_use_cases.iter().any(|uc| uc == use_case))
         {
             let better = better_catalog_candidate(&catalog, &profile.profile_id, use_case);
             if let Some(candidate) = better {
-                row.set_subtitle(&format!(
-                    "Ready · assigned to {} · better available: {} · {}",
+                let detail = format!(
+                    "Assigned to {} · {} · Better available: {} · {}",
                     profile.profile_id,
+                    use_case_kind(use_case),
                     candidate.profile_id,
                     format_size(candidate.disk_size_gb)
-                ));
-                row.set_tooltip_text(Some(&candidate.recommendation_reason));
+                );
                 let installed_better = profiles
                     .iter()
                     .any(|installed| installed.profile_id == candidate.profile_id);
-                if installed_better {
-                    let assign_btn = Button::with_label("Assign better");
-                    assign_btn.set_valign(gtk4::Align::Center);
+                let button = if installed_better {
+                    let button = Button::with_label("Assign better");
+                    button.set_valign(gtk4::Align::Center);
                     let profile_id = candidate.profile_id.clone();
                     let use_case = use_case.to_string();
                     let lists_for_assign = lists.clone();
-                    assign_btn.connect_clicked(move |btn| {
+                    button.connect_clicked(move |btn| {
                         let window = btn.root().and_then(|r| r.downcast::<gtk4::Window>().ok());
                         assign_use_case_direct(
                             profile_id.clone(),
@@ -1228,14 +1225,14 @@ fn render_readiness_list(
                             window,
                         );
                     });
-                    row.add_suffix(&assign_btn);
+                    Some(button)
                 } else {
-                    let install_btn = Button::with_label("Install better");
-                    install_btn.set_valign(gtk4::Align::Center);
-                    install_btn.set_sensitive(!candidate.installing);
+                    let button = Button::with_label("Install better");
+                    button.set_valign(gtk4::Align::Center);
+                    button.set_sensitive(!candidate.installing);
                     let profile_id = candidate.profile_id.clone();
                     let lists_for_install = lists.clone();
-                    install_btn.connect_clicked(move |btn| {
+                    button.connect_clicked(move |btn| {
                         btn.set_sensitive(false);
                         let window = btn.root().and_then(|r| r.downcast::<gtk4::Window>().ok());
                         install_catalog_profile(
@@ -1244,16 +1241,32 @@ fn render_readiness_list(
                             window,
                         );
                     });
-                    row.add_suffix(&install_btn);
-                }
+                    Some(button)
+                };
+                let row = readiness_row(
+                    use_case,
+                    "Ready",
+                    "success",
+                    &detail,
+                    button,
+                    Some(&candidate.recommendation_reason),
+                );
+                list_box.append(&row);
             } else {
-                row.set_subtitle(&format!(
-                    "Ready · assigned to {} · {}",
-                    profile.profile_id,
-                    model_kind(&profile.runtime_id)
-                ));
+                let row = readiness_row(
+                    use_case,
+                    "Ready",
+                    "success",
+                    &format!(
+                        "Assigned to {} · {}",
+                        profile.profile_id,
+                        use_case_kind(use_case)
+                    ),
+                    None,
+                    None,
+                );
+                list_box.append(&row);
             }
-            list_box.append(&row);
             continue;
         }
 
@@ -1264,37 +1277,51 @@ fn render_readiness_list(
             if let Some(candidate) =
                 better_catalog_candidate(&catalog, &profile.profile_id, use_case)
             {
-                row.set_subtitle(&format!(
-                    "Installed but not assigned · {} · better available: {} · {}",
+                let detail = format!(
+                    "{} is installed but not assigned · Better available: {} · {}",
                     profile.profile_id,
                     candidate.profile_id,
                     format_size(candidate.disk_size_gb)
-                ));
-                row.set_tooltip_text(Some(&candidate.recommendation_reason));
-                add_recommendation_action(&row, candidate, profiles.as_slice(), use_case, lists);
+                );
+                let button = recommendation_button(candidate, profiles.as_slice(), use_case, lists);
+                let row = readiness_row(
+                    use_case,
+                    "Installed",
+                    "accent",
+                    &detail,
+                    Some(button),
+                    Some(&candidate.recommendation_reason),
+                );
+                list_box.append(&row);
             } else {
-                row.set_subtitle(&format!(
-                    "Installed but not assigned · {} · {}",
-                    profile.profile_id,
-                    model_kind(&profile.runtime_id)
-                ));
-                let assign_btn = Button::with_label("Assign");
-                assign_btn.set_valign(gtk4::Align::Center);
+                let button = Button::with_label("Assign");
+                button.set_valign(gtk4::Align::Center);
                 let profile_id = profile.profile_id.clone();
-                let use_case = use_case.to_string();
+                let assigned_use_case = use_case.to_string();
                 let lists_for_assign = lists.clone();
-                assign_btn.connect_clicked(move |btn| {
+                button.connect_clicked(move |btn| {
                     let window = btn.root().and_then(|r| r.downcast::<gtk4::Window>().ok());
                     assign_use_case_direct(
                         profile_id.clone(),
-                        use_case.clone(),
+                        assigned_use_case.clone(),
                         lists_for_assign.clone(),
                         window,
                     );
                 });
-                row.add_suffix(&assign_btn);
+                let row = readiness_row(
+                    use_case,
+                    "Installed",
+                    "accent",
+                    &format!(
+                        "{} is installed but not assigned · {}",
+                        profile.profile_id,
+                        use_case_kind(use_case)
+                    ),
+                    Some(button),
+                    None,
+                );
+                list_box.append(&row);
             }
-            list_box.append(&row);
             continue;
         }
 
@@ -1306,48 +1333,114 @@ fn render_readiness_list(
             } else {
                 fit_label(&profile.fit_level, profile.recommended)
             };
-            row.set_subtitle(&format!(
-                "Missing · {} · {} · {}",
+            let detail = format!(
+                "Recommended: {} · {} · {}",
                 profile.profile_id,
                 status,
                 format_size(profile.disk_size_gb)
-            ));
-            row.set_tooltip_text(Some(&profile.recommendation_reason));
-            let install_btn = Button::with_label("Install");
-            install_btn.set_valign(gtk4::Align::Center);
-            install_btn.set_sensitive(!profile.installing);
+            );
+            let button = Button::with_label("Install");
+            button.set_valign(gtk4::Align::Center);
+            button.set_sensitive(!profile.installing);
             let profile_id = profile.profile_id.clone();
             let lists_for_install = lists.clone();
-            install_btn.connect_clicked(move |btn| {
+            button.connect_clicked(move |btn| {
                 btn.set_sensitive(false);
                 let window = btn.root().and_then(|r| r.downcast::<gtk4::Window>().ok());
                 install_catalog_profile(profile_id.clone(), lists_for_install.clone(), window);
             });
-            row.add_suffix(&install_btn);
+            let row = readiness_row(
+                use_case,
+                if profile.installing {
+                    "Installing"
+                } else {
+                    "Missing"
+                },
+                "warning",
+                &detail,
+                Some(button),
+                Some(&profile.recommendation_reason),
+            );
+            list_box.append(&row);
         } else {
-            row.set_subtitle("Missing · no profile in the library advertises this use-case");
+            let row = readiness_row(
+                use_case,
+                "Missing",
+                "warning",
+                "No profile in the library advertises this task.",
+                None,
+                None,
+            );
+            list_box.append(&row);
         }
-        list_box.append(&row);
     }
 }
 
-fn add_recommendation_action(
-    row: &ActionRow,
+fn readiness_row(
+    use_case: &str,
+    status: &str,
+    status_style: &str,
+    detail: &str,
+    button: Option<Button>,
+    tooltip: Option<&str>,
+) -> Box {
+    let row = Box::new(Orientation::Horizontal, 12);
+    row.set_margin_top(10);
+    row.set_margin_bottom(10);
+    row.set_margin_start(12);
+    row.set_margin_end(12);
+    row.set_tooltip_text(tooltip);
+
+    let details = Box::new(Orientation::Vertical, 4);
+    details.set_hexpand(true);
+
+    let heading = Box::new(Orientation::Horizontal, 8);
+    heading.set_valign(gtk4::Align::Center);
+
+    let title = Label::new(Some(use_case));
+    title.set_xalign(0.0);
+    title.add_css_class("heading");
+    heading.append(&title);
+
+    let status_label = Label::new(Some(status));
+    status_label.add_css_class("caption");
+    status_label.add_css_class("pill");
+    status_label.add_css_class(status_style);
+    heading.append(&status_label);
+
+    let subtitle = Label::new(Some(detail));
+    subtitle.set_xalign(0.0);
+    subtitle.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+    subtitle.add_css_class("dim-label");
+
+    details.append(&heading);
+    details.append(&subtitle);
+    row.append(&details);
+
+    if let Some(button) = button {
+        button.set_valign(gtk4::Align::Center);
+        row.append(&button);
+    }
+
+    row
+}
+
+fn recommendation_button(
     candidate: &aileron_varlink::aileron_Models::CatalogProfileInfo,
     profiles: &[aileron_varlink::aileron_Models::ProfileInfo],
     use_case: &str,
     lists: &ModelLists,
-) {
+) -> Button {
     let installed_better = profiles
         .iter()
         .any(|installed| installed.profile_id == candidate.profile_id);
     if installed_better {
-        let assign_btn = Button::with_label("Assign better");
-        assign_btn.set_valign(gtk4::Align::Center);
+        let button = Button::with_label("Assign better");
+        button.set_valign(gtk4::Align::Center);
         let profile_id = candidate.profile_id.clone();
         let use_case = use_case.to_string();
         let lists_for_assign = lists.clone();
-        assign_btn.connect_clicked(move |btn| {
+        button.connect_clicked(move |btn| {
             let window = btn.root().and_then(|r| r.downcast::<gtk4::Window>().ok());
             assign_use_case_direct(
                 profile_id.clone(),
@@ -1356,19 +1449,31 @@ fn add_recommendation_action(
                 window,
             );
         });
-        row.add_suffix(&assign_btn);
+        button
     } else {
-        let install_btn = Button::with_label("Install better");
-        install_btn.set_valign(gtk4::Align::Center);
-        install_btn.set_sensitive(!candidate.installing);
+        let button = Button::with_label("Install better");
+        button.set_valign(gtk4::Align::Center);
+        button.set_sensitive(!candidate.installing);
         let profile_id = candidate.profile_id.clone();
         let lists_for_install = lists.clone();
-        install_btn.connect_clicked(move |btn| {
+        button.connect_clicked(move |btn| {
             btn.set_sensitive(false);
             let window = btn.root().and_then(|r| r.downcast::<gtk4::Window>().ok());
             install_catalog_profile(profile_id.clone(), lists_for_install.clone(), window);
         });
-        row.add_suffix(&install_btn);
+        button
+    }
+}
+
+fn use_case_kind(use_case: &str) -> &'static str {
+    if use_case.starts_with("llm.") {
+        "Text"
+    } else if use_case.starts_with("asr.") {
+        "Speech"
+    } else if use_case.starts_with("vision.") {
+        "Vision"
+    } else {
+        "Task"
     }
 }
 
