@@ -3,7 +3,7 @@ use std::rc::Rc;
 use gtk4::prelude::*;
 use libadwaita::{Application, ApplicationWindow, HeaderBar, ToolbarView, ViewStack, ViewSwitcher};
 
-use crate::pages::{activity_page, models_page, permissions_page, runtimes_page};
+use crate::pages::{activity_page, downloads_page, models_page, permissions_page, runtimes_page};
 
 pub fn build_app() -> Application {
     let app = Application::builder()
@@ -41,6 +41,10 @@ fn build_window(app: &Application) {
     );
     perms_page.set_icon_name(Some("system-lock-screen-symbolic"));
 
+    let downloads_view = downloads_page::build();
+    let downloads_page = stack.add_titled(&downloads_view.widget, Some("downloads"), "Downloads");
+    downloads_page.set_icon_name(Some("emblem-downloads-symbolic"));
+
     let runtimes_page = stack.add_titled(&runtimes_view.widget, Some("runtimes"), "Runtimes");
     runtimes_page.set_icon_name(Some("package-x-generic-symbolic"));
 
@@ -48,8 +52,10 @@ fn build_window(app: &Application) {
     activity_page.set_icon_name(Some("emblem-synchronizing-symbolic"));
 
     stack.connect_visible_child_name_notify(move |stack| {
-        if stack.visible_child_name().as_deref() == Some("runtimes") {
-            refresh_runtimes();
+        match stack.visible_child_name().as_deref() {
+            Some("runtimes") => refresh_runtimes(),
+            Some("downloads") => downloads_view.refresh(),
+            _ => {}
         }
     });
 

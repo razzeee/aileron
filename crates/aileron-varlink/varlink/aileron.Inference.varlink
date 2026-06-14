@@ -27,6 +27,15 @@ type GuidedField (
   required: bool
 )
 
+type VisionSegment (
+  label: string,
+  confidence: float,
+  x: float,
+  y: float,
+  width: float,
+  height: float
+)
+
 # Return whether a profile is assigned and runnable for this use-case.
 method GetUseCaseAvailability(app_id: string, use_case: string) -> (availability: ModelAvailability)
 
@@ -57,9 +66,14 @@ method RespondGuided(session_id: string, prompt: string, fields: []GuidedField, 
 # language_hint: optional language hint; empty string means auto-detect/no hint
 method Transcribe(session_id: string, audio: string, language_hint: string) -> (text: string)
 
-# Describe an image. Session must have been created with vision.describe or vision.segment
+# Describe an image. Session must have been created with vision.describe
 # image: PNG or JPEG bytes encoded as base64
 method Describe(session_id: string, image: string) -> (text: string)
+
+# Identify objects in an image. Session must have been created with vision.segment
+# Coordinates are normalized to 0.0..1.0, relative to the image dimensions.
+# image: PNG or JPEG bytes encoded as base64
+method Segment(session_id: string, image: string) -> (segments: []VisionSegment)
 
 # End a session. The per-profile container remains pooled until idle timeout.
 method EndSession(session_id: string) -> ()

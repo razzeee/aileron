@@ -58,6 +58,16 @@ struct GuidedFieldDbus {
     required: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+struct VisionSegmentDbus {
+    label: String,
+    confidence: f64,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
 #[interface(name = "org.freedesktop.impl.portal.AI")]
 impl AiPortalBackend {
     async fn get_use_case_availability(
@@ -362,6 +372,34 @@ impl AiPortalBackend {
             .call()
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         Ok(reply.text)
+    }
+
+    async fn segment(
+        &self,
+        session_id: &str,
+        image_b64: &str,
+    ) -> zbus::fdo::Result<Vec<VisionSegmentDbus>> {
+        use aileron_varlink::aileron_Inference::VarlinkClientInterface;
+
+        let conn =
+            aileron_ipc::client::connect().map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn);
+        let reply = client
+            .segment(session_id.to_string(), image_b64.to_string())
+            .call()
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        Ok(reply
+            .segments
+            .into_iter()
+            .map(|segment| VisionSegmentDbus {
+                label: segment.label,
+                confidence: segment.confidence,
+                x: segment.x,
+                y: segment.y,
+                width: segment.width,
+                height: segment.height,
+            })
+            .collect())
     }
 
     async fn end_session(&self, session_id: &str) -> zbus::fdo::Result<()> {

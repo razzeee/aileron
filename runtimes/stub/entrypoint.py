@@ -112,6 +112,23 @@ def handle_describe(req: dict) -> None:
     send({"id": req_id, "token": "Stub description: an image was received.", "done": True})
 
 
+def handle_segment(req: dict) -> None:
+    req_id = req["id"]
+    result = {
+        "segments": [
+            {
+                "label": "stub object",
+                "confidence": 1.0,
+                "x": 0.1,
+                "y": 0.1,
+                "width": 0.8,
+                "height": 0.8,
+            }
+        ]
+    }
+    send({"id": req_id, "result": json.dumps(result), "done": True})
+
+
 def main() -> None:
     sys.stderr.write("[aileron-stub] ready\n")
     sys.stderr.flush()
@@ -140,6 +157,8 @@ def main() -> None:
                 handle_transcribe(req)
             elif req_type == "describe":
                 handle_describe(req)
+            elif req_type == "segment":
+                handle_segment(req)
             else:
                 send({"id": req_id, "error": "unsupported_type", "reason": req_type})
         except Exception as e:

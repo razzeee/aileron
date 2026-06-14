@@ -45,7 +45,9 @@ pub struct Inner {
     pub containers: ContainerPool,
     pub sessions: HashMap<String, Session>,
     pub installing_profiles: HashMap<String, InstallRecord>,
+    pub runtime_downloads: HashMap<String, InstallRecord>,
     pub recent_installs: VecDeque<(String, InstallRecord)>,
+    pub recent_runtime_downloads: VecDeque<(String, InstallRecord)>,
     /// Best available hardware variant, detected once at startup.
     pub variant: Variant,
 }
@@ -72,7 +74,9 @@ impl SharedState {
             containers,
             sessions: HashMap::new(),
             installing_profiles: HashMap::new(),
+            runtime_downloads: HashMap::new(),
             recent_installs: VecDeque::new(),
+            recent_runtime_downloads: VecDeque::new(),
             variant,
         }))))
     }

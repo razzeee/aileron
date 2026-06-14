@@ -1,5 +1,5 @@
 /// Varlink handler for `aileron.Models`.
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::manifests::{self, ManifestArtifact, ModelManifest};
@@ -10,9 +10,9 @@ use aileron_varlink::aileron_Models::{
     Call_AssignUseCase, Call_CancelInstall, Call_DeleteProfile, Call_InstallManifest,
     Call_InstallUrlProfile, Call_List, Call_ListCatalog, Call_ListInstalls, Call_ListRuntimeImages,
     Call_ListRuntimeManifests, Call_PruneUnusedRuntimeImages, Call_RemoveRuntimeImage,
-    CatalogProfileInfo, InstallProgress, InstallStatus, OciRuntimeImage, ProfileInfo, RuntimeImage,
-    RuntimeImageCleanupError, RuntimeManifestInfo, UseCaseConflict, UseCaseFitScore,
-    VarlinkCallError, VarlinkInterface,
+    Call_UpdateRuntimeImage, CatalogProfileInfo, InstallProgress, InstallStatus, OciRuntimeImage,
+    ProfileInfo, RuntimeImage, RuntimeImageCleanupError, RuntimeManifestInfo, UseCaseConflict,
+    UseCaseFitScore, VarlinkCallError, VarlinkInterface,
 };
 
 fn io_err(_msg: impl std::fmt::Display) -> varlink::Error {
@@ -151,6 +151,20 @@ impl VarlinkInterface for ModelsHandler {
         }
     }
 
+    fn update_runtime_image(
+        &self,
+        call: &mut dyn Call_UpdateRuntimeImage,
+        image_ref: String,
+    ) -> varlink::Result<()> {
+        let result = self
+            .rt
+            .block_on(async { start_runtime_image_update(&self.state, &image_ref).await });
+        match result {
+            Ok(()) => call.reply(),
+            Err(e) => Err(io_err(e)),
+        }
+    }
+
     fn prune_unused_runtime_images(
         &self,
         call: &mut dyn Call_PruneUnusedRuntimeImages,
@@ -188,6 +202,18 @@ impl VarlinkInterface for ModelsHandler {
                         .recent_installs
                         .iter()
                         .map(|(profile_id, install)| (profile_id, install)),
+                )
+                .chain(
+                    guard
+                        .runtime_downloads
+                        .iter()
+                        .map(|(image_ref, install)| (image_ref, install)),
+                )
+                .chain(
+                    guard
+                        .recent_runtime_downloads
+                        .iter()
+                        .map(|(image_ref, install)| (image_ref, install)),
                 )
                 .map(|(profile_id, install)| {
                     let bytes_per_second = install_bytes_per_second(install);
@@ -591,6 +617,12 @@ impl PodmanRuntimeImage {
     }
 }
 
+#[derive(Debug, Clone)]
+struct RuntimeImageUpdateCheck {
+    available: bool,
+    status: String,
+}
+
 async fn runtime_image_usage(state: &SharedState) -> RuntimeImageUsage {
     let guard = state.0.lock().await;
     let mut profiles_by_ref: HashMap<String, Vec<String>> = HashMap::new();
@@ -610,8 +642,13 @@ fn list_aileron_runtime_images(usage: &RuntimeImageUsage) -> anyhow::Result<Vec<
     let mut images = values
         .iter()
         .filter_map(parse_podman_runtime_image)
+        .collect::<Vec<_>>();
+    dedupe_runtime_images(&mut images);
+    let mut images = images
+        .into_iter()
         .map(|image| {
             let used_by_profiles = usage.used_by(&image);
+            let update = check_runtime_image_update(&image);
             OciRuntimeImage {
                 image_id: image.image_id,
                 image_ref: image.image_ref,
@@ -620,6 +657,8 @@ fn list_aileron_runtime_images(usage: &RuntimeImageUsage) -> anyhow::Result<Vec<
                 size_bytes: image.size_bytes,
                 in_use: !used_by_profiles.is_empty(),
                 used_by_profiles,
+                update_available: update.available,
+                update_status: update.status,
             }
         })
         .collect::<Vec<_>>();
@@ -630,6 +669,187 @@ fn list_aileron_runtime_images(usage: &RuntimeImageUsage) -> anyhow::Result<Vec<
             .then(a.image_ref.cmp(&b.image_ref))
     });
     Ok(images)
+}
+
+fn dedupe_runtime_images(images: &mut Vec<PodmanRuntimeImage>) {
+    let mut seen_ids = HashSet::new();
+    let mut seen_refs = HashSet::new();
+    images.retain(|image| {
+        let id_key = (
+            image.image_id.clone(),
+            image.runtime_id.clone(),
+            image.variant.clone(),
+        );
+        let ref_key = (
+            image.image_ref.clone(),
+            image.runtime_id.clone(),
+            image.variant.clone(),
+        );
+        seen_ids.insert(id_key) && seen_refs.insert(ref_key)
+    });
+}
+
+fn check_runtime_image_update(image: &PodmanRuntimeImage) -> RuntimeImageUpdateCheck {
+    let image_ref = update_check_ref(image);
+    if !remote_tag_is_checkable(&image_ref) {
+        return RuntimeImageUpdateCheck {
+            available: false,
+            status: "not checkable".to_string(),
+        };
+    }
+
+    let local_digest = match local_image_digest(&image_ref) {
+        Ok(Some(digest)) => digest,
+        Ok(None) => {
+            return RuntimeImageUpdateCheck {
+                available: false,
+                status: "check failed: local digest unavailable".to_string(),
+            };
+        }
+        Err(e) => {
+            return RuntimeImageUpdateCheck {
+                available: false,
+                status: format!("check failed: {e}"),
+            };
+        }
+    };
+
+    let remote_digest = match remote_image_digest(&image_ref) {
+        Ok(Some(digest)) => digest,
+        Ok(None) => {
+            return RuntimeImageUpdateCheck {
+                available: false,
+                status: "check failed: remote digest unavailable".to_string(),
+            };
+        }
+        Err(e) => {
+            return RuntimeImageUpdateCheck {
+                available: false,
+                status: format!("check failed: {e}"),
+            };
+        }
+    };
+
+    if local_digest == remote_digest {
+        RuntimeImageUpdateCheck {
+            available: false,
+            status: "current".to_string(),
+        }
+    } else {
+        RuntimeImageUpdateCheck {
+            available: true,
+            status: "update available".to_string(),
+        }
+    }
+}
+
+fn update_check_ref(image: &PodmanRuntimeImage) -> String {
+    image
+        .match_refs()
+        .into_iter()
+        .find(|image_ref| remote_tag_is_checkable(image_ref))
+        .unwrap_or_else(|| image.image_ref.clone())
+}
+
+fn remote_tag_is_checkable(image_ref: &str) -> bool {
+    !image_ref.is_empty()
+        && !image_ref.starts_with("localhost/")
+        && !image_ref.contains('@')
+        && image_ref
+            .rsplit_once('/')
+            .map_or(image_ref, |(_, after_slash)| after_slash)
+            .contains(':')
+}
+
+fn local_image_digest(image_ref: &str) -> anyhow::Result<Option<String>> {
+    let output = std::process::Command::new("podman")
+        .args(["image", "inspect", image_ref])
+        .output()?;
+    if !output.status.success() {
+        anyhow::bail!("podman image inspect failed for {image_ref}");
+    }
+    let values: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout)?;
+    Ok(values.first().and_then(|value| {
+        value_digest(value).or_else(|| {
+            value
+                .get("RepoDigests")
+                .and_then(|digests| digests.as_array())
+                .and_then(|digests| {
+                    digests
+                        .iter()
+                        .filter_map(|value| value.as_str())
+                        .find_map(digest_part)
+                })
+        })
+    }))
+}
+
+fn remote_image_digest(image_ref: &str) -> anyhow::Result<Option<String>> {
+    let output = std::process::Command::new("podman")
+        .args(["manifest", "inspect", image_ref])
+        .output()?;
+    if !output.status.success() {
+        anyhow::bail!("podman manifest inspect failed for {image_ref}");
+    }
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    Ok(manifest_digest(&value))
+}
+
+fn manifest_digest(value: &serde_json::Value) -> Option<String> {
+    value_digest(value).or_else(|| platform_manifest_digest(value))
+}
+
+fn value_digest(value: &serde_json::Value) -> Option<String> {
+    value
+        .get("Digest")
+        .or_else(|| value.get("digest"))
+        .and_then(|digest| digest.as_str())
+        .and_then(digest_part)
+}
+
+fn platform_manifest_digest(value: &serde_json::Value) -> Option<String> {
+    let manifests = value.get("manifests")?.as_array()?;
+    let arch = oci_arch(std::env::consts::ARCH);
+    manifests
+        .iter()
+        .find(|manifest| {
+            manifest
+                .get("platform")
+                .and_then(|platform| platform.get("os"))
+                .and_then(|os| os.as_str())
+                == Some("linux")
+                && manifest
+                    .get("platform")
+                    .and_then(|platform| platform.get("architecture"))
+                    .and_then(|architecture| architecture.as_str())
+                    == Some(arch)
+        })
+        .and_then(value_digest)
+}
+
+fn oci_arch(arch: &str) -> &str {
+    match arch {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        "powerpc64" => "ppc64",
+        "powerpc64le" => "ppc64le",
+        "s390x" => "s390x",
+        "x86" | "i386" | "i586" | "i686" => "386",
+        other => other,
+    }
+}
+
+fn digest_part(value: &str) -> Option<String> {
+    value
+        .rsplit_once('@')
+        .map_or(value, |(_, digest)| digest)
+        .starts_with("sha256:")
+        .then(|| {
+            value
+                .rsplit_once('@')
+                .map_or(value, |(_, digest)| digest)
+                .to_string()
+        })
 }
 
 fn podman_images_with_label(label: &str) -> anyhow::Result<Vec<serde_json::Value>> {
@@ -744,6 +964,28 @@ async fn remove_aileron_runtime_image(
         );
     }
     remove_podman_image(&image.image_id).await
+}
+
+async fn start_runtime_image_update(state: &SharedState, image_ref: &str) -> anyhow::Result<()> {
+    if !remote_tag_is_checkable(image_ref) {
+        anyhow::bail!("runtime image is not a remote tag: {image_ref}");
+    }
+    let usage = RuntimeImageUsage::default();
+    let known = list_aileron_runtime_images(&usage)?
+        .into_iter()
+        .any(|image| image.image_ref == image_ref || image.image_id == image_ref);
+    if !known {
+        anyhow::bail!("Aileron runtime image not found: {image_ref}");
+    }
+    begin_runtime_download(state, image_ref).await?;
+
+    let state = state.clone();
+    let image_ref = image_ref.to_string();
+    tokio::spawn(async move {
+        let result = pull_runtime_image_unconditional(&image_ref).await;
+        finish_runtime_download(&state, &image_ref, result.err().map(|e| e.to_string())).await;
+    });
+    Ok(())
 }
 
 async fn remove_podman_image(image_id: &str) -> anyhow::Result<()> {
@@ -880,7 +1122,7 @@ async fn install_manifest_data_inner(
     };
 
     update_install_status(state, &profile.profile_id, "Preparing runtime image...").await;
-    pull_runtime_image(&runtime_image).await?;
+    pull_runtime_image(state, &runtime_image).await?;
 
     install_artifacts(
         state,
@@ -934,6 +1176,46 @@ async fn finish_install(state: &SharedState, profile_id: &str, error: Option<Str
         while guard.recent_installs.len() > 10 {
             guard.recent_installs.pop_back();
         }
+    }
+}
+
+async fn begin_runtime_download(state: &SharedState, image_ref: &str) -> anyhow::Result<()> {
+    let mut guard = state.0.lock().await;
+    let key = format!("runtime:{image_ref}");
+    if guard.runtime_downloads.contains_key(&key) {
+        anyhow::bail!("runtime image download already running for {image_ref}");
+    }
+    guard
+        .recent_runtime_downloads
+        .retain(|(recent_image_ref, _)| recent_image_ref != &key);
+    guard.runtime_downloads.insert(
+        key,
+        InstallRecord {
+            bytes_pulled: 0,
+            total_bytes: 0,
+            status: "Pulling runtime image...".to_string(),
+            cancel_requested: false,
+            samples: std::collections::VecDeque::from([InstallSample {
+                at: chrono::Utc::now(),
+                bytes_pulled: 0,
+            }]),
+        },
+    );
+    Ok(())
+}
+
+async fn finish_runtime_download(state: &SharedState, image_ref: &str, error: Option<String>) {
+    let mut guard = state.0.lock().await;
+    let key = format!("runtime:{image_ref}");
+    let Some(mut download) = guard.runtime_downloads.remove(&key) else {
+        return;
+    };
+    download.status = error
+        .map(|error| format!("Failed: {error}"))
+        .unwrap_or_else(|| "Completed".to_string());
+    guard.recent_runtime_downloads.push_front((key, download));
+    while guard.recent_runtime_downloads.len() > 10 {
+        guard.recent_runtime_downloads.pop_back();
     }
 }
 
@@ -1035,7 +1317,7 @@ async fn ensure_install_not_cancelled(state: &SharedState, profile_id: &str) -> 
     Ok(())
 }
 
-async fn pull_runtime_image(image_ref: &str) -> anyhow::Result<()> {
+async fn pull_runtime_image(state: &SharedState, image_ref: &str) -> anyhow::Result<()> {
     let exists = tokio::process::Command::new("podman")
         .args(["image", "exists", image_ref])
         .status()
@@ -1048,6 +1330,18 @@ async fn pull_runtime_image(image_ref: &str) -> anyhow::Result<()> {
         anyhow::bail!("local runtime image is not built: {image_ref}");
     }
 
+    begin_runtime_download(state, image_ref).await?;
+    let result = pull_runtime_image_unconditional(image_ref).await;
+    finish_runtime_download(
+        state,
+        image_ref,
+        result.as_ref().err().map(|e| e.to_string()),
+    )
+    .await;
+    result
+}
+
+async fn pull_runtime_image_unconditional(image_ref: &str) -> anyhow::Result<()> {
     let status = tokio::process::Command::new("podman")
         .args(["pull", image_ref])
         .status()
@@ -1276,6 +1570,121 @@ mod tests {
 
         assert!(usage.used_by(&cpu).is_empty());
         assert_eq!(usage.used_by(&vulkan), vec!["whisper".to_string()]);
+    }
+
+    #[test]
+    fn dedupes_duplicate_runtime_image_rows() {
+        let mut images = vec![
+            PodmanRuntimeImage {
+                image_id: "same-image".to_string(),
+                image_ref: "example/vision:rocm".to_string(),
+                names: vec!["example/vision:rocm".to_string()],
+                runtime_id: "vision-llama-cpp-gemma4".to_string(),
+                variant: "rocm".to_string(),
+                size_bytes: 1,
+            },
+            PodmanRuntimeImage {
+                image_id: "same-image".to_string(),
+                image_ref: "example/vision:rocm".to_string(),
+                names: vec!["example/vision:rocm".to_string()],
+                runtime_id: "vision-llama-cpp-gemma4".to_string(),
+                variant: "rocm".to_string(),
+                size_bytes: 1,
+            },
+        ];
+
+        dedupe_runtime_images(&mut images);
+
+        assert_eq!(images.len(), 1);
+    }
+
+    #[test]
+    fn dedupes_same_runtime_image_with_multiple_refs() {
+        let mut images = vec![
+            PodmanRuntimeImage {
+                image_id: "same-image".to_string(),
+                image_ref: "ghcr.io/example/vision:rocm".to_string(),
+                names: vec!["ghcr.io/example/vision:rocm".to_string()],
+                runtime_id: "vision-llama-cpp-gemma4".to_string(),
+                variant: "rocm".to_string(),
+                size_bytes: 1,
+            },
+            PodmanRuntimeImage {
+                image_id: "same-image".to_string(),
+                image_ref: "localhost/vision:rocm".to_string(),
+                names: vec!["localhost/vision:rocm".to_string()],
+                runtime_id: "vision-llama-cpp-gemma4".to_string(),
+                variant: "rocm".to_string(),
+                size_bytes: 1,
+            },
+        ];
+
+        dedupe_runtime_images(&mut images);
+
+        assert_eq!(images.len(), 1);
+    }
+
+    #[test]
+    fn dedupes_same_runtime_ref_with_multiple_image_ids() {
+        let mut images = vec![
+            PodmanRuntimeImage {
+                image_id: "old-image".to_string(),
+                image_ref: "ghcr.io/example/vision:rocm".to_string(),
+                names: vec!["ghcr.io/example/vision:rocm".to_string()],
+                runtime_id: "vision-llama-cpp-gemma4".to_string(),
+                variant: "rocm".to_string(),
+                size_bytes: 1,
+            },
+            PodmanRuntimeImage {
+                image_id: "new-image".to_string(),
+                image_ref: "ghcr.io/example/vision:rocm".to_string(),
+                names: vec!["ghcr.io/example/vision:rocm".to_string()],
+                runtime_id: "vision-llama-cpp-gemma4".to_string(),
+                variant: "rocm".to_string(),
+                size_bytes: 1,
+            },
+        ];
+
+        dedupe_runtime_images(&mut images);
+
+        assert_eq!(images.len(), 1);
+    }
+
+    #[test]
+    fn remote_tag_check_rejects_local_digest_and_untagged_refs() {
+        assert!(remote_tag_is_checkable("ghcr.io/example/runtime:cpu"));
+        assert!(remote_tag_is_checkable("registry.example:5000/runtime:cpu"));
+        assert!(!remote_tag_is_checkable("localhost/runtime:cpu"));
+        assert!(!remote_tag_is_checkable(
+            "ghcr.io/example/runtime@sha256:1234"
+        ));
+        assert!(!remote_tag_is_checkable("ghcr.io/example/runtime"));
+    }
+
+    #[test]
+    fn manifest_digest_uses_current_linux_platform() {
+        let arch = oci_arch(std::env::consts::ARCH);
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "manifests": [
+                {
+                    "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "platform": {"architecture": "unknown", "os": "unknown"}
+                },
+                {
+                    "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "platform": {"architecture": arch, "os": "linux"}
+                }
+            ]
+        });
+
+        assert_eq!(
+            manifest_digest(&manifest),
+            Some(
+                "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    .to_string()
+            )
+        );
     }
 
     #[test]

@@ -56,6 +56,30 @@ impl PermissionStore {
         self.0.get(&Self::key(app_id, use_case)).map(|e| e.allowed)
     }
 
+    /// Record a denied permission entry when an app asks for a new use-case.
+    /// This lets management UIs show first-use denials without granting access.
+    pub fn deny_if_missing(&mut self, app_id: &str, use_case: &str) -> Result<()> {
+        if self.insert_denied_if_missing(app_id, use_case) {
+            self.save()?;
+        }
+        Ok(())
+    }
+
+    fn insert_denied_if_missing(&mut self, app_id: &str, use_case: &str) -> bool {
+        let key = Self::key(app_id, use_case);
+        if self.0.contains_key(&key) {
+            return false;
+        }
+        self.0.insert(
+            key,
+            PermissionEntry {
+                allowed: false,
+                last_used: None,
+            },
+        );
+        true
+    }
+
     /// Set a permission entry and persist.
     pub fn set(&mut self, app_id: String, use_case: String, allowed: bool) -> Result<()> {
         let key = Self::key(&app_id, &use_case);
@@ -88,5 +112,35 @@ impl PermissionStore {
                 Some((app_id, use_case, v))
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn denied_first_use_is_listed_for_later_approval() {
+        let mut store = PermissionStore::default();
+
+        assert!(store.insert_denied_if_missing("org.aileron.Demo", "llm.extract"));
+
+        assert_eq!(store.check("org.aileron.Demo", "llm.extract"), Some(false));
+    }
+
+    #[test]
+    fn denied_first_use_does_not_override_existing_grant() {
+        let mut store = PermissionStore::default();
+        store.0.insert(
+            PermissionStore::key("org.aileron.Demo", "llm.extract"),
+            PermissionEntry {
+                allowed: true,
+                last_used: None,
+            },
+        );
+
+        assert!(!store.insert_denied_if_missing("org.aileron.Demo", "llm.extract"));
+
+        assert_eq!(store.check("org.aileron.Demo", "llm.extract"), Some(true));
     }
 }

@@ -22,6 +22,8 @@ import os
 import sys
 
 from llama_cpp import Llama
+from jsonschema import ValidationError
+from jsonschema import validate as jsonschema_validate
 
 COMMON_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "_llama_cpp_common"))
 if os.path.isdir(COMMON_DIR):
@@ -129,7 +131,6 @@ def handle_generate_structured(llm: Llama, req: dict) -> None:
     )["choices"][0]["message"]["content"].strip()
 
     try:
-        from jsonschema import validate as jsonschema_validate, ValidationError
         parsed = json.loads(result_text)
         if schema:
             jsonschema_validate(instance=parsed, schema=schema)

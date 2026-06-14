@@ -98,6 +98,7 @@ jobs:
               RUNTIME_DESCRIPTION=Aileron Gemma 4 vision runtime using llama.cpp.
               ENTRYPOINT_PATH=runtimes/vision-llama-cpp-gemma4/entrypoint.py
               INSTALL_SOURCE=git
+              EXTRA_PIP_PACKAGES=jsonschema
           - runtime_id: vision-llama-cpp-gemma4
             image_name: aileron-runtime-vision-llama-cpp-gemma4
             description: Aileron Gemma 4 vision runtime using llama.cpp.
@@ -116,6 +117,7 @@ jobs:
               RUNTIME_DESCRIPTION=Aileron Gemma 4 vision runtime using llama.cpp.
               ENTRYPOINT_PATH=runtimes/vision-llama-cpp-gemma4/entrypoint.py
               INSTALL_SOURCE=git
+              EXTRA_PIP_PACKAGES=jsonschema
           - runtime_id: vision-llama-cpp-gemma4
             image_name: aileron-runtime-vision-llama-cpp-gemma4
             description: Aileron Gemma 4 vision runtime using llama.cpp.
@@ -135,6 +137,7 @@ jobs:
               RUNTIME_DESCRIPTION=Aileron Gemma 4 vision runtime using llama.cpp.
               ENTRYPOINT_PATH=runtimes/vision-llama-cpp-gemma4/entrypoint.py
               INSTALL_SOURCE=git
+              EXTRA_PIP_PACKAGES=jsonschema
           - runtime_id: vision-llama-cpp-gemma4
             image_name: aileron-runtime-vision-llama-cpp-gemma4
             description: Aileron Gemma 4 vision runtime using llama.cpp.
@@ -149,6 +152,7 @@ jobs:
               RUNTIME_DESCRIPTION=Aileron Gemma 4 vision runtime using llama.cpp.
               ENTRYPOINT_PATH=runtimes/vision-llama-cpp-gemma4/entrypoint.py
               INSTALL_SOURCE=git
+              EXTRA_PIP_PACKAGES=jsonschema
 
     steps:
       - uses: actions/checkout@v6.0.3

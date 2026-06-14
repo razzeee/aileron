@@ -34,10 +34,10 @@ varlink           = "13"
 varlink_generator = "13"
 
 zbus   = { version = "4", features = ["tokio"] }
-gtk4       = { version = "0.9", features = ["v4_12"] }
-libadwaita = { version = "0.7", features = ["v1_5"] }
-glib       = "0.20"
-gio        = "0.20"
+gtk4       = { version = "0.11", features = ["v4_12"] }
+libadwaita = { version = "0.9", features = ["v1_5"] }
+glib       = "0.22"
+gio        = "0.22"
 reqwest = { version = "0.12", features = ["blocking"] }
 chrono = "0.4"
 sha2 = "0.10"

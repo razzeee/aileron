@@ -5,11 +5,13 @@ use gtk4::{
     Spinner, Stack, StackSwitcher, TextBuffer, TextView,
 };
 use libadwaita::{Application, ApplicationWindow, HeaderBar, ToolbarView};
+use serde::Deserialize;
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use zbus::zvariant::Type;
 
 pub fn build_app() -> Application {
     let app = Application::builder()
@@ -294,10 +296,12 @@ fn build_window(app: &Application) {
 
     // ── Window ────────────────────────────────────────────────────────────────
     let stack = Stack::new();
+    let (chat_page, chat_entry) = build_chat_page();
     stack.add_titled(&text_box, Some("text"), "Text");
-    stack.add_titled(&build_chat_page(), Some("chat"), "Chat");
+    stack.add_titled(&chat_page, Some("chat"), "Chat");
     stack.add_titled(&build_speech_page(), Some("speech"), "Speech");
     stack.add_titled(&build_vision_page(), Some("vision"), "Vision");
+    stack.set_visible_child_name("chat");
 
     let switcher = StackSwitcher::new();
     switcher.set_stack(Some(&stack));
@@ -317,6 +321,7 @@ fn build_window(app: &Application) {
         .build();
 
     window.present();
+    chat_entry.grab_focus();
 }
 
 #[derive(Clone)]
@@ -325,7 +330,7 @@ struct ChatMessage {
     content: String,
 }
 
-fn build_chat_page() -> gtk4::Widget {
+fn build_chat_page() -> (gtk4::Widget, Entry) {
     let vbox = Box::new(Orientation::Vertical, 12);
     vbox.set_margin_top(12);
     vbox.set_margin_bottom(12);
@@ -515,6 +520,15 @@ fn build_chat_page() -> gtk4::Widget {
     }
 
     {
+        let send_button = send_button.clone();
+        input_entry.connect_activate(move |_| {
+            if send_button.is_sensitive() {
+                send_button.emit_clicked();
+            }
+        });
+    }
+
+    {
         let history = history.clone();
         let session_id = session_id.clone();
         let chat_buffer = chat_buffer.clone();
@@ -536,7 +550,7 @@ fn build_chat_page() -> gtk4::Widget {
         });
     }
 
-    vbox.upcast()
+    (vbox.upcast(), input_entry)
 }
 
 fn render_chat(buffer: &TextBuffer, history: &[ChatMessage], pending_assistant: Option<&str>) {
@@ -830,8 +844,10 @@ fn build_vision_page() -> gtk4::Widget {
         .label("Describe Image")
         .css_classes(vec!["suggested-action"])
         .build();
+    let segment_button = Button::with_label("Segment Objects");
     button_row.append(&choose_button);
     button_row.append(&describe_button);
+    button_row.append(&segment_button);
     vbox.append(&button_row);
 
     let selected_label = Label::builder()
@@ -906,7 +922,24 @@ fn build_vision_page() -> gtk4::Widget {
     vbox.append(
         &ScrolledWindow::builder()
             .child(&description_view)
-            .min_content_height(260)
+            .min_content_height(160)
+            .vexpand(true)
+            .build(),
+    );
+
+    let segments_buffer = TextBuffer::new(None);
+    let segments_view = TextView::builder()
+        .buffer(&segments_buffer)
+        .editable(false)
+        .wrap_mode(gtk4::WrapMode::WordChar)
+        .hexpand(true)
+        .vexpand(true)
+        .build();
+    vbox.append(&Label::builder().label("Segments").xalign(0.0).build());
+    vbox.append(
+        &ScrolledWindow::builder()
+            .child(&segments_view)
+            .min_content_height(140)
             .vexpand(true)
             .build(),
     );
@@ -940,7 +973,7 @@ fn build_vision_page() -> gtk4::Widget {
                             selected_label.set_text(&format!("Selected: {}", path.display()));
                             status_title.set_text("Image selected");
                             status_detail.set_text(
-                                "Use Describe Image to send it through the vision portal.",
+                                "Use Describe Image or Segment Objects to send it through the vision portal.",
                             );
                         }
                         Err(e) => {
@@ -958,6 +991,7 @@ fn build_vision_page() -> gtk4::Widget {
         let paste_buffer = paste_buffer.clone();
         let description_buffer = description_buffer.clone();
         let describe_button_for_click = describe_button.clone();
+        let segment_button_for_click = segment_button.clone();
         let status_spinner = status_spinner.clone();
         let status_title = status_title.clone();
         let status_detail = status_detail.clone();
@@ -980,6 +1014,7 @@ fn build_vision_page() -> gtk4::Widget {
 
             description_buffer.set_text("");
             describe_button_for_click.set_sensitive(false);
+            segment_button_for_click.set_sensitive(false);
             status_spinner.start();
             status_title.set_text("Creating vision session");
             status_detail.set_text("Opening a vision.describe session through the portal...");
@@ -987,6 +1022,7 @@ fn build_vision_page() -> gtk4::Widget {
             let (tx, rx) = std::sync::mpsc::channel::<VisionEvent>();
             let description_buffer = description_buffer.clone();
             let describe_button = describe_button_for_click.clone();
+            let segment_button = segment_button_for_click.clone();
             let status_spinner = status_spinner.clone();
             let status_title = status_title.clone();
             let status_detail = status_detail.clone();
@@ -1001,11 +1037,13 @@ fn build_vision_page() -> gtk4::Widget {
                         Ok(VisionEvent::Description(text)) => {
                             description_buffer.set_text(&text);
                         }
+                        Ok(VisionEvent::Segments(_)) => {}
                         Ok(VisionEvent::Error(message)) => {
                             status_spinner.stop();
                             status_title.set_text("Description failed");
                             status_detail.set_text(&message);
                             describe_button.set_sensitive(true);
+                            segment_button.set_sensitive(true);
                             return glib::ControlFlow::Break;
                         }
                         Ok(VisionEvent::Done) => {
@@ -1014,6 +1052,7 @@ fn build_vision_page() -> gtk4::Widget {
                             status_detail
                                 .set_text("Vision returned a description through the portal.");
                             describe_button.set_sensitive(true);
+                            segment_button.set_sensitive(true);
                             return glib::ControlFlow::Break;
                         }
                         Err(std::sync::mpsc::TryRecvError::Empty) => break,
@@ -1023,6 +1062,7 @@ fn build_vision_page() -> gtk4::Widget {
                             status_detail
                                 .set_text("The vision response channel closed unexpectedly.");
                             describe_button.set_sensitive(true);
+                            segment_button.set_sensitive(true);
                             return glib::ControlFlow::Break;
                         }
                     }
@@ -1034,6 +1074,99 @@ fn build_vision_page() -> gtk4::Widget {
             std::thread::spawn(move || {
                 if let Err(e) = describe_image(&image_b64, tx) {
                     eprintln!("[aileron-demo] describe error: {e}");
+                    let _ = error_tx.send(VisionEvent::Error(friendly_error(&e)));
+                }
+            });
+        });
+    }
+
+    {
+        let selected_image = selected_image.clone();
+        let paste_buffer = paste_buffer.clone();
+        let segments_buffer = segments_buffer.clone();
+        let describe_button_for_click = describe_button.clone();
+        let segment_button_for_click = segment_button.clone();
+        let status_spinner = status_spinner.clone();
+        let status_title = status_title.clone();
+        let status_detail = status_detail.clone();
+        segment_button.connect_clicked(move |_| {
+            let image_b64 = if let Some(bytes) = selected_image.borrow().clone() {
+                base64_encode(&bytes)
+            } else {
+                let (start, end) = paste_buffer.bounds();
+                paste_buffer
+                    .text(&start, &end, false)
+                    .trim()
+                    .replace(['\n', '\r', ' ', '\t'], "")
+            };
+
+            if image_b64.is_empty() {
+                status_title.set_text("No image input");
+                status_detail.set_text("Choose an image file or paste base64 image bytes first.");
+                return;
+            }
+
+            segments_buffer.set_text("");
+            describe_button_for_click.set_sensitive(false);
+            segment_button_for_click.set_sensitive(false);
+            status_spinner.start();
+            status_title.set_text("Creating vision session");
+            status_detail.set_text("Opening a vision.segment session through the portal...");
+
+            let (tx, rx) = std::sync::mpsc::channel::<VisionEvent>();
+            let segments_buffer = segments_buffer.clone();
+            let describe_button = describe_button_for_click.clone();
+            let segment_button = segment_button_for_click.clone();
+            let status_spinner = status_spinner.clone();
+            let status_title = status_title.clone();
+            let status_detail = status_detail.clone();
+            glib::timeout_add_local(std::time::Duration::from_millis(16), move || {
+                loop {
+                    match rx.try_recv() {
+                        Ok(VisionEvent::Phase(phase)) => {
+                            status_title.set_text(phase.title());
+                            status_detail.set_text(phase.detail());
+                            status_spinner.start();
+                        }
+                        Ok(VisionEvent::Description(_)) => {}
+                        Ok(VisionEvent::Segments(segments)) => {
+                            segments_buffer.set_text(&format_segments(&segments));
+                        }
+                        Ok(VisionEvent::Error(message)) => {
+                            status_spinner.stop();
+                            status_title.set_text("Segmentation failed");
+                            status_detail.set_text(&message);
+                            describe_button.set_sensitive(true);
+                            segment_button.set_sensitive(true);
+                            return glib::ControlFlow::Break;
+                        }
+                        Ok(VisionEvent::Done) => {
+                            status_spinner.stop();
+                            status_title.set_text("Segmentation complete");
+                            status_detail.set_text("Vision returned normalized object boxes.");
+                            describe_button.set_sensitive(true);
+                            segment_button.set_sensitive(true);
+                            return glib::ControlFlow::Break;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            status_spinner.stop();
+                            status_title.set_text("Segmentation interrupted");
+                            status_detail
+                                .set_text("The vision response channel closed unexpectedly.");
+                            describe_button.set_sensitive(true);
+                            segment_button.set_sensitive(true);
+                            return glib::ControlFlow::Break;
+                        }
+                    }
+                }
+                glib::ControlFlow::Continue
+            });
+
+            let error_tx = tx.clone();
+            std::thread::spawn(move || {
+                if let Err(e) = segment_image(&image_b64, tx) {
+                    eprintln!("[aileron-demo] segment error: {e}");
                     let _ = error_tx.send(VisionEvent::Error(friendly_error(&e)));
                 }
             });
@@ -1358,6 +1491,7 @@ impl SpeechPhase {
 enum VisionEvent {
     Phase(VisionPhase),
     Description(String),
+    Segments(Vec<VisionSegmentDbus>),
     Error(String),
     Done,
 }
@@ -1366,6 +1500,7 @@ enum VisionPhase {
     CreatingSession,
     LoadingModel,
     Describing,
+    Segmenting,
 }
 
 impl VisionPhase {
@@ -1374,18 +1509,28 @@ impl VisionPhase {
             VisionPhase::CreatingSession => "Creating vision session",
             VisionPhase::LoadingModel => "Loading vision model",
             VisionPhase::Describing => "Describing image",
+            VisionPhase::Segmenting => "Segmenting image",
         }
     }
 
     fn detail(&self) -> &'static str {
         match self {
-            VisionPhase::CreatingSession => {
-                "Opening a vision.describe session through the portal..."
-            }
+            VisionPhase::CreatingSession => "Opening a vision session through the portal...",
             VisionPhase::LoadingModel => "Starting the local vision container if it is cold...",
             VisionPhase::Describing => "Sending image bytes to the vision model...",
+            VisionPhase::Segmenting => "Asking the vision model for normalized object boxes...",
         }
     }
+}
+
+#[derive(Debug, Clone, Deserialize, Type)]
+struct VisionSegmentDbus {
+    label: String,
+    confidence: f64,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
 }
 
 fn temp_audio_path() -> PathBuf {
@@ -1549,7 +1694,7 @@ fn summarize_guided(text: &str, tx: std::sync::mpsc::Sender<DemoEvent>) -> anyho
         "CreateSession",
         &(
             "org.aileron.Demo",
-            "llm.analyze",
+            "llm.extract",
             "You extract concise, factual summary data as valid JSON.",
         ),
     )?;
@@ -1731,6 +1876,60 @@ fn describe_image(image_b64: &str, tx: std::sync::mpsc::Sender<VisionEvent>) -> 
     let _: () = proxy.call("EndSession", &(&session_id,))?;
     tx.send(VisionEvent::Done)?;
     Ok(())
+}
+
+fn segment_image(image_b64: &str, tx: std::sync::mpsc::Sender<VisionEvent>) -> anyhow::Result<()> {
+    use zbus::blocking::Connection;
+
+    const BUS: &str = "org.freedesktop.impl.portal.desktop.aileron";
+    const PATH: &str = "/org/freedesktop/portal/desktop";
+    const IFACE: &str = "org.freedesktop.impl.portal.AI";
+
+    let conn = Connection::session()?;
+    let proxy = zbus::blocking::Proxy::new(&conn, BUS, PATH, IFACE)?;
+
+    tx.send(VisionEvent::Phase(VisionPhase::CreatingSession))?;
+    let session_id: String = proxy.call(
+        "CreateSession",
+        &(
+            "org.aileron.Demo",
+            "vision.segment",
+            "Identify visible objects and return normalized rectangular boxes.",
+        ),
+    )?;
+
+    tx.send(VisionEvent::Phase(VisionPhase::LoadingModel))?;
+    tx.send(VisionEvent::Phase(VisionPhase::Segmenting))?;
+    let segments: Vec<VisionSegmentDbus> = proxy.call("Segment", &(&session_id, &image_b64))?;
+    tx.send(VisionEvent::Segments(segments))?;
+
+    let _: () = proxy.call("EndSession", &(&session_id,))?;
+    tx.send(VisionEvent::Done)?;
+    Ok(())
+}
+
+fn format_segments(segments: &[VisionSegmentDbus]) -> String {
+    if segments.is_empty() {
+        return "No objects returned.".to_string();
+    }
+
+    segments
+        .iter()
+        .enumerate()
+        .map(|(idx, segment)| {
+            format!(
+                "{}. {} ({:.0}%) x={:.3}, y={:.3}, w={:.3}, h={:.3}",
+                idx + 1,
+                segment.label,
+                segment.confidence * 100.0,
+                segment.x,
+                segment.y,
+                segment.width,
+                segment.height
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn base64_encode(data: &[u8]) -> String {
