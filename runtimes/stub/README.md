@@ -20,6 +20,12 @@ Run all commands below from the repository root.
 podman build -t docker.io/example/aileron-runtime-stub:cpu runtimes/stub
 ```
 
+The project also publishes this runtime to GHCR from the runtime image workflow:
+
+```sh
+podman pull ghcr.io/<owner>/aileron-runtime-stub:cpu
+```
+
 ## Runtime Manifest
 
 Publish the image ref through a runtime manifest file such as `/usr/share/aileron/manifests/runtimes/stub.json`:
@@ -28,7 +34,7 @@ Publish the image ref through a runtime manifest file such as `/usr/share/ailero
 {
   "runtime_id": "stub",
   "images": {
-    "cpu": "docker.io/example/aileron-runtime-stub:cpu"
+    "cpu": "ghcr.io/<owner>/aileron-runtime-stub:cpu"
   }
 }
 ```

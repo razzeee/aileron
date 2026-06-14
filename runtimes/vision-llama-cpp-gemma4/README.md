@@ -1,6 +1,6 @@
 # Vision Runtime
 
-This runtime runs llama.cpp through `llama-cpp-python` and implements `vision.describe` for a multimodal GGUF model mounted at `/model/model.gguf` plus a matching projection file mounted at `/model/mmproj.gguf`.
+This runtime runs llama.cpp through `llama-cpp-python` and implements both text generation and `vision.describe` for a multimodal Gemma GGUF model mounted at `/model/model.gguf` plus a matching projection file mounted at `/model/mmproj.gguf`.
 
 Model weights are not baked into the image. A model manifest downloads and verifies both artifacts, then references this runtime by `runtime_id`.
 
@@ -104,17 +104,21 @@ A model profile points at this runtime and provides both artifact URLs/checksums
   "profile_id": "gemma-4-e4b-it-qat",
   "model_id": "gemma-4-e4b-it-qat",
   "runtime_id": "vision-llama-cpp-gemma4",
-  "use_cases": ["vision.describe"],
+  "use_cases": ["llm.summarize", "vision.describe"],
   "artifacts": [
     {
+      "role": "model",
       "url": "https://huggingface.co/.../resolve/main/model.gguf",
       "filename": "model.gguf",
-      "sha256": "..."
+      "sha256": "...",
+      "size_bytes": 4977169568
     },
     {
+      "role": "mmproj",
       "url": "https://huggingface.co/.../resolve/main/mmproj.gguf",
       "filename": "mmproj.gguf",
-      "sha256": "..."
+      "sha256": "...",
+      "size_bytes": 990372672
     }
   ]
 }
@@ -124,7 +128,7 @@ When the profile is installed, the daemon downloads the artifacts to `$XDG_DATA_
 
 ## Manual Install
 
-This runtime needs both `model.gguf` and `mmproj.gguf`, so install it through a manifest with two artifacts. The one-URL manual installer is intended for single-artifact runtimes such as LLM and ASR.
+This runtime needs both `model.gguf` and `mmproj.gguf`, so install it through a manifest with two artifacts. Use artifact roles `model` and `mmproj` to make the layout explicit. The one-URL manual installer is intended for single-artifact runtimes such as LLM and ASR.
 
 ## Environment
 

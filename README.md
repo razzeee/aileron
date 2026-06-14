@@ -33,6 +33,13 @@ Aileron solves both. All IPC is over a Varlink Unix socket. Flatpak sandboxes ca
 
 The management UI (`aileron`) speaks directly to the daemon over the same Varlink socket and runs outside any sandbox.
 
+Further reading:
+
+| Document | Audience | Description |
+|---|---|---|
+| [Runtime stdio protocol](docs/runtime-protocol.md) | Runtime authors | Container request/response contract used by the daemon |
+| [App developer guide](docs/app-developer-guide.md) | App authors | How to use Aileron through portal-style task APIs instead of localhost REST |
+
 
 ## Workspace
 
@@ -168,17 +175,27 @@ Model manifests live under `models/` and reference a reusable runtime by ID:
 {
   "profile_id": "llama3.2-3b-instruct-q4",
   "model_id": "llama3.2-3b-instruct-q4",
+  "llmfit_model_id": "meta-llama/Llama-3.2-3B-Instruct",
   "runtime_id": "llm-llama-cpp",
+  "tier": "balanced",
   "use_cases": ["llm.summarize", "llm.translate", "llm.analyze"],
   "artifacts": [
     {
+      "role": "model",
       "url": "https://huggingface.co/.../resolve/main/model.gguf",
       "filename": "model.gguf",
-      "sha256": "..."
+      "sha256": "...",
+      "size_bytes": 2019377600
     }
   ]
 }
 ```
+
+The optional `artifacts[].role` field identifies what a file is for runtimes that need more than one artifact. Single-file profiles usually use `model`; llama.cpp vision profiles commonly use both `model` and `mmproj`. Artifact roles must be unique within a manifest when present.
+
+The `artifacts[].size_bytes` field is the preferred source for the user-facing install/download size, because it lives next to the exact URL and SHA-256 it describes. `disk_size_gb` is still accepted as fallback catalog metadata when exact artifact byte sizes are unavailable. The optional `llmfit_model_id` field should be the Hugging Face model name used by `llmfit-core`; when present, Aileron uses llmfit metadata to show a simple fit label and RAM/VRAM requirements for the current PC. If it is absent or unknown, Aileron falls back to the manifest's `min_ram_gb` metadata. These fields do not trigger automatic downloads or automatic reassignment.
+
+Distributions should package Aileron, runtime manifests, and model catalog manifests. They do not need to ship model weights in the distro package. The user explicitly chooses a catalog profile to install, sees its size and recommendation metadata, then Aileron downloads and verifies the declared artifacts.
 
 Runtime manifests live under `runtimes/` and map the runtime ID to OCI images for each hardware variant:
 
@@ -193,6 +210,8 @@ Runtime manifests live under `runtimes/` and map the runtime ID to OCI images fo
   }
 }
 ```
+
+Installed model artifacts are stored under `$XDG_DATA_HOME/aileron/models/<model-id>/`, or `$AILERON_DATA_HOME/aileron/models/<model-id>/` when `AILERON_DATA_HOME` is set. Aileron owns this directory and mounts the selected profile's artifact directory into runtimes at `/model:ro,z`.
 
 ## End-to-end test with the stub container
 
