@@ -5,20 +5,25 @@ FROM ${PYTHON_IMAGE} AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential cmake \
-        libvulkan-dev \
+        libvulkan-dev glslc glslang-tools spirv-headers \
     && rm -rf /var/lib/apt/lists/*
 
-ENV CMAKE_ARGS="-DWHISPER_VULKAN=on"
+ENV CMAKE_ARGS="-DGGML_VULKAN=on"
 
-RUN python -m pip install --root=/runtime --no-cache-dir "pywhispercpp>=1.2.0"
+RUN python -m pip install --root=/runtime --no-cache-dir --no-binary pywhispercpp "pywhispercpp>=1.2.0"
 
 FROM ${PYTHON_IMAGE}
+
+ENV XDG_CACHE_HOME=/tmp
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libgomp1 libvulkan1 mesa-vulkan-drivers \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /runtime/usr /usr
+
+RUN find /usr -path '*/site-packages/lib*.so*' -exec cp -a {} /usr/local/lib/ \; \
+    && ldconfig
 
 COPY entrypoint.py /entrypoint.py
 
