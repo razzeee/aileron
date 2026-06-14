@@ -3,6 +3,7 @@ FROM ${BASE_IMAGE}
 
 ARG RUNTIME_ID
 ARG RUNTIME_VARIANT="cpu"
+ARG RUNTIME_DESCRIPTION="Aileron llama.cpp runtime for local inference."
 ARG ENTRYPOINT_PATH
 ARG INSTALL_SOURCE="pypi"
 ARG LLAMA_CPP_PYTHON_REF="b5eefc82e0fd415d5547c81367c29b159c0268d3"
@@ -47,6 +48,8 @@ COPY ${ENTRYPOINT_PATH} /entrypoint.py
 
 LABEL org.aileron.runtime="true" \
       org.aileron.runtime_id="${RUNTIME_ID}" \
-      org.aileron.variant="${RUNTIME_VARIANT}"
+      org.aileron.variant="${RUNTIME_VARIANT}" \
+      org.opencontainers.image.description="${RUNTIME_DESCRIPTION}" \
+      org.opencontainers.image.licenses="GPL-3.0-or-later"
 
 ENTRYPOINT ["python", "/entrypoint.py"]

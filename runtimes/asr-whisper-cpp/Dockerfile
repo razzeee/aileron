@@ -13,6 +13,8 @@ COPY entrypoint.py /entrypoint.py
 
 LABEL org.aileron.runtime="true" \
       org.aileron.runtime_id="asr-whisper-cpp" \
-      org.aileron.variant="cpu"
+      org.aileron.variant="cpu" \
+      org.opencontainers.image.description="Aileron Whisper.cpp runtime for local speech transcription." \
+      org.opencontainers.image.licenses="GPL-3.0-or-later"
 
 ENTRYPOINT ["python", "/entrypoint.py"]

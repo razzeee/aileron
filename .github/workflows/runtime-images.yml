@@ -33,6 +33,7 @@ jobs:
             build_args: |
               RUNTIME_ID=llm-llama-cpp
               RUNTIME_VARIANT=cpu
+              RUNTIME_DESCRIPTION=Aileron llama.cpp runtime for local text generation.
               ENTRYPOINT_PATH=runtimes/llm-llama-cpp/entrypoint.py
               EXTRA_PIP_PACKAGES=jsonschema
           - runtime_id: llm-llama-cpp
@@ -48,6 +49,7 @@ jobs:
               LDFLAGS=-L/usr/local/cuda/lib64/stubs -Wl,-rpath-link,/usr/local/cuda/lib64/stubs
               RUNTIME_ID=llm-llama-cpp
               RUNTIME_VARIANT=cuda
+              RUNTIME_DESCRIPTION=Aileron llama.cpp runtime for local text generation.
               ENTRYPOINT_PATH=runtimes/llm-llama-cpp/entrypoint.py
               EXTRA_PIP_PACKAGES=jsonschema
           - runtime_id: llm-llama-cpp
@@ -64,6 +66,7 @@ jobs:
               PIP_INSTALL_ARGS=--no-binary llama-cpp-python
               RUNTIME_ID=llm-llama-cpp
               RUNTIME_VARIANT=rocm
+              RUNTIME_DESCRIPTION=Aileron llama.cpp runtime for local text generation.
               ENTRYPOINT_PATH=runtimes/llm-llama-cpp/entrypoint.py
               EXTRA_PIP_PACKAGES=jsonschema
           - runtime_id: llm-llama-cpp
@@ -76,6 +79,7 @@ jobs:
               CMAKE_ARGS=-DGGML_VULKAN=on
               RUNTIME_ID=llm-llama-cpp
               RUNTIME_VARIANT=vulkan
+              RUNTIME_DESCRIPTION=Aileron llama.cpp runtime for local text generation.
               ENTRYPOINT_PATH=runtimes/llm-llama-cpp/entrypoint.py
               EXTRA_PIP_PACKAGES=jsonschema
           - runtime_id: vision-llama-cpp-gemma4
@@ -86,6 +90,7 @@ jobs:
             build_args: |
               RUNTIME_ID=vision-llama-cpp-gemma4
               RUNTIME_VARIANT=cpu
+              RUNTIME_DESCRIPTION=Aileron Gemma 4 vision runtime using llama.cpp.
               ENTRYPOINT_PATH=runtimes/vision-llama-cpp-gemma4/entrypoint.py
               INSTALL_SOURCE=git
           - runtime_id: vision-llama-cpp-gemma4
@@ -101,6 +106,7 @@ jobs:
               LDFLAGS=-L/usr/local/cuda/lib64/stubs -Wl,-rpath-link,/usr/local/cuda/lib64/stubs
               RUNTIME_ID=vision-llama-cpp-gemma4
               RUNTIME_VARIANT=cuda
+              RUNTIME_DESCRIPTION=Aileron Gemma 4 vision runtime using llama.cpp.
               ENTRYPOINT_PATH=runtimes/vision-llama-cpp-gemma4/entrypoint.py
               INSTALL_SOURCE=git
           - runtime_id: vision-llama-cpp-gemma4
@@ -117,6 +123,7 @@ jobs:
               PIP_INSTALL_ARGS=--no-binary llama-cpp-python
               RUNTIME_ID=vision-llama-cpp-gemma4
               RUNTIME_VARIANT=rocm
+              RUNTIME_DESCRIPTION=Aileron Gemma 4 vision runtime using llama.cpp.
               ENTRYPOINT_PATH=runtimes/vision-llama-cpp-gemma4/entrypoint.py
               INSTALL_SOURCE=git
           - runtime_id: vision-llama-cpp-gemma4
@@ -129,6 +136,7 @@ jobs:
               CMAKE_ARGS=-DGGML_VULKAN=on
               RUNTIME_ID=vision-llama-cpp-gemma4
               RUNTIME_VARIANT=vulkan
+              RUNTIME_DESCRIPTION=Aileron Gemma 4 vision runtime using llama.cpp.
               ENTRYPOINT_PATH=runtimes/vision-llama-cpp-gemma4/entrypoint.py
               INSTALL_SOURCE=git
 
@@ -164,7 +172,11 @@ jobs:
             org.opencontainers.image.title=${{ matrix.image_name }}
             org.opencontainers.image.version=${{ matrix.variant }}
             org.opencontainers.image.description=${{ matrix.description }}
+            org.opencontainers.image.licenses=GPL-3.0-or-later
             org.opencontainers.image.documentation=${{ github.server_url }}/${{ github.repository }}/blob/${{ github.ref_name }}/${{ matrix.documentation_path }}
+          annotations: |
+            org.opencontainers.image.description=${{ matrix.description }}
+            org.opencontainers.image.licenses=GPL-3.0-or-later
           cache-from: type=gha,scope=${{ matrix.image_name }}-${{ matrix.variant }}
           cache-to: type=gha,mode=max,scope=${{ matrix.image_name }}-${{ matrix.variant }}
 
@@ -234,6 +246,10 @@ jobs:
             org.opencontainers.image.title=${{ matrix.image_name }}
             org.opencontainers.image.version=${{ matrix.variant }}
             org.opencontainers.image.description=${{ matrix.description }}
+            org.opencontainers.image.licenses=GPL-3.0-or-later
             org.opencontainers.image.documentation=${{ github.server_url }}/${{ github.repository }}/blob/${{ github.ref_name }}/${{ matrix.documentation_path }}
+          annotations: |
+            org.opencontainers.image.description=${{ matrix.description }}
+            org.opencontainers.image.licenses=GPL-3.0-or-later
           cache-from: type=gha,scope=${{ matrix.image_name }}-${{ matrix.variant }}
           cache-to: type=gha,mode=max,scope=${{ matrix.image_name }}-${{ matrix.variant }}
