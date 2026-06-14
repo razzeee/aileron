@@ -1,6 +1,15 @@
 /// Varlink handler for `aileron.Models`.
+use anyhow::Context;
 use std::collections::{HashMap, HashSet};
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::thread;
+use std::time::Duration;
 
 use crate::manifests::{self, ManifestArtifact, ModelManifest};
 use crate::profiles::{ArtifactHash, Profile};
@@ -14,6 +23,8 @@ use aileron_varlink::aileron_Models::{
     ProfileInfo, RuntimeImage, RuntimeImageCleanupError, RuntimeManifestInfo, UseCaseConflict,
     UseCaseFitScore, VarlinkCallError, VarlinkInterface,
 };
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 fn io_err(_msg: impl std::fmt::Display) -> varlink::Error {
     varlink::Error::from(varlink::ErrorKind::Io(std::io::ErrorKind::Other))
@@ -128,7 +139,8 @@ impl VarlinkInterface for ModelsHandler {
     fn list_runtime_images(&self, call: &mut dyn Call_ListRuntimeImages) -> varlink::Result<()> {
         let images = self.rt.block_on(async {
             let usage = runtime_image_usage(&self.state).await;
-            list_aileron_runtime_images(&usage)
+            let store = oci_store_for_state(&self.state).await;
+            list_aileron_runtime_images(&store, &usage)
         });
         match images {
             Ok(images) => call.reply(images),
@@ -143,7 +155,8 @@ impl VarlinkInterface for ModelsHandler {
     ) -> varlink::Result<()> {
         let result = self.rt.block_on(async {
             let usage = runtime_image_usage(&self.state).await;
-            remove_aileron_runtime_image(&image_id, &usage).await
+            let store = oci_store_for_state(&self.state).await;
+            remove_aileron_runtime_image(&store, &image_id, &usage).await
         });
         match result {
             Ok(()) => call.reply(),
@@ -171,11 +184,12 @@ impl VarlinkInterface for ModelsHandler {
     ) -> varlink::Result<()> {
         let result = self.rt.block_on(async {
             let usage = runtime_image_usage(&self.state).await;
-            let images = list_aileron_runtime_images(&usage)?;
+            let store = oci_store_for_state(&self.state).await;
+            let images = list_aileron_runtime_images(&store, &usage)?;
             let mut removed = Vec::new();
             let mut errors = Vec::new();
             for image in images.into_iter().filter(|image| !image.in_use) {
-                match remove_podman_image(&image.image_id).await {
+                match remove_oci_runtime_rootfs(&store, &image.image_id).await {
                     Ok(()) => removed.push(image.image_ref),
                     Err(e) => errors.push(RuntimeImageCleanupError {
                         image_ref: image.image_ref,
@@ -234,10 +248,7 @@ impl VarlinkInterface for ModelsHandler {
     ) -> varlink::Result<()> {
         self.rt.block_on(async {
             let mut guard = self.state.0.lock().await;
-            if let Some(install) = guard.installing_profiles.get_mut(&profile_id) {
-                install.cancel_requested = true;
-                install.status = "Cancelling...".to_string();
-            }
+            request_cancel_install(&mut guard, &profile_id);
             call.reply()
         })
     }
@@ -578,7 +589,7 @@ struct RuntimeImageUsage {
 }
 
 impl RuntimeImageUsage {
-    fn used_by(&self, image: &PodmanRuntimeImage) -> Vec<String> {
+    fn used_by(&self, image: &StoredRuntimeImage) -> Vec<String> {
         let mut profiles = Vec::new();
         for image_ref in image.match_refs() {
             if let Some(used_by) = self.profiles_by_ref.get(&image_ref) {
@@ -592,16 +603,17 @@ impl RuntimeImageUsage {
 }
 
 #[derive(Debug)]
-struct PodmanRuntimeImage {
+struct StoredRuntimeImage {
     image_id: String,
     image_ref: String,
     names: Vec<String>,
     runtime_id: String,
     variant: String,
+    digest: Option<String>,
     size_bytes: i64,
 }
 
-impl PodmanRuntimeImage {
+impl StoredRuntimeImage {
     fn match_refs(&self) -> Vec<String> {
         let mut refs = self.names.clone();
         refs.push(self.image_ref.clone());
@@ -632,18 +644,22 @@ async fn runtime_image_usage(state: &SharedState) -> RuntimeImageUsage {
     RuntimeImageUsage { profiles_by_ref }
 }
 
-fn list_aileron_runtime_images(usage: &RuntimeImageUsage) -> anyhow::Result<Vec<OciRuntimeImage>> {
-    let values = podman_images_with_label("org.aileron.runtime=true")?;
-    let mut images = values
-        .iter()
-        .filter_map(parse_podman_runtime_image)
-        .collect::<Vec<_>>();
+async fn oci_store_for_state(state: &SharedState) -> PathBuf {
+    let guard = state.0.lock().await;
+    guard.containers.oci_store.clone()
+}
+
+fn list_aileron_runtime_images(
+    store: &Path,
+    usage: &RuntimeImageUsage,
+) -> anyhow::Result<Vec<OciRuntimeImage>> {
+    let mut images = stored_runtime_images(store)?;
     dedupe_runtime_images(&mut images);
     let mut images = images
         .into_iter()
         .map(|image| {
             let used_by_profiles = usage.used_by(&image);
-            let update = check_runtime_image_update(&image);
+            let update = runtime_image_local_status(&image);
             OciRuntimeImage {
                 image_id: image.image_id,
                 image_ref: image.image_ref,
@@ -666,7 +682,7 @@ fn list_aileron_runtime_images(usage: &RuntimeImageUsage) -> anyhow::Result<Vec<
     Ok(images)
 }
 
-fn dedupe_runtime_images(images: &mut Vec<PodmanRuntimeImage>) {
+fn dedupe_runtime_images(images: &mut Vec<StoredRuntimeImage>) {
     let mut seen_ids = HashSet::new();
     let mut seen_refs = HashSet::new();
     images.retain(|image| {
@@ -684,66 +700,22 @@ fn dedupe_runtime_images(images: &mut Vec<PodmanRuntimeImage>) {
     });
 }
 
-fn check_runtime_image_update(image: &PodmanRuntimeImage) -> RuntimeImageUpdateCheck {
-    let image_ref = update_check_ref(image);
-    if !remote_tag_is_checkable(&image_ref) {
+fn runtime_image_local_status(image: &StoredRuntimeImage) -> RuntimeImageUpdateCheck {
+    if remote_tag_is_checkable(&image.image_ref) {
         return RuntimeImageUpdateCheck {
-            available: false,
-            status: "not checkable".to_string(),
+            available: true,
+            status: if image.digest.is_some() {
+                "installed: update not checked".to_string()
+            } else {
+                "installed: digest unavailable".to_string()
+            },
         };
     }
 
-    let local_digest = match local_image_digest(&image_ref) {
-        Ok(Some(digest)) => digest,
-        Ok(None) => {
-            return RuntimeImageUpdateCheck {
-                available: false,
-                status: "check failed: local digest unavailable".to_string(),
-            };
-        }
-        Err(e) => {
-            return RuntimeImageUpdateCheck {
-                available: false,
-                status: format!("check failed: {e}"),
-            };
-        }
-    };
-
-    let remote_digest = match remote_image_digest(&image_ref) {
-        Ok(Some(digest)) => digest,
-        Ok(None) => {
-            return RuntimeImageUpdateCheck {
-                available: false,
-                status: "check failed: remote digest unavailable".to_string(),
-            };
-        }
-        Err(e) => {
-            return RuntimeImageUpdateCheck {
-                available: false,
-                status: format!("check failed: {e}"),
-            };
-        }
-    };
-
-    if local_digest == remote_digest {
-        RuntimeImageUpdateCheck {
-            available: false,
-            status: "current".to_string(),
-        }
-    } else {
-        RuntimeImageUpdateCheck {
-            available: true,
-            status: "update available".to_string(),
-        }
+    RuntimeImageUpdateCheck {
+        available: false,
+        status: "not checkable".to_string(),
     }
-}
-
-fn update_check_ref(image: &PodmanRuntimeImage) -> String {
-    image
-        .match_refs()
-        .into_iter()
-        .find(|image_ref| remote_tag_is_checkable(image_ref))
-        .unwrap_or_else(|| image.image_ref.clone())
 }
 
 fn remote_tag_is_checkable(image_ref: &str) -> bool {
@@ -754,72 +726,6 @@ fn remote_tag_is_checkable(image_ref: &str) -> bool {
             .rsplit_once('/')
             .map_or(image_ref, |(_, after_slash)| after_slash)
             .contains(':')
-}
-
-fn local_image_digest(image_ref: &str) -> anyhow::Result<Option<String>> {
-    let output = std::process::Command::new("podman")
-        .args(["image", "inspect", image_ref])
-        .output()?;
-    if !output.status.success() {
-        anyhow::bail!("podman image inspect failed for {image_ref}");
-    }
-    let values: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout)?;
-    Ok(values.first().and_then(|value| {
-        value_digest(value).or_else(|| {
-            value
-                .get("RepoDigests")
-                .and_then(|digests| digests.as_array())
-                .and_then(|digests| {
-                    digests
-                        .iter()
-                        .filter_map(|value| value.as_str())
-                        .find_map(digest_part)
-                })
-        })
-    }))
-}
-
-fn remote_image_digest(image_ref: &str) -> anyhow::Result<Option<String>> {
-    let output = std::process::Command::new("podman")
-        .args(["manifest", "inspect", image_ref])
-        .output()?;
-    if !output.status.success() {
-        anyhow::bail!("podman manifest inspect failed for {image_ref}");
-    }
-    let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
-    Ok(manifest_digest(&value))
-}
-
-fn manifest_digest(value: &serde_json::Value) -> Option<String> {
-    value_digest(value).or_else(|| platform_manifest_digest(value))
-}
-
-fn value_digest(value: &serde_json::Value) -> Option<String> {
-    value
-        .get("Digest")
-        .or_else(|| value.get("digest"))
-        .and_then(|digest| digest.as_str())
-        .and_then(digest_part)
-}
-
-fn platform_manifest_digest(value: &serde_json::Value) -> Option<String> {
-    let manifests = value.get("manifests")?.as_array()?;
-    let arch = oci_arch(std::env::consts::ARCH);
-    manifests
-        .iter()
-        .find(|manifest| {
-            manifest
-                .get("platform")
-                .and_then(|platform| platform.get("os"))
-                .and_then(|os| os.as_str())
-                == Some("linux")
-                && manifest
-                    .get("platform")
-                    .and_then(|platform| platform.get("architecture"))
-                    .and_then(|architecture| architecture.as_str())
-                    == Some(arch)
-        })
-        .and_then(value_digest)
 }
 
 fn oci_arch(arch: &str) -> &str {
@@ -834,93 +740,114 @@ fn oci_arch(arch: &str) -> &str {
     }
 }
 
-fn digest_part(value: &str) -> Option<String> {
-    value
-        .rsplit_once('@')
-        .map_or(value, |(_, digest)| digest)
-        .starts_with("sha256:")
-        .then(|| {
-            value
-                .rsplit_once('@')
-                .map_or(value, |(_, digest)| digest)
-                .to_string()
-        })
-}
-
-fn podman_images_with_label(label: &str) -> anyhow::Result<Vec<serde_json::Value>> {
-    let output = std::process::Command::new("podman")
-        .args([
-            "image",
-            "ls",
-            "--filter",
-            &format!("label={label}"),
-            "--format",
-            "json",
-        ])
-        .output()?;
-    if !output.status.success() {
-        anyhow::bail!("podman image ls failed for label {label}");
+fn stored_runtime_images(store: &Path) -> anyhow::Result<Vec<StoredRuntimeImage>> {
+    let rootfs_dir = store.join("rootfs");
+    if !rootfs_dir.is_dir() {
+        return Ok(Vec::new());
     }
-    Ok(serde_json::from_slice(&output.stdout)?)
-}
 
-fn parse_podman_runtime_image(value: &serde_json::Value) -> Option<PodmanRuntimeImage> {
-    let labels = value.get("Labels")?;
-    if label_value(labels, "org.aileron.runtime").as_deref() != Some("true") {
-        return None;
+    let mut images = Vec::new();
+    for entry in std::fs::read_dir(&rootfs_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let image_id = entry.file_name().to_string_lossy().to_string();
+        let metadata =
+            read_runtime_rootfs_metadata(store, &image_id, &entry.path()).unwrap_or_default();
+        let image_ref = metadata
+            .image_ref
+            .clone()
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| image_id.clone());
+        let variant = metadata
+            .variant
+            .clone()
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| image_ref_variant(&image_ref).unwrap_or_default());
+        let runtime_id = metadata.runtime_id.unwrap_or_default();
+        let digest = metadata.digest;
+        let size_bytes = directory_size_bytes(&entry.path())
+            .unwrap_or(0)
+            .min(i64::MAX as u64) as i64;
+        images.push(StoredRuntimeImage {
+            image_id,
+            image_ref: image_ref.clone(),
+            names: vec![image_ref],
+            runtime_id,
+            variant,
+            digest,
+            size_bytes,
+        });
     }
-    let image_id = string_field(value, &["Id", "ID"])?;
-    let runtime_id = label_value(labels, "org.aileron.runtime_id").unwrap_or_default();
-    let names = image_names(value);
-    let variant = label_value(labels, "org.aileron.variant").unwrap_or_default();
-    let image_ref = label_value(labels, "org.aileron.image_ref")
-        .or_else(|| names.first().cloned())
-        .unwrap_or_else(|| image_id.clone());
-    Some(PodmanRuntimeImage {
-        image_id,
-        image_ref,
-        names,
-        runtime_id,
-        variant,
-        size_bytes: image_size_bytes(value),
-    })
+    Ok(images)
 }
 
-fn string_field(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
-    keys.iter()
-        .find_map(|key| value.get(*key)?.as_str().map(str::to_string))
+#[derive(Default, Deserialize, Serialize)]
+struct RuntimeRootfsMetadata {
+    image_ref: Option<String>,
+    runtime_id: Option<String>,
+    variant: Option<String>,
+    digest: Option<String>,
 }
 
-fn label_value(labels: &serde_json::Value, key: &str) -> Option<String> {
-    labels
-        .get(key)
-        .and_then(|value| value.as_str())
-        .map(str::to_string)
+#[derive(Deserialize)]
+struct OciIndex {
+    manifests: Vec<OciDescriptor>,
 }
 
-fn image_names(value: &serde_json::Value) -> Vec<String> {
-    if let Some(names) = value.get("Names").and_then(|names| names.as_array()) {
-        return names
-            .iter()
-            .filter_map(|name| name.as_str().map(str::to_string))
-            .collect();
-    }
-    let repository = string_field(value, &["Repository"]);
-    let tag = string_field(value, &["Tag"]);
-    match (repository, tag) {
-        (Some(repository), Some(tag)) => vec![format!("{repository}:{tag}")],
-        _ => Vec::new(),
-    }
+#[derive(Clone, Deserialize)]
+struct OciDescriptor {
+    digest: String,
+    platform: Option<OciPlatform>,
 }
 
-fn image_size_bytes(value: &serde_json::Value) -> i64 {
-    value
-        .get("Size")
-        .and_then(|size| {
-            size.as_i64()
-                .or_else(|| size.as_u64().map(|size| size as i64))
-        })
-        .unwrap_or(0)
+#[derive(Clone, Deserialize)]
+struct OciPlatform {
+    os: Option<String>,
+    architecture: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct OciManifest {
+    #[serde(skip)]
+    digest: Option<String>,
+    config: OciDescriptor,
+    layers: Vec<OciDescriptor>,
+}
+
+#[derive(Default, Deserialize)]
+struct OciImageConfig {
+    config: Option<OciImageConfigFields>,
+}
+
+#[derive(Default, Deserialize)]
+struct OciImageConfigFields {
+    #[serde(rename = "Labels")]
+    labels: Option<HashMap<String, String>>,
+}
+
+fn read_runtime_rootfs_metadata(
+    store: &Path,
+    image_id: &str,
+    rootfs: &Path,
+) -> anyhow::Result<RuntimeRootfsMetadata> {
+    let metadata_path = store.join("metadata").join(format!("{image_id}.json"));
+    let path = if metadata_path.is_file() {
+        metadata_path
+    } else {
+        rootfs.join("metadata.json")
+    };
+    let data = std::fs::read_to_string(path)?;
+    Ok(serde_json::from_str(&data)?)
+}
+
+fn image_ref_variant(image_ref: &str) -> Option<String> {
+    image_ref
+        .rsplit_once('/')
+        .map_or(image_ref, |(_, after_slash)| after_slash)
+        .rsplit_once(':')
+        .map(|(_, tag)| tag.to_string())
 }
 
 fn profile_artifact_size_bytes(path: &Path) -> i64 {
@@ -928,7 +855,10 @@ fn profile_artifact_size_bytes(path: &Path) -> i64 {
 }
 
 fn directory_size_bytes(path: &Path) -> std::io::Result<u64> {
-    let metadata = std::fs::metadata(path)?;
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        return Ok(0);
+    }
     if metadata.is_file() {
         return Ok(metadata.len());
     }
@@ -945,10 +875,11 @@ fn directory_size_bytes(path: &Path) -> std::io::Result<u64> {
 }
 
 async fn remove_aileron_runtime_image(
+    store: &Path,
     image_id: &str,
     usage: &RuntimeImageUsage,
 ) -> anyhow::Result<()> {
-    let image = list_aileron_runtime_images(usage)?
+    let image = list_aileron_runtime_images(store, usage)?
         .into_iter()
         .find(|image| image.image_id == image_id || image.image_ref == image_id)
         .ok_or_else(|| anyhow::anyhow!("Aileron runtime image not found: {image_id}"))?;
@@ -958,7 +889,7 @@ async fn remove_aileron_runtime_image(
             image.used_by_profiles.join(", ")
         );
     }
-    remove_podman_image(&image.image_id).await
+    remove_oci_runtime_rootfs(store, &image.image_id).await
 }
 
 async fn start_runtime_image_update(state: &SharedState, image_ref: &str) -> anyhow::Result<()> {
@@ -966,31 +897,29 @@ async fn start_runtime_image_update(state: &SharedState, image_ref: &str) -> any
         anyhow::bail!("runtime image is not a remote tag: {image_ref}");
     }
     let usage = RuntimeImageUsage::default();
-    let known = list_aileron_runtime_images(&usage)?
+    let store = oci_store_for_state(state).await;
+    let known = list_aileron_runtime_images(&store, &usage)?
         .into_iter()
         .any(|image| image.image_ref == image_ref || image.image_id == image_ref);
     if !known {
         anyhow::bail!("Aileron runtime image not found: {image_ref}");
     }
-    begin_runtime_download(state, image_ref).await?;
+    begin_runtime_download(state, image_ref, None).await?;
 
     let state = state.clone();
     let image_ref = image_ref.to_string();
     tokio::spawn(async move {
-        let result = pull_runtime_image_unconditional(&image_ref).await;
+        let result =
+            pull_runtime_image_unconditional(&store, &image_ref, Some(state.clone()), None).await;
         finish_runtime_download(&state, &image_ref, result.err().map(|e| e.to_string())).await;
     });
     Ok(())
 }
 
-async fn remove_podman_image(image_id: &str) -> anyhow::Result<()> {
-    let status = tokio::process::Command::new("podman")
-        .args(["image", "rm", image_id])
-        .status()
-        .await?;
-    if !status.success() {
-        anyhow::bail!("podman image rm failed for {image_id}");
-    }
+async fn remove_oci_runtime_rootfs(store: &Path, image_id: &str) -> anyhow::Result<()> {
+    let path = store.join("rootfs").join(image_id);
+    tokio::fs::remove_dir_all(&path).await?;
+    let _ = tokio::fs::remove_file(store.join("metadata").join(format!("{image_id}.json"))).await;
     Ok(())
 }
 
@@ -1117,7 +1046,7 @@ async fn install_manifest_data_inner(
     };
 
     update_install_status(state, &profile.profile_id, "Preparing runtime image...").await;
-    pull_runtime_image(state, &runtime_image).await?;
+    pull_runtime_image(state, &runtime_image, Some(&profile.profile_id)).await?;
 
     install_artifacts(
         state,
@@ -1174,9 +1103,54 @@ async fn finish_install(state: &SharedState, profile_id: &str, error: Option<Str
     }
 }
 
-async fn begin_runtime_download(state: &SharedState, image_ref: &str) -> anyhow::Result<()> {
+fn runtime_download_key(image_ref: &str) -> String {
+    format!("runtime:{image_ref}")
+}
+
+fn request_cancel_install(guard: &mut crate::state::Inner, profile_id: &str) {
+    request_cancel_records(
+        &mut guard.installing_profiles,
+        &mut guard.runtime_downloads,
+        &guard.runtime_download_owners,
+        profile_id,
+    );
+}
+
+fn request_cancel_records(
+    installing_profiles: &mut HashMap<String, InstallRecord>,
+    runtime_downloads: &mut HashMap<String, InstallRecord>,
+    runtime_download_owners: &HashMap<String, String>,
+    profile_id: &str,
+) {
+    if let Some(install) = installing_profiles.get_mut(profile_id) {
+        install.cancel_requested = true;
+        install.status = "Cancelling...".to_string();
+        let runtime_keys = runtime_download_owners
+            .iter()
+            .filter_map(|(runtime_key, owner)| (owner == profile_id).then_some(runtime_key.clone()))
+            .collect::<Vec<_>>();
+        for runtime_key in runtime_keys {
+            if let Some(download) = runtime_downloads.get_mut(&runtime_key) {
+                download.cancel_requested = true;
+                download.status = "Cancelling runtime setup...".to_string();
+            }
+        }
+        return;
+    }
+
+    if let Some(download) = runtime_downloads.get_mut(profile_id) {
+        download.cancel_requested = true;
+        download.status = "Cancelling runtime setup...".to_string();
+    }
+}
+
+async fn begin_runtime_download(
+    state: &SharedState,
+    image_ref: &str,
+    owner_profile_id: Option<&str>,
+) -> anyhow::Result<()> {
     let mut guard = state.0.lock().await;
-    let key = format!("runtime:{image_ref}");
+    let key = runtime_download_key(image_ref);
     if guard.runtime_downloads.contains_key(&key) {
         anyhow::bail!("runtime image download already running for {image_ref}");
     }
@@ -1184,7 +1158,7 @@ async fn begin_runtime_download(state: &SharedState, image_ref: &str) -> anyhow:
         .recent_runtime_downloads
         .retain(|(recent_image_ref, _)| recent_image_ref != &key);
     guard.runtime_downloads.insert(
-        key,
+        key.clone(),
         InstallRecord {
             bytes_pulled: 0,
             total_bytes: 0,
@@ -1196,15 +1170,21 @@ async fn begin_runtime_download(state: &SharedState, image_ref: &str) -> anyhow:
             }]),
         },
     );
+    if let Some(owner_profile_id) = owner_profile_id {
+        guard
+            .runtime_download_owners
+            .insert(key, owner_profile_id.to_string());
+    }
     Ok(())
 }
 
 async fn finish_runtime_download(state: &SharedState, image_ref: &str, error: Option<String>) {
     let mut guard = state.0.lock().await;
-    let key = format!("runtime:{image_ref}");
+    let key = runtime_download_key(image_ref);
     let Some(mut download) = guard.runtime_downloads.remove(&key) else {
         return;
     };
+    guard.runtime_download_owners.remove(&key);
     if let Some(error) = error {
         download.status = format!("Failed: {error}");
         guard.recent_runtime_downloads.push_front((key, download));
@@ -1312,21 +1292,31 @@ async fn ensure_install_not_cancelled(state: &SharedState, profile_id: &str) -> 
     Ok(())
 }
 
-async fn pull_runtime_image(state: &SharedState, image_ref: &str) -> anyhow::Result<()> {
-    let exists = tokio::process::Command::new("podman")
-        .args(["image", "exists", image_ref])
-        .status()
-        .await?;
-    if exists.success() {
+async fn pull_runtime_image(
+    state: &SharedState,
+    image_ref: &str,
+    owner_profile_id: Option<&str>,
+) -> anyhow::Result<()> {
+    let store = oci_store_for_state(state).await;
+    let rootfs = store
+        .join("rootfs")
+        .join(crate::container::store_key(image_ref));
+    if rootfs.is_dir() {
         return Ok(());
     }
 
     if image_ref.starts_with("localhost/") {
-        anyhow::bail!("local runtime image is not built: {image_ref}");
+        anyhow::bail!("local runtime rootfs is not installed: {image_ref}");
     }
 
-    begin_runtime_download(state, image_ref).await?;
-    let result = pull_runtime_image_unconditional(image_ref).await;
+    begin_runtime_download(state, image_ref, owner_profile_id).await?;
+    let result = pull_runtime_image_unconditional(
+        &store,
+        image_ref,
+        Some(state.clone()),
+        owner_profile_id.map(str::to_string),
+    )
+    .await;
     finish_runtime_download(
         state,
         image_ref,
@@ -1336,15 +1326,541 @@ async fn pull_runtime_image(state: &SharedState, image_ref: &str) -> anyhow::Res
     result
 }
 
-async fn pull_runtime_image_unconditional(image_ref: &str) -> anyhow::Result<()> {
-    let status = tokio::process::Command::new("podman")
-        .args(["pull", image_ref])
-        .status()
-        .await?;
-    if !status.success() {
-        anyhow::bail!("podman pull failed for {image_ref}");
+async fn pull_runtime_image_unconditional(
+    store: &Path,
+    image_ref: &str,
+    state: Option<SharedState>,
+    owner_profile_id: Option<String>,
+) -> anyhow::Result<()> {
+    let store = store.to_path_buf();
+    let image_ref = image_ref.to_string();
+    tokio::task::spawn_blocking(move || {
+        pull_runtime_image_blocking(&store, &image_ref, state, owner_profile_id)
+    })
+    .await
+    .context("runtime image pull task failed")?
+}
+
+fn pull_runtime_image_blocking(
+    store: &Path,
+    image_ref: &str,
+    state: Option<SharedState>,
+    owner_profile_id: Option<String>,
+) -> anyhow::Result<()> {
+    std::fs::create_dir_all(store.join("rootfs"))?;
+    std::fs::create_dir_all(store.join("metadata"))?;
+    std::fs::create_dir_all(store.join("tmp"))?;
+
+    let key = crate::container::store_key(image_ref);
+    let oci_layout = store
+        .join("tmp")
+        .join(format!("oci-layout-{}", Uuid::new_v4()));
+    let rootfs_tmp = store.join("tmp").join(format!("rootfs-{}", Uuid::new_v4()));
+
+    let result = (|| {
+        ensure_runtime_pull_not_cancelled(state.as_ref(), image_ref, owner_profile_id.as_deref())?;
+        let copy_steps = remote_runtime_copy_steps(image_ref).ok().flatten();
+        let cancel_check =
+            runtime_pull_cancel_check(state.clone(), image_ref, owner_profile_id.clone());
+        copy_image_to_oci_layout(
+            image_ref,
+            &oci_layout,
+            |progress| {
+                if let Some(state) = state.as_ref() {
+                    update_runtime_download_sync(state, image_ref, progress);
+                }
+            },
+            copy_steps,
+            cancel_check,
+        )?;
+        ensure_runtime_pull_not_cancelled(state.as_ref(), image_ref, owner_profile_id.as_deref())?;
+        let manifest = read_selected_manifest(&oci_layout)?;
+        if let Some(state) = state.as_ref() {
+            update_runtime_download_sync(
+                state,
+                image_ref,
+                RuntimePullProgress::Status("Unpacking runtime image...".to_string()),
+            );
+        }
+        std::fs::create_dir_all(&rootfs_tmp)?;
+        ensure_runtime_pull_not_cancelled(state.as_ref(), image_ref, owner_profile_id.as_deref())?;
+        render_oci_layout_dir(&oci_layout, &rootfs_tmp)?;
+        ensure_runtime_pull_not_cancelled(state.as_ref(), image_ref, owner_profile_id.as_deref())?;
+        let labels = read_image_config_labels(&oci_layout, &manifest).unwrap_or_default();
+
+        replace_runtime_rootfs(store, &key, &rootfs_tmp, || {
+            write_runtime_metadata(image_ref, &manifest, &labels, store, &key)
+        })?;
+        Ok(())
+    })();
+
+    let _ = std::fs::remove_dir_all(&oci_layout);
+    let _ = std::fs::remove_dir_all(&rootfs_tmp);
+    result
+}
+
+fn runtime_pull_cancel_check(
+    state: Option<SharedState>,
+    image_ref: &str,
+    owner_profile_id: Option<String>,
+) -> Option<Arc<dyn Fn() -> bool + Send + Sync>> {
+    let state = state?;
+    let image_ref = image_ref.to_string();
+    Some(Arc::new(move || {
+        runtime_pull_is_cancelled(&state, &image_ref, owner_profile_id.as_deref())
+    }))
+}
+
+fn ensure_runtime_pull_not_cancelled(
+    state: Option<&SharedState>,
+    image_ref: &str,
+    owner_profile_id: Option<&str>,
+) -> anyhow::Result<()> {
+    if let Some(state) = state
+        && runtime_pull_is_cancelled(state, image_ref, owner_profile_id)
+    {
+        anyhow::bail!("runtime image pull cancelled for {image_ref}");
     }
     Ok(())
+}
+
+fn runtime_pull_is_cancelled(
+    state: &SharedState,
+    image_ref: &str,
+    owner_profile_id: Option<&str>,
+) -> bool {
+    let mut guard = state.0.blocking_lock();
+    let key = runtime_download_key(image_ref);
+    let runtime_cancelled = guard
+        .runtime_downloads
+        .get(&key)
+        .map(|download| download.cancel_requested)
+        .unwrap_or(false);
+    let profile_cancelled = owner_profile_id
+        .and_then(|profile_id| guard.installing_profiles.get(profile_id))
+        .map(|install| install.cancel_requested)
+        .unwrap_or(false);
+    if profile_cancelled && let Some(download) = guard.runtime_downloads.get_mut(&key) {
+        download.cancel_requested = true;
+        download.status = "Cancelling runtime setup...".to_string();
+    }
+    runtime_cancelled || profile_cancelled
+}
+
+fn replace_runtime_rootfs(
+    store: &Path,
+    key: &str,
+    rootfs_tmp: &Path,
+    write_metadata: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let rootfs_final = store.join("rootfs").join(key);
+    let old_rootfs = store
+        .join("tmp")
+        .join(format!("old-rootfs-{}", Uuid::new_v4()));
+    let had_old = rootfs_final.exists();
+
+    if had_old {
+        std::fs::rename(&rootfs_final, &old_rootfs).with_context(|| {
+            format!(
+                "failed to move existing runtime rootfs {}",
+                rootfs_final.display()
+            )
+        })?;
+    }
+
+    if let Err(error) = std::fs::rename(rootfs_tmp, &rootfs_final).with_context(|| {
+        format!(
+            "failed to install runtime rootfs at {}",
+            rootfs_final.display()
+        )
+    }) {
+        rollback_runtime_rootfs(&rootfs_final, &old_rootfs, had_old);
+        return Err(error);
+    }
+
+    if let Err(error) = write_metadata() {
+        rollback_runtime_rootfs(&rootfs_final, &old_rootfs, had_old);
+        return Err(error);
+    }
+
+    if had_old {
+        let _ = std::fs::remove_dir_all(old_rootfs);
+    }
+    Ok(())
+}
+
+fn rollback_runtime_rootfs(rootfs_final: &Path, old_rootfs: &Path, had_old: bool) {
+    let _ = std::fs::remove_dir_all(rootfs_final);
+    if had_old && old_rootfs.exists() {
+        let _ = std::fs::rename(old_rootfs, rootfs_final);
+    }
+}
+
+enum RuntimePullProgress {
+    Status(String),
+    Percent(u64),
+}
+
+fn update_runtime_download_sync(
+    state: &SharedState,
+    image_ref: &str,
+    progress: RuntimePullProgress,
+) {
+    let mut guard = state.0.blocking_lock();
+    let key = runtime_download_key(image_ref);
+    let Some(download) = guard.runtime_downloads.get_mut(&key) else {
+        return;
+    };
+    match progress {
+        RuntimePullProgress::Status(status) => {
+            if status.contains("Unpacking") {
+                download.bytes_pulled = 0;
+                download.total_bytes = 0;
+                download.samples.clear();
+            }
+            download.status = status;
+        }
+        RuntimePullProgress::Percent(percent) => {
+            download.status = "Pulling runtime image...".to_string();
+            download.total_bytes = 100;
+            download.bytes_pulled = percent.min(100);
+            download.samples.push_back(InstallSample {
+                at: chrono::Utc::now(),
+                bytes_pulled: download.bytes_pulled,
+            });
+            while download.samples.len() > 20 {
+                download.samples.pop_front();
+            }
+        }
+    }
+}
+
+fn copy_image_to_oci_layout(
+    image_ref: &str,
+    oci_layout: &Path,
+    mut on_progress: impl FnMut(RuntimePullProgress),
+    copy_steps: Option<usize>,
+    cancel_check: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+) -> anyhow::Result<()> {
+    let source = if image_ref.contains("://") {
+        image_ref.to_string()
+    } else {
+        format!("docker://{image_ref}")
+    };
+    let destination = format!("oci:{}:image", oci_layout.display());
+    let mut child = std::process::Command::new("skopeo")
+        .args([
+            "copy",
+            "--override-os",
+            "linux",
+            "--override-arch",
+            oci_arch(std::env::consts::ARCH),
+            &source,
+            &destination,
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to run skopeo for {image_ref}"))?;
+    let child_done = Arc::new(AtomicBool::new(false));
+    let child_cancelled = Arc::new(AtomicBool::new(false));
+    let cancel_reader = cancel_check.map(|cancel_check| {
+        let child_done = child_done.clone();
+        let child_cancelled = child_cancelled.clone();
+        let pid = child.id().to_string();
+        thread::spawn(move || {
+            while !child_done.load(Ordering::Relaxed) {
+                if cancel_check() {
+                    child_cancelled.store(true, Ordering::Relaxed);
+                    let _ = std::process::Command::new("kill")
+                        .args(["-TERM", &pid])
+                        .status();
+                    break;
+                }
+                thread::sleep(Duration::from_millis(250));
+            }
+        })
+    });
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("failed to capture skopeo progress"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("failed to capture skopeo errors"))?;
+    let stderr_reader = thread::spawn(move || read_stream_to_string(stderr));
+    let mut progress_log = String::new();
+    let progress_result =
+        read_skopeo_progress(stdout, &mut progress_log, &mut on_progress, copy_steps);
+    let status = child.wait()?;
+    child_done.store(true, Ordering::Relaxed);
+    if let Some(cancel_reader) = cancel_reader {
+        let _ = cancel_reader.join();
+    }
+    progress_result?;
+    let error_log = stderr_reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("skopeo error reader panicked"))??;
+    if child_cancelled.load(Ordering::Relaxed) {
+        anyhow::bail!("runtime image pull cancelled for {image_ref}");
+    }
+    if !status.success() {
+        anyhow::bail!(
+            "skopeo copy failed for {image_ref}: {}",
+            [progress_log.as_str(), error_log.as_str()]
+                .into_iter()
+                .filter(|log| !log.trim().is_empty())
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+    on_progress(RuntimePullProgress::Percent(100));
+    Ok(())
+}
+
+fn read_stream_to_string(mut reader: impl Read) -> anyhow::Result<String> {
+    let mut buffer = String::new();
+    reader.read_to_string(&mut buffer)?;
+    Ok(buffer)
+}
+
+fn read_skopeo_progress(
+    mut reader: impl Read,
+    progress_log: &mut String,
+    on_progress: &mut impl FnMut(RuntimePullProgress),
+    copy_steps: Option<usize>,
+) -> anyhow::Result<()> {
+    let mut line = Vec::new();
+    let mut byte = [0];
+    let mut completed_steps = 0;
+    loop {
+        match reader.read(&mut byte)? {
+            0 => {
+                process_skopeo_progress_line(
+                    &line,
+                    progress_log,
+                    on_progress,
+                    copy_steps,
+                    &mut completed_steps,
+                );
+                break;
+            }
+            _ if byte[0] == b'\n' || byte[0] == b'\r' => {
+                process_skopeo_progress_line(
+                    &line,
+                    progress_log,
+                    on_progress,
+                    copy_steps,
+                    &mut completed_steps,
+                );
+                line.clear();
+            }
+            _ => line.push(byte[0]),
+        }
+    }
+    Ok(())
+}
+
+fn process_skopeo_progress_line(
+    line: &[u8],
+    progress_log: &mut String,
+    on_progress: &mut impl FnMut(RuntimePullProgress),
+    copy_steps: Option<usize>,
+    completed_steps: &mut usize,
+) {
+    let line = String::from_utf8_lossy(line);
+    let line = line.trim();
+    if line.is_empty() {
+        return;
+    }
+    progress_log.push_str(line);
+    progress_log.push('\n');
+    if let Some(percent) = skopeo_progress_percent(line) {
+        on_progress(RuntimePullProgress::Percent(percent));
+    } else if let Some(status) = skopeo_progress_status(line) {
+        on_progress(RuntimePullProgress::Status(status));
+        if let Some(copy_steps) = copy_steps
+            && skopeo_progress_is_copy_step(line)
+        {
+            *completed_steps = completed_steps.saturating_add(1);
+            let percent = ((*completed_steps as f64 / copy_steps.max(1) as f64) * 100.0)
+                .round()
+                .clamp(1.0, 99.0) as u64;
+            on_progress(RuntimePullProgress::Percent(percent));
+        }
+    }
+}
+
+fn remote_runtime_copy_steps(image_ref: &str) -> anyhow::Result<Option<usize>> {
+    let raw = skopeo_raw_manifest(image_ref)?;
+    let value: serde_json::Value = serde_json::from_slice(&raw)?;
+    let manifest = if value.get("layers").is_some() {
+        value
+    } else {
+        let index: OciIndex = serde_json::from_value(value)?;
+        let Some(descriptor) = index
+            .manifests
+            .iter()
+            .find(|descriptor| descriptor_matches_host(descriptor))
+            .or_else(|| index.manifests.first())
+        else {
+            return Ok(None);
+        };
+        let Some(digest_ref) = image_ref_with_digest(image_ref, &descriptor.digest) else {
+            return Ok(None);
+        };
+        serde_json::from_slice(&skopeo_raw_manifest(&digest_ref)?)?
+    };
+    let manifest: OciManifest = serde_json::from_value(manifest)?;
+    Ok(Some(manifest.layers.len() + 2))
+}
+
+fn skopeo_raw_manifest(image_ref: &str) -> anyhow::Result<Vec<u8>> {
+    let output = std::process::Command::new("skopeo")
+        .args(["inspect", "--raw", &transport_ref(image_ref)])
+        .output()?;
+    if !output.status.success() {
+        anyhow::bail!("skopeo raw inspect failed for {image_ref}");
+    }
+    Ok(output.stdout)
+}
+
+fn image_ref_with_digest(image_ref: &str, digest: &str) -> Option<String> {
+    if image_ref.contains('@') {
+        return Some(image_ref.to_string());
+    }
+    let (prefix, image) = image_ref.rsplit_once('/').unwrap_or(("", image_ref));
+    let image = image.rsplit_once(':').map_or(image, |(name, _)| name);
+    if prefix.is_empty() {
+        Some(format!("{image}@{digest}"))
+    } else {
+        Some(format!("{prefix}/{image}@{digest}"))
+    }
+}
+
+fn skopeo_progress_percent(line: &str) -> Option<u64> {
+    let percent_index = line.find('%')?;
+    let before_percent = &line[..percent_index];
+    let start = before_percent
+        .rfind(|ch: char| !(ch.is_ascii_digit() || ch == '.'))
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    before_percent[start..]
+        .parse::<f64>()
+        .ok()
+        .map(|percent| percent.round().clamp(0.0, 100.0) as u64)
+}
+
+fn skopeo_progress_status(line: &str) -> Option<String> {
+    if line.starts_with("Copying blob ") {
+        Some("Pulling runtime image layer...".to_string())
+    } else if line.starts_with("Copying config ") {
+        Some("Pulling runtime image config...".to_string())
+    } else if line.starts_with("Writing manifest") {
+        Some("Writing runtime image manifest...".to_string())
+    } else if line.starts_with("Storing signatures") {
+        Some("Storing runtime image signatures...".to_string())
+    } else {
+        None
+    }
+}
+
+fn skopeo_progress_is_copy_step(line: &str) -> bool {
+    line.starts_with("Copying blob ")
+        || line.starts_with("Copying config ")
+        || line.starts_with("Writing manifest")
+}
+
+fn transport_ref(image_ref: &str) -> String {
+    if image_ref.contains("://") {
+        image_ref.to_string()
+    } else {
+        format!("docker://{image_ref}")
+    }
+}
+
+fn read_selected_manifest(oci_layout: &Path) -> anyhow::Result<OciManifest> {
+    let index_path = oci_layout.join("index.json");
+    let index: OciIndex = serde_json::from_slice(&std::fs::read(&index_path)?)
+        .with_context(|| format!("failed to parse {}", index_path.display()))?;
+    let descriptor = index
+        .manifests
+        .iter()
+        .find(|descriptor| descriptor_matches_host(descriptor))
+        .or_else(|| index.manifests.first())
+        .ok_or_else(|| anyhow::anyhow!("OCI layout has no manifests"))?;
+    let manifest_path = blob_path(oci_layout, &descriptor.digest)?;
+    let mut manifest: OciManifest = serde_json::from_slice(&std::fs::read(&manifest_path)?)
+        .with_context(|| format!("failed to parse {}", manifest_path.display()))?;
+    manifest.digest = Some(descriptor.digest.clone());
+    Ok(manifest)
+}
+
+fn descriptor_matches_host(descriptor: &OciDescriptor) -> bool {
+    let Some(platform) = descriptor.platform.as_ref() else {
+        return false;
+    };
+    platform.os.as_deref() == Some("linux")
+        && platform.architecture.as_deref() == Some(oci_arch(std::env::consts::ARCH))
+}
+
+fn render_oci_layout_dir(oci_layout: &Path, rootfs: &Path) -> anyhow::Result<()> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(ocirender::convert_dir(oci_layout, rootfs))
+        .with_context(|| format!("failed to render OCI layout {}", oci_layout.display()))
+}
+
+fn read_image_config_labels(
+    oci_layout: &Path,
+    manifest: &OciManifest,
+) -> anyhow::Result<HashMap<String, String>> {
+    let config_path = blob_path(oci_layout, &manifest.config.digest)?;
+    let config: OciImageConfig = serde_json::from_slice(&std::fs::read(&config_path)?)
+        .with_context(|| format!("failed to parse {}", config_path.display()))?;
+    Ok(config
+        .config
+        .and_then(|config| config.labels)
+        .unwrap_or_default())
+}
+
+fn write_runtime_metadata(
+    image_ref: &str,
+    manifest: &OciManifest,
+    labels: &HashMap<String, String>,
+    store: &Path,
+    key: &str,
+) -> anyhow::Result<()> {
+    let metadata = RuntimeRootfsMetadata {
+        image_ref: Some(image_ref.to_string()),
+        runtime_id: labels.get("org.aileron.runtime_id").cloned(),
+        variant: labels
+            .get("org.aileron.variant")
+            .cloned()
+            .or_else(|| image_ref_variant(image_ref)),
+        digest: manifest.digest.clone(),
+    };
+    let metadata_dir = store.join("metadata");
+    std::fs::create_dir_all(&metadata_dir)?;
+    let path = metadata_dir.join(format!("{key}.json"));
+    std::fs::write(path, serde_json::to_vec_pretty(&metadata)?)?;
+    Ok(())
+}
+
+fn blob_path(oci_layout: &Path, digest: &str) -> anyhow::Result<PathBuf> {
+    let (algorithm, value) = digest
+        .split_once(':')
+        .ok_or_else(|| anyhow::anyhow!("invalid OCI digest {digest}"))?;
+    if algorithm != "sha256"
+        || !value
+            .chars()
+            .all(|ch| ch.is_ascii_hexdigit() || ch == '-' || ch == '_')
+    {
+        anyhow::bail!("unsupported OCI digest {digest}");
+    }
+    Ok(oci_layout.join("blobs").join(algorithm).join(value))
 }
 
 async fn register_profile(
@@ -1504,32 +2020,8 @@ async fn download_artifacts_to_temp(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parses_owned_runtime_image_labels() {
-        let image = serde_json::json!({
-            "Id": "def456",
-            "Names": ["registry.example/aileron-runtime-asr:cuda"],
-            "Size": 5678,
-            "Labels": {
-                "org.aileron.runtime": "true",
-                "org.aileron.runtime_id": "asr-whisper-cpp",
-                "org.aileron.variant": "cuda",
-                "org.aileron.image_ref": "registry.example/aileron-runtime-asr:cuda"
-            }
-        });
-
-        let parsed = parse_podman_runtime_image(&image).expect("owned runtime image parses");
-
-        assert_eq!(parsed.image_id, "def456");
-        assert_eq!(parsed.runtime_id, "asr-whisper-cpp");
-        assert_eq!(parsed.variant, "cuda");
-        assert_eq!(
-            parsed.image_ref,
-            "registry.example/aileron-runtime-asr:cuda"
-        );
-        assert_eq!(parsed.size_bytes, 5678);
-    }
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
 
     #[test]
     fn sums_profile_artifact_directory_size() {
@@ -1554,20 +2046,22 @@ mod tests {
                 vec!["whisper".to_string()],
             )]),
         };
-        let cpu = PodmanRuntimeImage {
+        let cpu = StoredRuntimeImage {
             image_id: "cpu".to_string(),
             image_ref: "example/asr:cpu".to_string(),
             names: vec!["example/asr:cpu".to_string()],
             runtime_id: "asr-whisper-cpp".to_string(),
             variant: "cpu".to_string(),
+            digest: None,
             size_bytes: 1,
         };
-        let vulkan = PodmanRuntimeImage {
+        let vulkan = StoredRuntimeImage {
             image_id: "vulkan".to_string(),
             image_ref: "example/asr:vulkan".to_string(),
             names: vec!["example/asr:vulkan".to_string()],
             runtime_id: "asr-whisper-cpp".to_string(),
             variant: "vulkan".to_string(),
+            digest: None,
             size_bytes: 1,
         };
 
@@ -1578,20 +2072,22 @@ mod tests {
     #[test]
     fn dedupes_duplicate_runtime_image_rows() {
         let mut images = vec![
-            PodmanRuntimeImage {
+            StoredRuntimeImage {
                 image_id: "same-image".to_string(),
                 image_ref: "example/vision:rocm".to_string(),
                 names: vec!["example/vision:rocm".to_string()],
                 runtime_id: "vision-llama-cpp-gemma4".to_string(),
                 variant: "rocm".to_string(),
+                digest: None,
                 size_bytes: 1,
             },
-            PodmanRuntimeImage {
+            StoredRuntimeImage {
                 image_id: "same-image".to_string(),
                 image_ref: "example/vision:rocm".to_string(),
                 names: vec!["example/vision:rocm".to_string()],
                 runtime_id: "vision-llama-cpp-gemma4".to_string(),
                 variant: "rocm".to_string(),
+                digest: None,
                 size_bytes: 1,
             },
         ];
@@ -1604,20 +2100,22 @@ mod tests {
     #[test]
     fn dedupes_same_runtime_image_with_multiple_refs() {
         let mut images = vec![
-            PodmanRuntimeImage {
+            StoredRuntimeImage {
                 image_id: "same-image".to_string(),
                 image_ref: "ghcr.io/example/vision:rocm".to_string(),
                 names: vec!["ghcr.io/example/vision:rocm".to_string()],
                 runtime_id: "vision-llama-cpp-gemma4".to_string(),
                 variant: "rocm".to_string(),
+                digest: None,
                 size_bytes: 1,
             },
-            PodmanRuntimeImage {
+            StoredRuntimeImage {
                 image_id: "same-image".to_string(),
                 image_ref: "localhost/vision:rocm".to_string(),
                 names: vec!["localhost/vision:rocm".to_string()],
                 runtime_id: "vision-llama-cpp-gemma4".to_string(),
                 variant: "rocm".to_string(),
+                digest: None,
                 size_bytes: 1,
             },
         ];
@@ -1630,20 +2128,22 @@ mod tests {
     #[test]
     fn dedupes_same_runtime_ref_with_multiple_image_ids() {
         let mut images = vec![
-            PodmanRuntimeImage {
+            StoredRuntimeImage {
                 image_id: "old-image".to_string(),
                 image_ref: "ghcr.io/example/vision:rocm".to_string(),
                 names: vec!["ghcr.io/example/vision:rocm".to_string()],
                 runtime_id: "vision-llama-cpp-gemma4".to_string(),
                 variant: "rocm".to_string(),
+                digest: None,
                 size_bytes: 1,
             },
-            PodmanRuntimeImage {
+            StoredRuntimeImage {
                 image_id: "new-image".to_string(),
                 image_ref: "ghcr.io/example/vision:rocm".to_string(),
                 names: vec!["ghcr.io/example/vision:rocm".to_string()],
                 runtime_id: "vision-llama-cpp-gemma4".to_string(),
                 variant: "rocm".to_string(),
+                digest: None,
                 size_bytes: 1,
             },
         ];
@@ -1665,42 +2165,431 @@ mod tests {
     }
 
     #[test]
-    fn manifest_digest_uses_current_linux_platform() {
-        let arch = oci_arch(std::env::consts::ARCH);
-        let manifest = serde_json::json!({
-            "schemaVersion": 2,
-            "manifests": [
-                {
-                    "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                    "platform": {"architecture": "unknown", "os": "unknown"}
-                },
-                {
-                    "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-                    "platform": {"architecture": arch, "os": "linux"}
-                }
-            ]
-        });
+    fn remote_tag_runtime_status_keeps_update_action_available_without_remote_check() {
+        let image = StoredRuntimeImage {
+            image_id: "runtime".to_string(),
+            image_ref: "ghcr.io/example/runtime:cpu".to_string(),
+            names: vec!["ghcr.io/example/runtime:cpu".to_string()],
+            runtime_id: "llm-llama-cpp".to_string(),
+            variant: "cpu".to_string(),
+            digest: Some("sha256:abc".to_string()),
+            size_bytes: 1,
+        };
 
+        let status = runtime_image_local_status(&image);
+
+        assert!(status.available);
+        assert_eq!(status.status, "installed: update not checked");
+    }
+
+    #[test]
+    fn digest_pinned_runtime_status_is_not_updateable() {
+        let image = StoredRuntimeImage {
+            image_id: "runtime".to_string(),
+            image_ref: "ghcr.io/example/runtime@sha256:abc".to_string(),
+            names: vec!["ghcr.io/example/runtime@sha256:abc".to_string()],
+            runtime_id: "llm-llama-cpp".to_string(),
+            variant: "cpu".to_string(),
+            digest: Some("sha256:abc".to_string()),
+            size_bytes: 1,
+        };
+
+        let status = runtime_image_local_status(&image);
+
+        assert!(!status.available);
+        assert_eq!(status.status, "not checkable");
+    }
+
+    #[test]
+    fn skopeo_progress_percent_parses_percentage_text() {
+        assert_eq!(skopeo_progress_percent("Copying blob abc 42%"), Some(42));
+        assert_eq!(skopeo_progress_percent("Copying blob abc 42.6%"), Some(43));
+        assert_eq!(skopeo_progress_percent("Copying blob abc"), None);
+    }
+
+    #[test]
+    fn skopeo_progress_status_maps_copy_phases() {
         assert_eq!(
-            manifest_digest(&manifest),
-            Some(
-                "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-                    .to_string()
-            )
+            skopeo_progress_status("Copying blob sha256:abc").as_deref(),
+            Some("Pulling runtime image layer...")
+        );
+        assert_eq!(
+            skopeo_progress_status("Writing manifest to image destination").as_deref(),
+            Some("Writing runtime image manifest...")
+        );
+        assert_eq!(
+            skopeo_progress_status("Getting image source signatures"),
+            None
         );
     }
 
     #[test]
-    fn ignores_legacy_labeled_runtime_image() {
-        let image = serde_json::json!({
-            "Id": "abc123",
-            "Names": ["localhost/aileron-runtime-llm-llama-cpp:cpu"],
-            "Size": 1234,
-            "Labels": {
-                "aileron.runtime_id": "llm-llama-cpp"
-            }
-        });
+    fn skopeo_progress_reader_derives_progress_from_stdout_lines() {
+        let output = b"Getting image source signatures\n\
+Copying blob sha256:one\n\
+Copying blob sha256:two\n\
+Copying config sha256:config\n\
+Writing manifest to image destination\n";
+        let mut events = Vec::new();
+        let mut log = String::new();
 
-        assert!(parse_podman_runtime_image(&image).is_none());
+        read_skopeo_progress(
+            &output[..],
+            &mut log,
+            &mut |progress| match progress {
+                RuntimePullProgress::Status(status) => events.push(format!("status:{status}")),
+                RuntimePullProgress::Percent(percent) => events.push(format!("percent:{percent}")),
+            },
+            Some(4),
+        )
+        .expect("read skopeo progress");
+
+        assert!(log.contains("Copying blob sha256:one"));
+        assert_eq!(
+            events,
+            vec![
+                "status:Pulling runtime image layer...",
+                "percent:25",
+                "status:Pulling runtime image layer...",
+                "percent:50",
+                "status:Pulling runtime image config...",
+                "percent:75",
+                "status:Writing runtime image manifest...",
+                "percent:99",
+            ]
+        );
+    }
+
+    #[test]
+    fn skopeo_copy_step_detection_ignores_non_copy_lines() {
+        assert!(skopeo_progress_is_copy_step("Copying blob sha256:abc"));
+        assert!(skopeo_progress_is_copy_step("Copying config sha256:abc"));
+        assert!(skopeo_progress_is_copy_step(
+            "Writing manifest to image destination"
+        ));
+        assert!(!skopeo_progress_is_copy_step(
+            "Getting image source signatures"
+        ));
+    }
+
+    #[test]
+    fn cancelling_profile_install_marks_owned_runtime_download_only() {
+        let mut installing_profiles = HashMap::from([("profile-a".to_string(), install_record())]);
+        let mut runtime_downloads = HashMap::from([
+            (
+                "runtime:ghcr.io/example/runtime-a:cpu".to_string(),
+                install_record(),
+            ),
+            (
+                "runtime:ghcr.io/example/runtime-b:cpu".to_string(),
+                install_record(),
+            ),
+        ]);
+        let runtime_download_owners = HashMap::from([(
+            "runtime:ghcr.io/example/runtime-a:cpu".to_string(),
+            "profile-a".to_string(),
+        )]);
+
+        request_cancel_records(
+            &mut installing_profiles,
+            &mut runtime_downloads,
+            &runtime_download_owners,
+            "profile-a",
+        );
+
+        assert!(installing_profiles["profile-a"].cancel_requested);
+        assert_eq!(installing_profiles["profile-a"].status, "Cancelling...");
+        assert!(runtime_downloads["runtime:ghcr.io/example/runtime-a:cpu"].cancel_requested);
+        assert_eq!(
+            runtime_downloads["runtime:ghcr.io/example/runtime-a:cpu"].status,
+            "Cancelling runtime setup..."
+        );
+        assert!(!runtime_downloads["runtime:ghcr.io/example/runtime-b:cpu"].cancel_requested);
+    }
+
+    #[test]
+    fn cancelling_runtime_download_id_marks_runtime_download() {
+        let mut installing_profiles = HashMap::new();
+        let mut runtime_downloads = HashMap::from([(
+            "runtime:ghcr.io/example/runtime-a:cpu".to_string(),
+            install_record(),
+        )]);
+        let runtime_download_owners = HashMap::new();
+
+        request_cancel_records(
+            &mut installing_profiles,
+            &mut runtime_downloads,
+            &runtime_download_owners,
+            "runtime:ghcr.io/example/runtime-a:cpu",
+        );
+
+        assert!(runtime_downloads["runtime:ghcr.io/example/runtime-a:cpu"].cancel_requested);
+        assert_eq!(
+            runtime_downloads["runtime:ghcr.io/example/runtime-a:cpu"].status,
+            "Cancelling runtime setup..."
+        );
+    }
+
+    #[test]
+    fn image_ref_with_digest_replaces_tag_after_last_slash() {
+        assert_eq!(
+            image_ref_with_digest("registry.example:5000/ns/runtime:cuda", "sha256:abc"),
+            Some("registry.example:5000/ns/runtime@sha256:abc".to_string())
+        );
+        assert_eq!(
+            image_ref_with_digest("runtime:cpu", "sha256:def"),
+            Some("runtime@sha256:def".to_string())
+        );
+    }
+
+    #[test]
+    fn render_oci_layout_applies_whiteout_files() {
+        let oci_layout = std::env::temp_dir().join(format!("aileron-oci-test-{}", Uuid::new_v4()));
+        let rootfs = std::env::temp_dir().join(format!("aileron-rootfs-test-{}", Uuid::new_v4()));
+        write_test_oci_layout(
+            &oci_layout,
+            vec![
+                tar_with_file("etc/keep", b"old"),
+                tar_with_file("etc/.wh.keep", b""),
+            ],
+        );
+
+        render_oci_layout_dir(&oci_layout, &rootfs).expect("render OCI layout");
+        assert!(!rootfs.join("etc/keep").exists());
+
+        let _ = std::fs::remove_dir_all(oci_layout);
+        let _ = std::fs::remove_dir_all(rootfs);
+    }
+
+    #[test]
+    fn render_oci_layout_applies_opaque_whiteout() {
+        let oci_layout = std::env::temp_dir().join(format!("aileron-oci-test-{}", Uuid::new_v4()));
+        let rootfs = std::env::temp_dir().join(format!("aileron-rootfs-test-{}", Uuid::new_v4()));
+        write_test_oci_layout(
+            &oci_layout,
+            vec![
+                tar_with_file("var/cache/old", b"old"),
+                tar_with_file("var/cache/.wh..wh..opq", b""),
+            ],
+        );
+
+        render_oci_layout_dir(&oci_layout, &rootfs).expect("render OCI layout");
+        assert!(!rootfs.join("var/cache/old").exists());
+
+        let _ = std::fs::remove_dir_all(oci_layout);
+        let _ = std::fs::remove_dir_all(rootfs);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn render_oci_layout_preserves_absolute_symlinks() {
+        let oci_layout = std::env::temp_dir().join(format!("aileron-oci-test-{}", Uuid::new_v4()));
+        let rootfs = std::env::temp_dir().join(format!("aileron-rootfs-test-{}", Uuid::new_v4()));
+        write_test_oci_layout(
+            &oci_layout,
+            vec![tar_with_symlink("etc/alternatives/awk", "/usr/bin/mawk")],
+        );
+
+        render_oci_layout_dir(&oci_layout, &rootfs).expect("render OCI layout");
+        assert_eq!(
+            std::fs::read_link(rootfs.join("etc/alternatives/awk")).unwrap(),
+            PathBuf::from("/usr/bin/mawk")
+        );
+
+        let _ = std::fs::remove_dir_all(oci_layout);
+        let _ = std::fs::remove_dir_all(rootfs);
+    }
+
+    #[test]
+    fn render_oci_layout_resolves_hardlinks_from_archive_root() {
+        let oci_layout = std::env::temp_dir().join(format!("aileron-oci-test-{}", Uuid::new_v4()));
+        let rootfs = std::env::temp_dir().join(format!("aileron-rootfs-test-{}", Uuid::new_v4()));
+        write_test_oci_layout(
+            &oci_layout,
+            vec![
+                tar_with_file("usr/bin/perl", b"perl"),
+                tar_with_hardlink("usr/bin/perl5.40.1", "usr/bin/perl"),
+            ],
+        );
+
+        render_oci_layout_dir(&oci_layout, &rootfs).expect("render OCI layout");
+        assert_eq!(
+            std::fs::read_to_string(rootfs.join("usr/bin/perl5.40.1")).unwrap(),
+            "perl"
+        );
+
+        let _ = std::fs::remove_dir_all(oci_layout);
+        let _ = std::fs::remove_dir_all(rootfs);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_size_does_not_follow_rootfs_symlinks() {
+        let rootfs = std::env::temp_dir().join(format!("aileron-rootfs-test-{}", Uuid::new_v4()));
+        let target = std::env::temp_dir().join(format!("aileron-rootfs-target-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&rootfs).expect("create rootfs");
+        std::fs::create_dir_all(&target).expect("create target");
+        std::fs::write(target.join("outside"), vec![0u8; 4096]).expect("write outside file");
+        symlink(&target, rootfs.join("var-run")).expect("create symlink");
+
+        assert_eq!(directory_size_bytes(&rootfs).unwrap(), 0);
+
+        let _ = std::fs::remove_dir_all(rootfs);
+        let _ = std::fs::remove_dir_all(target);
+    }
+
+    #[test]
+    #[ignore = "requires AILERON_TEST_OCI_LAYOUT pointing at a real OCI layout"]
+    fn render_real_oci_layout() {
+        let oci_layout = std::env::var("AILERON_TEST_OCI_LAYOUT").expect("AILERON_TEST_OCI_LAYOUT");
+        let rootfs = std::env::temp_dir().join(format!("aileron-rootfs-test-{}", Uuid::new_v4()));
+
+        render_oci_layout_dir(Path::new(&oci_layout), &rootfs).expect("render real OCI layout");
+
+        let _ = std::fs::remove_dir_all(rootfs);
+    }
+
+    #[test]
+    fn replace_runtime_rootfs_rolls_back_when_metadata_write_fails() {
+        let store = std::env::temp_dir().join(format!("aileron-store-test-{}", Uuid::new_v4()));
+        let rootfs_dir = store.join("rootfs");
+        let tmp_dir = store.join("tmp");
+        let rootfs_final = rootfs_dir.join("runtime");
+        let rootfs_tmp = tmp_dir.join("new-rootfs");
+        std::fs::create_dir_all(&rootfs_final).expect("create old rootfs");
+        std::fs::create_dir_all(&rootfs_tmp).expect("create new rootfs");
+        std::fs::write(rootfs_final.join("entrypoint.py"), "old").expect("write old file");
+        std::fs::write(rootfs_tmp.join("entrypoint.py"), "new").expect("write new file");
+
+        let error = replace_runtime_rootfs(&store, "runtime", &rootfs_tmp, || {
+            anyhow::bail!("metadata failed")
+        })
+        .expect_err("metadata failure should fail replacement");
+
+        assert!(error.to_string().contains("metadata failed"));
+        assert_eq!(
+            std::fs::read_to_string(rootfs_final.join("entrypoint.py")).unwrap(),
+            "old"
+        );
+        assert!(!rootfs_tmp.exists());
+
+        let _ = std::fs::remove_dir_all(store);
+    }
+
+    fn write_test_oci_layout(root: &Path, layers: Vec<Vec<u8>>) {
+        use sha2::{Digest, Sha256};
+
+        let blobs = root.join("blobs").join("sha256");
+        std::fs::create_dir_all(&blobs).expect("create OCI blob dir");
+        std::fs::write(root.join("oci-layout"), r#"{"imageLayoutVersion":"1.0.0"}"#)
+            .expect("write oci-layout");
+
+        let config = b"{\"architecture\":\"amd64\",\"os\":\"linux\",\"config\":{}}";
+        let config_digest = write_blob(&blobs, config);
+        let layer_descriptors = layers
+            .into_iter()
+            .map(|layer| {
+                let digest = write_blob(&blobs, &layer);
+                serde_json::json!({
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar",
+                    "digest": digest,
+                    "size": layer.len(),
+                })
+            })
+            .collect::<Vec<_>>();
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": config_digest,
+                "size": config.len(),
+            },
+            "layers": layer_descriptors,
+        });
+        let manifest_data = serde_json::to_vec(&manifest).expect("encode manifest");
+        let manifest_digest = write_blob(&blobs, &manifest_data);
+        let index = serde_json::json!({
+            "schemaVersion": 2,
+            "manifests": [{
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "digest": manifest_digest,
+                "size": manifest_data.len(),
+                "platform": {"architecture": "amd64", "os": "linux"},
+            }],
+        });
+        std::fs::write(root.join("index.json"), serde_json::to_vec(&index).unwrap())
+            .expect("write index");
+
+        fn write_blob(blobs: &Path, data: &[u8]) -> String {
+            let digest = Sha256::digest(data)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            std::fs::write(blobs.join(&digest), data).expect("write blob");
+            format!("sha256:{digest}")
+        }
+    }
+
+    fn install_record() -> InstallRecord {
+        InstallRecord {
+            bytes_pulled: 0,
+            total_bytes: 0,
+            status: "Pulling runtime image...".to_string(),
+            cancel_requested: false,
+            samples: std::collections::VecDeque::new(),
+        }
+    }
+
+    fn tar_with_file(path: &str, contents: &[u8]) -> Vec<u8> {
+        let mut data = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut data);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(contents.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, path, contents)
+                .expect("append tar entry");
+            builder.finish().expect("finish tar");
+        }
+        data
+    }
+
+    fn tar_with_symlink(path: &str, target: &str) -> Vec<u8> {
+        let mut data = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut data);
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Symlink);
+            header.set_size(0);
+            header.set_mode(0o777);
+            header.set_link_name(target).expect("set link target");
+            header.set_cksum();
+            builder
+                .append_data(&mut header, path, std::io::empty())
+                .expect("append symlink entry");
+            builder.finish().expect("finish tar");
+        }
+        data
+    }
+
+    fn tar_with_hardlink(path: &str, target: &str) -> Vec<u8> {
+        let mut data = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut data);
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Link);
+            header.set_size(0);
+            header.set_mode(0o755);
+            header.set_link_name(target).expect("set link target");
+            header.set_cksum();
+            builder
+                .append_data(&mut header, path, std::io::empty())
+                .expect("append hardlink entry");
+            builder.finish().expect("finish tar");
+        }
+        data
     }
 }

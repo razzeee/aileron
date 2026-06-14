@@ -26,8 +26,8 @@ Aileron solves both. All IPC is over a Varlink Unix socket. Flatpak sandboxes ca
                                                  aileron-portal
                                                         │ Varlink (Unix socket)
                                                  aileron-daemon
-                                                        │ stdin/stdout (hardened podman)
-                                                 OCI container
+                                                        │ stdin/stdout (hardened crun OCI bundle)
+                                                 OCI runtime bundle
                                                         │
                                                llama.cpp / whisper.cpp
                                                (inside image, no network)
@@ -41,6 +41,7 @@ Further reading:
 |---|---|---|
 | [Runtime stdio protocol](docs/runtime-protocol.md) | Runtime authors | Container request/response contract used by the daemon |
 | [App developer guide](docs/app-developer-guide.md) | App authors | How to use Aileron through portal-style task APIs instead of localhost REST |
+| [Distribution packaging guide](docs/distro-packaging.md) | Packagers | Runtime dependencies, install locations, services, and hardware access notes |
 
 
 ## Workspace
@@ -54,7 +55,7 @@ Further reading:
 | `aileron-varlink` | library | Varlink IDL files and generated bindings |
 | `aileron-ipc` | library | Varlink client/server connection helpers |
 
-Reusable runtime images live in `runtimes/`. Model artifacts are installed separately under `$XDG_DATA_HOME/aileron/models/<model-id>/` and mounted into runtimes at `/model:ro,z`. Model manifests reference a `runtime_id`; runtime manifests map that ID plus the detected hardware variant to an OCI image.
+Reusable runtime images live in `runtimes/`. Model artifacts are installed separately under `$XDG_DATA_HOME/aileron/models/<model-id>/` and mounted read-only into runtimes at `/model`. Model manifests reference a `runtime_id`; runtime manifests map that ID plus the detected hardware variant to an OCI image.
 
 | Directory | Description |
 |---|---|
@@ -85,9 +86,9 @@ sudo apt install \
     libdbus-1-dev \
     pkg-config
 
-# Runtime dependency
-sudo dnf install podman   # Fedora
-sudo apt install podman   # Debian/Ubuntu
+# Runtime dependencies
+sudo dnf install skopeo crun   # Fedora
+sudo apt install skopeo crun   # Debian/Ubuntu
 ```
 
 ### Build all crates
@@ -123,6 +124,8 @@ The daemon listens on `$XDG_RUNTIME_DIR/aileron.socket`.
 | `--allow-all` | `AILERON_ALLOW_ALL` | false | Bypass all permission checks (dev/test only) |
 | `--auto-grant` | `AILERON_AUTO_GRANT` | false | Grant permission automatically on first use |
 | `--idle-timeout-secs` | `AILERON_IDLE_TIMEOUT_SECS` | 300 | Container idle timeout in seconds |
+| `--container-memory` | `AILERON_CONTAINER_MEMORY` | `8g` | OCI memory limit for each runtime |
+| `--oci-store` | `AILERON_OCI_STORE` | `$XDG_DATA_HOME/aileron/oci` | Local OCI runtime store |
 
 ### Portal backend
 
@@ -156,7 +159,7 @@ aileron
 
 ## Building container images
 
-Runtime images are built with `podman build` or `docker build`. Model artifacts are not baked into these images; installed profiles point at artifact directories and runtime IDs, and runtime manifests map those IDs to variant-specific OCI images.
+Runtime images can be built with any OCI/Docker-compatible builder. The daemon pulls runtime images with `skopeo`, renders OCI layouts into root filesystems with `ocirender`, and executes the rendered rootfs with `crun`; model artifacts are not baked into runtime images. Installed profiles point at artifact directories and runtime IDs, and runtime manifests map those IDs to variant-specific OCI images.
 
 | Runtime | Details |
 |---|---|
@@ -213,7 +216,7 @@ Runtime manifests live under `runtimes/` and map the runtime ID to OCI images fo
 }
 ```
 
-Installed model artifacts are stored under `$XDG_DATA_HOME/aileron/models/<model-id>/`, or `$AILERON_DATA_HOME/aileron/models/<model-id>/` when `AILERON_DATA_HOME` is set. Aileron owns this directory and mounts the selected profile's artifact directory into runtimes at `/model:ro,z`.
+Installed model artifacts are stored under `$XDG_DATA_HOME/aileron/models/<model-id>/`, or `$AILERON_DATA_HOME/aileron/models/<model-id>/` when `AILERON_DATA_HOME` is set. Aileron owns this directory and mounts the selected profile's artifact directory read-only into runtimes at `/model`.
 
 ## End-to-end test with the stub container
 
@@ -223,8 +226,16 @@ The stub container requires no model download and responds instantly. It impleme
 # 1. Build the daemon
 cargo build -p aileron-daemon
 
-# 2. Build the stub runtime image (no model download needed)
+# 2. Build the stub runtime image (no model download needed) and export its
+#    merged rootfs into an Aileron OCI store. This keeps Podman as an optional
+#    local image builder/exporter; the daemon itself runs the rootfs with crun.
 podman build -t aileron/stub:cpu runtimes/stub/
+export AILERON_OCI_STORE="$PWD/.aileron-oci"
+stub_container=$(podman create localhost/aileron/stub:cpu)
+mkdir -p "$AILERON_OCI_STORE/rootfs/localhost_aileron_stub_cpu"
+podman export "$stub_container" |
+    tar -C "$AILERON_OCI_STORE/rootfs/localhost_aileron_stub_cpu" -xf -
+podman rm "$stub_container"
 
 # 3. Create local manifests for the stub runtime and profile
 mkdir -p manifests/runtimes manifests/models
@@ -236,7 +247,7 @@ cat > manifests/models/stub.json <<'JSON'
 JSON
 
 # 4. Start the daemon in allow-all mode (skips permission checks)
-AILERON_ALLOW_ALL=true ./target/debug/aileron-daemon &
+AILERON_ALLOW_ALL=true AILERON_OCI_STORE="$AILERON_OCI_STORE" ./target/debug/aileron-daemon &
 
 # 5. Install the stub profile from the local manifest
 varlink call "unix:$XDG_RUNTIME_DIR/aileron.socket/aileron.Models.InstallManifest" \
@@ -322,6 +333,7 @@ Create sessions, generate text, get structured JSON output, transcribe audio, de
 ```varlink
 type ModelAvailability (is_available: bool, reason: string)
 type GenerationOptions (maximum_response_tokens: int, temperature: float, sampling_mode: string, source_language_hint: string, target_language_hint: string)
+type ChatMessage (role: string, content: string)
 type GuidedField (name: string, kind: string, description: string, required: bool)
 type VisionSegment (label: string, confidence: float, x: float, y: float, width: float, height: float)
 
@@ -330,6 +342,8 @@ method CreateSession(app_id: string, use_case: string, instructions: string) -> 
 method Prewarm(session_id: string, prompt_prefix: string) -> ()
 method Respond(session_id: string, prompt: string, options: GenerationOptions) -> (content: string)
 method StreamResponse(session_id: string, prompt: string, options: GenerationOptions) -> (token: string)
+method Chat(session_id: string, messages: []ChatMessage, options: GenerationOptions) -> (content: string)
+method StreamChat(session_id: string, messages: []ChatMessage, options: GenerationOptions) -> (token: string)
 method RespondGuided(session_id: string, prompt: string, fields: []GuidedField, options: GenerationOptions) -> (content: string)
 method Transcribe(session_id: string, audio: string, language_hint: string) -> (text: string)
 method Describe(session_id: string, image: string) -> (text: string)
@@ -337,7 +351,7 @@ method Segment(session_id: string, image: string) -> (segments: []VisionSegment)
 method EndSession(session_id: string) -> ()
 ```
 
-`instructions` are stored on the session and forwarded to text containers as the container `system` prompt. `audio` is raw 16 kHz mono f32le PCM bytes encoded as base64. `image` is PNG or JPEG bytes encoded as base64. `VisionSegment` coordinates are normalized `0.0..1.0` rectangles relative to image dimensions.
+`instructions` are stored on the session and forwarded to text containers as the container `system` prompt. `ChatMessage.role` is the caller-supplied conversation role, typically `user` or `assistant`. `audio` is raw 16 kHz mono f32le PCM bytes encoded as base64. `image` is PNG or JPEG bytes encoded as base64. `VisionSegment` coordinates are normalized `0.0..1.0` rectangles relative to image dimensions.
 
 `GenerationOptions.maximum_response_tokens` must be greater than zero and fit in `u32`. `temperature` must be finite and non-negative. `sampling_mode` must be non-empty. `source_language_hint` and `target_language_hint` are optional strings for `llm.translate`; pass empty strings when unspecified. Today the daemon validates sampling fields, forwards `maximum_response_tokens` to containers as `max_tokens`, and folds translation hints into the session instructions for `llm.translate`.
 
@@ -352,11 +366,20 @@ List, install, delete, and assign installed profiles. Profiles reference model a
 ```varlink
 method List() -> (profiles: []ProfileInfo)
 method ListRuntimeManifests() -> (runtimes: []RuntimeManifestInfo)
+method ListRuntimeImages() -> (images: []OciRuntimeImage)
+method RemoveRuntimeImage(image_id: string) -> ()
+method UpdateRuntimeImage(image_ref: string) -> ()
+method PruneUnusedRuntimeImages() -> (removed: []string, errors: []RuntimeImageCleanupError)
+method ListCatalog() -> (profiles: []CatalogProfileInfo)
+method ListInstalls() -> (installs: []InstallStatus)
+method CancelInstall(profile_id: string) -> ()
 method InstallManifest(profile_id: string) -> (progress: InstallProgress, auto_assigned: []string, conflicts: []UseCaseConflict)
-method InstallUrlProfile(runtime_id: string, url: string, sha256: string, use_cases: []string) -> (progress: InstallProgress, auto_assigned: []string, conflicts: []UseCaseConflict)
+method InstallUrlProfile(runtime_id: string, url: string, sha256: string, mmproj_url: string, mmproj_sha256: string, use_cases: []string) -> (progress: InstallProgress, auto_assigned: []string, conflicts: []UseCaseConflict)
 method DeleteProfile(profile_id: string, force: bool) -> ()
 method AssignUseCase(profile_id: string, use_case: string) -> ()
 ```
+
+`InstallManifest` installs a packaged catalog profile, downloads and verifies declared artifacts, resolves the host variant through runtime manifests, and pulls the selected OCI runtime image with `skopeo`. `InstallUrlProfile` is the ad-hoc import path; pass empty `mmproj_url` and `mmproj_sha256` for single-artifact profiles.
 
 ### `aileron.Permissions`
 
@@ -423,7 +446,7 @@ The stable API surfaces are the D-Bus portal interface, the Varlink `aileron.Inf
 
 ## Container stdio protocol
 
-Each OCI image implements a simple newline-delimited JSON protocol over stdin/stdout. No ports, no sockets; the container has `--network=none`. The daemon is the only process that speaks this protocol.
+Each OCI image implements a simple newline-delimited JSON protocol over stdin/stdout. No ports, no sockets; the generated OCI bundle uses an isolated network namespace. The daemon is the only process that speaks this protocol.
 
 ### Framing and readiness
 
@@ -440,10 +463,11 @@ Each OCI image implements a simple newline-delimited JSON protocol over stdin/st
 | Field | Type | Used by | Description |
 |---|---|---|---|
 | `id` | string | all requests | Correlation ID generated by the daemon |
-| `type` | string | all requests | One of `generate`, `generate_structured`, `transcribe`, `describe` |
-| `system` | string | `generate`, `generate_structured` | Session instructions from `CreateSession` |
+| `type` | string | all requests | One of `generate`, `chat`, `generate_structured`, `transcribe`, `describe`, `segment` |
+| `system` | string | `generate`, `chat`, `generate_structured` | Session instructions from `CreateSession` |
 | `prompt` | string | `generate`, `generate_structured`, optionally `describe` | User prompt or image prompt |
-| `max_tokens` | number | `generate`, `generate_structured`, optionally `describe` | Derived from `GenerationOptions.maximum_response_tokens` for text requests |
+| `messages` | array | `chat` | Explicit chat history as `{ "role": string, "content": string }` objects |
+| `max_tokens` | number | `generate`, `chat`, `generate_structured`, optionally `describe` | Derived from `GenerationOptions.maximum_response_tokens` for text requests |
 | `audio` | string | `transcribe` | Base64-encoded raw PCM bytes, 16 kHz mono f32le |
 | `language_hint` | string | `transcribe` | Optional spoken language hint; omitted when unspecified |
 | `image` | string | `describe` | Base64-encoded PNG or JPEG bytes |
@@ -460,6 +484,16 @@ All requests may include an optional `system` field (string) to set the system p
 // response (one line per token, final line has done:true)
 {"id": "uuid", "token": "Here"}
 {"id": "uuid", "token": " is", "done": true}
+```
+
+### Chat generation
+
+```jsonc
+// request
+{"id": "uuid", "type": "chat", "messages": [{"role": "user", "content": "Hello"}], "max_tokens": 512}
+
+// response (one line per token, final line has done:true)
+{"id": "uuid", "token": "Hi", "done": true}
 ```
 
 ### Structured output
@@ -546,19 +580,23 @@ Runtime manifests declare explicit runtime images per variant. If the detected v
 
 ## Container security
 
-Every container is spawned with:
+Every runtime starts from an OCI `config.json` generated by the daemon. The bundle uses:
 
 ```
---network=none          # no network access
---read-only             # read-only root filesystem
---tmpfs=/tmp            # in-memory scratch, noexec
---cap-drop=all          # no Linux capabilities
---security-opt=no-new-privileges
---pids-limit=256        # fork bomb protection
---memory=4g             # OOM protection
+new network namespace   # no host network access
+read-only rootfs        # immutable unpacked runtime filesystem
+tmpfs /tmp              # in-memory scratch, noexec, nodev
+tmpfs /dev/shm          # shared memory for ML runtimes, noexec, nodev
+empty capabilities      # no Linux capabilities
+noNewPrivileges         # privilege escalation disabled
+pids limit 256          # fork bomb protection
+memory limit 8g         # OOM protection, configurable
+read-only /model        # selected profile artifact directory
 ```
 
-Running under rootless podman additionally places the container in a user namespace where container root maps to your unprivileged uid.
+Accelerator runtimes receive only the host device mounts they need: CUDA gets existing `/dev/nvidia*` devices and optional `/proc/driver/nvidia`, ROCm gets `/dev/kfd` and `/dev/dri`, and Vulkan gets `/dev/dri`. Accelerator variants also receive read-only `/sys` for driver and topology discovery.
+
+Running the daemon as a user service means `crun` executes runtime bundles rootlessly under the user's session.
 
 ## Data files
 
@@ -566,6 +604,8 @@ Running under rootless podman additionally places the container in a user namesp
 |---|---|
 | `$XDG_DATA_HOME/aileron/assignments.json` | Use-case → installed profile mapping |
 | `$XDG_DATA_HOME/aileron/permissions.json` | Per-app, per-use-case permission grants |
+| `$XDG_DATA_HOME/aileron/oci/rootfs/*` | Rendered runtime root filesystems |
+| `$XDG_DATA_HOME/aileron/oci/metadata/*.json` | Runtime image metadata used for listing and cleanup |
 | `$XDG_DATA_HOME/aileron/manifests/models/*.json` | User-installed model manifests |
 | `$XDG_DATA_HOME/aileron/manifests/runtimes/*.json` | User-installed runtime manifests |
 | `/etc/aileron/manifests/models/*.json` | Admin-provided model manifests |
@@ -577,8 +617,8 @@ Running under rootless podman additionally places the container in a user namesp
 
 - No inference engine code runs in the daemon process. A crash in llama.cpp kills only the container.
 - No REST API, no TCP, no UDP. Attack surface is the Varlink Unix socket and D-Bus.
-- Containers run with `--network=none`, `--cap-drop=all`, `--read-only`, and `--security-opt=no-new-privileges` (see [Container security](#container-security)).
-- Rootless podman places containers in a user namespace — container root maps to your unprivileged uid.
+- Containers run from daemon-generated OCI bundles with isolated networking, no capabilities, read-only root filesystems, and `noNewPrivileges` (see [Container security](#container-security)).
+- Rootless `crun` executes runtime bundles under the user's session instead of a privileged system daemon.
 - OCI images are content-addressed; image refs can be pinned to a digest (`@sha256:...`).
 - Per-app permissions are enforced in the daemon, not the portal.
 - The daemon runs with `PrivateNetwork=yes` in the systemd unit.
@@ -586,7 +626,7 @@ Running under rootless podman additionally places the container in a user namesp
 ## Out of scope for v1
 
 - Multi-user (the daemon is a user service, one instance per login session)
-- Model signature verification (podman trust policy handles this)
+- Model/runtime signature verification through containers/image policy
 - A system-wide shared model store
 
 ## License

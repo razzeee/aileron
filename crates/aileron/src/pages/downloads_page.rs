@@ -115,12 +115,32 @@ fn refresh_downloads_list(list: &ListBox) {
         return;
     }
 
-    for install in installs {
-        list.append(&download_row(&install, None));
+    let (profile_installs, runtime_installs): (Vec<_>, Vec<_>) = installs
+        .into_iter()
+        .partition(|install| !is_runtime_download(&install.profile_id));
+
+    if should_group_runtime_with_profile(&profile_installs, &runtime_installs) {
+        list.append(&profile_download_row(
+            &profile_installs[0],
+            Some(&runtime_installs[0]),
+            None,
+        ));
+        return;
+    }
+
+    for install in profile_installs {
+        list.append(&profile_download_row(&install, None, None));
+    }
+    for install in runtime_installs {
+        list.append(&runtime_setup_row(&install, false));
     }
 }
 
-fn download_row(install: &InstallStatus, window: Option<gtk4::Window>) -> Box {
+fn profile_download_row(
+    install: &InstallStatus,
+    runtime_install: Option<&InstallStatus>,
+    window: Option<gtk4::Window>,
+) -> Box {
     let row = Box::new(Orientation::Horizontal, 12);
     row.set_margin_top(10);
     row.set_margin_bottom(10);
@@ -141,13 +161,23 @@ fn download_row(install: &InstallStatus, window: Option<gtk4::Window>) -> Box {
         install.eta_seconds,
         &install.status,
         install.cancel_requested,
+        runtime_install,
     )));
     subtitle.set_xalign(0.0);
     subtitle.add_css_class("dim-label");
 
     details.append(&title);
     details.append(&subtitle);
-    if install.total_bytes > 0 {
+    if let Some(runtime_install) = runtime_install
+        && runtime_install.total_bytes > 0
+    {
+        let progress = ProgressBar::new();
+        progress.set_fraction(
+            (runtime_install.bytes_pulled as f64 / runtime_install.total_bytes as f64)
+                .clamp(0.0, 1.0),
+        );
+        details.append(&progress);
+    } else if install.total_bytes > 0 && !is_runtime_setup_status(&install.status) {
         let progress = ProgressBar::new();
         progress.set_fraction(
             (install.bytes_pulled as f64 / install.total_bytes as f64).clamp(0.0, 1.0),
@@ -156,14 +186,20 @@ fn download_row(install: &InstallStatus, window: Option<gtk4::Window>) -> Box {
     }
     row.append(&details);
 
-    if install.total_bytes <= 0 && !install_is_terminal(install) {
+    let runtime_is_indeterminate = runtime_install
+        .map(|runtime_install| runtime_install.total_bytes <= 0)
+        .unwrap_or(false);
+    if ((install.total_bytes <= 0 || is_runtime_setup_status(&install.status))
+        || runtime_is_indeterminate)
+        && !install_is_terminal(install)
+    {
         let spinner = Spinner::new();
         spinner.set_valign(gtk4::Align::Center);
         spinner.start();
         row.append(&spinner);
     }
 
-    if install_is_terminal(install) || is_runtime_download(&install.profile_id) {
+    if install_is_terminal(install) {
         return row;
     }
 
@@ -182,14 +218,62 @@ fn download_row(install: &InstallStatus, window: Option<gtk4::Window>) -> Box {
     row
 }
 
+fn runtime_setup_row(install: &InstallStatus, grouped: bool) -> Box {
+    let row = Box::new(Orientation::Horizontal, 12);
+    row.set_margin_top(if grouped { 6 } else { 8 });
+    row.set_margin_bottom(10);
+    row.set_margin_start(if grouped { 54 } else { 12 });
+    row.set_margin_end(12);
+
+    if !grouped {
+        let spinner = Spinner::new();
+        spinner.set_valign(gtk4::Align::Center);
+        spinner.start();
+        row.append(&spinner);
+    }
+
+    let details = Box::new(Orientation::Vertical, 5);
+    details.set_hexpand(true);
+
+    let title = Label::new(Some(&runtime_setup_title(install)));
+    title.set_xalign(0.0);
+    if !grouped {
+        title.add_css_class("heading");
+    }
+
+    let subtitle = Label::new(Some(&runtime_detail_line(install)));
+    subtitle.set_xalign(0.0);
+    subtitle.add_css_class("dim-label");
+    subtitle.set_wrap(true);
+
+    details.append(&title);
+    details.append(&subtitle);
+
+    row.append(&details);
+    row
+}
+
 fn download_title(id: &str) -> String {
     id.strip_prefix("runtime:")
-        .map(|image_ref| format!("Runtime image: {image_ref}"))
+        .map(runtime_title)
         .unwrap_or_else(|| id.to_string())
+}
+
+fn runtime_title(image_ref: &str) -> String {
+    format!("Runtime environment: {}", runtime_name(image_ref))
 }
 
 fn is_runtime_download(id: &str) -> bool {
     id.starts_with("runtime:")
+}
+
+fn should_group_runtime_with_profile(
+    profile_installs: &[InstallStatus],
+    runtime_installs: &[InstallStatus],
+) -> bool {
+    profile_installs.len() == 1
+        && runtime_installs.len() == 1
+        && is_runtime_setup_status(&profile_installs[0].status)
 }
 
 fn install_is_terminal(install: &InstallStatus) -> bool {
@@ -203,9 +287,24 @@ fn download_subtitle(
     eta_seconds: i64,
     status: &str,
     cancelling: bool,
+    runtime_install: Option<&InstallStatus>,
 ) -> String {
     if status.starts_with("Failed:") {
         return status.to_string();
+    }
+    if let Some(runtime_install) = runtime_install {
+        return if cancelling {
+            "Cancelling runtime setup".to_string()
+        } else {
+            runtime_profile_subtitle(runtime_install)
+        };
+    }
+    if is_runtime_setup_status(status) {
+        return if cancelling {
+            "Cancelling runtime setup".to_string()
+        } else {
+            "Setting up runtime environment before model download".to_string()
+        };
     }
 
     let prefix = if cancelling { "Cancelling" } else { status };
@@ -231,6 +330,74 @@ fn download_subtitle(
     } else {
         format!("{prefix} · size unknown{speed}")
     }
+}
+
+fn runtime_profile_subtitle(install: &InstallStatus) -> String {
+    let image_ref = runtime_download_image_ref(&install.profile_id);
+    let phase = runtime_phase(&install.status);
+    let progress = if install.total_bytes > 0 {
+        format!(
+            " · {:.0}%",
+            (install.bytes_pulled as f64 / install.total_bytes as f64 * 100.0).clamp(0.0, 100.0)
+        )
+    } else {
+        String::new()
+    };
+    format!("{phase} {}{progress}", runtime_name(image_ref))
+}
+
+fn is_runtime_setup_status(status: &str) -> bool {
+    status.contains("runtime image")
+}
+
+fn runtime_setup_title(install: &InstallStatus) -> String {
+    let image_ref = runtime_download_image_ref(&install.profile_id);
+    let phase = runtime_phase(&install.status);
+    format!("{phase} {}", runtime_name(image_ref))
+}
+
+fn runtime_detail_line(install: &InstallStatus) -> String {
+    let image_ref = runtime_download_image_ref(&install.profile_id);
+    if install.status.starts_with("Failed:") {
+        format!("{} · {}", install.status, compact_image_ref(image_ref))
+    } else {
+        compact_image_ref(image_ref)
+    }
+}
+
+fn runtime_download_image_ref(profile_id: &str) -> &str {
+    profile_id.strip_prefix("runtime:").unwrap_or(profile_id)
+}
+
+fn runtime_phase(status: &str) -> &'static str {
+    if status.starts_with("Failed:") {
+        "Failed to prepare"
+    } else if status.contains("Pulling") {
+        "Pulling"
+    } else if status.contains("Unpacking") || status.contains("unpack") {
+        "Unpacking"
+    } else {
+        "Preparing"
+    }
+}
+
+fn runtime_name(image_ref: &str) -> String {
+    let image = image_ref
+        .rsplit_once('/')
+        .map_or(image_ref, |(_, image)| image);
+    let (name, variant) = image.rsplit_once(':').unwrap_or((image, "runtime"));
+    let name = name.strip_prefix("aileron-runtime-").unwrap_or(name);
+    format!("{} runtime ({variant})", name.replace('-', " "))
+}
+
+fn compact_image_ref(image_ref: &str) -> String {
+    let Some((registry, rest)) = image_ref.split_once('/') else {
+        return image_ref.to_string();
+    };
+    let Some((_, image)) = rest.rsplit_once('/') else {
+        return image_ref.to_string();
+    };
+    format!("{registry}/…/{image}")
 }
 
 fn format_speed(bytes_per_second: i64) -> String {
@@ -301,5 +468,142 @@ fn cancel_install(profile_id: &str, window: Option<gtk4::Window>) {
 fn clear_list(list: &ListBox) {
     while let Some(child) = list.first_child() {
         list.remove(&child);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_name_is_human_readable() {
+        assert_eq!(
+            runtime_name("ghcr.io/razzeee/aileron-runtime-vision-llama-cpp-gemma4:rocm"),
+            "vision llama cpp gemma4 runtime (rocm)"
+        );
+    }
+
+    #[test]
+    fn compact_image_ref_keeps_registry_and_image() {
+        assert_eq!(
+            compact_image_ref("ghcr.io/razzeee/aileron-runtime-vision-llama-cpp-gemma4:rocm"),
+            "ghcr.io/…/aileron-runtime-vision-llama-cpp-gemma4:rocm"
+        );
+    }
+
+    #[test]
+    fn runtime_setup_text_hides_unknown_size_and_speed() {
+        let install = InstallStatus {
+            profile_id: "runtime:ghcr.io/razzeee/aileron-runtime-vision-llama-cpp-gemma4:rocm"
+                .to_string(),
+            bytes_pulled: 0,
+            total_bytes: 0,
+            bytes_per_second: 0,
+            eta_seconds: -1,
+            status: "Pulling runtime image...".to_string(),
+            cancel_requested: false,
+        };
+
+        let title = runtime_setup_title(&install);
+        let detail = runtime_detail_line(&install);
+
+        assert_eq!(title, "Pulling vision llama cpp gemma4 runtime (rocm)");
+        assert_eq!(
+            detail,
+            "ghcr.io/…/aileron-runtime-vision-llama-cpp-gemma4:rocm"
+        );
+        assert!(!title.contains("size unknown"));
+        assert!(!title.contains("speed calculating"));
+        assert!(!detail.contains("size unknown"));
+        assert!(!detail.contains("speed calculating"));
+    }
+
+    #[test]
+    fn profile_subtitle_hides_model_progress_during_runtime_setup() {
+        let runtime_install = InstallStatus {
+            profile_id: "runtime:ghcr.io/razzeee/aileron-runtime-asr-whisper-cpp:vulkan"
+                .to_string(),
+            bytes_pulled: 0,
+            total_bytes: 0,
+            bytes_per_second: 0,
+            eta_seconds: -1,
+            status: "Preparing runtime image...".to_string(),
+            cancel_requested: false,
+        };
+        let subtitle = download_subtitle(
+            0,
+            600_000_000,
+            0,
+            -1,
+            "Preparing runtime image...",
+            false,
+            Some(&runtime_install),
+        );
+
+        assert_eq!(subtitle, "Preparing asr whisper cpp runtime (vulkan)");
+        assert!(!subtitle.contains("0.0 / 0.6 GB"));
+        assert!(!subtitle.contains("speed calculating"));
+    }
+
+    #[test]
+    fn profile_subtitle_shows_runtime_percent() {
+        let runtime_install = InstallStatus {
+            profile_id: "runtime:ghcr.io/razzeee/aileron-runtime-asr-whisper-cpp:vulkan"
+                .to_string(),
+            bytes_pulled: 42,
+            total_bytes: 100,
+            bytes_per_second: 0,
+            eta_seconds: -1,
+            status: "Pulling runtime image...".to_string(),
+            cancel_requested: false,
+        };
+
+        assert_eq!(
+            runtime_profile_subtitle(&runtime_install),
+            "Pulling asr whisper cpp runtime (vulkan) · 42%"
+        );
+    }
+
+    #[test]
+    fn groups_runtime_with_profile_only_when_association_is_unambiguous() {
+        let runtime_profile = install_status("profile-a", "Preparing runtime image...");
+        let downloading_profile = install_status("profile-a", "Downloading model.gguf...");
+        let runtime_a = install_status(
+            "runtime:ghcr.io/example/runtime-a:cpu",
+            "Pulling runtime image...",
+        );
+        let runtime_b = install_status(
+            "runtime:ghcr.io/example/runtime-b:cpu",
+            "Pulling runtime image...",
+        );
+
+        assert!(should_group_runtime_with_profile(
+            std::slice::from_ref(&runtime_profile),
+            std::slice::from_ref(&runtime_a)
+        ));
+        assert!(!should_group_runtime_with_profile(
+            std::slice::from_ref(&runtime_profile),
+            &[runtime_a.clone(), runtime_b]
+        ));
+        assert!(!should_group_runtime_with_profile(
+            &[runtime_profile.clone(), downloading_profile.clone()],
+            std::slice::from_ref(&runtime_a)
+        ));
+        assert!(!should_group_runtime_with_profile(
+            std::slice::from_ref(&downloading_profile),
+            std::slice::from_ref(&runtime_a)
+        ));
+    }
+
+    fn install_status(profile_id: &str, status: &str) -> InstallStatus {
+        InstallStatus {
+            profile_id: profile_id.to_string(),
+            bytes_pulled: 0,
+            total_bytes: 0,
+            bytes_per_second: 0,
+            eta_seconds: -1,
+            status: status.to_string(),
+            cancel_requested: false,
+        }
     }
 }

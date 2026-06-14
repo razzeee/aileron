@@ -46,6 +46,7 @@ pub struct Inner {
     pub sessions: HashMap<String, Session>,
     pub installing_profiles: HashMap<String, InstallRecord>,
     pub runtime_downloads: HashMap<String, InstallRecord>,
+    pub runtime_download_owners: HashMap<String, String>,
     pub recent_installs: VecDeque<(String, InstallRecord)>,
     pub recent_runtime_downloads: VecDeque<(String, InstallRecord)>,
     /// Best available hardware variant, detected once at startup.
@@ -64,6 +65,10 @@ impl SharedState {
         let mut containers = ContainerPool::new();
         containers.idle_timeout_secs = config.idle_timeout_secs;
         containers.memory_limit = config.container_memory.clone();
+        containers.oci_store = config
+            .oci_store
+            .clone()
+            .unwrap_or_else(crate::container::default_oci_store);
         let variant = crate::hardware::detect();
         Ok(Self(Arc::new(Mutex::new(Inner {
             config,
@@ -75,6 +80,7 @@ impl SharedState {
             sessions: HashMap::new(),
             installing_profiles: HashMap::new(),
             runtime_downloads: HashMap::new(),
+            runtime_download_owners: HashMap::new(),
             recent_installs: VecDeque::new(),
             recent_runtime_downloads: VecDeque::new(),
             variant,

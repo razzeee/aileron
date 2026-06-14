@@ -25,3 +25,5 @@ varlink         = { workspace = true }
 chrono          = { workspace = true }
 reqwest         = { workspace = true }
 sha2            = { workspace = true }
+tar             = { workspace = true }
+ocirender       = { workspace = true }

@@ -21,4 +21,8 @@ pub struct Config {
     /// Memory limit passed to each model container.
     #[arg(long, env = "AILERON_CONTAINER_MEMORY", default_value = "8g")]
     pub container_memory: String,
+
+    /// Local OCI runtime store containing unpacked runtime root filesystems.
+    #[arg(long, env = "AILERON_OCI_STORE")]
+    pub oci_store: Option<std::path::PathBuf>,
 }

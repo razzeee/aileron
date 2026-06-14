@@ -12,7 +12,7 @@ The daemon starts containers with stdin, stdout, and stderr attached. A runtime 
 - Send `done: true` on the final response for every request.
 - Send errors as `{"id":"...","error":"code","reason":"human-readable detail","done":true}`.
 - Do not write protocol messages to stderr.
-- Do not require network access. The daemon runs runtimes with `--network=none`.
+- Do not require network access. The daemon runs runtimes in an isolated OCI network namespace.
 - Read model artifacts from `/model`, mounted read-only by the daemon.
 
 ## Common Fields
@@ -172,7 +172,7 @@ The daemon surfaces runtime errors as inference failures. A runtime should prefe
 
 ## Security Assumptions
 
-The daemon runs runtimes with a hardened `podman run` configuration:
+The daemon runs runtimes with a hardened generated OCI runtime configuration:
 
 - no network
 - read-only root filesystem

@@ -37,7 +37,7 @@ impl VarlinkInterface for InferenceHandler {
         use_case: String,
     ) -> varlink::Result<()> {
         self.rt.block_on(async {
-            let (image_ref, artifact_path) = {
+            let (image_ref, artifact_path, oci_store) = {
                 let guard = self.state.0.lock().await;
                 let profile_id = match guard.assignments.get(&use_case) {
                     Some(profile_id) => profile_id,
@@ -70,7 +70,11 @@ impl VarlinkInterface for InferenceHandler {
                         });
                     }
                 };
-                (image_ref, profile.artifact_path.clone())
+                (
+                    image_ref,
+                    profile.artifact_path.clone(),
+                    guard.containers.oci_store.clone(),
+                )
             };
 
             if !artifact_path.exists() {
@@ -80,18 +84,20 @@ impl VarlinkInterface for InferenceHandler {
                 });
             }
 
-            let status = tokio::process::Command::new("podman")
-                .args(["image", "exists", &image_ref])
-                .status()
-                .await
-                .map_err(io_err)?;
+            let runtime_rootfs = oci_store
+                .join("rootfs")
+                .join(crate::container::store_key(&image_ref));
+            let runtime_exists = runtime_rootfs.is_dir();
 
             call.reply(ModelAvailability {
-                is_available: status.success(),
-                reason: if status.success() {
+                is_available: runtime_exists,
+                reason: if runtime_exists {
                     "available".to_string()
                 } else {
-                    format!("runtime image {image_ref} is not present locally")
+                    format!(
+                        "runtime rootfs for {image_ref} is not present at {}",
+                        runtime_rootfs.display()
+                    )
                 },
             })
         })

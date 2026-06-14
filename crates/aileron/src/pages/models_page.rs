@@ -734,6 +734,14 @@ mod tests {
     }
 
     #[test]
+    fn readiness_sort_key_bubbles_non_ready_tasks() {
+        assert!(readiness_sort_key("Missing") < readiness_sort_key("Ready"));
+        assert!(readiness_sort_key("Installed") < readiness_sort_key("Ready"));
+        assert!(readiness_sort_key("Installing") < readiness_sort_key("Ready"));
+        assert_eq!(readiness_sort_key("Ready"), 1);
+    }
+
+    #[test]
     fn recommendation_uses_task_specific_fit_score() {
         let assigned = HashSet::new();
         let mut chat_better = catalog_profile("chat-better", "balanced", 2.0);
@@ -1201,6 +1209,7 @@ fn render_readiness_list(
         .flat_map(|profile| profile.assigned_use_cases.iter().map(String::as_str))
         .collect();
 
+    let mut rows = Vec::new();
     for &use_case in USE_CASES {
         if let Some(profile) = profiles
             .iter()
@@ -1259,7 +1268,7 @@ fn render_readiness_list(
                     button,
                     Some(&candidate.recommendation_reason),
                 );
-                list_box.append(&row);
+                rows.push((readiness_sort_key("Ready"), row));
             } else {
                 let row = readiness_row(
                     use_case,
@@ -1273,7 +1282,7 @@ fn render_readiness_list(
                     None,
                     None,
                 );
-                list_box.append(&row);
+                rows.push((readiness_sort_key("Ready"), row));
             }
             continue;
         }
@@ -1300,7 +1309,7 @@ fn render_readiness_list(
                     Some(button),
                     Some(&candidate.recommendation_reason),
                 );
-                list_box.append(&row);
+                rows.push((readiness_sort_key("Installed"), row));
             } else {
                 let button = Button::with_label("Assign");
                 button.set_valign(gtk4::Align::Center);
@@ -1328,7 +1337,7 @@ fn render_readiness_list(
                     Some(button),
                     None,
                 );
-                list_box.append(&row);
+                rows.push((readiness_sort_key("Installed"), row));
             }
             continue;
         }
@@ -1369,7 +1378,14 @@ fn render_readiness_list(
                 Some(button),
                 Some(&profile.recommendation_reason),
             );
-            list_box.append(&row);
+            rows.push((
+                readiness_sort_key(if profile.installing {
+                    "Installing"
+                } else {
+                    "Missing"
+                }),
+                row,
+            ));
         } else {
             let row = readiness_row(
                 use_case,
@@ -1379,9 +1395,18 @@ fn render_readiness_list(
                 None,
                 None,
             );
-            list_box.append(&row);
+            rows.push((readiness_sort_key("Missing"), row));
         }
     }
+
+    rows.sort_by_key(|(sort_key, _)| *sort_key);
+    for (_, row) in rows {
+        list_box.append(&row);
+    }
+}
+
+fn readiness_sort_key(status: &str) -> u8 {
+    if status == "Ready" { 1 } else { 0 }
 }
 
 fn readiness_row(

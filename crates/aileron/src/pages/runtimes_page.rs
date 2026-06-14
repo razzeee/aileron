@@ -1,9 +1,9 @@
-/// OCI runtimes page — list and clean up Aileron-owned Podman runtime images.
+/// OCI runtimes page — list and clean up Aileron-owned OCI runtime images.
 use std::collections::HashMap;
 
 use aileron_varlink::aileron_Models::{InstallStatus, OciRuntimeImage};
 use gtk4::prelude::*;
-use gtk4::{Button, ListBox, ScrolledWindow};
+use gtk4::{Box, Button, Label, ListBox, Orientation, ScrolledWindow};
 use libadwaita::prelude::*;
 use libadwaita::{ActionRow, PreferencesGroup, PreferencesPage};
 
@@ -25,10 +25,11 @@ pub fn build() -> RuntimeImagesView {
     let group = PreferencesGroup::new();
     group.set_title("OCI Runtime Images");
     group.set_description(Some(
-        "Aileron only manages Podman images labeled as Aileron runtimes.",
+        "Aileron only manages OCI images labeled as Aileron runtimes.",
     ));
 
     let actions = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+    actions.set_halign(gtk4::Align::End);
     actions.set_valign(gtk4::Align::Center);
     let prune_button = Button::with_label("Remove Unused");
     prune_button.add_css_class("destructive-action");
@@ -135,31 +136,60 @@ fn append_runtime_image_row(
     image: OciRuntimeImage,
     active_download: Option<&InstallStatus>,
 ) {
-    let row = ActionRow::new();
+    let row = Box::new(Orientation::Horizontal, 18);
+    row.set_margin_top(12);
+    row.set_margin_bottom(12);
+    row.set_margin_start(14);
+    row.set_margin_end(14);
+
+    let details = Box::new(Orientation::Vertical, 5);
+    details.set_hexpand(true);
+
     let variant = if image.variant.is_empty() {
         "unknown".to_string()
     } else {
         image.variant.clone()
     };
-    row.set_title(&format!("{} ({variant})", image.runtime_id));
+
+    let title = Label::new(Some(&format!("{} ({variant})", image.runtime_id)));
+    title.set_xalign(0.0);
+    title.add_css_class("heading");
+    details.append(&title);
+
+    let image_ref = Label::new(Some(&image.image_ref));
+    image_ref.set_xalign(0.0);
+    image_ref.set_wrap(true);
+    image_ref.set_wrap_mode(gtk4::pango::WrapMode::Char);
+    image_ref.add_css_class("dim-label");
+    details.append(&image_ref);
 
     let usage = if image.in_use {
         format!("in use by {}", image.used_by_profiles.join(", "))
     } else {
         "unused".to_string()
     };
-    let update_status = if let Some(download) = active_download {
-        format!("updating: {}", download.status)
+    let status = if let Some(download) = active_download {
+        format!("updating · {}", download.status)
     } else if image.update_status.is_empty() {
-        "unknown update status".to_string()
+        "status unknown".to_string()
     } else {
         image.update_status.clone()
     };
-    row.set_subtitle(&format!(
-        "{} · {} · {usage} · {update_status}",
-        image.image_ref,
+
+    let metadata = Label::new(Some(&format!(
+        "{} · {usage} · {status}",
         format_bytes(image.size_bytes),
-    ));
+    )));
+    metadata.set_xalign(0.0);
+    metadata.set_wrap(true);
+    metadata.add_css_class("dim-label");
+    details.append(&metadata);
+
+    row.append(&details);
+
+    let actions = Box::new(Orientation::Horizontal, 8);
+    actions.set_valign(gtk4::Align::Center);
+    actions.set_halign(gtk4::Align::End);
 
     if image.update_available || active_download.is_some() {
         let update_button = Button::with_label(if active_download.is_some() {
@@ -176,7 +206,7 @@ fn append_runtime_image_row(
             button.set_label("Updating...");
             update_runtime_image(&list_box, &image_ref);
         });
-        row.add_suffix(&update_button);
+        actions.append(&update_button);
     }
 
     if !image.in_use {
@@ -188,7 +218,11 @@ fn append_runtime_image_row(
         remove_button.connect_clicked(move |_| {
             remove_runtime_image(&list_box, &image_id);
         });
-        row.add_suffix(&remove_button);
+        actions.append(&remove_button);
+    }
+
+    if actions.first_child().is_some() {
+        row.append(&actions);
     }
 
     list_box.append(&row);

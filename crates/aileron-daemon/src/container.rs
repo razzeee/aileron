@@ -1,6 +1,6 @@
-/// Container lifecycle management.
+/// Runtime lifecycle management.
 ///
-/// One `podman` process is maintained per use-case. The process receives
+/// One OCI runtime process is maintained per use-case. The process receives
 /// newline-delimited JSON requests on stdin and emits newline-delimited JSON
 /// response chunks on stdout.
 ///
@@ -39,6 +39,7 @@
 /// Response (single line, no streaming):
 ///   {"id":"<uuid>","result":"{\"segments\":[...]}","done":true}
 use std::collections::HashMap;
+use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Stdio};
@@ -83,38 +84,41 @@ pub struct VisionSegment {
 }
 
 impl Container {
-    /// Spawn a hardened `podman run` for the given image and block until the
+    /// Spawn a hardened OCI runtime bundle for the given image and block until the
     /// entrypoint signals it is ready by writing `ready` to stderr.
     ///
     /// The `on_status` callback is called with human-readable progress lines
     /// from the container's stderr while we wait (e.g. model loading messages).
     /// It may be called from a background thread.
     ///
-    /// Isolation flags applied:
-    ///   --network=none       no network access whatsoever
-    ///   --read-only          root filesystem is read-only
-    ///   --tmpfs /tmp         writable scratch space (in-memory only)
-    ///   --no-new-privileges  prevents setuid/setcap escalation
-    ///   --cap-drop=all       drops every Linux capability
-    ///   --security-opt=no-new-privileges  belt-and-suspenders with the kernel
-    ///   --pids-limit=256     limits fork bombs
-    ///   --memory=<limit>     caps RAM usage
+    /// Isolation is encoded in the generated OCI `config.json`: no network
+    /// namespace, read-only rootfs, tmpfs `/tmp`, no capabilities, no new
+    /// privileges, PID limit, memory limit, and `/model` mounted read-only.
     pub fn spawn(
         image_ref: &str,
         artifact_path: &Path,
         runtime_options: &HashMap<String, String>,
         memory_limit: &str,
+        oci_store: &Path,
         mut on_status: impl FnMut(String) + Send + 'static,
     ) -> Result<Self> {
-        info!("spawning container for {}", image_ref);
-        let args = podman_run_args(image_ref, artifact_path, runtime_options, memory_limit);
-        let mut child = std::process::Command::new("podman")
-            .args(&args)
+        info!("spawning OCI runtime for {}", image_ref);
+        let bundle = OciRuntimeManager::new(oci_store).prepare_bundle(
+            image_ref,
+            artifact_path,
+            runtime_options,
+            memory_limit,
+        )?;
+        let container_id = format!("aileron-{}", Uuid::new_v4());
+        let mut child = std::process::Command::new("crun")
+            .args(["run", "--bundle"])
+            .arg(&bundle.bundle_dir)
+            .arg(&container_id)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .with_context(|| format!("failed to spawn podman for {}", image_ref))?;
+            .with_context(|| format!("failed to spawn crun for {}", image_ref))?;
 
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
@@ -493,57 +497,267 @@ fn vision_segment_schema() -> Value {
     })
 }
 
-fn podman_run_args(
+struct PreparedBundle {
+    bundle_dir: PathBuf,
+}
+
+struct OciRuntimeManager {
+    store: PathBuf,
+}
+
+impl OciRuntimeManager {
+    fn new(store: &Path) -> Self {
+        Self {
+            store: store.to_path_buf(),
+        }
+    }
+
+    fn prepare_bundle(
+        &self,
+        image_ref: &str,
+        artifact_path: &Path,
+        runtime_options: &HashMap<String, String>,
+        memory_limit: &str,
+    ) -> Result<PreparedBundle> {
+        let rootfs = self.rootfs_path(image_ref);
+        if !rootfs.is_dir() {
+            bail!(
+                "OCI rootfs for {image_ref} is not installed at {}; image transport/unpack is not implemented yet. Install skopeo/crun and populate the Aileron OCI store before starting this runtime.",
+                rootfs.display()
+            );
+        }
+
+        let bundle_dir = self.store.join("bundles").join(Uuid::new_v4().to_string());
+        fs::create_dir_all(&bundle_dir)
+            .with_context(|| format!("failed to create OCI bundle at {}", bundle_dir.display()))?;
+        let config = runtime_config_json(
+            image_ref,
+            &rootfs,
+            artifact_path,
+            runtime_options,
+            memory_limit,
+        )?;
+        let config_path = bundle_dir.join("config.json");
+        fs::write(&config_path, serde_json::to_vec_pretty(&config)?)
+            .with_context(|| format!("failed to write {}", config_path.display()))?;
+
+        Ok(PreparedBundle { bundle_dir })
+    }
+
+    fn rootfs_path(&self, image_ref: &str) -> PathBuf {
+        self.store.join("rootfs").join(store_key(image_ref))
+    }
+}
+
+pub fn default_oci_store() -> PathBuf {
+    let data_home = std::env::var("AILERON_DATA_HOME")
+        .or_else(|_| std::env::var("XDG_DATA_HOME"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+            PathBuf::from(home).join(".local").join("share")
+        });
+    data_home.join("aileron").join("oci")
+}
+
+fn runtime_config_json(
     image_ref: &str,
+    rootfs: &Path,
     artifact_path: &Path,
     runtime_options: &HashMap<String, String>,
     memory_limit: &str,
-) -> Vec<String> {
-    let mut args = vec![
-        "run".to_string(),
-        "--rm".to_string(),
-        "-i".to_string(),
-        "--network=none".to_string(),
-        "--read-only".to_string(),
-        "--tmpfs=/tmp:rw,noexec,nosuid,size=256m".to_string(),
-        "--cap-drop=all".to_string(),
-        "--security-opt=no-new-privileges".to_string(),
-        "--pids-limit=256".to_string(),
-        format!("--memory={memory_limit}"),
-        format!("--volume={}:/model:ro,z", artifact_path.display()),
+) -> Result<Value> {
+    let mut env = vec![
+        "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
+        "PYTHONUNBUFFERED=1".to_string(),
+    ];
+    let mut mounts = vec![
+        serde_json::json!({
+            "destination": "/proc",
+            "type": "proc",
+            "source": "proc",
+            "options": ["nosuid", "noexec", "nodev"]
+        }),
+        serde_json::json!({
+            "destination": "/tmp",
+            "type": "tmpfs",
+            "source": "tmpfs",
+            "options": ["rw", "nosuid", "noexec", "nodev", "size=256m"]
+        }),
+        serde_json::json!({
+            "destination": "/dev/shm",
+            "type": "tmpfs",
+            "source": "shm",
+            "options": ["rw", "nosuid", "noexec", "nodev", "size=256m", "mode=1777"]
+        }),
+        serde_json::json!({
+            "destination": "/model",
+            "type": "bind",
+            "source": artifact_path.display().to_string(),
+            "options": ["rbind", "ro", "nosuid", "nodev"]
+        }),
     ];
 
     if image_ref_uses_tag(image_ref, "cuda") {
-        args.push("--device=nvidia.com/gpu=all".to_string());
-        args.push("--env=N_GPU_LAYERS=-1".to_string());
-        args.push("--env=AILERON_DEVICE=cuda".to_string());
+        add_cuda_mounts(&mut mounts);
+        add_readonly_mount(&mut mounts, "/sys");
+        env.push("N_GPU_LAYERS=-1".to_string());
+        env.push("AILERON_DEVICE=cuda".to_string());
     } else if image_ref_uses_tag(image_ref, "rocm") {
-        args.extend([
-            "--device=/dev/kfd".to_string(),
-            "--device=/dev/dri".to_string(),
-            "--group-add=keep-groups".to_string(),
-            "--ipc=host".to_string(),
-            "--env=HSA_OVERRIDE_GFX_VERSION=10.3.0".to_string(),
-            "--env=N_GPU_LAYERS=-1".to_string(),
-            "--env=AILERON_DEVICE=rocm".to_string(),
-        ]);
+        add_device_mount(&mut mounts, "/dev/kfd");
+        add_device_mount(&mut mounts, "/dev/dri");
+        add_readonly_mount(&mut mounts, "/sys");
+        env.push("HSA_OVERRIDE_GFX_VERSION=10.3.0".to_string());
+        env.push("N_GPU_LAYERS=-1".to_string());
+        env.push("AILERON_DEVICE=rocm".to_string());
     } else if image_ref_uses_tag(image_ref, "vulkan") {
-        args.extend([
-            "--device=/dev/dri".to_string(),
-            "--group-add=keep-groups".to_string(),
-            "--env=N_GPU_LAYERS=-1".to_string(),
-            "--env=AILERON_DEVICE=vulkan".to_string(),
-        ]);
+        add_device_mount(&mut mounts, "/dev/dri");
+        add_readonly_mount(&mut mounts, "/sys");
+        env.push("N_GPU_LAYERS=-1".to_string());
+        env.push("AILERON_DEVICE=vulkan".to_string());
     }
 
     let mut runtime_options: Vec<_> = runtime_options.iter().collect();
     runtime_options.sort_by(|a, b| a.0.cmp(b.0));
     for (key, value) in runtime_options {
-        args.push(format!("--env={key}={value}"));
+        env.push(format!("{key}={value}"));
     }
 
-    args.push(image_ref.to_string());
-    args
+    Ok(serde_json::json!({
+        "ociVersion": "1.0.2",
+        "process": {
+            "terminal": false,
+            "user": { "uid": 0, "gid": 0 },
+            "args": ["python", "/entrypoint.py"],
+            "env": env,
+            "cwd": "/",
+            "noNewPrivileges": true,
+            "capabilities": {
+                "bounding": [],
+                "effective": [],
+                "inheritable": [],
+                "permitted": [],
+                "ambient": []
+            }
+        },
+        "root": {
+            "path": rootfs.display().to_string(),
+            "readonly": true
+        },
+        "hostname": "aileron-runtime",
+        "mounts": mounts,
+        "linux": {
+            "namespaces": [
+                { "type": "pid" },
+                { "type": "ipc" },
+                { "type": "uts" },
+                { "type": "mount" },
+                { "type": "network" },
+                { "type": "cgroup" }
+            ],
+            "maskedPaths": [
+                "/proc/acpi",
+                "/proc/asound",
+                "/proc/kcore",
+                "/proc/keys",
+                "/proc/latency_stats",
+                "/proc/timer_list",
+                "/proc/timer_stats",
+                "/proc/sched_debug",
+                "/sys/firmware"
+            ],
+            "readonlyPaths": [
+                "/proc/bus",
+                "/proc/fs",
+                "/proc/irq",
+                "/proc/sys",
+                "/proc/sysrq-trigger"
+            ],
+            "devices": [],
+            "resources": {
+                "pids": { "limit": 256 },
+                "memory": { "limit": parse_memory_limit(memory_limit)? }
+            }
+        }
+    }))
+}
+
+fn add_device_mount(mounts: &mut Vec<Value>, path: &str) {
+    mounts.push(serde_json::json!({
+        "destination": path,
+        "type": "bind",
+        "source": path,
+        "options": ["rbind", "rw", "nosuid"]
+    }));
+}
+
+fn add_cuda_mounts(mounts: &mut Vec<Value>) {
+    add_existing_device_mounts(
+        mounts,
+        [
+            "/dev/nvidia0",
+            "/dev/nvidia1",
+            "/dev/nvidiactl",
+            "/dev/nvidia-modeset",
+            "/dev/nvidia-uvm",
+            "/dev/nvidia-uvm-tools",
+            "/dev/nvidia-caps",
+        ],
+    );
+    if Path::new("/proc/driver/nvidia").exists() {
+        add_readonly_mount(mounts, "/proc/driver/nvidia");
+    }
+}
+
+fn add_existing_device_mounts<const N: usize>(mounts: &mut Vec<Value>, paths: [&str; N]) {
+    for path in paths {
+        if Path::new(path).exists() {
+            add_device_mount(mounts, path);
+        }
+    }
+}
+
+fn add_readonly_mount(mounts: &mut Vec<Value>, path: &str) {
+    mounts.push(serde_json::json!({
+        "destination": path,
+        "type": "bind",
+        "source": path,
+        "options": ["rbind", "ro", "nosuid", "nodev", "noexec"]
+    }));
+}
+
+fn parse_memory_limit(limit: &str) -> Result<i64> {
+    let limit = limit.trim();
+    let split = limit
+        .find(|ch: char| !ch.is_ascii_digit())
+        .unwrap_or(limit.len());
+    let (digits, suffix) = limit.split_at(split);
+    let value: i64 = digits
+        .parse()
+        .with_context(|| format!("invalid memory limit '{limit}'"))?;
+    let multiplier = match suffix.to_ascii_lowercase().as_str() {
+        "" | "b" => 1,
+        "k" | "kb" => 1024,
+        "m" | "mb" => 1024 * 1024,
+        "g" | "gb" => 1024 * 1024 * 1024,
+        other => bail!("unsupported memory limit suffix '{other}' in '{limit}'"),
+    };
+    value
+        .checked_mul(multiplier)
+        .context("memory limit is too large")
+}
+
+pub(crate) fn store_key(image_ref: &str) -> String {
+    image_ref
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 fn image_ref_uses_tag(image_ref: &str, tag: &str) -> bool {
@@ -741,8 +955,10 @@ pub struct ContainerPool {
     containers: HashMap<String, Container>,
     /// Idle timeout in seconds (default 300 = 5 min).
     pub idle_timeout_secs: u64,
-    /// Podman memory limit applied to each model container.
+    /// OCI memory limit applied to each model runtime.
     pub memory_limit: String,
+    /// Local Aileron-owned OCI runtime store.
+    pub oci_store: PathBuf,
 }
 
 impl ContainerPool {
@@ -751,6 +967,7 @@ impl ContainerPool {
             containers: HashMap::new(),
             idle_timeout_secs: 300,
             memory_limit: "8g".to_string(),
+            oci_store: default_oci_store(),
         }
     }
 
@@ -783,6 +1000,7 @@ impl ContainerPool {
                 artifact_path,
                 runtime_options,
                 &self.memory_limit,
+                &self.oci_store,
                 on_status,
             )?;
             self.containers.insert(profile_id.to_string(), c);
@@ -872,105 +1090,197 @@ mod tests {
     use super::*;
 
     #[test]
-    fn podman_args_expose_rocm_devices_for_rocm_tag() {
-        let args = podman_run_args(
-            "localhost/aileron/summarize:rocm",
-            Path::new("/models/foo"),
-            &HashMap::new(),
-            "8g",
-        );
-
-        assert!(args.contains(&"--device=/dev/kfd".to_string()));
-        assert!(args.contains(&"--device=/dev/dri".to_string()));
-        assert!(args.contains(&"--group-add=keep-groups".to_string()));
-        assert!(args.contains(&"--ipc=host".to_string()));
-        assert!(args.contains(&"--env=HSA_OVERRIDE_GFX_VERSION=10.3.0".to_string()));
-        assert!(args.contains(&"--env=N_GPU_LAYERS=-1".to_string()));
-        assert!(args.contains(&"--env=AILERON_DEVICE=rocm".to_string()));
-        assert_eq!(
-            args.last().map(String::as_str),
-            Some("localhost/aileron/summarize:rocm")
-        );
-    }
-
-    #[test]
-    fn podman_args_expose_cuda_device_for_cuda_tag() {
-        let args = podman_run_args(
-            "localhost/aileron/summarize:cuda",
-            Path::new("/models/foo"),
-            &HashMap::new(),
-            "8g",
-        );
-
-        assert!(args.contains(&"--device=nvidia.com/gpu=all".to_string()));
-        assert!(!args.contains(&"--device=/dev/kfd".to_string()));
-        assert!(!args.contains(&"--device=/dev/dri".to_string()));
-        assert!(!args.contains(&"--ipc=host".to_string()));
-        assert!(!args.contains(&"--env=HSA_OVERRIDE_GFX_VERSION=10.3.0".to_string()));
-        assert!(!args.contains(&"--group-add=keep-groups".to_string()));
-        assert!(args.contains(&"--env=N_GPU_LAYERS=-1".to_string()));
-        assert!(args.contains(&"--env=AILERON_DEVICE=cuda".to_string()));
-    }
-
-    #[test]
-    fn podman_args_expose_vulkan_device_for_vulkan_tag() {
-        let args = podman_run_args(
-            "localhost/aileron/summarize:vulkan",
-            Path::new("/models/foo"),
-            &HashMap::new(),
-            "8g",
-        );
-
-        assert!(args.contains(&"--device=/dev/dri".to_string()));
-        assert!(args.contains(&"--group-add=keep-groups".to_string()));
-        assert!(!args.contains(&"--device=/dev/kfd".to_string()));
-        assert!(!args.contains(&"--device=nvidia.com/gpu=all".to_string()));
-        assert!(!args.contains(&"--ipc=host".to_string()));
-        assert!(!args.contains(&"--env=HSA_OVERRIDE_GFX_VERSION=10.3.0".to_string()));
-        assert!(args.contains(&"--env=N_GPU_LAYERS=-1".to_string()));
-        assert!(args.contains(&"--env=AILERON_DEVICE=vulkan".to_string()));
-    }
-
-    #[test]
-    fn podman_args_do_not_expose_gpu_devices_for_cpu_tag() {
-        let args = podman_run_args(
+    fn oci_config_preserves_core_sandbox_settings() {
+        let config = runtime_config_json(
             "localhost/aileron/summarize:cpu",
+            Path::new("/store/rootfs/runtime"),
             Path::new("/models/foo"),
             &HashMap::new(),
             "8g",
-        );
+        )
+        .expect("build OCI config");
 
-        assert!(!args.contains(&"--device=/dev/kfd".to_string()));
-        assert!(!args.contains(&"--device=/dev/dri".to_string()));
-        assert!(!args.contains(&"--device=nvidia.com/gpu=all".to_string()));
-        assert!(!args.contains(&"--ipc=host".to_string()));
-        assert!(!args.contains(&"--env=HSA_OVERRIDE_GFX_VERSION=10.3.0".to_string()));
-        assert!(!args.contains(&"--group-add=keep-groups".to_string()));
-        assert!(!args.contains(&"--env=N_GPU_LAYERS=-1".to_string()));
+        assert_eq!(config["root"]["readonly"], true);
+        assert_eq!(config["root"]["path"], "/store/rootfs/runtime");
+        assert_eq!(config["process"]["noNewPrivileges"], true);
+        assert_eq!(
+            config["process"]["capabilities"]["bounding"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(config["linux"]["resources"]["pids"]["limit"], 256);
+        assert_eq!(
+            config["linux"]["resources"]["memory"]["limit"],
+            8 * 1024 * 1024 * 1024i64
+        );
+        assert!(mounts(&config).iter().any(|mount| {
+            mount["destination"] == "/tmp"
+                && mount["type"] == "tmpfs"
+                && array_contains(&mount["options"], "noexec")
+                && array_contains(&mount["options"], "size=256m")
+        }));
+        assert!(mounts(&config).iter().any(|mount| {
+            mount["destination"] == "/dev/shm"
+                && mount["type"] == "tmpfs"
+                && array_contains(&mount["options"], "mode=1777")
+        }));
+        assert!(mounts(&config).iter().any(|mount| {
+            mount["destination"] == "/model"
+                && mount["source"] == "/models/foo"
+                && array_contains(&mount["options"], "ro")
+        }));
+        assert!(namespaces(&config).contains(&"network"));
+    }
+
+    #[test]
+    fn oci_config_exposes_rocm_devices_for_rocm_tag() {
+        let config = runtime_config_json(
+            "localhost/aileron/summarize:rocm",
+            Path::new("/store/rootfs/runtime"),
+            Path::new("/models/foo"),
+            &HashMap::new(),
+            "8g",
+        )
+        .expect("build OCI config");
+
+        assert!(device_mounts(&config).contains(&"/dev/kfd"));
+        assert!(device_mounts(&config).contains(&"/dev/dri"));
+        assert_device_mount_has_no_nodev(&config, "/dev/kfd");
+        assert_device_mount_has_no_nodev(&config, "/dev/dri");
+        assert!(mount_destinations(&config).contains(&"/sys"));
+        assert!(env(&config).contains(&"HSA_OVERRIDE_GFX_VERSION=10.3.0"));
+        assert!(env(&config).contains(&"N_GPU_LAYERS=-1"));
+        assert!(env(&config).contains(&"AILERON_DEVICE=rocm"));
+    }
+
+    #[test]
+    fn oci_config_exposes_cuda_env_for_cuda_tag() {
+        let config = runtime_config_json(
+            "localhost/aileron/summarize:cuda",
+            Path::new("/store/rootfs/runtime"),
+            Path::new("/models/foo"),
+            &HashMap::new(),
+            "8g",
+        )
+        .expect("build OCI config");
+
+        assert!(!device_mounts(&config).contains(&"/dev/kfd"));
+        assert!(!device_mounts(&config).contains(&"/dev/dri"));
+        assert!(mount_destinations(&config).contains(&"/sys"));
+        assert!(!env(&config).contains(&"HSA_OVERRIDE_GFX_VERSION=10.3.0"));
+        assert!(env(&config).contains(&"N_GPU_LAYERS=-1"));
+        assert!(env(&config).contains(&"AILERON_DEVICE=cuda"));
+    }
+
+    #[test]
+    fn oci_config_exposes_vulkan_device_for_vulkan_tag() {
+        let config = runtime_config_json(
+            "localhost/aileron/summarize:vulkan",
+            Path::new("/store/rootfs/runtime"),
+            Path::new("/models/foo"),
+            &HashMap::new(),
+            "8g",
+        )
+        .expect("build OCI config");
+
+        assert!(device_mounts(&config).contains(&"/dev/dri"));
+        assert!(!device_mounts(&config).contains(&"/dev/kfd"));
+        assert!(mount_destinations(&config).contains(&"/sys"));
+        assert!(!env(&config).contains(&"HSA_OVERRIDE_GFX_VERSION=10.3.0"));
+        assert!(env(&config).contains(&"N_GPU_LAYERS=-1"));
+        assert!(env(&config).contains(&"AILERON_DEVICE=vulkan"));
+    }
+
+    #[test]
+    fn oci_config_does_not_expose_gpu_devices_for_cpu_tag() {
+        let config = runtime_config_json(
+            "localhost/aileron/summarize:cpu",
+            Path::new("/store/rootfs/runtime"),
+            Path::new("/models/foo"),
+            &HashMap::new(),
+            "8g",
+        )
+        .expect("build OCI config");
+
+        assert!(!device_mounts(&config).contains(&"/dev/kfd"));
+        assert!(!device_mounts(&config).contains(&"/dev/dri"));
+        assert!(!mount_destinations(&config).contains(&"/sys"));
+        assert!(!env(&config).contains(&"N_GPU_LAYERS=-1"));
         assert!(
-            !args
+            !env(&config)
                 .iter()
-                .any(|arg| arg.starts_with("--env=AILERON_DEVICE="))
+                .any(|entry| entry.starts_with("AILERON_DEVICE="))
         );
     }
 
     #[test]
-    fn podman_args_include_runtime_options_as_env() {
+    fn all_declared_runtime_refs_get_expected_accelerator_mounts() {
+        let refs = [
+            "ghcr.io/razzeee/aileron-runtime-asr-whisper-cpp:cpu",
+            "ghcr.io/razzeee/aileron-runtime-asr-whisper-cpp:cuda",
+            "ghcr.io/razzeee/aileron-runtime-asr-whisper-cpp:vulkan",
+            "ghcr.io/razzeee/aileron-runtime-llm-llama-cpp:cpu",
+            "ghcr.io/razzeee/aileron-runtime-llm-llama-cpp:cuda",
+            "ghcr.io/razzeee/aileron-runtime-llm-llama-cpp:rocm",
+            "ghcr.io/razzeee/aileron-runtime-llm-llama-cpp:vulkan",
+            "ghcr.io/razzeee/aileron-runtime-vision-llama-cpp-gemma4:cpu",
+            "ghcr.io/razzeee/aileron-runtime-vision-llama-cpp-gemma4:cuda",
+            "ghcr.io/razzeee/aileron-runtime-vision-llama-cpp-gemma4:rocm",
+            "ghcr.io/razzeee/aileron-runtime-vision-llama-cpp-gemma4:vulkan",
+        ];
+
+        for image_ref in refs {
+            let config = runtime_config_json(
+                image_ref,
+                Path::new("/store/rootfs/runtime"),
+                Path::new("/models/foo"),
+                &HashMap::new(),
+                "8g",
+            )
+            .unwrap_or_else(|error| panic!("build OCI config for {image_ref}: {error}"));
+
+            assert!(
+                mount_destinations(&config).contains(&"/dev/shm"),
+                "{image_ref} should mount /dev/shm"
+            );
+            if image_ref_uses_tag(image_ref, "cpu") {
+                assert_cpu_runtime_mounts(image_ref, &config);
+            } else if image_ref_uses_tag(image_ref, "cuda") {
+                assert_accelerator_common_mounts(image_ref, &config);
+                assert!(env(&config).contains(&"AILERON_DEVICE=cuda"));
+                assert_optional_device_mounts_have_no_nodev(&config, "/dev/nvidia");
+            } else if image_ref_uses_tag(image_ref, "rocm") {
+                assert_accelerator_common_mounts(image_ref, &config);
+                assert!(env(&config).contains(&"AILERON_DEVICE=rocm"));
+                assert_device_mount_has_no_nodev(&config, "/dev/kfd");
+                assert_device_mount_has_no_nodev(&config, "/dev/dri");
+            } else if image_ref_uses_tag(image_ref, "vulkan") {
+                assert_accelerator_common_mounts(image_ref, &config);
+                assert!(env(&config).contains(&"AILERON_DEVICE=vulkan"));
+                assert_device_mount_has_no_nodev(&config, "/dev/dri");
+            } else {
+                panic!("unhandled runtime variant in {image_ref}");
+            }
+        }
+    }
+
+    #[test]
+    fn oci_config_includes_runtime_options_as_env() {
         let mut runtime_options = HashMap::new();
         runtime_options.insert("VISION_HANDLER".to_string(), "gemma4".to_string());
 
-        let args = podman_run_args(
+        let config = runtime_config_json(
             "localhost/aileron/vision:cpu",
+            Path::new("/store/rootfs/runtime"),
             Path::new("/models/foo"),
             &runtime_options,
             "8g",
-        );
+        )
+        .expect("build OCI config");
 
-        assert!(args.contains(&"--env=VISION_HANDLER=gemma4".to_string()));
-        assert_eq!(
-            args.last().map(String::as_str),
-            Some("localhost/aileron/vision:cpu")
-        );
+        assert!(env(&config).contains(&"VISION_HANDLER=gemma4"));
     }
 
     #[test]
@@ -979,32 +1289,152 @@ mod tests {
         runtime_options.insert("N_GPU_LAYERS".to_string(), "16".to_string());
         runtime_options.insert("AILERON_DEVICE".to_string(), "cpu".to_string());
 
-        let args = podman_run_args(
+        let config = runtime_config_json(
             "localhost/aileron/llm:cuda",
+            Path::new("/store/rootfs/runtime"),
             Path::new("/models/foo"),
             &runtime_options,
             "8g",
+        )
+        .expect("build OCI config");
+
+        let values = env(&config);
+        let n_gpu_layers: Vec<_> = values
+            .iter()
+            .copied()
+            .filter(|arg| arg.starts_with("N_GPU_LAYERS="))
+            .collect();
+        let devices: Vec<_> = values
+            .iter()
+            .copied()
+            .filter(|arg| arg.starts_with("AILERON_DEVICE="))
+            .collect();
+
+        assert_eq!(n_gpu_layers, ["N_GPU_LAYERS=-1", "N_GPU_LAYERS=16"]);
+        assert_eq!(devices, ["AILERON_DEVICE=cuda", "AILERON_DEVICE=cpu"]);
+    }
+
+    #[test]
+    fn existing_device_mounts_only_include_present_paths() {
+        let root = std::env::temp_dir().join(format!("aileron-device-test-{}", Uuid::new_v4()));
+        let present = root.join("present");
+        let missing = root.join("missing");
+        std::fs::create_dir_all(&root).expect("create temp dir");
+        std::fs::write(&present, "device placeholder").expect("write present path");
+
+        let mut mounts = Vec::new();
+        add_existing_device_mounts(
+            &mut mounts,
+            [present.to_str().unwrap(), missing.to_str().unwrap()],
         );
 
-        let n_gpu_layers: Vec<_> = args
+        let destinations = mounts
             .iter()
-            .filter(|arg| arg.starts_with("--env=N_GPU_LAYERS="))
-            .map(String::as_str)
-            .collect();
-        let devices: Vec<_> = args
-            .iter()
-            .filter(|arg| arg.starts_with("--env=AILERON_DEVICE="))
-            .map(String::as_str)
-            .collect();
+            .filter_map(|mount| mount["destination"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(destinations, vec![present.to_str().unwrap()]);
 
-        assert_eq!(
-            n_gpu_layers,
-            ["--env=N_GPU_LAYERS=-1", "--env=N_GPU_LAYERS=16"]
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn env(config: &Value) -> Vec<&str> {
+        config["process"]["env"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect()
+    }
+
+    fn mounts(config: &Value) -> Vec<&Value> {
+        config["mounts"].as_array().unwrap().iter().collect()
+    }
+
+    fn device_mounts(config: &Value) -> Vec<&str> {
+        mounts(config)
+            .into_iter()
+            .filter(|mount| {
+                mount["destination"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .starts_with("/dev/")
+            })
+            .filter_map(|mount| mount["destination"].as_str())
+            .collect()
+    }
+
+    fn mount_destinations(config: &Value) -> Vec<&str> {
+        mounts(config)
+            .into_iter()
+            .filter_map(|mount| mount["destination"].as_str())
+            .collect()
+    }
+
+    fn assert_device_mount_has_no_nodev(config: &Value, path: &str) {
+        assert!(mounts(config).iter().any(|mount| {
+            mount["destination"] == path && !array_contains(&mount["options"], "nodev")
+        }));
+    }
+
+    fn assert_optional_device_mounts_have_no_nodev(config: &Value, prefix: &str) {
+        for mount in mounts(config) {
+            if mount["destination"]
+                .as_str()
+                .map(|destination| destination.starts_with(prefix))
+                .unwrap_or(false)
+            {
+                assert!(!array_contains(&mount["options"], "nodev"));
+            }
+        }
+    }
+
+    fn assert_accelerator_common_mounts(image_ref: &str, config: &Value) {
+        assert!(
+            mount_destinations(config).contains(&"/sys"),
+            "{image_ref} should mount /sys"
         );
-        assert_eq!(
-            devices,
-            ["--env=AILERON_DEVICE=cuda", "--env=AILERON_DEVICE=cpu"]
+        assert!(
+            mount_destinations(config).contains(&"/dev/shm"),
+            "{image_ref} should mount /dev/shm"
         );
+        assert!(
+            env(config).contains(&"N_GPU_LAYERS=-1"),
+            "{image_ref} should enable GPU offload"
+        );
+    }
+
+    fn assert_cpu_runtime_mounts(image_ref: &str, config: &Value) {
+        assert!(
+            !mount_destinations(config).contains(&"/sys"),
+            "{image_ref} should not mount accelerator topology"
+        );
+        assert!(
+            !env(config)
+                .iter()
+                .any(|entry| entry.starts_with("AILERON_DEVICE=")),
+            "{image_ref} should not set accelerator device env"
+        );
+        assert!(
+            !env(config).contains(&"N_GPU_LAYERS=-1"),
+            "{image_ref} should not enable GPU offload"
+        );
+    }
+
+    fn namespaces(config: &Value) -> Vec<&str> {
+        config["linux"]["namespaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|namespace| namespace["type"].as_str())
+            .collect()
+    }
+
+    fn array_contains(value: &Value, expected: &str) -> bool {
+        value
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value.as_str() == Some(expected))
     }
 
     #[test]
@@ -1061,17 +1491,26 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires a prebuilt stub runtime image and podman"]
+    #[ignore = "requires a prebuilt stub runtime rootfs and crun"]
     fn stub_runtime_roundtrip_through_container_wrapper() {
         let image_ref = std::env::var("AILERON_STUB_IMAGE")
             .unwrap_or_else(|_| "localhost/aileron/stub:ci".to_string());
+        let oci_store = std::env::var("AILERON_OCI_STORE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| default_oci_store());
         let artifact_path =
             std::env::temp_dir().join(format!("aileron-stub-artifacts-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&artifact_path).expect("create temporary artifact directory");
 
-        let mut container =
-            Container::spawn(&image_ref, &artifact_path, &HashMap::new(), "512m", |_| {})
-                .expect("spawn stub runtime");
+        let mut container = Container::spawn(
+            &image_ref,
+            &artifact_path,
+            &HashMap::new(),
+            "512m",
+            &oci_store,
+            |_| {},
+        )
+        .expect("spawn stub runtime");
 
         let mut generated = String::new();
         container
