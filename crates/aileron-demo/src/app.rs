@@ -382,36 +382,61 @@ fn build_window(app: &Application) {
 
     let sidebar = ViewSwitcherSidebar::builder().stack(&stack).build();
 
-    let content = OverlaySplitView::new();
-    content.set_sidebar(Some(&sidebar));
-    content.set_content(Some(&stack));
-    content.set_min_sidebar_width(150.0);
-    content.set_max_sidebar_width(180.0);
-    content.set_show_sidebar(true);
+    let split_view = OverlaySplitView::new();
+    split_view.set_min_sidebar_width(150.0);
+    split_view.set_max_sidebar_width(180.0);
+    split_view.set_show_sidebar(true);
 
-    let header = HeaderBar::new();
-    let sidebar_toggle = Button::builder()
+    let sidebar_header = HeaderBar::new();
+    let hide_sidebar_button = Button::builder()
         .icon_name("sidebar-show-symbolic")
         .tooltip_text("Toggle Sidebar")
         .build();
     {
-        let content = content.clone();
-        sidebar_toggle.connect_clicked(move |_| {
-            content.set_show_sidebar(!content.shows_sidebar());
+        let split_view = split_view.clone();
+        hide_sidebar_button.connect_clicked(move |_| {
+            split_view.set_show_sidebar(false);
         });
     }
-    header.pack_start(&sidebar_toggle);
-    header.set_title_widget(Some(&Label::new(Some("Aileron Demo"))));
-    let toolbar_view = ToolbarView::new();
-    toolbar_view.add_top_bar(&header);
-    toolbar_view.set_content(Some(&content));
+    sidebar_header.pack_start(&hide_sidebar_button);
+    sidebar_header.set_title_widget(Some(&Label::new(None)));
+    let sidebar_view = ToolbarView::new();
+    sidebar_view.add_top_bar(&sidebar_header);
+    sidebar_view.set_content(Some(&sidebar));
+
+    let content_header = HeaderBar::new();
+    let show_sidebar_button = Button::builder()
+        .icon_name("sidebar-show-symbolic")
+        .tooltip_text("Toggle Sidebar")
+        .build();
+    {
+        let split_view = split_view.clone();
+        show_sidebar_button.connect_clicked(move |_| {
+            split_view.set_show_sidebar(true);
+        });
+    }
+    content_header.pack_start(&show_sidebar_button);
+    content_header.set_title_widget(Some(&Label::new(Some("Aileron Demo"))));
+    let content_view = ToolbarView::new();
+    content_view.add_top_bar(&content_header);
+    content_view.set_content(Some(&stack));
+
+    split_view.set_sidebar(Some(&sidebar_view));
+    split_view.set_content(Some(&content_view));
+    {
+        let show_sidebar_button = show_sidebar_button.clone();
+        split_view.connect_show_sidebar_notify(move |split_view| {
+            show_sidebar_button.set_visible(!split_view.shows_sidebar());
+        });
+    }
+    show_sidebar_button.set_visible(false);
 
     let window = ApplicationWindow::builder()
         .application(app)
         .title("Aileron Demo")
         .default_width(860)
         .default_height(700)
-        .content(&toolbar_view)
+        .content(&split_view)
         .build();
 
     window.present();

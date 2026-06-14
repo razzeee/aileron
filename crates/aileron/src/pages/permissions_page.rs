@@ -1,7 +1,7 @@
 /// Permissions page — per-app, per-use-case toggles with last-used timestamps.
 use chrono::{DateTime, Local, TimeZone};
 use gtk4::prelude::*;
-use gtk4::{Button, ListBox, ScrolledWindow};
+use gtk4::{ListBox, ScrolledWindow};
 use libadwaita::prelude::*;
 use libadwaita::{ActionRow, PreferencesGroup, PreferencesPage, SwitchRow};
 
@@ -10,9 +10,6 @@ pub fn build() -> gtk4::Widget {
 
     let group = PreferencesGroup::new();
     group.set_title("App Permissions");
-
-    let refresh_button = Button::with_label("Refresh");
-    group.set_header_suffix(Some(&refresh_button));
 
     let list_box = ListBox::new();
     list_box.set_selection_mode(gtk4::SelectionMode::None);
@@ -26,10 +23,6 @@ pub fn build() -> gtk4::Widget {
         .build();
     group.add(&scroll);
 
-    {
-        let list_box = list_box.clone();
-        refresh_button.connect_clicked(move |_| refresh_permissions(&list_box));
-    }
     refresh_permissions(&list_box);
 
     page.add(&group);
