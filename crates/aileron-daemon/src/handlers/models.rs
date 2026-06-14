@@ -1205,12 +1205,12 @@ async fn finish_runtime_download(state: &SharedState, image_ref: &str, error: Op
     let Some(mut download) = guard.runtime_downloads.remove(&key) else {
         return;
     };
-    download.status = error
-        .map(|error| format!("Failed: {error}"))
-        .unwrap_or_else(|| "Completed".to_string());
-    guard.recent_runtime_downloads.push_front((key, download));
-    while guard.recent_runtime_downloads.len() > 10 {
-        guard.recent_runtime_downloads.pop_back();
+    if let Some(error) = error {
+        download.status = format!("Failed: {error}");
+        guard.recent_runtime_downloads.push_front((key, download));
+        while guard.recent_runtime_downloads.len() > 10 {
+            guard.recent_runtime_downloads.pop_back();
+        }
     }
 }
 

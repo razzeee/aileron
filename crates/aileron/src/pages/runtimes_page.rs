@@ -1,4 +1,7 @@
 /// OCI runtimes page — list and clean up Aileron-owned Podman runtime images.
+use std::collections::HashMap;
+
+use aileron_varlink::aileron_Models::{InstallStatus, OciRuntimeImage};
 use gtk4::prelude::*;
 use gtk4::{Button, ListBox, ScrolledWindow};
 use libadwaita::prelude::*;
@@ -69,41 +72,58 @@ fn refresh_runtime_images(list_box: &ListBox) {
 
     let list_box = list_box.clone();
     glib::spawn_future_local(async move {
-        let images = gio::spawn_blocking(move || {
+        let result = gio::spawn_blocking(move || {
             use aileron_varlink::aileron_Models::VarlinkClientInterface;
 
             aileron_ipc::client::connect()
                 .map_err(|e| e.to_string())
                 .and_then(|conn| {
                     let mut client = aileron_varlink::aileron_Models::VarlinkClient::new(conn);
-                    client
+                    let images = client
                         .list_runtime_images()
                         .call()
                         .map(|reply| reply.images)
-                        .map_err(|e| e.to_string())
+                        .map_err(|e| e.to_string())?;
+                    let installs = client
+                        .list_installs()
+                        .call()
+                        .map(|reply| reply.installs)
+                        .map_err(|e| e.to_string())?;
+                    Ok((images, installs))
                 })
         })
         .await
         .map_err(|_| "Runtime image list task failed".to_string())
         .and_then(|result| result);
 
-        render_runtime_images(&list_box, images);
+        render_runtime_images(&list_box, result);
     });
 }
 
 fn render_runtime_images(
     list_box: &ListBox,
-    images: Result<Vec<aileron_varlink::aileron_Models::OciRuntimeImage>, String>,
+    result: Result<(Vec<OciRuntimeImage>, Vec<InstallStatus>), String>,
 ) {
     clear_list(list_box);
-    match images {
-        Ok(images) => {
+    match result {
+        Ok((images, installs)) => {
             if images.is_empty() {
                 append_empty_state(list_box);
                 return;
             }
+            let active_runtime_downloads = installs
+                .into_iter()
+                .filter(|install| is_active_runtime_download(install))
+                .map(|install| {
+                    (
+                        runtime_download_image_ref(&install.profile_id).to_string(),
+                        install,
+                    )
+                })
+                .collect::<HashMap<_, _>>();
             for image in images {
-                append_runtime_image_row(list_box, image);
+                let active_download = active_runtime_downloads.get(&image.image_ref);
+                append_runtime_image_row(list_box, image, active_download);
             }
         }
         Err(e) => append_message(list_box, &format!("Error: {e}")),
@@ -112,7 +132,8 @@ fn render_runtime_images(
 
 fn append_runtime_image_row(
     list_box: &ListBox,
-    image: aileron_varlink::aileron_Models::OciRuntimeImage,
+    image: OciRuntimeImage,
+    active_download: Option<&InstallStatus>,
 ) {
     let row = ActionRow::new();
     let variant = if image.variant.is_empty() {
@@ -127,7 +148,9 @@ fn append_runtime_image_row(
     } else {
         "unused".to_string()
     };
-    let update_status = if image.update_status.is_empty() {
+    let update_status = if let Some(download) = active_download {
+        format!("updating: {}", download.status)
+    } else if image.update_status.is_empty() {
         "unknown update status".to_string()
     } else {
         image.update_status.clone()
@@ -138,9 +161,14 @@ fn append_runtime_image_row(
         format_bytes(image.size_bytes),
     ));
 
-    if image.update_available {
-        let update_button = Button::with_label("Update");
+    if image.update_available || active_download.is_some() {
+        let update_button = Button::with_label(if active_download.is_some() {
+            "Updating..."
+        } else {
+            "Update"
+        });
         update_button.add_css_class("suggested-action");
+        update_button.set_sensitive(active_download.is_none());
         let list_box = list_box.clone();
         let image_ref = image.image_ref.clone();
         update_button.connect_clicked(move |button| {
@@ -154,6 +182,7 @@ fn append_runtime_image_row(
     if !image.in_use {
         let remove_button = Button::with_label("Remove");
         remove_button.add_css_class("destructive-action");
+        remove_button.set_sensitive(active_download.is_none());
         let list_box = list_box.clone();
         let image_id = image.image_id.clone();
         remove_button.connect_clicked(move |_| {
@@ -163,6 +192,18 @@ fn append_runtime_image_row(
     }
 
     list_box.append(&row);
+}
+
+fn is_active_runtime_download(install: &InstallStatus) -> bool {
+    install.profile_id.starts_with("runtime:") && !install_is_terminal(install)
+}
+
+fn install_is_terminal(install: &InstallStatus) -> bool {
+    install.status.starts_with("Failed:") || install.status == "Completed"
+}
+
+fn runtime_download_image_ref(profile_id: &str) -> &str {
+    profile_id.strip_prefix("runtime:").unwrap_or(profile_id)
 }
 
 fn update_runtime_image(list_box: &ListBox, image_ref: &str) {

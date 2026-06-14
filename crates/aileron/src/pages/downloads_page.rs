@@ -3,7 +3,7 @@ use std::rc::Rc;
 
 use aileron_varlink::aileron_Models::InstallStatus;
 use gtk4::prelude::*;
-use gtk4::{Box, Button, Label, ListBox, Orientation, ProgressBar, ScrolledWindow};
+use gtk4::{Box, Button, Label, ListBox, Orientation, ProgressBar, ScrolledWindow, Spinner};
 use libadwaita::prelude::*;
 use libadwaita::{ActionRow, AlertDialog, PreferencesGroup, PreferencesPage};
 
@@ -100,6 +100,11 @@ fn refresh_downloads_list(list: &ListBox) {
         }
     };
 
+    let installs = installs
+        .into_iter()
+        .filter(|install| install.status != "Completed")
+        .collect::<Vec<_>>();
+
     if installs.is_empty() {
         let row = ActionRow::new();
         row.set_title("No active downloads");
@@ -140,19 +145,23 @@ fn download_row(install: &InstallStatus, window: Option<gtk4::Window>) -> Box {
     subtitle.set_xalign(0.0);
     subtitle.add_css_class("dim-label");
 
-    let progress = ProgressBar::new();
+    details.append(&title);
+    details.append(&subtitle);
     if install.total_bytes > 0 {
+        let progress = ProgressBar::new();
         progress.set_fraction(
             (install.bytes_pulled as f64 / install.total_bytes as f64).clamp(0.0, 1.0),
         );
-    } else {
-        progress.pulse();
+        details.append(&progress);
     }
-
-    details.append(&title);
-    details.append(&subtitle);
-    details.append(&progress);
     row.append(&details);
+
+    if install.total_bytes <= 0 && !install_is_terminal(install) {
+        let spinner = Spinner::new();
+        spinner.set_valign(gtk4::Align::Center);
+        spinner.start();
+        row.append(&spinner);
+    }
 
     if install_is_terminal(install) || is_runtime_download(&install.profile_id) {
         return row;
