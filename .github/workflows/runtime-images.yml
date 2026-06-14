@@ -10,6 +10,7 @@ on:
       - "runtimes/llm-llama-cpp/**"
       - "runtimes/vision-llama-cpp-gemma4/**"
       - "runtimes/asr-whisper-cpp/**"
+      - "runtimes/stub/**"
   workflow_dispatch:
 
 permissions:
@@ -60,7 +61,7 @@ jobs:
             image_name: aileron-runtime-llm-llama-cpp
             variant: vulkan
             build_args: |
-              APT_PACKAGES=build-essential cmake git ninja-build libvulkan-dev vulkan-tools libvulkan1 mesa-vulkan-drivers
+              APT_PACKAGES=build-essential cmake git ninja-build libvulkan-dev glslc vulkan-tools libvulkan1 mesa-vulkan-drivers
               CMAKE_ARGS=-DGGML_VULKAN=on
               RUNTIME_ID=llm-llama-cpp
               ENTRYPOINT_PATH=runtimes/llm-llama-cpp/entrypoint.py
@@ -98,7 +99,7 @@ jobs:
             image_name: aileron-runtime-vision-llama-cpp-gemma4
             variant: vulkan
             build_args: |
-              APT_PACKAGES=build-essential cmake git ninja-build libvulkan-dev vulkan-tools libvulkan1 mesa-vulkan-drivers
+              APT_PACKAGES=build-essential cmake git ninja-build libvulkan-dev glslc vulkan-tools libvulkan1 mesa-vulkan-drivers
               CMAKE_ARGS=-DGGML_VULKAN=on
               RUNTIME_ID=vision-llama-cpp-gemma4
               ENTRYPOINT_PATH=runtimes/vision-llama-cpp-gemma4/entrypoint.py
@@ -160,6 +161,11 @@ jobs:
             variant: vulkan
             context: runtimes/asr-whisper-cpp
             file: runtimes/asr-whisper-cpp/Dockerfile.vulkan
+          - runtime_id: stub
+            image_name: aileron-runtime-stub
+            variant: cpu
+            context: runtimes/stub
+            file: runtimes/stub/Dockerfile
     steps:
       - uses: actions/checkout@v4
 
