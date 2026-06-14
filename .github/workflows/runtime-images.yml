@@ -48,7 +48,7 @@ jobs:
             image_name: aileron-runtime-llm-llama-cpp
             variant: rocm
             build_args: |
-              BASE_IMAGE=rocm/dev-ubuntu-22.04:7.2.4-complete
+              BASE_IMAGE=rocm/dev-ubuntu-22.04:7.2.4
               APT_PACKAGES=python3 python3-pip python3-dev build-essential cmake git ninja-build
               CMAKE_ARGS=-DGGML_HIP=on -DAMDGPU_TARGETS=gfx1030
               FORCE_CMAKE=1
@@ -89,9 +89,12 @@ jobs:
             image_name: aileron-runtime-vision-llama-cpp-gemma4
             variant: rocm
             build_args: |
-              BASE_IMAGE=rocm/dev-ubuntu-22.04:7.2.4-complete
+              BASE_IMAGE=rocm/dev-ubuntu-22.04:7.2.4
               APT_PACKAGES=python3 python3-pip python3-dev build-essential cmake git ninja-build
-              CMAKE_ARGS=-DGGML_HIP=on
+              CMAKE_ARGS=-DGGML_HIP=on -DAMDGPU_TARGETS=gfx1030
+              FORCE_CMAKE=1
+              HSA_OVERRIDE_GFX_VERSION=10.3.0
+              PIP_INSTALL_ARGS=--no-binary llama-cpp-python
               RUNTIME_ID=vision-llama-cpp-gemma4
               ENTRYPOINT_PATH=runtimes/vision-llama-cpp-gemma4/entrypoint.py
               INSTALL_SOURCE=git
