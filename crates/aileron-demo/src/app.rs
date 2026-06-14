@@ -1,8 +1,8 @@
 /// aileron-demo — sandboxed GTK4 article summarizer.
 use gtk4::prelude::*;
 use gtk4::{
-    Align, Box, Button, CheckButton, Entry, FileDialog, Label, Orientation, ScrolledWindow,
-    Spinner, TextBuffer, TextView,
+    Align, Box, Button, CheckButton, CssProvider, Entry, FileDialog, Label, Orientation,
+    ScrolledWindow, Spinner, TextBuffer, TextView,
 };
 use libadwaita::{
     Application, ApplicationWindow, HeaderBar, OverlaySplitView, ToolbarView, ViewStack,
@@ -450,6 +450,8 @@ struct ChatMessage {
 }
 
 fn build_chat_page() -> (gtk4::Widget, Entry) {
+    install_chat_css();
+
     let vbox = Box::new(Orientation::Vertical, 12);
     vbox.set_margin_top(12);
     vbox.set_margin_bottom(12);
@@ -494,21 +496,23 @@ fn build_chat_page() -> (gtk4::Widget, Entry) {
     status_row.append(&status_text);
     vbox.append(&status_row);
 
-    let chat_buffer = TextBuffer::new(None);
-    let chat_view = TextView::builder()
-        .buffer(&chat_buffer)
-        .editable(false)
-        .wrap_mode(gtk4::WrapMode::WordChar)
+    let chat_box = Box::new(Orientation::Vertical, 10);
+    chat_box.set_margin_top(12);
+    chat_box.set_margin_bottom(12);
+    chat_box.set_margin_start(24);
+    chat_box.set_margin_end(24);
+    chat_box.set_valign(Align::Start);
+    chat_box.set_vexpand(true);
+
+    render_chat(&chat_box, &[], None);
+
+    let chat_scroller = ScrolledWindow::builder()
+        .child(&chat_box)
+        .min_content_height(360)
         .hexpand(true)
         .vexpand(true)
         .build();
-    vbox.append(
-        &ScrolledWindow::builder()
-            .child(&chat_view)
-            .min_content_height(360)
-            .vexpand(true)
-            .build(),
-    );
+    vbox.append(&chat_scroller);
 
     let input_row = Box::new(Orientation::Horizontal, 8);
     let input_entry = Entry::builder()
@@ -535,7 +539,7 @@ fn build_chat_page() -> (gtk4::Widget, Entry) {
         let send_button_for_click = send_button.clone();
         let send_button = send_button.clone();
         let clear_button = clear_button.clone();
-        let chat_buffer = chat_buffer.clone();
+        let chat_box = chat_box.clone();
         let status_spinner = status_spinner.clone();
         let status_title = status_title.clone();
         let status_detail = status_detail.clone();
@@ -556,7 +560,7 @@ fn build_chat_page() -> (gtk4::Widget, Entry) {
                 role: "user".to_string(),
                 content: text,
             });
-            render_chat(&chat_buffer, &history.borrow(), None);
+            render_chat(&chat_box, &history.borrow(), None);
 
             let messages = history.borrow().clone();
             let existing_session = session_id.borrow().clone();
@@ -564,7 +568,7 @@ fn build_chat_page() -> (gtk4::Widget, Entry) {
 
             let history_for_rx = history.clone();
             let session_for_rx = session_id.clone();
-            let chat_buffer_for_rx = chat_buffer.clone();
+            let chat_box_for_rx = chat_box.clone();
             let send_button_for_rx = send_button.clone();
             let clear_button_for_rx = clear_button.clone();
             let status_spinner_for_rx = status_spinner.clone();
@@ -584,7 +588,7 @@ fn build_chat_page() -> (gtk4::Widget, Entry) {
                             status_title_for_rx.set_text("Streaming response");
                             status_detail_for_rx.set_text("Appending chat tokens as they arrive.");
                             render_chat(
-                                &chat_buffer_for_rx,
+                                &chat_box_for_rx,
                                 &history_for_rx.borrow(),
                                 Some(&assistant_text),
                             );
@@ -604,7 +608,7 @@ fn build_chat_page() -> (gtk4::Widget, Entry) {
                                     content: assistant_text.clone(),
                                 });
                             }
-                            render_chat(&chat_buffer_for_rx, &history_for_rx.borrow(), None);
+                            render_chat(&chat_box_for_rx, &history_for_rx.borrow(), None);
                             status_spinner_for_rx.stop();
                             status_title_for_rx.set_text("Response complete");
                             status_detail_for_rx
@@ -650,7 +654,7 @@ fn build_chat_page() -> (gtk4::Widget, Entry) {
     {
         let history = history.clone();
         let session_id = session_id.clone();
-        let chat_buffer = chat_buffer.clone();
+        let chat_box = chat_box.clone();
         let status_spinner = status_spinner.clone();
         let status_title = status_title.clone();
         let status_detail = status_detail.clone();
@@ -661,7 +665,7 @@ fn build_chat_page() -> (gtk4::Widget, Entry) {
                 });
             }
             history.borrow_mut().clear();
-            render_chat(&chat_buffer, &history.borrow(), None);
+            render_chat(&chat_box, &history.borrow(), None);
             status_spinner.stop();
             status_title.set_text("Ready");
             status_detail
@@ -672,27 +676,97 @@ fn build_chat_page() -> (gtk4::Widget, Entry) {
     (vbox.upcast(), input_entry)
 }
 
-fn render_chat(buffer: &TextBuffer, history: &[ChatMessage], pending_assistant: Option<&str>) {
-    let mut text = String::new();
+fn install_chat_css() {
+    let Some(display) = gtk4::gdk::Display::default() else {
+        return;
+    };
+
+    let provider = CssProvider::new();
+    provider.load_from_string(
+        r#"
+        .chat-empty-state {
+            color: alpha(currentColor, 0.65);
+        }
+
+        .chat-bubble {
+            border-radius: 18px;
+            padding: 10px 13px;
+        }
+
+        .chat-bubble-user {
+            background: @accent_bg_color;
+            color: @accent_fg_color;
+            border-bottom-right-radius: 4px;
+        }
+
+        .chat-bubble-assistant {
+            background: @card_bg_color;
+            color: @window_fg_color;
+            border: 1px solid @borders;
+            border-bottom-left-radius: 4px;
+        }
+        "#,
+    );
+    gtk4::style_context_add_provider_for_display(
+        &display,
+        &provider,
+        gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+    );
+}
+
+fn render_chat(chat_box: &Box, history: &[ChatMessage], pending_assistant: Option<&str>) {
+    while let Some(child) = chat_box.first_child() {
+        chat_box.remove(&child);
+    }
+
     if history.is_empty() && pending_assistant.is_none() {
-        text.push_str("No messages yet.\n");
+        let empty_state = Label::builder()
+            .label("No messages yet.")
+            .halign(Align::Center)
+            .valign(Align::Center)
+            .vexpand(true)
+            .css_classes(vec!["chat-empty-state"])
+            .build();
+        chat_box.append(&empty_state);
+        return;
     }
+
     for message in history {
-        let label = if message.role == "assistant" {
-            "Assistant"
-        } else {
-            "User"
-        };
-        text.push_str(label);
-        text.push_str(":\n");
-        text.push_str(&message.content);
-        text.push_str("\n\n");
+        append_chat_bubble(chat_box, &message.role, &message.content);
     }
+
     if let Some(content) = pending_assistant {
-        text.push_str("Assistant:\n");
-        text.push_str(content);
+        append_chat_bubble(chat_box, "assistant", content);
     }
-    buffer.set_text(&text);
+}
+
+fn append_chat_bubble(chat_box: &Box, role: &str, content: &str) {
+    let is_assistant = role == "assistant";
+    let row = Box::new(Orientation::Horizontal, 0);
+    row.set_hexpand(true);
+    row.set_halign(if is_assistant { Align::Start } else { Align::End });
+    row.set_margin_top(2);
+    row.set_margin_bottom(2);
+
+    let bubble = Box::new(Orientation::Vertical, 0);
+    bubble.add_css_class("chat-bubble");
+    bubble.add_css_class(if is_assistant {
+        "chat-bubble-assistant"
+    } else {
+        "chat-bubble-user"
+    });
+
+    let label = Label::builder()
+        .label(content)
+        .wrap(true)
+        .wrap_mode(gtk4::pango::WrapMode::WordChar)
+        .selectable(true)
+        .xalign(0.0)
+        .max_width_chars(72)
+        .build();
+    bubble.append(&label);
+    row.append(&bubble);
+    chat_box.append(&row);
 }
 
 struct Recording {
