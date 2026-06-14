@@ -35,11 +35,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends ${APT_PACKAGES}
     fi
 
 RUN if [ "$INSTALL_SOURCE" = "git" ]; then \
-        python -m pip install --prefix=/runtime --no-cache-dir ${PIP_INSTALL_ARGS} \
+        python -m pip install --root=/runtime --no-cache-dir ${PIP_INSTALL_ARGS} \
             "git+https://github.com/abetlen/llama-cpp-python.git@${LLAMA_CPP_PYTHON_REF}" \
             ${EXTRA_PIP_PACKAGES}; \
     else \
-        python -m pip install --prefix=/runtime --no-cache-dir ${PIP_INSTALL_ARGS} \
+        python -m pip install --root=/runtime --no-cache-dir ${PIP_INSTALL_ARGS} \
             "llama-cpp-python>=0.2.90" \
             ${EXTRA_PIP_PACKAGES}; \
     fi
@@ -62,7 +62,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ${RUNTIME_APT_P
     && rm -rf /var/lib/apt/lists/* \
     && (command -v python >/dev/null || ln -sf python3 /usr/bin/python)
 
-COPY --from=builder /runtime /usr/local
+COPY --from=builder /runtime/usr /usr
 
 COPY runtimes/_llama_cpp_common/aileron_runtime_common.py /aileron_runtime_common.py
 COPY ${ENTRYPOINT_PATH} /entrypoint.py

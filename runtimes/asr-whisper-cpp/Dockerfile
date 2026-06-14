@@ -8,7 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential cmake \
     && rm -rf /var/lib/apt/lists/*
 
-RUN python -m pip install --prefix=/runtime --no-cache-dir "pywhispercpp>=1.2.0"
+RUN python -m pip install --root=/runtime --no-cache-dir "pywhispercpp>=1.2.0"
 
 FROM ${PYTHON_IMAGE}
 
@@ -16,7 +16,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /runtime /usr/local
+COPY --from=builder /runtime/usr /usr
 
 COPY entrypoint.py /entrypoint.py
 
