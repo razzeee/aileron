@@ -27,3 +27,11 @@ reqwest         = { workspace = true }
 sha2            = { workspace = true }
 tar             = { workspace = true }
 ocirender       = { workspace = true }
+
+[dev-dependencies]
+criterion = "0.7"
+tempfile = "3"
+
+[[bench]]
+name = "daemon_bookkeeping"
+harness = false

@@ -1064,3 +1064,96 @@ fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
     }
     Ok(out)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn generation_options() -> GenerationOptions {
+        GenerationOptions {
+            maximum_response_tokens: 128,
+            temperature: 0.7,
+            sampling_mode: "default".to_string(),
+            source_language_hint: String::new(),
+            target_language_hint: String::new(),
+        }
+    }
+
+    #[test]
+    fn validate_options_accepts_normal_generation_options() {
+        assert_eq!(validate_options(&generation_options()), Ok(128));
+    }
+
+    #[test]
+    fn validate_options_rejects_zero_tokens() {
+        let mut options = generation_options();
+        options.maximum_response_tokens = 0;
+
+        assert_eq!(
+            validate_options(&options),
+            Err("maximum_response_tokens must be greater than zero".to_string())
+        );
+    }
+
+    #[test]
+    fn validate_options_rejects_invalid_temperature() {
+        let mut options = generation_options();
+        options.temperature = f64::NAN;
+
+        assert_eq!(
+            validate_options(&options),
+            Err("temperature must be a finite non-negative number".to_string())
+        );
+    }
+
+    #[test]
+    fn validate_options_rejects_empty_sampling_mode() {
+        let mut options = generation_options();
+        options.sampling_mode = "  ".to_string();
+
+        assert_eq!(
+            validate_options(&options),
+            Err("sampling_mode must not be empty".to_string())
+        );
+    }
+
+    #[test]
+    fn llm_generation_is_limited_to_llm_use_cases() {
+        assert!(ensure_llm_use_case("llm.chat").is_ok());
+        assert_eq!(
+            ensure_llm_use_case("vision.describe"),
+            Err("text generation requires an llm.* use-case, got vision.describe".to_string())
+        );
+    }
+
+    #[test]
+    fn guided_fields_schema_rejects_duplicate_names() {
+        let fields = vec![
+            GuidedField {
+                name: "answer".to_string(),
+                kind: "string".to_string(),
+                description: String::new(),
+                required: true,
+            },
+            GuidedField {
+                name: "answer".to_string(),
+                kind: "string".to_string(),
+                description: String::new(),
+                required: false,
+            },
+        ];
+
+        assert_eq!(
+            guided_fields_schema(&fields),
+            Err("duplicate guided field 'answer'".to_string())
+        );
+    }
+
+    #[test]
+    fn base64_decode_rejects_invalid_input() {
+        assert_eq!(
+            base64_decode("not base64!"),
+            Err("invalid base64 char:  ".to_string())
+        );
+    }
+}

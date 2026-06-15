@@ -961,6 +961,12 @@ pub struct ContainerPool {
     pub oci_store: PathBuf,
 }
 
+impl Default for ContainerPool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ContainerPool {
     pub fn new() -> Self {
         Self {
