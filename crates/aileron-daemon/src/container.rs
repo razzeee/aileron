@@ -100,10 +100,11 @@ impl Container {
         runtime_options: &HashMap<String, String>,
         memory_limit: &str,
         oci_store: &Path,
+        system_oci_store: &Path,
         mut on_status: impl FnMut(String) + Send + 'static,
     ) -> Result<Self> {
         info!("spawning OCI runtime for {}", image_ref);
-        let bundle = OciRuntimeManager::new(oci_store).prepare_bundle(
+        let bundle = OciRuntimeManager::new(oci_store, system_oci_store).prepare_bundle(
             image_ref,
             artifact_path,
             runtime_options,
@@ -503,12 +504,14 @@ struct PreparedBundle {
 
 struct OciRuntimeManager {
     store: PathBuf,
+    system_store: PathBuf,
 }
 
 impl OciRuntimeManager {
-    fn new(store: &Path) -> Self {
+    fn new(store: &Path, system_store: &Path) -> Self {
         Self {
             store: store.to_path_buf(),
+            system_store: system_store.to_path_buf(),
         }
     }
 
@@ -519,13 +522,21 @@ impl OciRuntimeManager {
         runtime_options: &HashMap<String, String>,
         memory_limit: &str,
     ) -> Result<PreparedBundle> {
-        let rootfs = self.rootfs_path(image_ref);
-        if !rootfs.is_dir() {
+        let Some(rootfs) =
+            runtime_rootfs_path_from_stores(&self.store, &self.system_store, image_ref)
+        else {
             bail!(
-                "OCI rootfs for {image_ref} is not installed at {}; image transport/unpack is not implemented yet. Install skopeo/crun and populate the Aileron OCI store before starting this runtime.",
-                rootfs.display()
+                "OCI rootfs for {image_ref} is not installed under {} or {}; image transport/unpack is not implemented yet. Install skopeo/crun and populate the Aileron OCI store before starting this runtime.",
+                self.store
+                    .join("rootfs")
+                    .join(store_key(image_ref))
+                    .display(),
+                self.system_store
+                    .join("rootfs")
+                    .join(store_key(image_ref))
+                    .display()
             );
-        }
+        };
 
         let bundle_dir = self.store.join("bundles").join(Uuid::new_v4().to_string());
         fs::create_dir_all(&bundle_dir)
@@ -543,10 +554,6 @@ impl OciRuntimeManager {
 
         Ok(PreparedBundle { bundle_dir })
     }
-
-    fn rootfs_path(&self, image_ref: &str) -> PathBuf {
-        self.store.join("rootfs").join(store_key(image_ref))
-    }
 }
 
 pub fn default_oci_store() -> PathBuf {
@@ -558,6 +565,26 @@ pub fn default_oci_store() -> PathBuf {
             PathBuf::from(home).join(".local").join("share")
         });
     data_home.join("aileron").join("oci")
+}
+
+pub fn default_system_oci_store() -> PathBuf {
+    crate::profiles::system_data_dir().join("oci")
+}
+
+pub fn runtime_rootfs_path(user_store: &Path, image_ref: &str) -> Option<PathBuf> {
+    runtime_rootfs_path_from_stores(user_store, &default_system_oci_store(), image_ref)
+}
+
+fn runtime_rootfs_path_from_stores(
+    user_store: &Path,
+    system_store: &Path,
+    image_ref: &str,
+) -> Option<PathBuf> {
+    let key = store_key(image_ref);
+    [user_store, system_store]
+        .into_iter()
+        .map(|store| store.join("rootfs").join(&key))
+        .find(|path| path.is_dir())
 }
 
 fn runtime_config_json(
@@ -959,6 +986,8 @@ pub struct ContainerPool {
     pub memory_limit: String,
     /// Local Aileron-owned OCI runtime store.
     pub oci_store: PathBuf,
+    /// Read-only distro-managed OCI runtime store.
+    pub system_oci_store: PathBuf,
 }
 
 impl ContainerPool {
@@ -968,6 +997,7 @@ impl ContainerPool {
             idle_timeout_secs: 300,
             memory_limit: "8g".to_string(),
             oci_store: default_oci_store(),
+            system_oci_store: default_system_oci_store(),
         }
     }
 
@@ -1001,6 +1031,7 @@ impl ContainerPool {
                 runtime_options,
                 &self.memory_limit,
                 &self.oci_store,
+                &self.system_oci_store,
                 on_status,
             )?;
             self.containers.insert(profile_id.to_string(), c);
@@ -1508,6 +1539,7 @@ mod tests {
             &HashMap::new(),
             "512m",
             &oci_store,
+            &default_system_oci_store(),
             |_| {},
         )
         .expect("spawn stub runtime");

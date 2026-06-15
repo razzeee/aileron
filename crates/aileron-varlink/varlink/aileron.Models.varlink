@@ -18,7 +18,8 @@ type ProfileInfo (
     use_cases: []string,
     assigned_use_cases: []string,
     size_bytes: int,
-    installed_at: string
+    installed_at: string,
+    source: string
 )
 
 type RuntimeManifestInfo (
@@ -35,7 +36,8 @@ type OciRuntimeImage (
     in_use: bool,
     used_by_profiles: []string,
     update_available: bool,
-    update_status: string
+    update_status: string,
+    source: string
 )
 
 type RuntimeImageCleanupError (

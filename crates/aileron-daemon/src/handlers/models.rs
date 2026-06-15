@@ -12,7 +12,7 @@ use std::thread;
 use std::time::Duration;
 
 use crate::manifests::{self, ManifestArtifact, ModelManifest};
-use crate::profiles::{ArtifactHash, Profile};
+use crate::profiles::Profile;
 use crate::state::{InstallRecord, InstallSample, SharedState};
 #[allow(unused_imports)]
 use aileron_varlink::aileron_Models::{
@@ -77,6 +77,7 @@ impl VarlinkInterface for ModelsHandler {
                         assigned_use_cases,
                         size_bytes: profile_artifact_size_bytes(&profile.artifact_path),
                         installed_at: profile.installed_at.clone(),
+                        source: profile.source.clone(),
                     }
                 })
                 .collect();
@@ -611,6 +612,7 @@ struct StoredRuntimeImage {
     variant: String,
     digest: Option<String>,
     size_bytes: i64,
+    source: String,
 }
 
 impl StoredRuntimeImage {
@@ -653,7 +655,11 @@ fn list_aileron_runtime_images(
     store: &Path,
     usage: &RuntimeImageUsage,
 ) -> anyhow::Result<Vec<OciRuntimeImage>> {
-    let mut images = stored_runtime_images(store)?;
+    let mut images = stored_runtime_images(store, "user")?;
+    images.extend(stored_runtime_images(
+        &crate::container::default_system_oci_store(),
+        "system",
+    )?);
     dedupe_runtime_images(&mut images);
     let mut images = images
         .into_iter()
@@ -670,6 +676,7 @@ fn list_aileron_runtime_images(
                 used_by_profiles,
                 update_available: update.available,
                 update_status: update.status,
+                source: image.source,
             }
         })
         .collect::<Vec<_>>();
@@ -701,6 +708,13 @@ fn dedupe_runtime_images(images: &mut Vec<StoredRuntimeImage>) {
 }
 
 fn runtime_image_local_status(image: &StoredRuntimeImage) -> RuntimeImageUpdateCheck {
+    if image.source == "system" {
+        return RuntimeImageUpdateCheck {
+            available: false,
+            status: "system package".to_string(),
+        };
+    }
+
     if remote_tag_is_checkable(&image.image_ref) {
         return RuntimeImageUpdateCheck {
             available: true,
@@ -740,7 +754,7 @@ fn oci_arch(arch: &str) -> &str {
     }
 }
 
-fn stored_runtime_images(store: &Path) -> anyhow::Result<Vec<StoredRuntimeImage>> {
+fn stored_runtime_images(store: &Path, source: &str) -> anyhow::Result<Vec<StoredRuntimeImage>> {
     let rootfs_dir = store.join("rootfs");
     if !rootfs_dir.is_dir() {
         return Ok(Vec::new());
@@ -778,6 +792,7 @@ fn stored_runtime_images(store: &Path) -> anyhow::Result<Vec<StoredRuntimeImage>
             variant,
             digest,
             size_bytes,
+            source: source.to_string(),
         });
     }
     Ok(images)
@@ -883,6 +898,12 @@ async fn remove_aileron_runtime_image(
         .into_iter()
         .find(|image| image.image_id == image_id || image.image_ref == image_id)
         .ok_or_else(|| anyhow::anyhow!("Aileron runtime image not found: {image_id}"))?;
+    if image.source != "user" {
+        anyhow::bail!(
+            "system runtime image cannot be removed: {}",
+            image.image_ref
+        );
+    }
     if image.in_use {
         anyhow::bail!(
             "runtime image is used by {}",
@@ -961,30 +982,6 @@ fn generated_model_id(runtime_id: &str, filename: &str, sha256: &str) -> String 
         .join("-");
     let prefix: String = sha256.chars().take(12).collect();
     format!("{runtime_id}-{stem}-{prefix}")
-}
-
-impl ModelManifest {
-    fn into_profile(self, artifact_path: PathBuf) -> Profile {
-        Profile {
-            profile_id: self.profile_id,
-            model_id: self.model_id,
-            runtime_id: self.runtime_id,
-            runtime_options: self.runtime_options,
-            artifact_path,
-            runtime_images: self.runtime_images,
-            use_cases: self.use_cases,
-            artifact_hashes: self
-                .artifacts
-                .into_iter()
-                .map(|artifact| ArtifactHash {
-                    role: artifact.role,
-                    filename: artifact.filename,
-                    sha256: artifact.sha256,
-                })
-                .collect(),
-            installed_at: chrono::Utc::now().to_rfc3339(),
-        }
-    }
 }
 
 async fn install_manifest_path(
@@ -1298,10 +1295,7 @@ async fn pull_runtime_image(
     owner_profile_id: Option<&str>,
 ) -> anyhow::Result<()> {
     let store = oci_store_for_state(state).await;
-    let rootfs = store
-        .join("rootfs")
-        .join(crate::container::store_key(image_ref));
-    if rootfs.is_dir() {
+    if crate::container::runtime_rootfs_path(&store, image_ref).is_some() {
         return Ok(());
     }
 
@@ -2054,6 +2048,7 @@ mod tests {
             variant: "cpu".to_string(),
             digest: None,
             size_bytes: 1,
+            source: "user".to_string(),
         };
         let vulkan = StoredRuntimeImage {
             image_id: "vulkan".to_string(),
@@ -2063,6 +2058,7 @@ mod tests {
             variant: "vulkan".to_string(),
             digest: None,
             size_bytes: 1,
+            source: "user".to_string(),
         };
 
         assert!(usage.used_by(&cpu).is_empty());
@@ -2080,6 +2076,7 @@ mod tests {
                 variant: "rocm".to_string(),
                 digest: None,
                 size_bytes: 1,
+                source: "user".to_string(),
             },
             StoredRuntimeImage {
                 image_id: "same-image".to_string(),
@@ -2089,6 +2086,7 @@ mod tests {
                 variant: "rocm".to_string(),
                 digest: None,
                 size_bytes: 1,
+                source: "user".to_string(),
             },
         ];
 
@@ -2108,6 +2106,7 @@ mod tests {
                 variant: "rocm".to_string(),
                 digest: None,
                 size_bytes: 1,
+                source: "user".to_string(),
             },
             StoredRuntimeImage {
                 image_id: "same-image".to_string(),
@@ -2117,6 +2116,7 @@ mod tests {
                 variant: "rocm".to_string(),
                 digest: None,
                 size_bytes: 1,
+                source: "user".to_string(),
             },
         ];
 
@@ -2136,6 +2136,7 @@ mod tests {
                 variant: "rocm".to_string(),
                 digest: None,
                 size_bytes: 1,
+                source: "user".to_string(),
             },
             StoredRuntimeImage {
                 image_id: "new-image".to_string(),
@@ -2145,12 +2146,44 @@ mod tests {
                 variant: "rocm".to_string(),
                 digest: None,
                 size_bytes: 1,
+                source: "user".to_string(),
             },
         ];
 
         dedupe_runtime_images(&mut images);
 
         assert_eq!(images.len(), 1);
+    }
+
+    #[test]
+    fn dedupe_prefers_user_runtime_before_system_runtime() {
+        let mut images = vec![
+            StoredRuntimeImage {
+                image_id: "same-image".to_string(),
+                image_ref: "ghcr.io/example/vision:cpu".to_string(),
+                names: vec!["ghcr.io/example/vision:cpu".to_string()],
+                runtime_id: "vision-llama-cpp-gemma4".to_string(),
+                variant: "cpu".to_string(),
+                digest: None,
+                size_bytes: 1,
+                source: "user".to_string(),
+            },
+            StoredRuntimeImage {
+                image_id: "same-image".to_string(),
+                image_ref: "ghcr.io/example/vision:cpu".to_string(),
+                names: vec!["ghcr.io/example/vision:cpu".to_string()],
+                runtime_id: "vision-llama-cpp-gemma4".to_string(),
+                variant: "cpu".to_string(),
+                digest: None,
+                size_bytes: 1,
+                source: "system".to_string(),
+            },
+        ];
+
+        dedupe_runtime_images(&mut images);
+
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].source, "user");
     }
 
     #[test]
@@ -2174,6 +2207,7 @@ mod tests {
             variant: "cpu".to_string(),
             digest: Some("sha256:abc".to_string()),
             size_bytes: 1,
+            source: "user".to_string(),
         };
 
         let status = runtime_image_local_status(&image);
@@ -2192,6 +2226,7 @@ mod tests {
             variant: "cpu".to_string(),
             digest: Some("sha256:abc".to_string()),
             size_bytes: 1,
+            source: "user".to_string(),
         };
 
         let status = runtime_image_local_status(&image);

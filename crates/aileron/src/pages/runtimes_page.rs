@@ -177,8 +177,9 @@ fn append_runtime_image_row(
     };
 
     let metadata = Label::new(Some(&format!(
-        "{} · {usage} · {status}",
+        "{} · {} · {usage} · {status}",
         format_bytes(image.size_bytes),
+        source_label(&image.source),
     )));
     metadata.set_xalign(0.0);
     metadata.set_wrap(true);
@@ -191,7 +192,7 @@ fn append_runtime_image_row(
     actions.set_valign(gtk4::Align::Center);
     actions.set_halign(gtk4::Align::End);
 
-    if image.update_available || active_download.is_some() {
+    if image.source != "system" && (image.update_available || active_download.is_some()) {
         let update_button = Button::with_label(if active_download.is_some() {
             "Updating..."
         } else {
@@ -209,7 +210,7 @@ fn append_runtime_image_row(
         actions.append(&update_button);
     }
 
-    if !image.in_use {
+    if !image.in_use && image.source != "system" {
         let remove_button = Button::with_label("Remove");
         remove_button.add_css_class("destructive-action");
         remove_button.set_sensitive(active_download.is_none());
@@ -382,6 +383,14 @@ fn format_bytes(bytes: i64) -> String {
         format!("{} {unit}", value as i64)
     } else {
         format!("{value:.1} {unit}")
+    }
+}
+
+fn source_label(source: &str) -> &'static str {
+    match source {
+        "system" => "System",
+        "user" => "User",
+        _ => "Unknown source",
     }
 }
 

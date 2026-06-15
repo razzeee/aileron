@@ -63,12 +63,13 @@ Suggested install locations:
 | `portal/aileron.portal` | `/usr/share/xdg-desktop-portal/portals/aileron.portal` |
 | `portal/org.freedesktop.impl.portal.desktop.aileron.service` | `/usr/share/dbus-1/services/org.freedesktop.impl.portal.desktop.aileron.service` |
 | `manifests/` | `/usr/share/aileron/manifests/` |
-
-Do not install runtime root filesystems or model artifacts into `/usr`. Those are user-managed data.
+| packaged runtime rootfs trees | `/usr/lib/aileron/oci/rootfs/<store-key>/` |
+| packaged runtime metadata | `/usr/lib/aileron/oci/metadata/<store-key>.json` |
+| packaged model artifacts | `/usr/lib/aileron/models/<model-id>/` |
 
 ## Shipping Manifests, Runtimes, And Models
 
-Distributions should normally ship manifests, not installed runtime rootfs trees or model weights.
+Distributions should normally ship manifests. They may also ship read-only runtime rootfs trees and model weights for offline systems.
 
 Recommended package split:
 
@@ -78,16 +79,55 @@ Recommended package split:
 | `aileron-portal` | portal backend, D-Bus service file, portal descriptor | Depends on `xdg-desktop-portal` integration according to distro policy |
 | `aileron` | management UI | Optional on minimal/headless systems |
 | `aileron-manifests` | curated model and runtime manifests under `/usr/share/aileron/manifests/` | Recommended default catalog package |
-| `aileron-runtimes-*` | optional runtime manifests pointing at distro-approved OCI images | Use this when the distro wants to curate/mirror runtime image refs |
-| `aileron-models-*` | optional model manifests, or model weights only when license/size policy allows | Keep large or restricted models opt-in |
+| `aileron-runtimes-*` | optional runtime manifests or pre-rendered rootfs trees | Use this when the distro wants offline runtime availability or curated image refs |
+| `aileron-models-*` | optional model manifests and model weights when license/size policy allows | Keep large or restricted models opt-in |
 
 Runtime manifests are small JSON files that map runtime IDs to OCI image refs. A distro can ship upstream runtime manifests as-is, replace image refs with distro-hosted registry refs, or split hardware families into separate packages. For example, a conservative base package can include only CPU runtime manifests, while separate packages add CUDA, ROCm, or Vulkan runtime manifests.
 
 Model catalog manifests are also small JSON files. They describe downloadable artifacts, checksums, sizes, use-cases, and runtime IDs. Shipping a model manifest does not install the model weights. It only makes the profile visible in the management UI and available to `InstallManifest`; the user still chooses to download it.
 
-If a distro chooses to ship model weights directly, install them as user-visible packaged data only when the model license, redistribution terms, package size, and update policy are acceptable. Aileron's current daemon-managed install path expects per-user model artifacts under `$XDG_DATA_HOME/aileron/models/`, so system-packaged weights should be integrated through distro-specific manifests or post-install/user setup policy rather than by placing mutable daemon state in `/usr`.
+If a distro chooses to ship model weights directly, install them under `/usr/lib/aileron/models/<model-id>/` only when the model license, redistribution terms, package size, and update policy are acceptable. Each packaged filename must match the corresponding model manifest artifact `filename` field, and the manifest should be installed under `/usr/share/aileron/manifests/models/` or provided by a dependency.
 
 Do not pre-populate `$XDG_DATA_HOME/aileron/oci/` or `$XDG_DATA_HOME/aileron/models/` from a system package. Those directories are per-user daemon state and may contain user-selected profiles, rendered root filesystems, runtime metadata, permissions, and assignments.
+
+## Offline Deployment
+
+Aileron resolves artifacts from user-managed paths first, then distro-managed system paths, then falls back to download when a user explicitly installs or updates online content.
+
+Runtime rootfs lookup order:
+
+```text
+$XDG_DATA_HOME/aileron/oci/rootfs/<store-key>/
+/usr/lib/aileron/oci/rootfs/<store-key>/
+```
+
+Model artifact lookup order:
+
+```text
+$XDG_DATA_HOME/aileron/models/<model-id>/
+/usr/lib/aileron/models/<model-id>/
+```
+
+`<store-key>` is derived from the image reference by keeping ASCII letters, digits, `.`, `-`, and `_`, and replacing every other character with `_`. For example, `ghcr.io/razzeee/aileron-runtime-llm-llama-cpp:cpu` becomes `ghcr.io_razzeee_aileron-runtime-llm-llama-cpp_cpu`.
+
+Runtime packages for offline use should install pre-rendered rootfs trees and optional metadata:
+
+```text
+/usr/lib/aileron/oci/rootfs/<store-key>/
+/usr/lib/aileron/oci/metadata/<store-key>.json
+```
+
+Model packages should install artifacts under:
+
+```text
+/usr/lib/aileron/models/<model-id>/
+```
+
+The daemon verifies packaged model artifacts against manifest SHA-256 values before exposing the system-backed profile. Incomplete or corrupted system model directories are ignored.
+
+System artifacts are read-only. Users can shadow a system profile or runtime by installing a user-managed copy with the same profile ID, model ID, or runtime store key. Deleting the user-managed copy reveals the packaged system copy again if it is still installed. The management UI labels artifacts as `System` or `User`; system-backed profiles and runtime images cannot be removed through Aileron.
+
+Traditional distro packages, live/install media, immutable OS images, rpm-ostree layers, NixOS configurations, transactional snapshots, and systemd-sysext extensions can all provide `/usr/lib/aileron` without creating per-user home directories or running per-user seeding scriptlets.
 
 ## User Data
 

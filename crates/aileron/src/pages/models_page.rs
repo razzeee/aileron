@@ -237,6 +237,7 @@ struct ProfileDetails {
     model_id: String,
     runtime_id: String,
     artifact_path: String,
+    source: String,
     runtime_images: Vec<String>,
     use_cases: Vec<String>,
     assigned_use_cases: Vec<String>,
@@ -570,6 +571,7 @@ fn show_profile_details(window: Option<&gtk4::Window>, details: &ProfileDetails)
 
     add_detail_row(&list, "Model", &details.model_id);
     add_detail_row(&list, "Runtime", &details.runtime_id);
+    add_detail_row(&list, "Source", &details.source);
     add_detail_row(&list, "Artifact Directory", &details.artifact_path);
     add_detail_row(&list, "Runtime Images", &details.runtime_images.join("\n"));
     add_detail_row(
@@ -668,6 +670,14 @@ fn format_profile_size(bytes: i64) -> String {
     }
 
     format!("{gib:.1} GB")
+}
+
+fn source_label(source: &str) -> &'static str {
+    match source {
+        "system" => "System",
+        "user" => "User",
+        _ => "Unknown source",
+    }
 }
 
 fn assignment_count(use_cases: &[String]) -> String {
@@ -1864,9 +1874,10 @@ fn refresh_model_list(lists: &ModelLists) {
                 row.set_title(&model.profile_id);
                 let availability = profile_availability(&model.assigned_use_cases);
                 row.set_subtitle(&format!(
-                    "{} · {} · {} · {}",
+                    "{} · {} · {} · {} · {}",
                     availability,
                     model_kind(&model.runtime_id),
+                    source_label(&model.source),
                     assignment_count(&model.assigned_use_cases),
                     format_profile_size(model.size_bytes)
                 ));
@@ -1878,6 +1889,7 @@ fn refresh_model_list(lists: &ModelLists) {
                     model_id: model.model_id.clone(),
                     runtime_id: model.runtime_id.clone(),
                     artifact_path: model.artifact_path.clone(),
+                    source: source_label(&model.source).to_string(),
                     runtime_images: model
                         .runtime_images
                         .iter()
@@ -1967,6 +1979,12 @@ fn refresh_model_list(lists: &ModelLists) {
                 let delete_btn = Button::with_label("Delete");
                 delete_btn.add_css_class("destructive-action");
                 delete_btn.set_valign(gtk4::Align::Center);
+                delete_btn.set_sensitive(model.source != "system");
+                if model.source == "system" {
+                    delete_btn.set_tooltip_text(Some(
+                        "System-backed profiles are managed by distro packages.",
+                    ));
+                }
                 let profile_id = model.profile_id.clone();
                 let lists_ref = lists.clone();
                 delete_btn.connect_clicked(move |btn| {

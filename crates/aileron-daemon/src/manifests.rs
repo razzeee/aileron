@@ -52,6 +52,31 @@ pub struct ManifestArtifact {
     pub size_bytes: u64,
 }
 
+impl ModelManifest {
+    pub fn into_profile(self, artifact_path: PathBuf) -> crate::profiles::Profile {
+        crate::profiles::Profile {
+            profile_id: self.profile_id,
+            model_id: self.model_id,
+            runtime_id: self.runtime_id,
+            runtime_options: self.runtime_options,
+            artifact_path,
+            runtime_images: self.runtime_images,
+            use_cases: self.use_cases,
+            artifact_hashes: self
+                .artifacts
+                .into_iter()
+                .map(|artifact| crate::profiles::ArtifactHash {
+                    role: artifact.role,
+                    filename: artifact.filename,
+                    sha256: artifact.sha256,
+                })
+                .collect(),
+            installed_at: chrono::Utc::now().to_rfc3339(),
+            source: "user".to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RuntimeManifestInfo {
     pub runtime_id: String,

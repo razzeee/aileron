@@ -84,20 +84,14 @@ impl VarlinkInterface for InferenceHandler {
                 });
             }
 
-            let runtime_rootfs = oci_store
-                .join("rootfs")
-                .join(crate::container::store_key(&image_ref));
-            let runtime_exists = runtime_rootfs.is_dir();
+            let runtime_exists = crate::container::runtime_rootfs_path(&oci_store, &image_ref).is_some();
 
             call.reply(ModelAvailability {
                 is_available: runtime_exists,
                 reason: if runtime_exists {
                     "available".to_string()
                 } else {
-                    format!(
-                        "runtime rootfs for {image_ref} is not present at {}",
-                        runtime_rootfs.display()
-                    )
+                    format!("runtime rootfs for {image_ref} is not present in the user or system OCI store")
                 },
             })
         })
