@@ -4,10 +4,11 @@ use gtk4::{
     Align, Box, Button, CssProvider, DropDown, Entry, FileDialog, Label, Orientation,
     ScrolledWindow, Spinner, TextBuffer, TextView,
 };
+use libadwaita::prelude::*;
 use libadwaita::{
-    Application, ApplicationWindow, HeaderBar, OverlaySplitView, ToolbarView, ViewStack,
-    ViewSwitcherSidebar,
+    ApplicationWindow, HeaderBar, OverlaySplitView, ToolbarView, ViewStack, ViewSwitcherSidebar,
 };
+use relm4::{ComponentParts, ComponentSender, RelmApp, SimpleComponent};
 use serde::Deserialize;
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -16,19 +17,52 @@ use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use zbus::zvariant::Type;
 
-pub fn build_app() -> Application {
-    let app = Application::builder()
-        .application_id("org.aileron.Demo")
-        .build();
+#[derive(Debug)]
+pub enum AppMsg {}
 
-    app.connect_activate(|app| {
-        build_window(app);
-    });
+pub struct AppModel;
 
-    app
+pub struct AppWidgets;
+
+pub fn run() {
+    libadwaita::init().expect("failed to initialise libadwaita");
+    let app = RelmApp::new("org.aileron.Demo");
+    app.run::<AppModel>(());
 }
 
-fn build_window(app: &Application) {
+impl SimpleComponent for AppModel {
+    type Init = ();
+    type Input = AppMsg;
+    type Output = ();
+    type Widgets = AppWidgets;
+    type Root = ApplicationWindow;
+
+    fn init_root() -> Self::Root {
+        ApplicationWindow::builder()
+            .title("Aileron Demo")
+            .default_width(860)
+            .default_height(700)
+            .build()
+    }
+
+    fn init(
+        (): Self::Init,
+        window: Self::Root,
+        _sender: ComponentSender<Self>,
+    ) -> ComponentParts<Self> {
+        build_window(&window);
+        ComponentParts {
+            model: AppModel,
+            widgets: AppWidgets,
+        }
+    }
+
+    fn update(&mut self, msg: Self::Input, _sender: ComponentSender<Self>) {
+        match msg {}
+    }
+}
+
+fn build_window(window: &ApplicationWindow) {
     let text_box = Box::new(Orientation::Vertical, 12);
     text_box.set_margin_top(12);
     text_box.set_margin_bottom(12);
@@ -358,15 +392,7 @@ fn build_window(app: &Application) {
     }
     show_sidebar_button.set_visible(false);
 
-    let window = ApplicationWindow::builder()
-        .application(app)
-        .title("Aileron Demo")
-        .default_width(860)
-        .default_height(700)
-        .content(&split_view)
-        .build();
-
-    window.present();
+    window.set_content(Some(&split_view));
     chat_entry.grab_focus();
 }
 

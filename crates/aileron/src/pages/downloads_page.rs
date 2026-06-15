@@ -6,49 +6,93 @@ use gtk4::prelude::*;
 use gtk4::{Box, Button, Label, ListBox, Orientation, ProgressBar, ScrolledWindow, Spinner};
 use libadwaita::prelude::*;
 use libadwaita::{ActionRow, AlertDialog, PreferencesGroup, PreferencesPage};
+use relm4::{ComponentParts, ComponentSender, SimpleComponent};
 
-#[derive(Clone)]
-pub struct DownloadsView {
-    pub widget: gtk4::Widget,
-    list_box: ListBox,
+pub struct DownloadsPage {
     poll_active: Rc<Cell<bool>>,
+    start_poll: bool,
 }
 
-impl DownloadsView {
-    pub fn refresh(&self) {
-        refresh_downloads_list(&self.list_box);
-        if has_active_downloads() {
-            self.start_poll();
-        }
+#[derive(Debug)]
+pub enum DownloadsMsg {
+    Refresh,
+}
+
+pub struct DownloadsWidgets {
+    list_box: ListBox,
+}
+
+impl SimpleComponent for DownloadsPage {
+    type Init = ();
+    type Input = DownloadsMsg;
+    type Output = ();
+    type Widgets = DownloadsWidgets;
+    type Root = PreferencesPage;
+
+    fn init_root() -> Self::Root {
+        PreferencesPage::new()
     }
 
-    fn start_poll(&self) {
-        if self.poll_active.get() {
-            return;
-        }
-        self.poll_active.set(true);
-        refresh_downloads_list(&self.list_box);
+    fn init(
+        (): Self::Init,
+        page: Self::Root,
+        sender: ComponentSender<Self>,
+    ) -> ComponentParts<Self> {
+        let list_box = build_page(&page);
+        refresh_downloads_list(&list_box);
+        let model = DownloadsPage {
+            poll_active: Rc::new(Cell::new(false)),
+            start_poll: has_active_downloads(),
+        };
+        let mut widgets = DownloadsWidgets { list_box };
+        model.update_view(&mut widgets, sender);
+        ComponentParts { model, widgets }
+    }
 
-        let view = self.clone();
-        let mut grace_ticks = 15;
-        glib::timeout_add_seconds_local(2, move || {
-            refresh_downloads_list(&view.list_box);
-            if has_active_downloads() {
-                grace_ticks = 15;
-                glib::ControlFlow::Continue
-            } else if grace_ticks > 0 {
-                grace_ticks -= 1;
-                glib::ControlFlow::Continue
-            } else {
-                view.poll_active.set(false);
-                glib::ControlFlow::Break
+    fn update(&mut self, msg: Self::Input, _sender: ComponentSender<Self>) {
+        match msg {
+            DownloadsMsg::Refresh => {
+                self.start_poll = has_active_downloads();
             }
-        });
+        }
+    }
+
+    fn update_view(&self, widgets: &mut Self::Widgets, sender: ComponentSender<Self>) {
+        refresh_downloads_list(&widgets.list_box);
+        if self.start_poll {
+            start_poll(&widgets.list_box, self.poll_active.clone(), sender);
+        }
     }
 }
 
-pub fn build() -> DownloadsView {
-    let page = PreferencesPage::new();
+fn start_poll(
+    list_box: &ListBox,
+    poll_active: Rc<Cell<bool>>,
+    sender: ComponentSender<DownloadsPage>,
+) {
+    if poll_active.get() {
+        return;
+    }
+    poll_active.set(true);
+    refresh_downloads_list(list_box);
+
+    let mut grace_ticks = 15;
+    glib::timeout_add_seconds_local(2, move || {
+        sender.input(DownloadsMsg::Refresh);
+        if has_active_downloads() {
+            grace_ticks = 15;
+            glib::ControlFlow::Continue
+        } else if grace_ticks > 0 {
+            grace_ticks -= 1;
+            glib::ControlFlow::Continue
+        } else {
+            poll_active.set(false);
+            glib::ControlFlow::Break
+        }
+    });
+}
+
+fn build_page(page: &PreferencesPage) -> ListBox {
     let group = PreferencesGroup::new();
     group.set_title("Downloads");
     group.set_description(Some(
@@ -68,14 +112,7 @@ pub fn build() -> DownloadsView {
         .build();
     group.add(&scroll);
     page.add(&group);
-
-    let view = DownloadsView {
-        widget: page.upcast(),
-        list_box,
-        poll_active: Rc::new(Cell::new(false)),
-    };
-    view.refresh();
-    view
+    list_box
 }
 
 fn refresh_downloads_list(list: &ListBox) {

@@ -38,6 +38,7 @@ gtk4       = { version = "0.11", features = ["v4_12"] }
 libadwaita = { version = "0.9", features = ["v1_9"] }
 glib       = "0.22"
 gio        = "0.22"
+relm4      = { version = "0.11", features = ["libadwaita"] }
 reqwest = { version = "0.13", features = ["blocking"] }
 chrono = "0.4"
 sha2 = "0.11"
