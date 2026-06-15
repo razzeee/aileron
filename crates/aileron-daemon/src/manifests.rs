@@ -100,7 +100,7 @@ impl RuntimeManifestStore {
         Self::load_from_dirs(manifest_dirs())
     }
 
-    fn load_from_dirs(dirs: Vec<PathBuf>) -> Result<Self> {
+    pub fn load_from_dirs(dirs: Vec<PathBuf>) -> Result<Self> {
         let mut runtimes = HashMap::new();
         for dir in dirs {
             let runtimes_dir = dir.join("runtimes");

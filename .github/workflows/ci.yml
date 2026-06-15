@@ -121,7 +121,7 @@ jobs:
 
   # ── Stub container image ────────────────────────────────────────────────────
   # Verifies the stub Dockerfile builds successfully, then smoke-tests the
-  # container protocol by piping a generate request directly to it.
+  # daemon container wrapper and the protocol by piping requests directly to it.
   stub-image:
     name: Stub container — build + protocol smoke test
     runs-on: ubuntu-24.04
@@ -131,6 +131,9 @@ jobs:
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Install container runtime deps
+        run: sudo apt-get install -y --no-install-recommends podman crun
 
       - name: Cache cargo registry + build
         uses: actions/cache@v5.0.5
@@ -146,9 +149,20 @@ jobs:
       - name: Build stub image
         run: podman build -t aileron/stub:ci runtimes/stub/
 
+      - name: Export stub rootfs for daemon wrapper
+        env:
+          AILERON_OCI_STORE: ${{ runner.temp }}/aileron-oci
+        run: |
+          mkdir -p "$AILERON_OCI_STORE/rootfs/aileron_stub_ci"
+          stub_container=$(podman create aileron/stub:ci)
+          podman export "$stub_container" |
+            tar -C "$AILERON_OCI_STORE/rootfs/aileron_stub_ci" -xf -
+          podman rm "$stub_container"
+
       - name: Container wrapper roundtrip — all stub capabilities
         env:
           AILERON_STUB_IMAGE: aileron/stub:ci
+          AILERON_OCI_STORE: ${{ runner.temp }}/aileron-oci
         run: >
           cargo test
           -p aileron-daemon
