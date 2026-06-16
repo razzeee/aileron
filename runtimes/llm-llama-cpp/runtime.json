@@ -3,7 +3,8 @@
   "capabilities": [
     "generate",
     "chat",
-    "generate_structured"
+    "generate_structured",
+    "embed"
   ],
   "variants": [
     "cpu",

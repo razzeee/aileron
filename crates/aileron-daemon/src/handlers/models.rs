@@ -579,7 +579,8 @@ fn fit_category(use_case: &str) -> Option<&'static str> {
         "llm.summarize" | "llm.translate" | "llm.rephrase" | "llm.chat" => Some("Chat"),
         "llm.analyze" => Some("Reasoning"),
         "llm.classify" | "llm.extract" => Some("General"),
-        "vision.describe" | "vision.segment" => Some("Multimodal"),
+        "llm.embed" => Some("Embeddings"),
+        "vision.describe" | "vision.segment" | "vision.ocr" => Some("Multimodal"),
         _ => None,
     }
 }

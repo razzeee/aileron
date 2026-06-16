@@ -20,9 +20,12 @@ const USE_CASES: &[&str] = &[
     "llm.extract",
     "llm.analyze",
     "llm.chat",
+    "llm.embed",
     "asr.transcribe",
+    "asr.translate",
     "vision.describe",
     "vision.segment",
+    "vision.ocr",
 ];
 
 pub fn build(runtime_images_changed: Rc<dyn Fn()>) -> gtk4::Widget {
@@ -1711,7 +1714,9 @@ fn candidate_rank(
         10
     } else if profile.recommended {
         0
-    } else if use_case == "asr.transcribe" && profile.fit_level == "fits_minimum" {
+    } else if matches!(use_case, "asr.transcribe" | "asr.translate")
+        && profile.fit_level == "fits_minimum"
+    {
         match profile.tier.as_str() {
             "balanced" => 1,
             "large" => 2,
@@ -1796,7 +1801,7 @@ fn compare_asr_quality(
     b: &aileron_varlink::aileron_Models::CatalogProfileInfo,
     use_case: &str,
 ) -> std::cmp::Ordering {
-    if use_case == "asr.transcribe" {
+    if matches!(use_case, "asr.transcribe" | "asr.translate") {
         asr_quality_rank(a).cmp(&asr_quality_rank(b))
     } else {
         std::cmp::Ordering::Equal

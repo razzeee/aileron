@@ -325,9 +325,12 @@ pub const SUPPORTED_USE_CASES: &[&str] = &[
     "llm.extract",
     "llm.analyze",
     "llm.chat",
+    "llm.embed",
     "asr.transcribe",
+    "asr.translate",
     "vision.describe",
     "vision.segment",
+    "vision.ocr",
 ];
 
 fn validate_artifact(artifact: &ManifestArtifact) -> Result<()> {

@@ -9,6 +9,8 @@ Supported request types:
   chat  - stream text tokens from explicit chat messages
   generate_structured - return a JSON result constrained to a schema
   describe  - describe a PNG/JPEG image using a llama.cpp multimodal model
+  ocr  - extract text from a PNG/JPEG image using a llama.cpp multimodal model
+  segment  - identify objects in a PNG/JPEG image as normalized bounding boxes
 """
 
 import base64
@@ -41,6 +43,13 @@ SEGMENT_PROMPT = os.environ.get(
     "VISION_SEGMENT_PROMPT",
     "Identify the main visible objects in this image. Return only JSON matching the schema. "
     "Use normalized bounding boxes where x and y are the top-left corner and width and height are relative to the image size.",
+)
+OCR_PROMPT = os.environ.get(
+    "VISION_OCR_PROMPT",
+    "Extract all text visible in this image exactly as written. "
+    "Preserve the reading order and line breaks. "
+    "Return only the transcribed text with no commentary. "
+    "If there is no text, return an empty response.",
 )
 SEGMENT_SCHEMA = {
     "type": "object",
@@ -221,6 +230,33 @@ def handle_describe(llm: Llama, req: dict) -> None:
     send({"id": req_id, "token": text, "done": True})
 
 
+def handle_ocr(llm: Llama, req: dict) -> None:
+    req_id = req["id"]
+    prompt = req.get("prompt") or OCR_PROMPT
+
+    try:
+        image_url = image_to_data_url(req.get("image"))
+    except Exception as e:
+        send({"id": req_id, "error": "invalid_image", "reason": str(e), "done": True})
+        return
+
+    response = llm.create_chat_completion(
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": image_url}},
+                ],
+            }
+        ],
+        max_tokens=int(req.get("max_tokens", 1024)),
+        stream=False,
+    )
+    text = response["choices"][0]["message"]["content"].strip()
+    send({"id": req_id, "token": text, "done": True})
+
+
 def handle_segment(llm: Llama, req: dict) -> None:
     req_id = req["id"]
     prompt = req.get("prompt") or SEGMENT_PROMPT
@@ -273,6 +309,7 @@ def main() -> None:
             "chat": handle_chat,
             "generate_structured": handle_generate_structured,
             "describe": handle_describe,
+            "ocr": handle_ocr,
             "segment": handle_segment,
         },
         log_prefix="aileron-vision",

@@ -1,6 +1,6 @@
 {
   "runtime_id": "stub",
-  "capabilities": ["generate", "generate_structured", "transcribe", "describe"],
+  "capabilities": ["generate", "chat", "generate_structured", "embed", "transcribe", "describe", "ocr", "segment"],
   "variants": ["cpu"],
   "artifact_layout": {}
 }

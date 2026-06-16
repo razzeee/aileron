@@ -61,7 +61,12 @@ method StreamChat(session_id: string, messages: []ChatMessage, options: Generati
 # Session must have been created with an llm.* use_case.
 method RespondGuided(session_id: string, prompt: string, fields: []GuidedField, options: GenerationOptions) -> (content: string)
 
-# Transcribe audio. Session must have been created with use_case: asr.transcribe
+# Compute embedding vectors for text. Session must have been created with use_case: llm.embed
+# embedding: the embedding vector for the supplied text
+method Embed(session_id: string, text: string) -> (embedding: []float)
+
+# Transcribe or translate audio. Session must have been created with
+# use_case: asr.transcribe (verbatim, source language) or asr.translate (translated to English).
 # audio: raw PCM bytes encoded as base64 (16kHz mono f32le)
 # language_hint: optional language hint; empty string means auto-detect/no hint
 method Transcribe(session_id: string, audio: string, language_hint: string) -> (text: string)
@@ -69,6 +74,10 @@ method Transcribe(session_id: string, audio: string, language_hint: string) -> (
 # Describe an image. Session must have been created with vision.describe
 # image: PNG or JPEG bytes encoded as base64
 method Describe(session_id: string, image: string) -> (text: string)
+
+# Extract text from an image (OCR). Session must have been created with vision.ocr
+# image: PNG or JPEG bytes encoded as base64
+method Ocr(session_id: string, image: string) -> (text: string)
 
 # Identify objects in an image. Session must have been created with vision.segment
 # Coordinates are normalized to 0.0..1.0, relative to the image dimensions.

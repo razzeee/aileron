@@ -8,6 +8,7 @@ Supported request types:
   generate            – stream tokens via instructor partial streaming
   chat                – stream tokens from explicit chat messages
   generate_structured – return a single JSON result constrained to a schema
+  embed               – return an embedding vector for the supplied text
 
 GPU auto-detection order (highest priority first):
   1. N_GPU_LAYERS env var set explicitly  → use as-is
@@ -46,6 +47,7 @@ def load_model() -> Llama:
         model_path=MODEL_PATH,
         n_ctx=N_CTX,
         n_threads=N_THREADS,
+        embedding=True,
     )
 
 
@@ -141,6 +143,26 @@ def handle_generate_structured(llm: Llama, req: dict) -> None:
     send({"id": req_id, "result": result_text, "done": True})
 
 
+def handle_embed(llm: Llama, req: dict) -> None:
+    """Compute an embedding vector for the supplied text."""
+    req_id = req["id"]
+    text   = req.get("prompt", "")
+
+    embedding = llm.embed(text)
+
+    # llama.cpp returns either a flat vector or a list of per-token vectors
+    # (depending on the pooling type); mean-pool the latter into one vector.
+    if embedding and isinstance(embedding[0], list):
+        cols = len(embedding[0])
+        means = [0.0] * cols
+        for row in embedding:
+            for i, value in enumerate(row):
+                means[i] += value
+        embedding = [value / len(embedding) for value in means]
+
+    send({"id": req_id, "embedding": embedding, "done": True})
+
+
 def main() -> None:
     llm = load_model()
     serve_requests(
@@ -149,6 +171,7 @@ def main() -> None:
             "generate": handle_generate,
             "chat": handle_chat,
             "generate_structured": handle_generate_structured,
+            "embed": handle_embed,
         },
         log_prefix="aileron-llm",
         unsupported_done=False,
