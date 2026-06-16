@@ -360,6 +360,19 @@ impl AiPortalBackend {
         Ok(reply.content)
     }
 
+    async fn embed(&self, session_id: &str, text: &str) -> zbus::fdo::Result<Vec<f64>> {
+        use aileron_varlink::aileron_Inference::VarlinkClientInterface;
+
+        let conn =
+            aileron_ipc::client::connect().map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn);
+        let reply = client
+            .embed(session_id.to_string(), text.to_string())
+            .call()
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        Ok(reply.embedding)
+    }
+
     async fn transcribe(
         &self,
         session_id: &str,
@@ -390,6 +403,19 @@ impl AiPortalBackend {
         let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn);
         let reply = client
             .describe(session_id.to_string(), image_b64.to_string())
+            .call()
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        Ok(reply.text)
+    }
+
+    async fn ocr(&self, session_id: &str, image_b64: &str) -> zbus::fdo::Result<String> {
+        use aileron_varlink::aileron_Inference::VarlinkClientInterface;
+
+        let conn =
+            aileron_ipc::client::connect().map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn);
+        let reply = client
+            .ocr(session_id.to_string(), image_b64.to_string())
             .call()
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         Ok(reply.text)

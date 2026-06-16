@@ -116,7 +116,27 @@ Response:
 
 The daemon-side validator supports the schema subset used by guided generation: `type`, `required`, `properties`, `items`, `minItems`, `maxItems`, `minLength`, `maxLength`, `minimum`, `maximum`, `enum`, and `additionalProperties: false`. `$ref`, `allOf`, `anyOf`, and `oneOf` are intentionally unsupported.
 
-## Audio Transcription
+## Embeddings
+
+Request:
+
+```json
+{
+  "id": "request-id",
+  "type": "embed",
+  "prompt": "text to embed"
+}
+```
+
+Response (single line, not streamed):
+
+```json
+{"id":"request-id","embedding":[0.012,-0.044,0.031],"done":true}
+```
+
+`embedding` is a flat array of floats. Documents and queries embedded by the same profile share a vector space.
+
+## Audio Transcription And Translation
 
 Request:
 
@@ -125,11 +145,12 @@ Request:
   "id": "request-id",
   "type": "transcribe",
   "audio": "base64-encoded-audio",
+  "task": "transcribe",
   "language_hint": "en"
 }
 ```
 
-Audio is raw PCM bytes encoded as base64. The current portal-facing API documents 16 kHz mono `f32le` input. `language_hint` is optional and omitted when the caller leaves the hint unspecified.
+Audio is raw PCM bytes encoded as base64. The current portal-facing API documents 16 kHz mono `f32le` input. `language_hint` is optional and omitted when the caller leaves the hint unspecified. `task` is `transcribe` for a verbatim transcript in the source language (the default when omitted) or `translate` to translate the speech to English.
 
 Response uses the same token stream shape as text generation:
 
@@ -154,6 +175,44 @@ Response uses the same token stream shape as text generation:
 ```json
 {"id":"request-id","token":"A cat sitting on a windowsill.","done":true}
 ```
+
+## Image OCR
+
+Request:
+
+```json
+{
+  "id": "request-id",
+  "type": "ocr",
+  "image": "base64-encoded-png-or-jpeg"
+}
+```
+
+Response uses the same token stream shape as text generation:
+
+```json
+{"id":"request-id","token":"Invoice #4815 - Total: $42.00","done":true}
+```
+
+## Image Segmentation
+
+Request:
+
+```json
+{
+  "id": "request-id",
+  "type": "segment",
+  "image": "base64-encoded-png-or-jpeg"
+}
+```
+
+Response is a single line containing a JSON string of normalized object boxes:
+
+```json
+{"id":"request-id","result":"{\"segments\":[{\"label\":\"cat\",\"confidence\":0.9,\"x\":0.1,\"y\":0.1,\"width\":0.5,\"height\":0.6}]}","done":true}
+```
+
+`result` is a string containing JSON. Coordinates are normalized to `0.0..1.0` relative to the image dimensions, where `x` and `y` are the top-left corner.
 
 ## Error Responses
 

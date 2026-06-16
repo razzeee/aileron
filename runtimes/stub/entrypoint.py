@@ -9,8 +9,11 @@ Behaviour per request type:
   generate            – streams the prompt back as tokens, word by word
   chat                – streams a deterministic response to the latest user turn
   generate_structured – returns a minimal valid JSON object matching the schema
-  transcribe          – returns a fixed transcript string
+  embed               – returns a fixed embedding vector
+  transcribe          – returns a fixed transcript/translation string
   describe            – returns a fixed image description string
+  ocr                 – returns a fixed extracted-text string
+  segment             – returns a fixed normalized bounding box
 """
 
 import json
@@ -103,13 +106,26 @@ def _stub_object(schema: dict) -> object:
 def handle_transcribe(req: dict) -> None:
     req_id = req["id"]
     language_hint = req.get("language_hint", "")
+    task = req.get("task", "transcribe")
+    verb = "translation" if task == "translate" else "transcription"
     suffix = f" Language hint: {language_hint}." if language_hint else ""
-    send({"id": req_id, "token": f"Stub transcription: audio received.{suffix}", "done": True})
+    send({"id": req_id, "token": f"Stub {verb}: audio received.{suffix}", "done": True})
+
+
+def handle_embed(req: dict) -> None:
+    req_id = req["id"]
+    # Deterministic fixed-size stub embedding vector.
+    send({"id": req_id, "embedding": [0.0, 0.1, 0.2, 0.3], "done": True})
 
 
 def handle_describe(req: dict) -> None:
     req_id = req["id"]
     send({"id": req_id, "token": "Stub description: an image was received.", "done": True})
+
+
+def handle_ocr(req: dict) -> None:
+    req_id = req["id"]
+    send({"id": req_id, "token": "Stub OCR: extracted text from image.", "done": True})
 
 
 def handle_segment(req: dict) -> None:
@@ -153,10 +169,14 @@ def main() -> None:
                 handle_chat(req)
             elif req_type == "generate_structured":
                 handle_generate_structured(req)
+            elif req_type == "embed":
+                handle_embed(req)
             elif req_type == "transcribe":
                 handle_transcribe(req)
             elif req_type == "describe":
                 handle_describe(req)
+            elif req_type == "ocr":
+                handle_ocr(req)
             elif req_type == "segment":
                 handle_segment(req)
             else:

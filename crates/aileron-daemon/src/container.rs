@@ -21,9 +21,17 @@
 /// Response (single line, no streaming):
 ///   {"id":"<uuid>","result":"{\"name\":\"Alice\",\"age\":30}","done":true}
 ///
-/// ### Audio transcription
+/// ### Embeddings
 /// Request:
-///   {"id":"<uuid>","type":"transcribe","audio":"<base64 PCM>","language_hint":"en"}
+///   {"id":"<uuid>","type":"embed","prompt":"text to embed"}
+/// Response (single line, no streaming):
+///   {"id":"<uuid>","embedding":[0.1,0.2,...],"done":true}
+///
+/// ### Audio transcription / translation
+/// Request:
+///   {"id":"<uuid>","type":"transcribe","audio":"<base64 PCM>","task":"transcribe","language_hint":"en"}
+/// `task` is "transcribe" (verbatim, source language) or "translate"
+/// (translate speech to English).
 /// Response (streamed tokens, same as generate):
 ///   {"id":"<uuid>","token":"Hello world","done":true}
 ///
@@ -32,6 +40,12 @@
 ///   {"id":"<uuid>","type":"describe","image":"<base64 PNG/JPEG>"}
 /// Response (same as generate):
 ///   {"id":"<uuid>","token":"A cat sitting...","done":true}
+///
+/// ### Image OCR (text extraction)
+/// Request:
+///   {"id":"<uuid>","type":"ocr","image":"<base64 PNG/JPEG>"}
+/// Response (same as generate):
+///   {"id":"<uuid>","token":"extracted text...","done":true}
 ///
 /// ### Image segmentation
 /// Request:
@@ -204,6 +218,7 @@ impl Container {
             messages: None,
             max_tokens: Some(max_tokens),
             audio: None,
+            task: None,
             image: None,
             language_hint: None,
             response_format: None,
@@ -255,6 +270,7 @@ impl Container {
             messages: Some(messages.to_vec()),
             max_tokens: Some(max_tokens),
             audio: None,
+            task: None,
             image: None,
             language_hint: None,
             response_format: None,
@@ -312,6 +328,7 @@ impl Container {
             messages: None,
             max_tokens: Some(max_tokens),
             audio: None,
+            task: None,
             image: None,
             language_hint: None,
             response_format: Some(ResponseFormat {
@@ -342,7 +359,15 @@ impl Container {
     }
 
     /// Send a transcribe request and return the full transcript.
-    pub fn transcribe(&mut self, audio: Vec<u8>, language_hint: Option<&str>) -> Result<String> {
+    ///
+    /// `task` is "transcribe" (verbatim, source language) or "translate"
+    /// (translate speech to English).
+    pub fn transcribe(
+        &mut self,
+        audio: Vec<u8>,
+        language_hint: Option<&str>,
+        task: &str,
+    ) -> Result<String> {
         let id = Uuid::new_v4().to_string();
         let req = ContainerRequest {
             id: id.clone(),
@@ -352,6 +377,7 @@ impl Container {
             messages: None,
             max_tokens: None,
             audio: Some(base64_encode(&audio)),
+            task: Some(task.to_string()),
             image: None,
             language_hint: language_hint
                 .filter(|hint| !hint.is_empty())
@@ -376,6 +402,30 @@ impl Container {
             messages: None,
             max_tokens: None,
             audio: None,
+            task: None,
+            image: Some(base64_encode(&image)),
+            language_hint: None,
+            response_format: None,
+        };
+        let line = serde_json::to_string(&req)? + "\n";
+        self.stdin.write_all(line.as_bytes())?;
+        self.stdin.flush()?;
+        self.last_used = std::time::Instant::now();
+        self.read_text_response(&id)
+    }
+
+    /// Send a vision OCR request and return the extracted text.
+    pub fn ocr(&mut self, image: Vec<u8>) -> Result<String> {
+        let id = Uuid::new_v4().to_string();
+        let req = ContainerRequest {
+            id: id.clone(),
+            r#type: "ocr".to_string(),
+            system: None,
+            prompt: None,
+            messages: None,
+            max_tokens: None,
+            audio: None,
+            task: None,
             image: Some(base64_encode(&image)),
             language_hint: None,
             response_format: None,
@@ -399,6 +449,7 @@ impl Container {
             messages: None,
             max_tokens: None,
             audio: None,
+            task: None,
             image: Some(base64_encode(&image)),
             language_hint: None,
             response_format: None,
@@ -421,6 +472,50 @@ impl Container {
             if let Some(result) = structured_response_result(resp, &schema)? {
                 let value: VisionSegmentResult = serde_json::from_str(&result)?;
                 return Ok(value.segments);
+            }
+        }
+    }
+
+    /// Send an embedding request and return the embedding vector.
+    pub fn embed(&mut self, text: &str) -> Result<Vec<f32>> {
+        let id = Uuid::new_v4().to_string();
+        let req = ContainerRequest {
+            id: id.clone(),
+            r#type: "embed".to_string(),
+            system: None,
+            prompt: Some(text.to_string()),
+            messages: None,
+            max_tokens: None,
+            audio: None,
+            task: None,
+            image: None,
+            language_hint: None,
+            response_format: None,
+        };
+        let line = serde_json::to_string(&req)? + "\n";
+        self.stdin.write_all(line.as_bytes())?;
+        self.stdin.flush()?;
+        self.last_used = std::time::Instant::now();
+
+        loop {
+            let mut buf = String::new();
+            let n = self.stdout.read_line(&mut buf)?;
+            if n == 0 {
+                bail!("container stdout closed unexpectedly");
+            }
+            let resp: ContainerResponse = serde_json::from_str(buf.trim())?;
+            if resp.id != id {
+                continue;
+            }
+            if let Some(error) = resp.error {
+                let reason = resp.reason.unwrap_or(error);
+                bail!("container returned error: {reason}");
+            }
+            if let Some(embedding) = resp.embedding {
+                return Ok(embedding);
+            }
+            if resp.done.unwrap_or(false) {
+                bail!("container completed embedding request without an embedding");
             }
         }
     }
@@ -1094,6 +1189,10 @@ struct ContainerRequest {
     max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     audio: Option<String>,
+    /// Present only for `transcribe` requests: "transcribe" (verbatim) or
+    /// "translate" (translate speech to English).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    task: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     image: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1117,6 +1216,8 @@ struct ContainerResponse {
     token: Option<String>,
     /// Present in structured output responses (the full JSON string).
     result: Option<String>,
+    /// Present in embedding responses.
+    embedding: Option<Vec<f32>>,
     error: Option<String>,
     reason: Option<String>,
     done: Option<bool>,
@@ -1480,6 +1581,7 @@ mod tests {
             id: "request-1".to_string(),
             token: None,
             result: None,
+            embedding: None,
             error: Some("schema_validation_failed".to_string()),
             reason: Some("expected object".to_string()),
             done: None,
@@ -1497,6 +1599,7 @@ mod tests {
             id: "request-1".to_string(),
             token: None,
             result: Some(r#"{"name":"Ada"}"#.to_string()),
+            embedding: None,
             error: None,
             reason: None,
             done: Some(true),
@@ -1571,14 +1674,29 @@ mod tests {
         assert!(structured_json.get("name").is_some());
 
         let transcript = container
-            .transcribe(Vec::new(), None)
+            .transcribe(Vec::new(), None, "transcribe")
             .expect("transcribe through container wrapper");
         assert!(!transcript.is_empty());
+
+        let translation = container
+            .transcribe(Vec::new(), None, "translate")
+            .expect("translate through container wrapper");
+        assert!(!translation.is_empty());
+
+        let embedding = container
+            .embed("hello world")
+            .expect("embed through container wrapper");
+        assert!(!embedding.is_empty());
 
         let description = container
             .describe(Vec::new())
             .expect("describe through container wrapper");
         assert!(!description.is_empty());
+
+        let extracted = container
+            .ocr(Vec::new())
+            .expect("ocr through container wrapper");
+        assert!(!extracted.is_empty());
 
         let segments = container
             .segment(Vec::new())

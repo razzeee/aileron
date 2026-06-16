@@ -8,10 +8,11 @@ use crate::state::SharedState;
 #[allow(unused_imports)]
 // VarlinkCallError is a supertrait; its methods reach us via Call_* dyn objects.
 use aileron_varlink::aileron_Inference::{
-    Call_Chat, Call_CreateSession, Call_Describe, Call_EndSession, Call_GetUseCaseAvailability,
-    Call_Prewarm, Call_Respond, Call_RespondGuided, Call_Segment, Call_StreamChat,
-    Call_StreamResponse, Call_Transcribe, ChatMessage, GenerationOptions, GuidedField,
-    ModelAvailability, VarlinkCallError, VarlinkInterface, VisionSegment,
+    Call_Chat, Call_CreateSession, Call_Describe, Call_Embed, Call_EndSession,
+    Call_GetUseCaseAvailability, Call_Ocr, Call_Prewarm, Call_Respond, Call_RespondGuided,
+    Call_Segment, Call_StreamChat, Call_StreamResponse, Call_Transcribe, ChatMessage,
+    GenerationOptions, GuidedField, ModelAvailability, VarlinkCallError, VarlinkInterface,
+    VisionSegment,
 };
 
 pub struct InferenceHandler {
@@ -368,14 +369,13 @@ impl VarlinkInterface for InferenceHandler {
         self.rt.block_on(async {
             let mut guard = self.state.0.lock().await;
 
-            let (app_id, use_case, profile_id, image_ref, artifact_path, runtime_options) =
+            let (app_id, use_case, task, profile_id, image_ref, artifact_path, runtime_options) =
                 match guard.sessions.get(&session_id) {
                     Some(s) => {
-                        if let Err(reason) =
-                            ensure_exact_use_case(&s.use_case, "asr.transcribe", "Transcribe")
-                        {
-                            return call.reply_model_unavailable(reason);
-                        }
+                        let task = match ensure_asr_use_case(&s.use_case) {
+                            Ok(task) => task,
+                            Err(reason) => return call.reply_model_unavailable(reason),
+                        };
                         let (profile_id, image_ref, artifact_path, runtime_options) =
                             match profile_runtime(&guard, &s.profile_id) {
                                 Ok(resolved) => resolved,
@@ -384,6 +384,7 @@ impl VarlinkInterface for InferenceHandler {
                         (
                             s.app_id.clone(),
                             s.use_case.clone(),
+                            task,
                             profile_id,
                             image_ref,
                             artifact_path,
@@ -406,7 +407,7 @@ impl VarlinkInterface for InferenceHandler {
                 Err(e) => return call.reply_generation_failed(e.to_string()),
             };
 
-            match container.transcribe(audio_bytes, Some(&language_hint)) {
+            match container.transcribe(audio_bytes, Some(&language_hint), task) {
                 Ok(text) => call.reply(text),
                 Err(e) => call.reply_generation_failed(e.to_string()),
             }
@@ -461,6 +462,59 @@ impl VarlinkInterface for InferenceHandler {
             };
 
             match container.describe(image_bytes) {
+                Ok(text) => call.reply(text),
+                Err(e) => call.reply_generation_failed(e.to_string()),
+            }
+        })
+    }
+
+    fn ocr(
+        &self,
+        call: &mut dyn Call_Ocr,
+        session_id: String,
+        image: String,
+    ) -> varlink::Result<()> {
+        self.rt.block_on(async {
+            let mut guard = self.state.0.lock().await;
+
+            let (app_id, use_case, profile_id, image_ref, artifact_path, runtime_options) =
+                match guard.sessions.get(&session_id) {
+                    Some(s) => {
+                        if let Err(reason) = ensure_exact_use_case(&s.use_case, "vision.ocr", "Ocr")
+                        {
+                            return call.reply_model_unavailable(reason);
+                        }
+                        let (profile_id, image_ref, artifact_path, runtime_options) =
+                            match profile_runtime(&guard, &s.profile_id) {
+                                Ok(resolved) => resolved,
+                                Err(reason) => return call.reply_model_unavailable(reason),
+                            };
+                        (
+                            s.app_id.clone(),
+                            s.use_case.clone(),
+                            profile_id,
+                            image_ref,
+                            artifact_path,
+                            runtime_options,
+                        )
+                    }
+                    None => return call.reply_session_not_found(session_id),
+                };
+
+            let _ = guard.permissions.touch(&app_id, &use_case);
+            let image_bytes = base64_decode(&image).map_err(io_err)?;
+            let container = match guard.containers.get_or_spawn(
+                &profile_id,
+                &image_ref,
+                &artifact_path,
+                &runtime_options,
+                |_| {},
+            ) {
+                Ok(container) => container,
+                Err(e) => return call.reply_generation_failed(e.to_string()),
+            };
+
+            match container.ocr(image_bytes) {
                 Ok(text) => call.reply(text),
                 Err(e) => call.reply_generation_failed(e.to_string()),
             }
@@ -528,6 +582,59 @@ impl VarlinkInterface for InferenceHandler {
                         })
                         .collect(),
                 ),
+                Err(e) => call.reply_generation_failed(e.to_string()),
+            }
+        })
+    }
+
+    fn embed(
+        &self,
+        call: &mut dyn Call_Embed,
+        session_id: String,
+        text: String,
+    ) -> varlink::Result<()> {
+        self.rt.block_on(async {
+            let mut guard = self.state.0.lock().await;
+
+            let (app_id, use_case, profile_id, image_ref, artifact_path, runtime_options) =
+                match guard.sessions.get(&session_id) {
+                    Some(s) => {
+                        if let Err(reason) =
+                            ensure_exact_use_case(&s.use_case, "llm.embed", "Embed")
+                        {
+                            return call.reply_model_unavailable(reason);
+                        }
+                        let (profile_id, image_ref, artifact_path, runtime_options) =
+                            match profile_runtime(&guard, &s.profile_id) {
+                                Ok(resolved) => resolved,
+                                Err(reason) => return call.reply_model_unavailable(reason),
+                            };
+                        (
+                            s.app_id.clone(),
+                            s.use_case.clone(),
+                            profile_id,
+                            image_ref,
+                            artifact_path,
+                            runtime_options,
+                        )
+                    }
+                    None => return call.reply_session_not_found(session_id),
+                };
+
+            let _ = guard.permissions.touch(&app_id, &use_case);
+            let container = match guard.containers.get_or_spawn(
+                &profile_id,
+                &image_ref,
+                &artifact_path,
+                &runtime_options,
+                |_| {},
+            ) {
+                Ok(container) => container,
+                Err(e) => return call.reply_generation_failed(e.to_string()),
+            };
+
+            match container.embed(&text) {
+                Ok(embedding) => call.reply(embedding.into_iter().map(f64::from).collect()),
                 Err(e) => call.reply_generation_failed(e.to_string()),
             }
         })
@@ -965,7 +1072,9 @@ fn validate_options(options: &GenerationOptions) -> Result<u32, String> {
 }
 
 fn ensure_llm_use_case(use_case: &str) -> Result<(), String> {
-    if use_case.starts_with("llm.") {
+    // `llm.embed` is an llm.* token but produces vectors, not text, so it is
+    // not a valid use-case for the text-generation methods.
+    if use_case.starts_with("llm.") && use_case != "llm.embed" {
         Ok(())
     } else {
         Err(format!(
@@ -981,6 +1090,18 @@ fn ensure_exact_use_case(use_case: &str, expected: &str, method: &str) -> Result
         Err(format!(
             "{method} requires use-case {expected}, got {use_case}"
         ))
+    }
+}
+
+/// Validate the session use-case for the Transcribe method and return the
+/// whisper task to run: "transcribe" (verbatim) or "translate" (to English).
+fn ensure_asr_use_case(use_case: &str) -> Result<&'static str, String> {
+    match use_case {
+        "asr.transcribe" => Ok("transcribe"),
+        "asr.translate" => Ok("translate"),
+        other => Err(format!(
+            "Transcribe requires use-case asr.transcribe or asr.translate, got {other}"
+        )),
     }
 }
 
@@ -1118,6 +1239,21 @@ mod tests {
             ensure_llm_use_case("vision.describe"),
             Err("text generation requires an llm.* use-case, got vision.describe".to_string())
         );
+    }
+
+    #[test]
+    fn llm_generation_excludes_embed_use_case() {
+        assert_eq!(
+            ensure_llm_use_case("llm.embed"),
+            Err("text generation requires an llm.* use-case, got llm.embed".to_string())
+        );
+    }
+
+    #[test]
+    fn asr_use_case_maps_to_whisper_task() {
+        assert_eq!(ensure_asr_use_case("asr.transcribe"), Ok("transcribe"));
+        assert_eq!(ensure_asr_use_case("asr.translate"), Ok("translate"));
+        assert!(ensure_asr_use_case("llm.chat").is_err());
     }
 
     #[test]

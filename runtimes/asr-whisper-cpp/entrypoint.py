@@ -5,7 +5,9 @@ Aileron ASR container entrypoint — whisper.cpp backend (via pywhispercpp).
 Reads newline-delimited JSON requests from stdin, writes responses to stdout.
 
 Supported request types:
-  transcribe  – transcribe base64-encoded raw PCM (16 kHz mono f32le)
+  transcribe  – transcribe (or translate to English) base64-encoded raw PCM
+                (16 kHz mono f32le). The optional "task" field selects
+                "transcribe" (verbatim, default) or "translate" (to English).
 
 Device auto-detection order (highest priority first):
   1. AILERON_DEVICE env var set explicitly → use as-is
@@ -107,6 +109,9 @@ def handle_transcribe(model: Model, req: dict) -> None:
     req_id    = req["id"]
     audio_b64 = req.get("audio", "")
     language_hint = req.get("language_hint", "")
+    # "transcribe" (verbatim, source language) or "translate" (to English).
+    task = req.get("task", "transcribe")
+    translate = task == "translate"
 
     try:
         raw_pcm = base64.b64decode(audio_b64)
@@ -116,7 +121,11 @@ def handle_transcribe(model: Model, req: dict) -> None:
 
     try:
         audio = decode_pcm_f32le(raw_pcm)
-        segments = model.transcribe(audio, language=language_hint or None)
+        segments = model.transcribe(
+            audio,
+            language=language_hint or None,
+            translate=translate,
+        )
         for seg in segments:
             text = seg.text if hasattr(seg, "text") else str(seg)
             send({"id": req_id, "token": text})

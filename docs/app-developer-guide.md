@@ -33,8 +33,11 @@ Current tokens:
 - `llm.extract`
 - `llm.analyze`
 - `llm.chat`
+- `llm.embed`
 - `asr.transcribe`
+- `asr.translate`
 - `vision.describe`
+- `vision.ocr`
 - `vision.segment`
 
 Avoid treating model names as application requirements. A user may satisfy `llm.summarize` with a small CPU model, a GPU model, or a future system model without changing the app.
@@ -77,11 +80,15 @@ Use guided generation when the app needs structured data. The portal API accepts
 
 This is appropriate for extraction, classification, and form-filling workflows. It is not a replacement for validating untrusted data in the app; keep normal app-side validation.
 
+## Embeddings
+
+Use `llm.embed` with `Embed` to turn text into a fixed-length vector for semantic search, clustering, deduplication, or retrieval-augmented generation. `Embed` returns the embedding as a list of floats. Embed documents and queries with the same assigned profile so the vectors share a space
+
 ## Audio And Vision
 
-Use `asr.transcribe` for speech-to-text. Audio is passed as base64-encoded raw PCM bytes through the portal-facing API. `Transcribe` also accepts an optional `language_hint` string; pass an empty string to let the runtime auto-detect or use its default behavior.
+Use `asr.transcribe` for verbatim speech-to-text and `asr.translate` to translate spoken audio into English text. Both use the `Transcribe` method; the daemon selects the whisper transcribe or translate task from the session use case. Audio is passed as base64-encoded raw PCM bytes through the portal-facing API. `Transcribe` also accepts an optional `language_hint` string; pass an empty string to let the runtime auto-detect or use its default behavior.
 
-Use `vision.describe` for image description. Use `vision.segment` to identify visible objects with normalized rectangular boxes. Images are passed as base64-encoded PNG or JPEG bytes.
+Use `vision.describe` for image description and `vision.ocr` to extract text from an image with the `Ocr` method. Use `vision.segment` to identify visible objects with normalized rectangular boxes. Images are passed as base64-encoded PNG or JPEG bytes.
 
 Large media inputs can be expensive. Prefer user-initiated actions, visible progress, and cancellation-friendly UI.
 

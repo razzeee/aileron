@@ -5,6 +5,7 @@
     "chat",
     "generate_structured",
     "describe",
+    "ocr",
     "segment"
   ],
   "variants": [

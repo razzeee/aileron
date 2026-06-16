@@ -308,7 +308,7 @@ Paste or fetch an article URL, then click **Summarize**. Tokens stream into the 
 
 Use-case tokens are the daemon's routing and policy keys. A token maps to one assigned profile, permissions are granted per app and token, and warm containers are pooled per profile. Assigning the same profile to multiple tokens is valid.
 
-Use-cases describe the task intent and modality; methods describe the operation shape. `Respond` and `RespondGuided` are text-generation operations for `llm.*` sessions. `Transcribe` is for `asr.transcribe`, `Describe` is for `vision.describe`, and `Segment` is for `vision.segment`. There is intentionally no separate `llm.guided` token: guided generation is an output constraint for a real LLM task use-case, not a task intent of its own. Use `llm.analyze` when one guided response combines multiple analytical intents, such as summary, extraction, and classification fields.
+Use-cases describe the task intent and modality; methods describe the operation shape. `Respond` and `RespondGuided` are text-generation operations for `llm.*` sessions (except `llm.embed`). `Embed` is for `llm.embed`. `Transcribe` serves both `asr.transcribe` and `asr.translate` (the daemon runs the whisper transcribe or translate-to-English task based on the session use-case). `Describe` is for `vision.describe`, `Ocr` is for `vision.ocr`, and `Segment` is for `vision.segment`. There is intentionally no separate `llm.guided` token: guided generation is an output constraint for a real LLM task use-case, not a task intent of its own. Use `llm.analyze` when one guided response combines multiple analytical intents, such as summary, extraction, and classification fields.
 
 | Token | Task | Backend |
 |---|---|---|
@@ -318,8 +318,12 @@ Use-cases describe the task intent and modality; methods describe the operation 
 | `llm.classify` | Classify / tag text | llama.cpp |
 | `llm.extract` | Extract structured data | llama.cpp |
 | `llm.analyze` | Derive mixed structured insights from text | llama.cpp |
+| `llm.chat` | Stateless chat turns | llama.cpp |
+| `llm.embed` | Compute text embedding vectors | llama.cpp |
 | `asr.transcribe` | Transcribe audio (16 kHz mono f32le, base64) | whisper.cpp |
+| `asr.translate` | Translate spoken audio to English text | whisper.cpp |
 | `vision.describe` | Describe image contents (PNG/JPEG, base64) | llava / llama.cpp |
+| `vision.ocr` | Extract text from an image (PNG/JPEG, base64) | llama.cpp multimodal |
 | `vision.segment` | Identify objects in image | llama.cpp multimodal |
 
 ## Varlink interfaces
@@ -328,7 +332,7 @@ The daemon exposes four interfaces over `$XDG_RUNTIME_DIR/aileron.socket`.
 
 ### `aileron.Inference`
 
-Create sessions, generate text, get structured JSON output, transcribe audio, describe images.
+Create sessions, generate text, get structured JSON output, compute embeddings, transcribe and translate audio, describe and OCR images.
 
 ```varlink
 type ModelAvailability (is_available: bool, reason: string)
@@ -345,13 +349,15 @@ method StreamResponse(session_id: string, prompt: string, options: GenerationOpt
 method Chat(session_id: string, messages: []ChatMessage, options: GenerationOptions) -> (content: string)
 method StreamChat(session_id: string, messages: []ChatMessage, options: GenerationOptions) -> (token: string)
 method RespondGuided(session_id: string, prompt: string, fields: []GuidedField, options: GenerationOptions) -> (content: string)
+method Embed(session_id: string, text: string) -> (embedding: []float)
 method Transcribe(session_id: string, audio: string, language_hint: string) -> (text: string)
 method Describe(session_id: string, image: string) -> (text: string)
+method Ocr(session_id: string, image: string) -> (text: string)
 method Segment(session_id: string, image: string) -> (segments: []VisionSegment)
 method EndSession(session_id: string) -> ()
 ```
 
-`instructions` are stored on the session and forwarded to text containers as the container `system` prompt. `ChatMessage.role` is the caller-supplied conversation role, typically `user` or `assistant`. `audio` is raw 16 kHz mono f32le PCM bytes encoded as base64. `image` is PNG or JPEG bytes encoded as base64. `VisionSegment` coordinates are normalized `0.0..1.0` rectangles relative to image dimensions.
+`instructions` are stored on the session and forwarded to text containers as the container `system` prompt. `ChatMessage.role` is the caller-supplied conversation role, typically `user` or `assistant`. `audio` is raw 16 kHz mono f32le PCM bytes encoded as base64; `Transcribe` returns a verbatim transcript for `asr.transcribe` sessions and an English translation for `asr.translate` sessions. `image` is PNG or JPEG bytes encoded as base64. `Embed` returns the embedding vector for `text`. `VisionSegment` coordinates are normalized `0.0..1.0` rectangles relative to image dimensions.
 
 `GenerationOptions.maximum_response_tokens` must be greater than zero and fit in `u32`. `temperature` must be finite and non-negative. `sampling_mode` must be non-empty. `source_language_hint` and `target_language_hint` are optional strings for `llm.translate`; pass empty strings when unspecified. Today the daemon validates sampling fields, forwards `maximum_response_tokens` to containers as `max_tokens`, and folds translation hints into the session instructions for `llm.translate`.
 
@@ -417,8 +423,10 @@ The portal does not talk to containers directly. It translates D-Bus calls into 
 | `Chat` | `session_id: s, messages: a(ss), options: (xdsss)` | `content: s` | Stateless chat; app sends explicit user/assistant history |
 | `StreamChat` | `session_id: s, messages: a(ss), options: (xdsss)` | `()` | Emits `TokenReceived` signals; final token has `done=true` |
 | `RespondGuided` | `session_id: s, prompt: s, fields: a(sssb), options: (xdsss)` | `content: s` | LLM sessions only; returns JSON matching guided output fields |
-| `Transcribe` | `session_id: s, audio_b64: s, language_hint: s` | `text: s` | 16 kHz mono f32le PCM, base64; empty hint means auto-detect/no hint |
+| `Embed` | `session_id: s, text: s` | `embedding: ad` | `llm.embed` sessions only; returns an embedding vector |
+| `Transcribe` | `session_id: s, audio_b64: s, language_hint: s` | `text: s` | 16 kHz mono f32le PCM, base64; empty hint means auto-detect/no hint; transcribes or translates per use-case |
 | `Describe` | `session_id: s, image_b64: s` | `text: s` | PNG or JPEG, base64 |
+| `Ocr` | `session_id: s, image_b64: s` | `text: s` | `vision.ocr` sessions only; PNG or JPEG, base64; extracts text |
 | `Segment` | `session_id: s, image_b64: s` | `segments: []VisionSegment` | PNG or JPEG, base64; normalized boxes |
 | `EndSession` | `session_id: s` | `()` | |
 
