@@ -11,6 +11,7 @@ use gtk4::{
 };
 use libadwaita::prelude::*;
 use libadwaita::{ActionRow, AlertDialog, PreferencesGroup, ViewStack};
+use relm4::{ComponentParts, ComponentSender, SimpleComponent};
 
 const USE_CASES: &[&str] = &[
     "llm.summarize",
@@ -28,7 +29,42 @@ const USE_CASES: &[&str] = &[
     "vision.ocr",
 ];
 
-pub fn build(runtime_images_changed: Rc<dyn Fn()>) -> gtk4::Widget {
+pub struct ModelsPage;
+
+#[derive(Debug)]
+pub enum ModelsMsg {}
+
+pub struct ModelsWidgets;
+
+impl SimpleComponent for ModelsPage {
+    type Init = Rc<dyn Fn()>;
+    type Input = ModelsMsg;
+    type Output = ();
+    type Widgets = ModelsWidgets;
+    type Root = Box;
+
+    fn init_root() -> Self::Root {
+        Box::new(Orientation::Vertical, 0)
+    }
+
+    fn init(
+        runtime_images_changed: Self::Init,
+        root: Self::Root,
+        _sender: ComponentSender<Self>,
+    ) -> ComponentParts<Self> {
+        root.append(&build_widget(runtime_images_changed));
+        ComponentParts {
+            model: ModelsPage,
+            widgets: ModelsWidgets,
+        }
+    }
+
+    fn update(&mut self, msg: Self::Input, _sender: ComponentSender<Self>) {
+        match msg {}
+    }
+}
+
+fn build_widget(runtime_images_changed: Rc<dyn Fn()>) -> gtk4::Widget {
     let root = Box::new(Orientation::Vertical, 12);
     root.set_margin_top(12);
     root.set_margin_bottom(12);

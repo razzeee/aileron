@@ -1,18 +1,23 @@
-use std::rc::Rc;
-
 use libadwaita::prelude::*;
-use libadwaita::{ApplicationWindow, HeaderBar, ToolbarView, ViewStack, ViewSwitcher};
+use libadwaita::{
+    ApplicationWindow, HeaderBar, OverlaySplitView, ToolbarView, ViewStack, ViewSwitcherSidebar,
+};
 use relm4::{
     Component, ComponentController, ComponentParts, ComponentSender, Controller, RelmApp,
     SimpleComponent,
 };
 
-use crate::pages::{activity_page, downloads_page, models_page, permissions_page, runtimes_page};
+use crate::pages::{
+    activity_page, downloads_page, models_page, overview_page, permissions_page, runtimes_page,
+};
 
 #[derive(Debug)]
 pub enum AppMsg {}
 
 pub struct AppModel {
+    _overview: Controller<overview_page::OverviewPage>,
+    _models: Controller<models_page::ModelsPage>,
+    _runtimes: Controller<runtimes_page::RuntimesPage>,
     _permissions: Controller<permissions_page::PermissionsPage>,
     _downloads: Controller<downloads_page::DownloadsPage>,
     _activity: Controller<activity_page::ActivityPage>,
@@ -46,15 +51,34 @@ impl SimpleComponent for AppModel {
         window: Self::Root,
         _sender: ComponentSender<Self>,
     ) -> ComponentParts<Self> {
+        let overview = overview_page::OverviewPage::builder().launch(()).detach();
+        let runtimes = runtimes_page::RuntimesPage::builder().launch(()).detach();
+        let runtimes_sender = runtimes.sender().clone();
+        let models = models_page::ModelsPage::builder()
+            .launch(std::rc::Rc::new(move || {
+                let _ = runtimes_sender.send(runtimes_page::RuntimesMsg::Refresh);
+            }))
+            .detach();
         let permissions = permissions_page::PermissionsPage::builder()
             .launch(())
             .detach();
         let downloads = downloads_page::DownloadsPage::builder().launch(()).detach();
         let activity = activity_page::ActivityPage::builder().launch(()).detach();
 
-        build_window(&window, &permissions, &downloads, &activity);
+        build_window(
+            &window,
+            &overview,
+            &models,
+            &runtimes,
+            &permissions,
+            &downloads,
+            &activity,
+        );
         ComponentParts {
             model: AppModel {
+                _overview: overview,
+                _models: models,
+                _runtimes: runtimes,
                 _permissions: permissions,
                 _downloads: downloads,
                 _activity: activity,
@@ -70,6 +94,9 @@ impl SimpleComponent for AppModel {
 
 fn build_window(
     window: &ApplicationWindow,
+    overview: &Controller<overview_page::OverviewPage>,
+    models: &Controller<models_page::ModelsPage>,
+    runtimes: &Controller<runtimes_page::RuntimesPage>,
     permissions: &Controller<permissions_page::PermissionsPage>,
     downloads: &Controller<downloads_page::DownloadsPage>,
     activity: &Controller<activity_page::ActivityPage>,
@@ -77,18 +104,14 @@ fn build_window(
     // AdwViewStack provides the per-page title/icon metadata that AdwViewSwitcher needs.
     let stack = ViewStack::new();
 
-    let runtimes_view = runtimes_page::build();
-    let refresh_runtimes = {
-        let runtimes_view = runtimes_view.clone();
-        Rc::new(move || runtimes_view.refresh())
-    };
+    let overview_page = stack.add_titled(overview.widget(), Some("overview"), "Overview");
+    overview_page.set_icon_name(Some("view-dashboard-symbolic"));
 
-    let models_page = stack.add_titled(
-        &models_page::build(refresh_runtimes.clone()),
-        Some("profiles"),
-        "Profiles",
-    );
+    let models_page = stack.add_titled(models.widget(), Some("profiles"), "Profiles");
     models_page.set_icon_name(Some("drive-harddisk-symbolic"));
+
+    let runtimes_page = stack.add_titled(runtimes.widget(), Some("runtimes"), "Runtimes");
+    runtimes_page.set_icon_name(Some("package-x-generic-symbolic"));
 
     let perms_page = stack.add_titled(permissions.widget(), Some("permissions"), "Permissions");
     perms_page.set_icon_name(Some("system-lock-screen-symbolic"));
@@ -96,16 +119,21 @@ fn build_window(
     let downloads_page = stack.add_titled(downloads.widget(), Some("downloads"), "Downloads");
     downloads_page.set_icon_name(Some("emblem-downloads-symbolic"));
 
-    let runtimes_page = stack.add_titled(&runtimes_view.widget, Some("runtimes"), "Runtimes");
-    runtimes_page.set_icon_name(Some("package-x-generic-symbolic"));
-
     let activity_page = stack.add_titled(activity.widget(), Some("activity"), "Activity");
     activity_page.set_icon_name(Some("emblem-synchronizing-symbolic"));
+    stack.set_visible_child_name("overview");
 
     let downloads_sender = downloads.sender().clone();
+    let runtimes_sender = runtimes.sender().clone();
+    let overview_sender = overview.sender().clone();
     stack.connect_visible_child_name_notify(move |stack| {
         match stack.visible_child_name().as_deref() {
-            Some("runtimes") => refresh_runtimes(),
+            Some("overview") => {
+                let _ = overview_sender.send(overview_page::OverviewMsg::Refresh);
+            }
+            Some("runtimes") => {
+                let _ = runtimes_sender.send(runtimes_page::RuntimesMsg::Refresh);
+            }
             Some("downloads") => {
                 let _ = downloads_sender.send(downloads_page::DownloadsMsg::Refresh);
             }
@@ -113,18 +141,26 @@ fn build_window(
         }
     });
 
-    // The switcher sits in the header bar.
-    let switcher = ViewSwitcher::builder()
-        .stack(&stack)
-        .policy(libadwaita::ViewSwitcherPolicy::Wide)
-        .build();
+    let split_view = OverlaySplitView::new();
+    split_view.set_min_sidebar_width(180.0);
+    split_view.set_max_sidebar_width(230.0);
+    split_view.set_show_sidebar(true);
+
+    let sidebar = ViewSwitcherSidebar::builder().stack(&stack).build();
+    let sidebar_header = HeaderBar::new();
+    sidebar_header.set_title_widget(Some(&gtk4::Label::new(Some("Aileron"))));
+    let sidebar_view = ToolbarView::new();
+    sidebar_view.add_top_bar(&sidebar_header);
+    sidebar_view.set_content(Some(&sidebar));
 
     let header = HeaderBar::new();
-    header.set_title_widget(Some(&switcher));
+    header.set_title_widget(Some(&gtk4::Label::new(Some("Operations Console"))));
 
     let toolbar_view = ToolbarView::new();
     toolbar_view.add_top_bar(&header);
     toolbar_view.set_content(Some(&stack));
 
-    window.set_content(Some(&toolbar_view));
+    split_view.set_sidebar(Some(&sidebar_view));
+    split_view.set_content(Some(&toolbar_view));
+    window.set_content(Some(&split_view));
 }

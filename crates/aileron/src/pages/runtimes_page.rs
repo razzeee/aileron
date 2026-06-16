@@ -6,22 +6,55 @@ use gtk4::prelude::*;
 use gtk4::{Box, Button, Label, ListBox, Orientation, ScrolledWindow};
 use libadwaita::prelude::*;
 use libadwaita::{ActionRow, PreferencesGroup, PreferencesPage};
+use relm4::{ComponentParts, ComponentSender, SimpleComponent};
 
-#[derive(Clone)]
-pub struct RuntimeImagesView {
-    pub widget: gtk4::Widget,
+pub struct RuntimesPage;
+
+#[derive(Debug)]
+pub enum RuntimesMsg {
+    Refresh,
+}
+
+pub struct RuntimesWidgets {
     list_box: ListBox,
 }
 
-impl RuntimeImagesView {
-    pub fn refresh(&self) {
-        refresh_runtime_images(&self.list_box);
+impl SimpleComponent for RuntimesPage {
+    type Init = ();
+    type Input = RuntimesMsg;
+    type Output = ();
+    type Widgets = RuntimesWidgets;
+    type Root = PreferencesPage;
+
+    fn init_root() -> Self::Root {
+        PreferencesPage::new()
+    }
+
+    fn init(
+        (): Self::Init,
+        page: Self::Root,
+        _sender: ComponentSender<Self>,
+    ) -> ComponentParts<Self> {
+        let list_box = build_page(&page);
+        refresh_runtime_images(&list_box);
+        ComponentParts {
+            model: RuntimesPage,
+            widgets: RuntimesWidgets { list_box },
+        }
+    }
+
+    fn update(&mut self, msg: Self::Input, _sender: ComponentSender<Self>) {
+        match msg {
+            RuntimesMsg::Refresh => {}
+        }
+    }
+
+    fn update_view(&self, widgets: &mut Self::Widgets, _sender: ComponentSender<Self>) {
+        refresh_runtime_images(&widgets.list_box);
     }
 }
 
-pub fn build() -> RuntimeImagesView {
-    let page = PreferencesPage::new();
-
+fn build_page(page: &PreferencesPage) -> ListBox {
     let group = PreferencesGroup::new();
     group.set_title("OCI Runtime Images");
     group.set_description(Some(
@@ -61,10 +94,7 @@ pub fn build() -> RuntimeImagesView {
 
     refresh_runtime_images(&list_box);
     page.add(&group);
-    RuntimeImagesView {
-        widget: page.upcast(),
-        list_box,
-    }
+    list_box
 }
 
 fn refresh_runtime_images(list_box: &ListBox) {
