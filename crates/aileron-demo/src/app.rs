@@ -1,7 +1,7 @@
 /// aileron-demo — sandboxed GTK4 article summarizer.
 use gtk4::prelude::*;
 use gtk4::{
-    Align, Box, Button, CheckButton, CssProvider, Entry, FileDialog, Label, Orientation,
+    Align, Box, Button, CssProvider, DropDown, Entry, FileDialog, Label, Orientation,
     ScrolledWindow, Spinner, TextBuffer, TextView,
 };
 use libadwaita::{
@@ -66,24 +66,10 @@ fn build_window(app: &Application) {
     // Mode switch + action button
     let mode_row = Box::new(Orientation::Horizontal, 8);
     mode_row.append(&Label::builder().label("Mode").xalign(0.0).build());
-    let summarize_mode = CheckButton::with_label("Summarize");
-    summarize_mode.set_active(true);
-    let translate_mode = CheckButton::with_label("Translate");
-    translate_mode.set_group(Some(&summarize_mode));
-    let rephrase_mode = CheckButton::with_label("Rephrase");
-    rephrase_mode.set_group(Some(&summarize_mode));
-    let classify_mode = CheckButton::with_label("Classify");
-    classify_mode.set_group(Some(&summarize_mode));
-    let extract_mode = CheckButton::with_label("Extract JSON");
-    extract_mode.set_group(Some(&summarize_mode));
-    let analyze_mode = CheckButton::with_label("Analyze");
-    analyze_mode.set_group(Some(&summarize_mode));
-    mode_row.append(&summarize_mode);
-    mode_row.append(&translate_mode);
-    mode_row.append(&rephrase_mode);
-    mode_row.append(&classify_mode);
-    mode_row.append(&extract_mode);
-    mode_row.append(&analyze_mode);
+    let mode_dropdown = DropDown::from_strings(&DemoMode::labels());
+    mode_dropdown.set_selected(DemoMode::Summarize.index());
+    mode_dropdown.set_hexpand(true);
+    mode_row.append(&mode_dropdown);
     text_box.append(&mode_row);
 
     let summarize_button = Button::builder()
@@ -94,55 +80,9 @@ fn build_window(app: &Application) {
 
     {
         let summarize_button = summarize_button.clone();
-        summarize_mode.connect_toggled(move |button| {
-            if button.is_active() {
-                summarize_button.set_label("Summarize");
-            }
-        });
-    }
-
-    {
-        let summarize_button = summarize_button.clone();
-        translate_mode.connect_toggled(move |button| {
-            if button.is_active() {
-                summarize_button.set_label("Translate");
-            }
-        });
-    }
-
-    {
-        let summarize_button = summarize_button.clone();
-        rephrase_mode.connect_toggled(move |button| {
-            if button.is_active() {
-                summarize_button.set_label("Rephrase");
-            }
-        });
-    }
-
-    {
-        let summarize_button = summarize_button.clone();
-        classify_mode.connect_toggled(move |button| {
-            if button.is_active() {
-                summarize_button.set_label("Classify");
-            }
-        });
-    }
-
-    {
-        let summarize_button = summarize_button.clone();
-        extract_mode.connect_toggled(move |button| {
-            if button.is_active() {
-                summarize_button.set_label("Extract JSON");
-            }
-        });
-    }
-
-    {
-        let summarize_button = summarize_button.clone();
-        analyze_mode.connect_toggled(move |button| {
-            if button.is_active() {
-                summarize_button.set_label("Analyze");
-            }
+        mode_dropdown.connect_selected_notify(move |dropdown| {
+            let mode = DemoMode::from_index(dropdown.selected()).unwrap_or(DemoMode::Summarize);
+            summarize_button.set_label(mode.ready_label());
         });
     }
 
@@ -231,30 +171,15 @@ fn build_window(app: &Application) {
         let status_spinner = status_spinner.clone();
         let status_title = status_title.clone();
         let status_detail = status_detail.clone();
-        let translate_mode = translate_mode.clone();
-        let rephrase_mode = rephrase_mode.clone();
-        let classify_mode = classify_mode.clone();
-        let extract_mode = extract_mode.clone();
-        let analyze_mode = analyze_mode.clone();
+        let mode_dropdown = mode_dropdown.clone();
         summarize_button.connect_clicked(move |_| {
             let (start, end) = source_buffer.bounds();
             let text = source_buffer.text(&start, &end, false).to_string();
             if text.trim().is_empty() {
                 return;
             }
-            let mode = if translate_mode.is_active() {
-                DemoMode::Translate
-            } else if rephrase_mode.is_active() {
-                DemoMode::Rephrase
-            } else if classify_mode.is_active() {
-                DemoMode::Classify
-            } else if extract_mode.is_active() {
-                DemoMode::Extract
-            } else if analyze_mode.is_active() {
-                DemoMode::Analyze
-            } else {
-                DemoMode::Summarize
-            };
+            let mode =
+                DemoMode::from_index(mode_dropdown.selected()).unwrap_or(DemoMode::Summarize);
             output_buffer.set_text("");
             summarize_button_for_click.set_sensitive(false);
             summarize_button_for_click.set_label(mode.busy_label());
@@ -1921,6 +1846,40 @@ enum DemoMode {
 }
 
 impl DemoMode {
+    fn labels() -> [&'static str; 6] {
+        [
+            DemoMode::Summarize.ready_label(),
+            DemoMode::Translate.ready_label(),
+            DemoMode::Rephrase.ready_label(),
+            DemoMode::Classify.ready_label(),
+            DemoMode::Extract.ready_label(),
+            DemoMode::Analyze.ready_label(),
+        ]
+    }
+
+    fn index(&self) -> u32 {
+        match self {
+            DemoMode::Summarize => 0,
+            DemoMode::Translate => 1,
+            DemoMode::Rephrase => 2,
+            DemoMode::Classify => 3,
+            DemoMode::Extract => 4,
+            DemoMode::Analyze => 5,
+        }
+    }
+
+    fn from_index(index: u32) -> Option<Self> {
+        match index {
+            0 => Some(DemoMode::Summarize),
+            1 => Some(DemoMode::Translate),
+            2 => Some(DemoMode::Rephrase),
+            3 => Some(DemoMode::Classify),
+            4 => Some(DemoMode::Extract),
+            5 => Some(DemoMode::Analyze),
+            _ => None,
+        }
+    }
+
     fn ready_label(&self) -> &'static str {
         match self {
             DemoMode::Summarize => "Summarize",

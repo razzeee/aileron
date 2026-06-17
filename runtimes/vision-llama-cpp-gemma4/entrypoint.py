@@ -11,6 +11,7 @@ Supported request types:
   describe  - describe a PNG/JPEG image using a llama.cpp multimodal model
   ocr  - extract text from a PNG/JPEG image using a llama.cpp multimodal model
   segment  - identify objects in a PNG/JPEG image as normalized bounding boxes
+  embed  - return an embedding vector for the supplied text
 """
 
 import base64
@@ -95,6 +96,7 @@ def load_model() -> Llama:
         ),
         n_ctx=N_CTX,
         n_threads=N_THREADS,
+        embedding=True,
     )
 
 
@@ -300,6 +302,26 @@ def handle_segment(llm: Llama, req: dict) -> None:
     send({"id": req_id, "result": json.dumps(parsed, separators=(",", ":")), "done": True})
 
 
+def handle_embed(llm: Llama, req: dict) -> None:
+    """Compute an embedding vector for the supplied text."""
+    req_id = req["id"]
+    text = req.get("prompt", "")
+
+    embedding = llm.embed(text)
+
+    # llama.cpp returns either a flat vector or a list of per-token vectors
+    # depending on pooling; mean-pool token vectors into one response vector.
+    if embedding and isinstance(embedding[0], list):
+        cols = len(embedding[0])
+        means = [0.0] * cols
+        for row in embedding:
+            for i, value in enumerate(row):
+                means[i] += value
+        embedding = [value / len(embedding) for value in means]
+
+    send({"id": req_id, "embedding": embedding, "done": True})
+
+
 def main() -> None:
     llm = load_model()
     serve_requests(
@@ -311,6 +333,7 @@ def main() -> None:
             "describe": handle_describe,
             "ocr": handle_ocr,
             "segment": handle_segment,
+            "embed": handle_embed,
         },
         log_prefix="aileron-vision",
         unsupported_done=False,
