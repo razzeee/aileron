@@ -5,13 +5,13 @@
   "tier": "balanced",
   "min_ram_gb": 6.0,
   "use_cases": [
-    "llm.summarize",
-    "llm.chat",
-    "llm.translate",
-    "llm.rephrase",
-    "llm.classify",
-    "llm.extract",
-    "llm.analyze"
+    "language.summarize",
+    "language.chat",
+    "language.translate",
+    "language.rephrase",
+    "language.classify",
+    "language.extract",
+    "language.analyze"
   ],
   "artifacts": [
     {

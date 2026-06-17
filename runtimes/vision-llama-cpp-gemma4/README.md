@@ -108,7 +108,7 @@ A model profile points at this runtime and provides both artifact URLs/checksums
   "profile_id": "gemma-4-e4b-it-qat",
   "model_id": "gemma-4-e4b-it-qat",
   "runtime_id": "vision-llama-cpp-gemma4",
-  "use_cases": ["llm.summarize", "vision.describe", "vision.segment"],
+  "use_cases": ["language.summarize", "vision.describe", "vision.segment"],
   "artifacts": [
     {
       "role": "model",

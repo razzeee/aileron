@@ -45,28 +45,28 @@ method CreateSession(app_id: string, use_case: string, instructions: string) -> 
 # Start the backing container before the first user-visible response.
 method Prewarm(session_id: string, prompt_prefix: string) -> ()
 
-# Generate a complete response. Session must have been created with an llm.* use_case.
+# Generate a complete response. Session must have been created with a language.* use_case.
 method Respond(session_id: string, prompt: string, options: GenerationOptions) -> (content: string)
 
-# Stream response tokens. Session must have been created with an llm.* use_case.
+# Stream response tokens. Session must have been created with a language.* use_case.
 method StreamResponse(session_id: string, prompt: string, options: GenerationOptions) -> (token: string)
 
-# Generate a chat response from explicit conversation messages. Session must use llm.chat.
+# Generate a chat response from explicit conversation messages. Session must use language.chat.
 method Chat(session_id: string, messages: []ChatMessage, options: GenerationOptions) -> (content: string)
 
-# Stream chat response tokens from explicit conversation messages. Session must use llm.chat.
+# Stream chat response tokens from explicit conversation messages. Session must use language.chat.
 method StreamChat(session_id: string, messages: []ChatMessage, options: GenerationOptions) -> (token: string)
 
 # Generate JSON matching field guides converted to a JSON Schema object.
-# Session must have been created with an llm.* use_case.
+# Session must have been created with a language.* use_case.
 method RespondGuided(session_id: string, prompt: string, fields: []GuidedField, options: GenerationOptions) -> (content: string)
 
-# Compute embedding vectors for text. Session must have been created with use_case: llm.embed
+# Compute embedding vectors for text. Session must have been created with use_case: language.embed
 # embedding: the embedding vector for the supplied text
 method Embed(session_id: string, text: string) -> (embedding: []float)
 
 # Transcribe or translate audio. Session must have been created with
-# use_case: asr.transcribe (verbatim, source language) or asr.translate (translated to English).
+# use_case: speech.transcribe (verbatim, source language) or speech.translate (translated to English).
 # audio: raw PCM bytes encoded as base64 (16kHz mono f32le)
 # language_hint: optional language hint; empty string means auto-detect/no hint
 method Transcribe(session_id: string, audio: string, language_hint: string) -> (text: string)

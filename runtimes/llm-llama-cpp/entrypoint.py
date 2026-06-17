@@ -122,7 +122,7 @@ def handle_generate_structured(llm: Llama, req: dict) -> None:
     except Exception:
         grammar = LlamaGrammar.from_string('root ::= value\n', verbose=False)
 
-    result_text = llm.create_chat_completion(
+        result_text = llm.create_chat_completion(
         messages=[
             {"role": "system", "content": system},
             {"role": "user",   "content": prompt},

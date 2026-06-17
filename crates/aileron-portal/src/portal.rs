@@ -1,33 +1,68 @@
-/// D-Bus portal backend for `org.freedesktop.impl.portal.AI`.
+/// D-Bus portal backend for task-oriented local model capabilities.
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::process::Command;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tracing::info;
 use zbus::zvariant::Type;
 use zbus::{connection, interface, object_server::SignalEmitter};
 
+const BUS_NAME: &str = "org.freedesktop.impl.portal.desktop.aileron";
+const OBJECT_PATH: &str = "/org/freedesktop/portal/desktop";
+
 pub async fn run() -> Result<()> {
     info!("registering D-Bus portal backend");
 
-    let portal = AiPortalBackend::default();
+    let state = Arc::new(PortalState::default());
     let conn = connection::Builder::session()?
-        .name("org.freedesktop.impl.portal.desktop.aileron")?
-        .serve_at("/org/freedesktop/portal/desktop", portal)?
+        .name(BUS_NAME)?
+        .serve_at(OBJECT_PATH, LanguagePortalBackend::new(state.clone()))?
+        .serve_at(OBJECT_PATH, SpeechPortalBackend::new(state.clone()))?
+        .serve_at(OBJECT_PATH, VisionPortalBackend::new(state))?
         .build()
         .await?;
 
-    info!("D-Bus connection established; serving portal interface");
+    info!("D-Bus connection established; serving portal interfaces");
     let _ = conn;
     std::future::pending::<()>().await;
     Ok(())
 }
 
 #[derive(Default)]
-struct AiPortalBackend {
+struct PortalState {
     warm: Mutex<HashSet<String>>,
     session_use_cases: Mutex<HashMap<String, String>>,
+}
+
+struct LanguagePortalBackend {
+    state: Arc<PortalState>,
+}
+
+struct SpeechPortalBackend {
+    state: Arc<PortalState>,
+}
+
+struct VisionPortalBackend {
+    state: Arc<PortalState>,
+}
+
+impl LanguagePortalBackend {
+    fn new(state: Arc<PortalState>) -> Self {
+        Self { state }
+    }
+}
+
+impl SpeechPortalBackend {
+    fn new(state: Arc<PortalState>) -> Self {
+        Self { state }
+    }
+}
+
+impl VisionPortalBackend {
+    fn new(state: Arc<PortalState>) -> Self {
+        Self { state }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -69,27 +104,15 @@ struct VisionSegmentDbus {
     height: f64,
 }
 
-#[interface(name = "org.freedesktop.impl.portal.AI")]
-impl AiPortalBackend {
+#[interface(name = "org.freedesktop.impl.portal.Language")]
+impl LanguagePortalBackend {
     async fn get_use_case_availability(
         &self,
         app_id: &str,
         use_case: &str,
     ) -> zbus::fdo::Result<ModelAvailabilityDbus> {
-        use aileron_varlink::aileron_Inference::VarlinkClientInterface;
-
-        let conn =
-            aileron_ipc::client::connect().map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-        let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn);
-        let reply = client
-            .get_use_case_availability(app_id.to_string(), use_case.to_string())
-            .call()
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-
-        Ok(ModelAvailabilityDbus {
-            is_available: reply.availability.is_available,
-            reason: reply.availability.reason,
-        })
+        ensure_use_case_prefix(use_case, "language.", "Language")?;
+        get_use_case_availability_impl(app_id, use_case)
     }
 
     async fn create_session(
@@ -98,45 +121,8 @@ impl AiPortalBackend {
         use_case: &str,
         instructions: &str,
     ) -> zbus::fdo::Result<String> {
-        use aileron_varlink::aileron_Inference::VarlinkClientInterface;
-
-        let conn =
-            aileron_ipc::client::connect().map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-        let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn);
-        let reply = match client
-            .create_session(
-                app_id.to_string(),
-                use_case.to_string(),
-                instructions.to_string(),
-            )
-            .call()
-        {
-            Ok(reply) => reply,
-            Err(e) if is_permission_denied(&e) => {
-                if !prompt_permission(app_id, use_case)? {
-                    set_permission(app_id, use_case, false)?;
-                    return Err(zbus::fdo::Error::AccessDenied(format!(
-                        "Permission denied for {app_id} / {use_case}"
-                    )));
-                }
-                set_permission(app_id, use_case, true)?;
-                client
-                    .create_session(
-                        app_id.to_string(),
-                        use_case.to_string(),
-                        instructions.to_string(),
-                    )
-                    .call()
-                    .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?
-            }
-            Err(e) => return Err(zbus::fdo::Error::Failed(e.to_string())),
-        };
-
-        self.session_use_cases
-            .lock()
-            .unwrap()
-            .insert(reply.session_id.clone(), use_case.to_string());
-        Ok(reply.session_id)
+        ensure_use_case_prefix(use_case, "language.", "Language")?;
+        create_session_impl(&self.state, app_id, use_case, instructions)
     }
 
     async fn prewarm(
@@ -145,30 +131,10 @@ impl AiPortalBackend {
         prompt_prefix: &str,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) -> zbus::fdo::Result<()> {
-        use aileron_varlink::aileron_Inference::VarlinkClientInterface;
-
-        AiPortalBackend::model_loading(&emitter, "starting model")
+        LanguagePortalBackend::model_loading(&emitter, "starting model")
             .await
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-
-        let conn =
-            aileron_ipc::client::connect().map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-        let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn);
-        client
-            .prewarm(session_id.to_string(), prompt_prefix.to_string())
-            .call()
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-
-        if let Some(use_case) = self
-            .session_use_cases
-            .lock()
-            .unwrap()
-            .get(session_id)
-            .cloned()
-        {
-            self.warm.lock().unwrap().insert(use_case);
-        }
-        Ok(())
+        prewarm_impl(&self.state, session_id, prompt_prefix)
     }
 
     #[zbus(signal)]
@@ -229,14 +195,14 @@ impl AiPortalBackend {
                 .token;
 
             if let Some(previous) = pending_token.replace(token) {
-                AiPortalBackend::token_received(&emitter, &session_id, &previous, false)
+                LanguagePortalBackend::token_received(&emitter, &session_id, &previous, false)
                     .await
                     .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
             }
         }
 
         if let Some(token) = pending_token {
-            AiPortalBackend::token_received(&emitter, &session_id, &token, true)
+            LanguagePortalBackend::token_received(&emitter, &session_id, &token, true)
                 .await
                 .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         }
@@ -306,14 +272,14 @@ impl AiPortalBackend {
                 .token;
 
             if let Some(previous) = pending_token.replace(token) {
-                AiPortalBackend::token_received(&emitter, &session_id, &previous, false)
+                LanguagePortalBackend::token_received(&emitter, &session_id, &previous, false)
                     .await
                     .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
             }
         }
 
         if let Some(token) = pending_token {
-            AiPortalBackend::token_received(&emitter, &session_id, &token, true)
+            LanguagePortalBackend::token_received(&emitter, &session_id, &token, true)
                 .await
                 .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         }
@@ -373,6 +339,47 @@ impl AiPortalBackend {
         Ok(reply.embedding)
     }
 
+    async fn end_session(&self, session_id: &str) -> zbus::fdo::Result<()> {
+        end_session_impl(&self.state, session_id)
+    }
+}
+
+#[interface(name = "org.freedesktop.impl.portal.Speech")]
+impl SpeechPortalBackend {
+    async fn get_use_case_availability(
+        &self,
+        app_id: &str,
+        use_case: &str,
+    ) -> zbus::fdo::Result<ModelAvailabilityDbus> {
+        ensure_use_case_prefix(use_case, "speech.", "Speech")?;
+        get_use_case_availability_impl(app_id, use_case)
+    }
+
+    async fn create_session(
+        &self,
+        app_id: &str,
+        use_case: &str,
+        instructions: &str,
+    ) -> zbus::fdo::Result<String> {
+        ensure_use_case_prefix(use_case, "speech.", "Speech")?;
+        create_session_impl(&self.state, app_id, use_case, instructions)
+    }
+
+    async fn prewarm(
+        &self,
+        session_id: &str,
+        prompt_prefix: &str,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> zbus::fdo::Result<()> {
+        SpeechPortalBackend::model_loading(&emitter, "starting model")
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        prewarm_impl(&self.state, session_id, prompt_prefix)
+    }
+
+    #[zbus(signal)]
+    async fn model_loading(emitter: &SignalEmitter<'_>, message: &str) -> zbus::Result<()>;
+
     async fn transcribe(
         &self,
         session_id: &str,
@@ -394,6 +401,47 @@ impl AiPortalBackend {
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         Ok(reply.text)
     }
+
+    async fn end_session(&self, session_id: &str) -> zbus::fdo::Result<()> {
+        end_session_impl(&self.state, session_id)
+    }
+}
+
+#[interface(name = "org.freedesktop.impl.portal.Vision")]
+impl VisionPortalBackend {
+    async fn get_use_case_availability(
+        &self,
+        app_id: &str,
+        use_case: &str,
+    ) -> zbus::fdo::Result<ModelAvailabilityDbus> {
+        ensure_use_case_prefix(use_case, "vision.", "Vision")?;
+        get_use_case_availability_impl(app_id, use_case)
+    }
+
+    async fn create_session(
+        &self,
+        app_id: &str,
+        use_case: &str,
+        instructions: &str,
+    ) -> zbus::fdo::Result<String> {
+        ensure_use_case_prefix(use_case, "vision.", "Vision")?;
+        create_session_impl(&self.state, app_id, use_case, instructions)
+    }
+
+    async fn prewarm(
+        &self,
+        session_id: &str,
+        prompt_prefix: &str,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> zbus::fdo::Result<()> {
+        VisionPortalBackend::model_loading(&emitter, "starting model")
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        prewarm_impl(&self.state, session_id, prompt_prefix)
+    }
+
+    #[zbus(signal)]
+    async fn model_loading(emitter: &SignalEmitter<'_>, message: &str) -> zbus::Result<()>;
 
     async fn describe(&self, session_id: &str, image_b64: &str) -> zbus::fdo::Result<String> {
         use aileron_varlink::aileron_Inference::VarlinkClientInterface;
@@ -450,18 +498,127 @@ impl AiPortalBackend {
     }
 
     async fn end_session(&self, session_id: &str) -> zbus::fdo::Result<()> {
-        use aileron_varlink::aileron_Inference::VarlinkClientInterface;
-
-        let conn =
-            aileron_ipc::client::connect().map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-        let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn);
-        client
-            .end_session(session_id.to_string())
-            .call()
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-        self.session_use_cases.lock().unwrap().remove(session_id);
-        Ok(())
+        end_session_impl(&self.state, session_id)
     }
+}
+
+fn ensure_use_case_prefix(use_case: &str, prefix: &str, interface: &str) -> zbus::fdo::Result<()> {
+    if use_case.starts_with(prefix) {
+        return Ok(());
+    }
+
+    Err(zbus::fdo::Error::Failed(format!(
+        "{interface} portal expects {prefix} use-cases, got {use_case}"
+    )))
+}
+
+fn get_use_case_availability_impl(
+    app_id: &str,
+    use_case: &str,
+) -> zbus::fdo::Result<ModelAvailabilityDbus> {
+    use aileron_varlink::aileron_Inference::VarlinkClientInterface;
+
+    let conn =
+        aileron_ipc::client::connect().map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+    let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn);
+    let reply = client
+        .get_use_case_availability(app_id.to_string(), use_case.to_string())
+        .call()
+        .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+
+    Ok(ModelAvailabilityDbus {
+        is_available: reply.availability.is_available,
+        reason: reply.availability.reason,
+    })
+}
+
+fn create_session_impl(
+    state: &PortalState,
+    app_id: &str,
+    use_case: &str,
+    instructions: &str,
+) -> zbus::fdo::Result<String> {
+    use aileron_varlink::aileron_Inference::VarlinkClientInterface;
+
+    let conn =
+        aileron_ipc::client::connect().map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+    let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn);
+    let reply = match client
+        .create_session(
+            app_id.to_string(),
+            use_case.to_string(),
+            instructions.to_string(),
+        )
+        .call()
+    {
+        Ok(reply) => reply,
+        Err(e) if is_permission_denied(&e) => {
+            if !prompt_permission(app_id, use_case)? {
+                set_permission(app_id, use_case, false)?;
+                return Err(zbus::fdo::Error::AccessDenied(format!(
+                    "Permission denied for {app_id} / {use_case}"
+                )));
+            }
+            set_permission(app_id, use_case, true)?;
+            client
+                .create_session(
+                    app_id.to_string(),
+                    use_case.to_string(),
+                    instructions.to_string(),
+                )
+                .call()
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?
+        }
+        Err(e) => return Err(zbus::fdo::Error::Failed(e.to_string())),
+    };
+
+    state
+        .session_use_cases
+        .lock()
+        .unwrap()
+        .insert(reply.session_id.clone(), use_case.to_string());
+    Ok(reply.session_id)
+}
+
+fn prewarm_impl(
+    state: &PortalState,
+    session_id: &str,
+    prompt_prefix: &str,
+) -> zbus::fdo::Result<()> {
+    use aileron_varlink::aileron_Inference::VarlinkClientInterface;
+
+    let conn =
+        aileron_ipc::client::connect().map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+    let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn);
+    client
+        .prewarm(session_id.to_string(), prompt_prefix.to_string())
+        .call()
+        .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+
+    if let Some(use_case) = state
+        .session_use_cases
+        .lock()
+        .unwrap()
+        .get(session_id)
+        .cloned()
+    {
+        state.warm.lock().unwrap().insert(use_case);
+    }
+    Ok(())
+}
+
+fn end_session_impl(state: &PortalState, session_id: &str) -> zbus::fdo::Result<()> {
+    use aileron_varlink::aileron_Inference::VarlinkClientInterface;
+
+    let conn =
+        aileron_ipc::client::connect().map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+    let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn);
+    client
+        .end_session(session_id.to_string())
+        .call()
+        .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+    state.session_use_cases.lock().unwrap().remove(session_id);
+    Ok(())
 }
 
 fn is_permission_denied(error: &impl std::fmt::Display) -> bool {
@@ -483,7 +640,7 @@ fn set_permission(app_id: &str, use_case: &str, allowed: bool) -> zbus::fdo::Res
 
 fn prompt_permission(app_id: &str, use_case: &str) -> zbus::fdo::Result<bool> {
     let text = format!(
-        "Allow {app_id} to use local AI for {use_case}?\n\nAileron will process this request locally using the assigned model."
+        "Allow {app_id} to use the local model capability {use_case}?\n\nAileron will process this request locally using the assigned model."
     );
 
     if let Ok(status) = Command::new("zenity")
@@ -512,13 +669,14 @@ fn prompt_permission(app_id: &str, use_case: &str) -> zbus::fdo::Result<bool> {
     ))
 }
 
-impl AiPortalBackend {
+impl LanguagePortalBackend {
     async fn emit_loading_if_cold(
         &self,
         session_id: &str,
         emitter: &SignalEmitter<'_>,
     ) -> zbus::fdo::Result<()> {
         let use_case = self
+            .state
             .session_use_cases
             .lock()
             .unwrap()
@@ -526,9 +684,9 @@ impl AiPortalBackend {
             .cloned();
         let is_warm = use_case
             .as_ref()
-            .is_some_and(|u| self.warm.lock().unwrap().contains(u));
+            .is_some_and(|u| self.state.warm.lock().unwrap().contains(u));
         if !is_warm {
-            AiPortalBackend::model_loading(emitter, "starting model")
+            LanguagePortalBackend::model_loading(emitter, "starting model")
                 .await
                 .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         }
@@ -537,13 +695,14 @@ impl AiPortalBackend {
 
     fn mark_warm(&self, session_id: &str) {
         if let Some(use_case) = self
+            .state
             .session_use_cases
             .lock()
             .unwrap()
             .get(session_id)
             .cloned()
         {
-            self.warm.lock().unwrap().insert(use_case);
+            self.state.warm.lock().unwrap().insert(use_case);
         }
     }
 }

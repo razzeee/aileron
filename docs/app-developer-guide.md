@@ -1,6 +1,6 @@
 # App Developer Guide
 
-Aileron gives Linux apps access to local AI through the desktop portal model. Apps do not connect to a localhost REST server, do not discover model files, and do not run inference engines themselves. They request a task-oriented capability from the portal, and the portal/daemon enforce the local policy boundary.
+Aileron gives Linux apps access to local model capabilities through the desktop portal model. Apps do not connect to a localhost REST server, do not discover model files, and do not run inference engines themselves. They request a task-oriented capability from the portal, and the portal/daemon enforce the local policy boundary.
 
 ## Mental Model
 
@@ -26,27 +26,27 @@ Use cases are stable task tokens. Apps should request the narrowest token that m
 
 Current tokens:
 
-- `llm.summarize`
-- `llm.translate`
-- `llm.rephrase`
-- `llm.classify`
-- `llm.extract`
-- `llm.analyze`
-- `llm.chat`
-- `llm.embed`
-- `asr.transcribe`
-- `asr.translate`
+- `language.summarize`
+- `language.translate`
+- `language.rephrase`
+- `language.classify`
+- `language.extract`
+- `language.analyze`
+- `language.chat`
+- `language.embed`
+- `speech.transcribe`
+- `speech.translate`
 - `vision.describe`
 - `vision.ocr`
 - `vision.segment`
 
-Avoid treating model names as application requirements. A user may satisfy `llm.summarize` with a small CPU model, a GPU model, or a future system model without changing the app.
+Avoid treating model names as application requirements. A user may satisfy `language.summarize` with a small CPU model, a GPU model, or a future system model without changing the app.
 
 ## Recommended Flow
 
 1. Check availability for the use case.
 2. Create a session with stable instructions.
-3. Optionally prewarm before the first visible response.
+3. Optionally prewarm on the same portal interface before the first visible operation.
 4. Send task input through the appropriate method.
 5. End the session when the user-visible task is complete.
 
@@ -54,7 +54,7 @@ For chat features, keep stable instructions in the session and send the explicit
 
 ## Text Generation
 
-Use `llm.*` use cases with `Respond` for full responses or `StreamResponse` for token streaming.
+Use `language.*` use cases with `Respond` for full responses or `StreamResponse` for token streaming.
 
 Good prompt shape:
 
@@ -68,11 +68,11 @@ Prefer explicit output constraints over relying on a specific model's behavior.
 
 ## Chat
 
-Use `llm.chat` with `Chat` for a full assistant turn or `StreamChat` for token streaming. The message list is stateless: include the prior turns the model should consider on every call.
+Use `language.chat` with `Chat` for a full assistant turn or `StreamChat` for token streaming. The message list is stateless: include the prior turns the model should consider on every call.
 
 Messages accept `user` and `assistant` roles. Keep system or developer instructions in `CreateSession.instructions` instead of adding them to the message list.
 
-For `llm.translate`, `GenerationOptions` includes optional `source_language_hint` and `target_language_hint` strings. Pass empty strings when the app does not know one side. These are hints, not strict locale settings; apps should still make the requested translation clear in the prompt.
+For `language.translate`, `GenerationOptions` includes optional `source_language_hint` and `target_language_hint` strings. Pass empty strings when the app does not know one side. These are hints, not strict locale settings; apps should still make the requested translation clear in the prompt.
 
 ## Guided Output
 
@@ -82,11 +82,11 @@ This is appropriate for extraction, classification, and form-filling workflows. 
 
 ## Embeddings
 
-Use `llm.embed` with `Embed` to turn text into a fixed-length vector for semantic search, clustering, deduplication, or retrieval-augmented generation. `Embed` returns the embedding as a list of floats. Embed documents and queries with the same assigned profile so the vectors share a space
+Use `language.embed` with `Embed` to turn text into a fixed-length vector for semantic search, clustering, deduplication, or retrieval-augmented generation. `Embed` returns the embedding as a list of floats. Embed documents and queries with the same assigned profile so the vectors share a space
 
-## Audio And Vision
+## Speech And Vision
 
-Use `asr.transcribe` for verbatim speech-to-text and `asr.translate` to translate spoken audio into English text. Both use the `Transcribe` method; the daemon selects the whisper transcribe or translate task from the session use case. Audio is passed as base64-encoded raw PCM bytes through the portal-facing API. `Transcribe` also accepts an optional `language_hint` string; pass an empty string to let the runtime auto-detect or use its default behavior.
+Use `speech.transcribe` for verbatim speech-to-text and `speech.translate` to translate spoken audio into English text. Both use the `Transcribe` method; the daemon selects the whisper transcribe or translate task from the session use case. Audio is passed as base64-encoded raw PCM bytes through the portal-facing API. `Transcribe` also accepts an optional `language_hint` string; pass an empty string to let the runtime auto-detect or use its default behavior.
 
 Use `vision.describe` for image description and `vision.ocr` to extract text from an image with the `Ocr` method. Use `vision.segment` to identify visible objects with normalized rectangular boxes. Images are passed as base64-encoded PNG or JPEG bytes.
 
@@ -94,9 +94,9 @@ Large media inputs can be expensive. Prefer user-initiated actions, visible prog
 
 ## Privacy And Permissions
 
-Design UI as if AI access is a user-controlled capability, not a hidden implementation detail.
+Design UI as if local model access is a user-controlled capability, not a hidden implementation detail.
 
-- Explain why the feature needs local AI.
+- Explain why the feature needs a local model capability.
 - Request the narrowest use case.
 - Do not send data to network services as a fallback without explicit user consent.
 - Do not ask users to start or configure a localhost server.
@@ -108,7 +108,7 @@ An unavailable use case is normal. The user may not have installed a matching pr
 
 Recommended behavior:
 
-- Disable or soften the AI feature entry point.
+- Disable or soften the model-backed feature entry point.
 - Explain that a local model profile is required.
 - Offer a non-AI fallback when possible.
 - Avoid model-specific instructions in the app UI.

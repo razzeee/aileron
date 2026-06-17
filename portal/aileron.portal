@@ -1,4 +1,4 @@
 [portal]
 DBusName=org.freedesktop.impl.portal.desktop.aileron
-Interfaces=org.freedesktop.impl.portal.AI;
+Interfaces=org.freedesktop.impl.portal.Language;org.freedesktop.impl.portal.Speech;org.freedesktop.impl.portal.Vision;
 UseIn=gnome;kde;lxqt;

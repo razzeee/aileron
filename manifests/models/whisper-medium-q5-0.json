@@ -4,7 +4,7 @@
   "runtime_id": "asr-whisper-cpp",
   "tier": "balanced",
   "min_ram_gb": 2.0,
-  "use_cases": ["asr.transcribe", "asr.translate"],
+  "use_cases": ["speech.transcribe", "speech.translate"],
   "artifacts": [
     {
       "role": "model",

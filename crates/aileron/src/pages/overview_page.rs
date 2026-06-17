@@ -6,14 +6,14 @@ use libadwaita::{ActionRow, PreferencesGroup, PreferencesPage};
 use relm4::{ComponentParts, ComponentSender, SimpleComponent};
 
 const USE_CASES: &[&str] = &[
-    "llm.summarize",
-    "llm.translate",
-    "llm.rephrase",
-    "llm.classify",
-    "llm.extract",
-    "llm.analyze",
-    "llm.chat",
-    "asr.transcribe",
+    "language.summarize",
+    "language.translate",
+    "language.rephrase",
+    "language.classify",
+    "language.extract",
+    "language.analyze",
+    "language.chat",
+    "speech.transcribe",
     "vision.describe",
     "vision.segment",
 ];

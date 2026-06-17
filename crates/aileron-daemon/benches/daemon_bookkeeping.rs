@@ -16,7 +16,7 @@ fn model_manifest_json() -> String {
             { "variant": "cpu", "image_ref": "registry.example/aileron/llama-cpp:cpu" },
             { "variant": "vulkan", "image_ref": "registry.example/aileron/llama-cpp:vulkan" }
         ],
-        "use_cases": ["llm.chat", "llm.summarize", "llm.extract"],
+        "use_cases": ["language.chat", "language.summarize", "language.extract"],
         "artifacts": [
             {
                 "role": "model",

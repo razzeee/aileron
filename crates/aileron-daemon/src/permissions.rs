@@ -123,24 +123,30 @@ mod tests {
     fn denied_first_use_is_listed_for_later_approval() {
         let mut store = PermissionStore::default();
 
-        assert!(store.insert_denied_if_missing("org.aileron.Demo", "llm.extract"));
+        assert!(store.insert_denied_if_missing("org.aileron.Demo", "language.extract"));
 
-        assert_eq!(store.check("org.aileron.Demo", "llm.extract"), Some(false));
+        assert_eq!(
+            store.check("org.aileron.Demo", "language.extract"),
+            Some(false)
+        );
     }
 
     #[test]
     fn denied_first_use_does_not_override_existing_grant() {
         let mut store = PermissionStore::default();
         store.0.insert(
-            PermissionStore::key("org.aileron.Demo", "llm.extract"),
+            PermissionStore::key("org.aileron.Demo", "language.extract"),
             PermissionEntry {
                 allowed: true,
                 last_used: None,
             },
         );
 
-        assert!(!store.insert_denied_if_missing("org.aileron.Demo", "llm.extract"));
+        assert!(!store.insert_denied_if_missing("org.aileron.Demo", "language.extract"));
 
-        assert_eq!(store.check("org.aileron.Demo", "llm.extract"), Some(true));
+        assert_eq!(
+            store.check("org.aileron.Demo", "language.extract"),
+            Some(true)
+        );
     }
 }

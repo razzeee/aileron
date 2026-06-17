@@ -20,7 +20,7 @@ Aileron solves both. All IPC is over a Varlink Unix socket. Flatpak sandboxes ca
 ```
 ┌─────────────────────────────────────────┐
 │  Flatpak sandbox                        │
-│  aileron-demo  ──── D-Bus ────────────► │──► org.freedesktop.impl.portal.AI
+│  aileron-demo  ──── D-Bus ────────────► │──► org.freedesktop.impl.portal.{Language,Speech,Vision}
 └─────────────────────────────────────────┘             │
                                                         │ D-Bus
                                                  aileron-portal
@@ -183,7 +183,7 @@ Model manifests live under `models/` and reference a reusable runtime by ID:
   "llmfit_model_id": "meta-llama/Llama-3.2-3B-Instruct",
   "runtime_id": "llm-llama-cpp",
   "tier": "balanced",
-  "use_cases": ["llm.summarize", "llm.translate", "llm.analyze"],
+  "use_cases": ["language.summarize", "language.translate", "language.analyze"],
   "artifacts": [
     {
       "role": "model",
@@ -243,7 +243,7 @@ cat > manifests/runtimes/stub.json <<'JSON'
 {"runtime_id":"stub","images":{"cpu":"localhost/aileron/stub:cpu"}}
 JSON
 cat > manifests/models/stub.json <<'JSON'
-{"profile_id":"stub","model_id":"stub","runtime_id":"stub","use_cases":["llm.summarize","llm.analyze","asr.transcribe","vision.describe"],"artifacts":[]}
+{"profile_id":"stub","model_id":"stub","runtime_id":"stub","use_cases":["language.summarize","language.analyze","speech.transcribe","vision.describe"],"artifacts":[]}
 JSON
 
 # 4. Start the daemon in allow-all mode (skips permission checks)
@@ -255,7 +255,7 @@ varlink call "unix:$XDG_RUNTIME_DIR/aileron.socket/aileron.Models.InstallManifes
 
 # 6. Create a session
 varlink call "unix:$XDG_RUNTIME_DIR/aileron.socket/aileron.Inference.CreateSession" \
-    '{"app_id":"test","use_case":"llm.summarize","instructions":"You are a concise test assistant."}'
+    '{"app_id":"test","use_case":"language.summarize","instructions":"You are a concise test assistant."}'
 # → {"session_id": "..."}   copy the value
 
 # 7. Generate (replace SESSION_ID)
@@ -282,7 +282,7 @@ Install the `varlink` CLI with: `cargo install varlink-cli`
 aileron
 ```
 
-In the **Models** page, click **Add Profile...**, choose one of the available runtime IDs, and provide the model file URL, SHA-256, and use-cases. Aileron derives the filename, model ID, and profile ID. Installed profiles can then be assigned to use-case tokens. Assign the same LLM profile to multiple LLM task tokens when one model backs several operations, for example `llm.summarize` for free-text summaries and `llm.analyze` for guided structured analysis.
+In the **Models** page, click **Add Profile...**, choose one of the available runtime IDs, and provide the model file URL, SHA-256, and use-cases. Aileron derives the filename, model ID, and profile ID. Installed profiles can then be assigned to use-case tokens. Assign the same language profile to multiple language task tokens when one model backs several operations, for example `language.summarize` for free-text summaries and `language.analyze` for guided structured analysis.
 
 ### 2. Grant permission to an app
 
@@ -291,7 +291,7 @@ The first time an app requests inference, Aileron denies it (no entry exists). G
 ```
 aileron.Permissions.SetAppPermission(
     app_id:   "org.example.MyApp",
-    use_case: "llm.summarize",
+    use_case: "language.summarize",
     allowed:  true
 )
 ```
@@ -308,20 +308,20 @@ Paste or fetch an article URL, then click **Summarize**. Tokens stream into the 
 
 Use-case tokens are the daemon's routing and policy keys. A token maps to one assigned profile, permissions are granted per app and token, and warm containers are pooled per profile. Assigning the same profile to multiple tokens is valid.
 
-Use-cases describe the task intent and modality; methods describe the operation shape. `Respond` and `RespondGuided` are text-generation operations for `llm.*` sessions (except `llm.embed`). `Embed` is for `llm.embed`. `Transcribe` serves both `asr.transcribe` and `asr.translate` (the daemon runs the whisper transcribe or translate-to-English task based on the session use-case). `Describe` is for `vision.describe`, `Ocr` is for `vision.ocr`, and `Segment` is for `vision.segment`. There is intentionally no separate `llm.guided` token: guided generation is an output constraint for a real LLM task use-case, not a task intent of its own. Use `llm.analyze` when one guided response combines multiple analytical intents, such as summary, extraction, and classification fields.
+Use-cases describe the task intent and modality; methods describe the operation shape. `Respond` and `RespondGuided` are text-generation operations for `language.*` sessions (except `language.embed`). `Embed` is for `language.embed`. `Transcribe` serves both `speech.transcribe` and `speech.translate` (the daemon runs the whisper transcribe or translate-to-English task based on the session use-case). `Describe` is for `vision.describe`, `Ocr` is for `vision.ocr`, and `Segment` is for `vision.segment`. There is intentionally no separate `language.guided` token: guided generation is an output constraint for a real language task use-case, not a task intent of its own. Use `language.analyze` when one guided response combines multiple analytical intents, such as summary, extraction, and classification fields.
 
 | Token | Task | Backend |
 |---|---|---|
-| `llm.summarize` | Summarize text | llama.cpp |
-| `llm.translate` | Translate text | llama.cpp |
-| `llm.rephrase` | Rewrite / simplify text | llama.cpp |
-| `llm.classify` | Classify / tag text | llama.cpp |
-| `llm.extract` | Extract structured data | llama.cpp |
-| `llm.analyze` | Derive mixed structured insights from text | llama.cpp |
-| `llm.chat` | Stateless chat turns | llama.cpp |
-| `llm.embed` | Compute text embedding vectors | llama.cpp |
-| `asr.transcribe` | Transcribe audio (16 kHz mono f32le, base64) | whisper.cpp |
-| `asr.translate` | Translate spoken audio to English text | whisper.cpp |
+| `language.summarize` | Summarize text | llama.cpp |
+| `language.translate` | Translate text | llama.cpp |
+| `language.rephrase` | Rewrite / simplify text | llama.cpp |
+| `language.classify` | Classify / tag text | llama.cpp |
+| `language.extract` | Extract structured data | llama.cpp |
+| `language.analyze` | Derive mixed structured insights from text | llama.cpp |
+| `language.chat` | Stateless chat turns | llama.cpp |
+| `language.embed` | Compute text embedding vectors | llama.cpp |
+| `speech.transcribe` | Transcribe audio (16 kHz mono f32le, base64) | whisper.cpp |
+| `speech.translate` | Translate spoken audio to English text | whisper.cpp |
 | `vision.describe` | Describe image contents (PNG/JPEG, base64) | llava / llama.cpp |
 | `vision.ocr` | Extract text from an image (PNG/JPEG, base64) | llama.cpp multimodal |
 | `vision.segment` | Identify objects in image | llama.cpp multimodal |
@@ -357,9 +357,9 @@ method Segment(session_id: string, image: string) -> (segments: []VisionSegment)
 method EndSession(session_id: string) -> ()
 ```
 
-`instructions` are stored on the session and forwarded to text containers as the container `system` prompt. `ChatMessage.role` is the caller-supplied conversation role, typically `user` or `assistant`. `audio` is raw 16 kHz mono f32le PCM bytes encoded as base64; `Transcribe` returns a verbatim transcript for `asr.transcribe` sessions and an English translation for `asr.translate` sessions. `image` is PNG or JPEG bytes encoded as base64. `Embed` returns the embedding vector for `text`. `VisionSegment` coordinates are normalized `0.0..1.0` rectangles relative to image dimensions.
+`instructions` are stored on the session and forwarded to text containers as the container `system` prompt. `ChatMessage.role` is the caller-supplied conversation role, typically `user` or `assistant`. `audio` is raw 16 kHz mono f32le PCM bytes encoded as base64; `Transcribe` returns a verbatim transcript for `speech.transcribe` sessions and an English translation for `speech.translate` sessions. `image` is PNG or JPEG bytes encoded as base64. `Embed` returns the embedding vector for `text`. `VisionSegment` coordinates are normalized `0.0..1.0` rectangles relative to image dimensions.
 
-`GenerationOptions.maximum_response_tokens` must be greater than zero and fit in `u32`. `temperature` must be finite and non-negative. `sampling_mode` must be non-empty. `source_language_hint` and `target_language_hint` are optional strings for `llm.translate`; pass empty strings when unspecified. Today the daemon validates sampling fields, forwards `maximum_response_tokens` to containers as `max_tokens`, and folds translation hints into the session instructions for `llm.translate`.
+`GenerationOptions.maximum_response_tokens` must be greater than zero and fit in `u32`. `temperature` must be finite and non-negative. `sampling_mode` must be non-empty. `source_language_hint` and `target_language_hint` are optional strings for `language.translate`; pass empty strings when unspecified. Today the daemon validates sampling fields, forwards `maximum_response_tokens` to containers as `max_tokens`, and folds translation hints into the session instructions for `language.translate`.
 
 `GuidedField.kind` supports `string`, `number`, `integer`, `boolean`, and `string_array`. The daemon converts guided fields into a JSON Schema object with `additionalProperties: false`, sends it to the container as `response_format.schema`, then validates the returned JSON before replying.
 
@@ -405,39 +405,62 @@ method ListActive() -> (sessions: []SessionInfo)
 method KillSession(session_id: string) -> ()
 ```
 
-## D-Bus portal interface
+## D-Bus portal interfaces
 
-`aileron-portal` is the sandbox-facing API. It registers on the session bus as `org.freedesktop.impl.portal.desktop.aileron` at path `/org/freedesktop/portal/desktop`, interface `org.freedesktop.impl.portal.AI`.
+`aileron-portal` is the sandbox-facing API. It registers on the session bus as `org.freedesktop.impl.portal.desktop.aileron` at path `/org/freedesktop/portal/desktop` and serves three task-clustered interfaces.
 
 The portal does not talk to containers directly. It translates D-Bus calls into `aileron.Inference` Varlink calls, and the daemon owns permissions, sessions, model assignments, and container stdio.
 
-### Methods
+| Interface | Use-case prefix | Methods |
+|---|---|---|
+| `org.freedesktop.impl.portal.Language` | `language.*` | `GetUseCaseAvailability`, `CreateSession`, `Prewarm`, `Respond`, `StreamResponse`, `Chat`, `StreamChat`, `RespondGuided`, `Embed`, `EndSession` |
+| `org.freedesktop.impl.portal.Speech` | `speech.*` | `GetUseCaseAvailability`, `CreateSession`, `Prewarm`, `Transcribe`, `EndSession` |
+| `org.freedesktop.impl.portal.Vision` | `vision.*` | `GetUseCaseAvailability`, `CreateSession`, `Prewarm`, `Describe`, `Ocr`, `Segment`, `EndSession` |
+
+`GetUseCaseAvailability`, `CreateSession`, and `EndSession` have the same signatures on each interface. Each interface validates that the requested use-case token matches its prefix.
+
+### Shared Methods
 
 | Method | Parameters | Returns | Notes |
 |---|---|---|---|
 | `GetUseCaseAvailability` | `app_id: s, use_case: s` | `(is_available: b, reason: s)` | Checks whether an assigned profile has local artifacts and a runtime image |
 | `CreateSession` | `app_id: s, use_case: s, instructions: s` | `session_id: s` | Creates a session bound to the assigned profile; does not start the container by itself |
-| `Prewarm` | `session_id: s, prompt_prefix: s` | `()` | Starts the backing container before the first response |
+| `Prewarm` | `session_id: s, prompt_prefix: s` | `()` | Starts the backing container before the first user-visible operation; pass an empty prefix when no text prefix applies |
+| `EndSession` | `session_id: s` | `()` | Ends the session; the per-profile container remains pooled until idle timeout |
+
+### Language Methods
+
+| Method | Parameters | Returns | Notes |
+|---|---|---|---|
 | `Respond` | `session_id: s, prompt: s, options: (xdsss)` | `content: s` | Returns full generated text |
 | `StreamResponse` | `session_id: s, prompt: s, options: (xdsss)` | `()` | Emits `TokenReceived` signals; final token has `done=true` |
 | `Chat` | `session_id: s, messages: a(ss), options: (xdsss)` | `content: s` | Stateless chat; app sends explicit user/assistant history |
 | `StreamChat` | `session_id: s, messages: a(ss), options: (xdsss)` | `()` | Emits `TokenReceived` signals; final token has `done=true` |
-| `RespondGuided` | `session_id: s, prompt: s, fields: a(sssb), options: (xdsss)` | `content: s` | LLM sessions only; returns JSON matching guided output fields |
-| `Embed` | `session_id: s, text: s` | `embedding: ad` | `llm.embed` sessions only; returns an embedding vector |
+| `RespondGuided` | `session_id: s, prompt: s, fields: a(sssb), options: (xdsss)` | `content: s` | Language sessions only; returns JSON matching guided output fields |
+| `Embed` | `session_id: s, text: s` | `embedding: ad` | `language.embed` sessions only; returns an embedding vector |
+
+### Speech Methods
+
+| Method | Parameters | Returns | Notes |
+|---|---|---|---|
 | `Transcribe` | `session_id: s, audio_b64: s, language_hint: s` | `text: s` | 16 kHz mono f32le PCM, base64; empty hint means auto-detect/no hint; transcribes or translates per use-case |
+
+### Vision Methods
+
+| Method | Parameters | Returns | Notes |
+|---|---|---|---|
 | `Describe` | `session_id: s, image_b64: s` | `text: s` | PNG or JPEG, base64 |
 | `Ocr` | `session_id: s, image_b64: s` | `text: s` | `vision.ocr` sessions only; PNG or JPEG, base64; extracts text |
 | `Segment` | `session_id: s, image_b64: s` | `segments: []VisionSegment` | PNG or JPEG, base64; normalized boxes |
-| `EndSession` | `session_id: s` | `()` | |
 
-These are D-Bus signatures: parentheses define a struct, and `a(...)` means an array of structs. `options: (xdsss)` is `GenerationOptions`: `maximum_response_tokens` as int64, `temperature` as float64, `sampling_mode` as string, `source_language_hint` as string, and `target_language_hint` as string. Empty language hints mean unspecified. The language hints only affect `llm.translate`. `messages: a(ss)` is an array of `ChatMessage` structs: role, content. `fields: a(sssb)` is an array of `GuidedField` structs: name, kind, description, required.
+These are D-Bus signatures: parentheses define a struct, and `a(...)` means an array of structs. `options: (xdsss)` is `GenerationOptions`: `maximum_response_tokens` as int64, `temperature` as float64, `sampling_mode` as string, `source_language_hint` as string, and `target_language_hint` as string. Empty language hints mean unspecified. The language hints only affect `language.translate`. `messages: a(ss)` is an array of `ChatMessage` structs: role, content. `fields: a(sssb)` is an array of `GuidedField` structs: name, kind, description, required.
 
 ### Signals
 
 | Signal | Parameters | Fired when |
 |---|---|---|
-| `ModelLoading` | `message: s` | The portal is about to start a cold text-generation container |
-| `TokenReceived` | `session_id: s, token: s, done: b` | Each token during `StreamResponse` or `StreamChat` |
+| `ModelLoading` | `message: s` | The portal is about to start a cold backing container; available on each interface |
+| `TokenReceived` | `session_id: s, token: s, done: b` | Each token during `StreamResponse` or `StreamChat` on `Language` |
 
 D-Bus callers see underlying Varlink failures as `org.freedesktop.DBus.Error.Failed` with the Varlink error text.
 
@@ -445,7 +468,7 @@ D-Bus callers see underlying Varlink failures as `org.freedesktop.DBus.Error.Fai
 
 There is no direct portal-to-container transport. The complete inference API path is:
 
-1. Sandboxed app calls `org.freedesktop.impl.portal.AI` over session D-Bus.
+1. Sandboxed app calls `org.freedesktop.impl.portal.Language`, `org.freedesktop.impl.portal.Speech`, or `org.freedesktop.impl.portal.Vision` over session D-Bus.
 2. `aileron-portal` maps that call to `aileron.Inference` over the daemon's Varlink Unix socket.
 3. `aileron-daemon` validates permissions/options, resolves the assigned profile for the session use-case, and serializes one request at a time to the profile container over stdio.
 4. The container returns newline-delimited JSON chunks on stdout; the daemon aggregates or streams them back through Varlink, and the portal returns a D-Bus value or emits D-Bus signals.

@@ -14,16 +14,16 @@ use libadwaita::{ActionRow, AlertDialog, PreferencesGroup, ViewStack};
 use relm4::{ComponentParts, ComponentSender, SimpleComponent};
 
 const USE_CASES: &[&str] = &[
-    "llm.summarize",
-    "llm.translate",
-    "llm.rephrase",
-    "llm.classify",
-    "llm.extract",
-    "llm.analyze",
-    "llm.chat",
-    "llm.embed",
-    "asr.transcribe",
-    "asr.translate",
+    "language.summarize",
+    "language.translate",
+    "language.rephrase",
+    "language.classify",
+    "language.extract",
+    "language.analyze",
+    "language.chat",
+    "language.embed",
+    "speech.transcribe",
+    "speech.translate",
     "vision.describe",
     "vision.segment",
     "vision.ocr",
@@ -762,7 +762,7 @@ mod tests {
         let medium = catalog_profile("whisper-medium-q5-0", "balanced", 0.50);
 
         assert_eq!(
-            compare_candidates(&turbo, &medium, &assigned, "asr.transcribe"),
+            compare_candidates(&turbo, &medium, &assigned, "speech.transcribe"),
             std::cmp::Ordering::Less
         );
     }
@@ -802,14 +802,17 @@ mod tests {
         chat_better.recommended = true;
         chat_better.fit_level = "recommended".to_string();
         chat_better.fit_score = 50.0;
-        chat_better.use_cases = vec!["llm.summarize".to_string(), "llm.analyze".to_string()];
+        chat_better.use_cases = vec![
+            "language.summarize".to_string(),
+            "language.analyze".to_string(),
+        ];
         chat_better.use_case_fit_scores = vec![
             aileron_varlink::aileron_Models::UseCaseFitScore {
-                use_case: "llm.summarize".to_string(),
+                use_case: "language.summarize".to_string(),
                 score: 90.0,
             },
             aileron_varlink::aileron_Models::UseCaseFitScore {
-                use_case: "llm.analyze".to_string(),
+                use_case: "language.analyze".to_string(),
                 score: 60.0,
             },
         ];
@@ -818,24 +821,37 @@ mod tests {
         reasoning_better.recommended = true;
         reasoning_better.fit_level = "recommended".to_string();
         reasoning_better.fit_score = 50.0;
-        reasoning_better.use_cases = vec!["llm.summarize".to_string(), "llm.analyze".to_string()];
+        reasoning_better.use_cases = vec![
+            "language.summarize".to_string(),
+            "language.analyze".to_string(),
+        ];
         reasoning_better.use_case_fit_scores = vec![
             aileron_varlink::aileron_Models::UseCaseFitScore {
-                use_case: "llm.summarize".to_string(),
+                use_case: "language.summarize".to_string(),
                 score: 70.0,
             },
             aileron_varlink::aileron_Models::UseCaseFitScore {
-                use_case: "llm.analyze".to_string(),
+                use_case: "language.analyze".to_string(),
                 score: 95.0,
             },
         ];
 
         assert_eq!(
-            compare_candidates(&chat_better, &reasoning_better, &assigned, "llm.summarize"),
+            compare_candidates(
+                &chat_better,
+                &reasoning_better,
+                &assigned,
+                "language.summarize"
+            ),
             std::cmp::Ordering::Less
         );
         assert_eq!(
-            compare_candidates(&chat_better, &reasoning_better, &assigned, "llm.analyze"),
+            compare_candidates(
+                &chat_better,
+                &reasoning_better,
+                &assigned,
+                "language.analyze"
+            ),
             std::cmp::Ordering::Greater
         );
     }
@@ -846,9 +862,9 @@ mod tests {
         current.recommended = true;
         current.fit_level = "recommended".to_string();
         current.fit_score = 70.0;
-        current.use_cases = vec!["llm.summarize".to_string()];
+        current.use_cases = vec!["language.summarize".to_string()];
         current.use_case_fit_scores = vec![aileron_varlink::aileron_Models::UseCaseFitScore {
-            use_case: "llm.summarize".to_string(),
+            use_case: "language.summarize".to_string(),
             score: 70.0,
         }];
 
@@ -856,16 +872,16 @@ mod tests {
         better.recommended = true;
         better.fit_level = "recommended".to_string();
         better.fit_score = 90.0;
-        better.use_cases = vec!["llm.summarize".to_string()];
+        better.use_cases = vec!["language.summarize".to_string()];
         better.use_case_fit_scores = vec![aileron_varlink::aileron_Models::UseCaseFitScore {
-            use_case: "llm.summarize".to_string(),
+            use_case: "language.summarize".to_string(),
             score: 90.0,
         }];
 
         let catalog = vec![current, better];
 
         assert_eq!(
-            better_catalog_candidate(&catalog, "current", "llm.summarize")
+            better_catalog_candidate(&catalog, "current", "language.summarize")
                 .map(|profile| profile.profile_id.as_str()),
             Some("better")
         );
@@ -877,18 +893,18 @@ mod tests {
         installed.recommended = true;
         installed.fit_level = "recommended".to_string();
         installed.fit_score = 60.0;
-        installed.use_cases = vec!["llm.summarize".to_string()];
+        installed.use_cases = vec!["language.summarize".to_string()];
 
         let mut better = catalog_profile("better", "balanced", 5.0);
         better.recommended = true;
         better.fit_level = "recommended".to_string();
         better.fit_score = 90.0;
-        better.use_cases = vec!["llm.summarize".to_string()];
+        better.use_cases = vec!["language.summarize".to_string()];
 
         let catalog = vec![installed, better];
 
         assert_eq!(
-            better_catalog_candidate(&catalog, "installed", "llm.summarize")
+            better_catalog_candidate(&catalog, "installed", "language.summarize")
                 .map(|profile| profile.profile_id.as_str()),
             Some("better")
         );
@@ -916,7 +932,7 @@ mod tests {
             recommended: false,
             installing: false,
             recommendation_reason: String::new(),
-            use_cases: vec!["asr.transcribe".to_string()],
+            use_cases: vec!["speech.transcribe".to_string()],
         }
     }
 }
@@ -1554,9 +1570,9 @@ fn recommendation_button(
 }
 
 fn use_case_kind(use_case: &str) -> &'static str {
-    if use_case.starts_with("llm.") {
+    if use_case.starts_with("language.") {
         "Text"
-    } else if use_case.starts_with("asr.") {
+    } else if use_case.starts_with("speech.") {
         "Speech"
     } else if use_case.starts_with("vision.") {
         "Vision"
@@ -1756,7 +1772,7 @@ fn candidate_rank(
         10
     } else if profile.recommended {
         0
-    } else if matches!(use_case, "asr.transcribe" | "asr.translate")
+    } else if matches!(use_case, "speech.transcribe" | "speech.translate")
         && profile.fit_level == "fits_minimum"
     {
         match profile.tier.as_str() {
@@ -1843,7 +1859,7 @@ fn compare_asr_quality(
     b: &aileron_varlink::aileron_Models::CatalogProfileInfo,
     use_case: &str,
 ) -> std::cmp::Ordering {
-    if matches!(use_case, "asr.transcribe" | "asr.translate") {
+    if matches!(use_case, "speech.transcribe" | "speech.translate") {
         asr_quality_rank(a).cmp(&asr_quality_rank(b))
     } else {
         std::cmp::Ordering::Equal

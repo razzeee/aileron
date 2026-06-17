@@ -318,16 +318,16 @@ pub fn validate_use_cases(use_cases: &[String]) -> Result<()> {
 }
 
 pub const SUPPORTED_USE_CASES: &[&str] = &[
-    "llm.summarize",
-    "llm.translate",
-    "llm.rephrase",
-    "llm.classify",
-    "llm.extract",
-    "llm.analyze",
-    "llm.chat",
-    "llm.embed",
-    "asr.transcribe",
-    "asr.translate",
+    "language.summarize",
+    "language.translate",
+    "language.rephrase",
+    "language.classify",
+    "language.extract",
+    "language.analyze",
+    "language.chat",
+    "language.embed",
+    "speech.transcribe",
+    "speech.translate",
     "vision.describe",
     "vision.segment",
     "vision.ocr",
@@ -478,7 +478,7 @@ mod tests {
             "tier": "small",
             "disk_size_gb": 0.0,
             "min_ram_gb": 1.0,
-            "use_cases": ["llm.summarize"],
+            "use_cases": ["language.summarize"],
             "artifacts": []
         }
         "#;
@@ -538,7 +538,7 @@ mod tests {
             disk_size_gb: 99.0,
             min_ram_gb: 0.0,
             runtime_images: Vec::new(),
-            use_cases: vec!["llm.summarize".to_string()],
+            use_cases: vec!["language.summarize".to_string()],
             artifacts: vec![ManifestArtifact {
                 role: "model".to_string(),
                 url: "https://example.invalid/model.gguf".to_string(),
@@ -647,7 +647,7 @@ mod tests {
             "profile_id": "stub",
             "model_id": "stub",
             "runtime_id": "stub",
-            "use_cases": ["llm.magic"],
+            "use_cases": ["language.magic"],
             "artifacts": []
         }
         "#;
@@ -664,7 +664,7 @@ mod tests {
             "profile_id": "bad",
             "model_id": "bad",
             "runtime_id": "stub",
-            "use_cases": ["llm.summarize"],
+            "use_cases": ["language.summarize"],
             "artifacts": [{
                 "role": "model",
                 "url": "https://example.invalid/model.gguf",
@@ -748,7 +748,7 @@ mod tests {
             "model_id": "stub",
             "runtime_id": "stub",
             "tier": "tiny-ish",
-            "use_cases": ["llm.summarize"],
+            "use_cases": ["language.summarize"],
             "artifacts": []
         }
         "#;

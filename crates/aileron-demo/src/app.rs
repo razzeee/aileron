@@ -147,7 +147,7 @@ fn build_window(window: &ApplicationWindow) {
         .css_classes(vec!["heading"])
         .build();
     let status_detail = Label::builder()
-        .label("Paste text, then run a local LLM task.")
+        .label("Paste text, then run a local Language task.")
         .xalign(0.0)
         .wrap(true)
         .build();
@@ -422,7 +422,7 @@ fn build_lab_overview(stack: &ViewStack) -> gtk4::Widget {
     let cards = Box::new(Orientation::Vertical, 12);
     cards.append(&lab_card(
         "Chat Lab",
-        "Run multi-turn llm.chat sessions with explicit local history.",
+        "Run multi-turn language.chat sessions with explicit local history.",
         "StreamChat, Chat, CreateSession, EndSession",
         "Try: ask a follow-up question after the first response.",
         "Open Chat Lab",
@@ -440,7 +440,7 @@ fn build_lab_overview(stack: &ViewStack) -> gtk4::Widget {
     ));
     cards.append(&lab_card(
         "Speech Lab",
-        "Record microphone audio and transcribe it through the ASR portal path.",
+        "Record microphone audio and transcribe it through the Speech portal path.",
         "Transcribe",
         "Try: record 5-10 seconds of speech, then transcribe locally.",
         "Open Speech Lab",
@@ -562,7 +562,7 @@ fn build_chat_page() -> (gtk4::Widget, Entry) {
 
     vbox.append(
         &Label::builder()
-            .label("Send a multi-turn local chat through the stateless llm.chat API.")
+            .label("Send a multi-turn local chat through the stateless language.chat API.")
             .xalign(0.0)
             .wrap(true)
             .build(),
@@ -683,7 +683,7 @@ fn build_chat_page() -> (gtk4::Widget, Entry) {
                         Ok(ChatEvent::SessionCreated(id)) => {
                             *session_for_rx.borrow_mut() = Some(id);
                             status_title_for_rx.set_text("Chat session ready");
-                            status_detail_for_rx.set_text("The llm.chat session is active.");
+                            status_detail_for_rx.set_text("The language.chat session is active.");
                         }
                         Ok(ChatEvent::Token(token)) => {
                             assistant_text.push_str(&token);
@@ -771,7 +771,7 @@ fn build_chat_page() -> (gtk4::Widget, Entry) {
             status_spinner.stop();
             status_title.set_text("Ready");
             status_detail
-                .set_text("Chat cleared. The next message creates a fresh llm.chat session.");
+                .set_text("Chat cleared. The next message creates a fresh language.chat session.");
         });
     }
 
@@ -889,7 +889,7 @@ fn build_speech_page() -> gtk4::Widget {
 
     vbox.append(
         &Label::builder()
-            .label("Record microphone audio, then transcribe it or translate it to English through the ASR portal path.")
+            .label("Record microphone audio, then transcribe it or translate it to English through the Speech portal path.")
             .xalign(0.0)
             .wrap(true)
             .build(),
@@ -1078,7 +1078,7 @@ fn build_speech_page() -> gtk4::Widget {
                 transcribe_button.set_sensitive(false);
                 translate_button.set_sensitive(false);
                 status_spinner.start();
-                status_title.set_text("Creating ASR session");
+                status_title.set_text("Creating Speech session");
                 status_detail.set_text(&format!(
                     "Opening an {use_case} session through the portal..."
                 ));
@@ -1103,7 +1103,7 @@ fn build_speech_page() -> gtk4::Widget {
                             }
                             Ok(SpeechEvent::Error(message)) => {
                                 status_spinner.stop();
-                                status_title.set_text("ASR request failed");
+                                status_title.set_text("Speech request failed");
                                 status_detail.set_text(&message);
                                 transcribe_button.set_sensitive(true);
                                 translate_button.set_sensitive(true);
@@ -1111,8 +1111,8 @@ fn build_speech_page() -> gtk4::Widget {
                             }
                             Ok(SpeechEvent::Done) => {
                                 status_spinner.stop();
-                                status_title.set_text("ASR result complete");
-                                status_detail.set_text("ASR returned text through the portal.");
+                                status_title.set_text("Speech result complete");
+                                status_detail.set_text("Speech returned text through the portal.");
                                 transcribe_button.set_sensitive(true);
                                 translate_button.set_sensitive(true);
                                 return glib::ControlFlow::Break;
@@ -1120,9 +1120,9 @@ fn build_speech_page() -> gtk4::Widget {
                             Err(std::sync::mpsc::TryRecvError::Empty) => break,
                             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                                 status_spinner.stop();
-                                status_title.set_text("ASR request interrupted");
+                                status_title.set_text("Speech request interrupted");
                                 status_detail
-                                    .set_text("The ASR response channel closed unexpectedly.");
+                                    .set_text("The Speech response channel closed unexpectedly.");
                                 transcribe_button.set_sensitive(true);
                                 translate_button.set_sensitive(true);
                                 return glib::ControlFlow::Break;
@@ -1135,7 +1135,7 @@ fn build_speech_page() -> gtk4::Widget {
                 let error_tx = tx.clone();
                 std::thread::spawn(move || {
                     if let Err(e) = transcribe_recording(&path, use_case, tx) {
-                        eprintln!("[aileron-demo] asr error: {e}");
+                        eprintln!("[aileron-demo] speech error: {e}");
                         let _ = error_tx.send(SpeechEvent::Error(friendly_error(&e)));
                     }
                 });
@@ -1143,8 +1143,8 @@ fn build_speech_page() -> gtk4::Widget {
         }
     };
 
-    wire_asr_action(&transcribe_button, "asr.transcribe", "transcribing");
-    wire_asr_action(&translate_button, "asr.translate", "translating");
+    wire_asr_action(&transcribe_button, "speech.transcribe", "transcribing");
+    wire_asr_action(&translate_button, "speech.translate", "translating");
 
     scrollable_page(&vbox)
 }
@@ -1647,7 +1647,7 @@ fn build_embed_page() -> gtk4::Widget {
 
     vbox.append(
         &Label::builder()
-            .label("Turn text into an embedding vector through the llm.embed portal path. Useful for semantic search, clustering, and retrieval.")
+            .label("Turn text into an embedding vector through the language.embed portal path. Useful for semantic search, clustering, and retrieval.")
             .xalign(0.0)
             .wrap(true)
             .build(),
@@ -1753,7 +1753,7 @@ fn build_embed_page() -> gtk4::Widget {
             embed_button_for_click.set_sensitive(false);
             status_spinner.start();
             status_title.set_text("Creating embedding session");
-            status_detail.set_text("Opening an llm.embed session through the portal...");
+            status_detail.set_text("Opening a language.embed session through the portal...");
 
             let (tx, rx) = std::sync::mpsc::channel::<EmbedEvent>();
             let output_buffer = output_buffer.clone();
@@ -2090,12 +2090,12 @@ impl DemoMode {
 
     fn initial_detail(&self) -> &'static str {
         match self {
-            DemoMode::Summarize => "Opening an llm.summarize session through the portal...",
-            DemoMode::Translate => "Opening an llm.translate session through the portal...",
-            DemoMode::Rephrase => "Opening an llm.rephrase session through the portal...",
-            DemoMode::Classify => "Opening an llm.classify session through the portal...",
-            DemoMode::Extract => "Opening an llm.extract session through the portal...",
-            DemoMode::Analyze => "Opening an llm.analyze session through the portal...",
+            DemoMode::Summarize => "Opening a language.summarize session through the portal...",
+            DemoMode::Translate => "Opening a language.translate session through the portal...",
+            DemoMode::Rephrase => "Opening a language.rephrase session through the portal...",
+            DemoMode::Classify => "Opening a language.classify session through the portal...",
+            DemoMode::Extract => "Opening a language.extract session through the portal...",
+            DemoMode::Analyze => "Opening a language.analyze session through the portal...",
         }
     }
 
@@ -2124,12 +2124,12 @@ impl DemoMode {
 
     fn use_case(&self) -> &'static str {
         match self {
-            DemoMode::Summarize => "llm.summarize",
-            DemoMode::Translate => "llm.translate",
-            DemoMode::Rephrase => "llm.rephrase",
-            DemoMode::Classify => "llm.classify",
-            DemoMode::Extract => "llm.extract",
-            DemoMode::Analyze => "llm.analyze",
+            DemoMode::Summarize => "language.summarize",
+            DemoMode::Translate => "language.translate",
+            DemoMode::Rephrase => "language.rephrase",
+            DemoMode::Classify => "language.classify",
+            DemoMode::Extract => "language.extract",
+            DemoMode::Analyze => "language.analyze",
         }
     }
 
@@ -2219,17 +2219,17 @@ enum SpeechPhase {
 impl SpeechPhase {
     fn title(&self) -> &'static str {
         match self {
-            SpeechPhase::CreatingSession => "Creating ASR session",
-            SpeechPhase::LoadingModel => "Loading ASR model",
+            SpeechPhase::CreatingSession => "Creating Speech session",
+            SpeechPhase::LoadingModel => "Loading Speech model",
             SpeechPhase::Transcribing => "Processing audio",
         }
     }
 
     fn detail(&self) -> &'static str {
         match self {
-            SpeechPhase::CreatingSession => "Opening an ASR session through the portal...",
-            SpeechPhase::LoadingModel => "Starting the local ASR container if it is cold...",
-            SpeechPhase::Transcribing => "Sending recorded microphone audio to the ASR model...",
+            SpeechPhase::CreatingSession => "Opening a Speech session through the portal...",
+            SpeechPhase::LoadingModel => "Starting the local Speech container if it is cold...",
+            SpeechPhase::Transcribing => "Sending recorded microphone audio to the Speech model...",
         }
     }
 }
@@ -2307,7 +2307,7 @@ impl EmbedPhase {
 
     fn detail(&self) -> &'static str {
         match self {
-            EmbedPhase::CreatingSession => "Opening an llm.embed session through the portal...",
+            EmbedPhase::CreatingSession => "Opening a language.embed session through the portal...",
             EmbedPhase::LoadingModel => "Starting the local model container if it is cold...",
             EmbedPhase::Embedding => "Sending text to the model for embedding...",
         }
@@ -2365,7 +2365,7 @@ fn concise_error(message: &str) -> String {
     }
 
     if message.contains("huggingface.co") && message.contains("ggml-") {
-        return "ASR model is missing from the assigned container image. The container tried to download a Whisper model from Hugging Face, but Aileron starts inference containers with networking disabled. Rebuild or assign an ASR image that has the Whisper model baked into /model.".to_string();
+        return "Speech model is missing from the assigned container image. The container tried to download a Whisper model from Hugging Face, but Aileron starts inference containers with networking disabled. Rebuild or assign a Speech image that has the Whisper model baked into /model.".to_string();
     }
 
     message.to_string()
@@ -2393,7 +2393,7 @@ fn summarize_streaming(text: &str, tx: std::sync::mpsc::Sender<DemoEvent>) -> an
 
     const BUS: &str = "org.freedesktop.impl.portal.desktop.aileron";
     const PATH: &str = "/org/freedesktop/portal/desktop";
-    const IFACE: &str = "org.freedesktop.impl.portal.AI";
+    const IFACE: &str = "org.freedesktop.impl.portal.Language";
 
     // Separate connections for method calls and signal subscriptions —
     // the blocking zbus connection is single-threaded; mixing signals and
@@ -2462,7 +2462,7 @@ fn extract_guided(text: &str, tx: std::sync::mpsc::Sender<DemoEvent>) -> anyhow:
 
     const BUS: &str = "org.freedesktop.impl.portal.desktop.aileron";
     const PATH: &str = "/org/freedesktop/portal/desktop";
-    const IFACE: &str = "org.freedesktop.impl.portal.AI";
+    const IFACE: &str = "org.freedesktop.impl.portal.Language";
 
     let conn = Connection::session()?;
     let proxy = zbus::blocking::Proxy::new(&conn, BUS, PATH, IFACE)?;
@@ -2519,7 +2519,7 @@ fn classify_guided(text: &str, tx: std::sync::mpsc::Sender<DemoEvent>) -> anyhow
 
     const BUS: &str = "org.freedesktop.impl.portal.desktop.aileron";
     const PATH: &str = "/org/freedesktop/portal/desktop";
-    const IFACE: &str = "org.freedesktop.impl.portal.AI";
+    const IFACE: &str = "org.freedesktop.impl.portal.Language";
 
     let conn = Connection::session()?;
     let proxy = zbus::blocking::Proxy::new(&conn, BUS, PATH, IFACE)?;
@@ -2593,7 +2593,7 @@ fn respond_text_task(
 
     const BUS: &str = "org.freedesktop.impl.portal.desktop.aileron";
     const PATH: &str = "/org/freedesktop/portal/desktop";
-    const IFACE: &str = "org.freedesktop.impl.portal.AI";
+    const IFACE: &str = "org.freedesktop.impl.portal.Language";
 
     let conn = Connection::session()?;
     let proxy = zbus::blocking::Proxy::new(&conn, BUS, PATH, IFACE)?;
@@ -2627,7 +2627,7 @@ fn chat_stream(
 
     const BUS: &str = "org.freedesktop.impl.portal.desktop.aileron";
     const PATH: &str = "/org/freedesktop/portal/desktop";
-    const IFACE: &str = "org.freedesktop.impl.portal.AI";
+    const IFACE: &str = "org.freedesktop.impl.portal.Language";
 
     let call_conn = Connection::session()?;
     let signal_conn = Connection::session()?;
@@ -2642,7 +2642,7 @@ fn chat_stream(
                 "CreateSession",
                 &(
                     "org.aileron.Demo",
-                    "llm.chat",
+                    "language.chat",
                     "You are a helpful local assistant. Be concise, accurate, and conversational.",
                 ),
             )?;
@@ -2680,7 +2680,7 @@ fn end_chat_session(session_id: &str) -> anyhow::Result<()> {
 
     const BUS: &str = "org.freedesktop.impl.portal.desktop.aileron";
     const PATH: &str = "/org/freedesktop/portal/desktop";
-    const IFACE: &str = "org.freedesktop.impl.portal.AI";
+    const IFACE: &str = "org.freedesktop.impl.portal.Language";
 
     let conn = Connection::session()?;
     let proxy = zbus::blocking::Proxy::new(&conn, BUS, PATH, IFACE)?;
@@ -2697,14 +2697,14 @@ fn transcribe_recording(
 
     const BUS: &str = "org.freedesktop.impl.portal.desktop.aileron";
     const PATH: &str = "/org/freedesktop/portal/desktop";
-    const IFACE: &str = "org.freedesktop.impl.portal.AI";
+    const IFACE: &str = "org.freedesktop.impl.portal.Speech";
 
     let audio = std::fs::read(path)?;
     if audio.is_empty() {
         anyhow::bail!("recording is empty");
     }
 
-    let instructions = if use_case == "asr.translate" {
+    let instructions = if use_case == "speech.translate" {
         "Translate the provided audio into English accurately."
     } else {
         "Transcribe the provided audio accurately."
@@ -2722,7 +2722,7 @@ fn transcribe_recording(
     tx.send(SpeechEvent::Phase(SpeechPhase::LoadingModel))?;
     tx.send(SpeechEvent::Phase(SpeechPhase::Transcribing))?;
     let audio_b64 = base64_encode(&audio);
-    // asr.translate reuses the Transcribe method; the daemon selects the
+    // speech.translate reuses the Transcribe method; the daemon selects the
     // whisper transcribe-vs-translate task from the session use_case.
     let transcript: String = proxy.call("Transcribe", &(&session_id, &audio_b64, ""))?;
     tx.send(SpeechEvent::Transcript(transcript))?;
@@ -2737,7 +2737,7 @@ fn describe_image(image_b64: &str, tx: std::sync::mpsc::Sender<VisionEvent>) -> 
 
     const BUS: &str = "org.freedesktop.impl.portal.desktop.aileron";
     const PATH: &str = "/org/freedesktop/portal/desktop";
-    const IFACE: &str = "org.freedesktop.impl.portal.AI";
+    const IFACE: &str = "org.freedesktop.impl.portal.Vision";
 
     let conn = Connection::session()?;
     let proxy = zbus::blocking::Proxy::new(&conn, BUS, PATH, IFACE)?;
@@ -2767,7 +2767,7 @@ fn ocr_image(image_b64: &str, tx: std::sync::mpsc::Sender<VisionEvent>) -> anyho
 
     const BUS: &str = "org.freedesktop.impl.portal.desktop.aileron";
     const PATH: &str = "/org/freedesktop/portal/desktop";
-    const IFACE: &str = "org.freedesktop.impl.portal.AI";
+    const IFACE: &str = "org.freedesktop.impl.portal.Vision";
 
     let conn = Connection::session()?;
     let proxy = zbus::blocking::Proxy::new(&conn, BUS, PATH, IFACE)?;
@@ -2797,7 +2797,7 @@ fn segment_image(image_b64: &str, tx: std::sync::mpsc::Sender<VisionEvent>) -> a
 
     const BUS: &str = "org.freedesktop.impl.portal.desktop.aileron";
     const PATH: &str = "/org/freedesktop/portal/desktop";
-    const IFACE: &str = "org.freedesktop.impl.portal.AI";
+    const IFACE: &str = "org.freedesktop.impl.portal.Vision";
 
     let conn = Connection::session()?;
     let proxy = zbus::blocking::Proxy::new(&conn, BUS, PATH, IFACE)?;
@@ -2827,7 +2827,7 @@ fn embed_text(text: &str, tx: std::sync::mpsc::Sender<EmbedEvent>) -> anyhow::Re
 
     const BUS: &str = "org.freedesktop.impl.portal.desktop.aileron";
     const PATH: &str = "/org/freedesktop/portal/desktop";
-    const IFACE: &str = "org.freedesktop.impl.portal.AI";
+    const IFACE: &str = "org.freedesktop.impl.portal.Language";
 
     let conn = Connection::session()?;
     let proxy = zbus::blocking::Proxy::new(&conn, BUS, PATH, IFACE)?;
@@ -2837,7 +2837,7 @@ fn embed_text(text: &str, tx: std::sync::mpsc::Sender<EmbedEvent>) -> anyhow::Re
         "CreateSession",
         &(
             "org.aileron.Demo",
-            "llm.embed",
+            "language.embed",
             "Compute an embedding vector for the provided text.",
         ),
     )?;

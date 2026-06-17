@@ -267,7 +267,7 @@ mod tests {
             runtime_options: HashMap::new(),
             artifact_path: PathBuf::from("/tmp/model"),
             runtime_images,
-            use_cases: vec!["asr.transcribe".to_string()],
+            use_cases: vec!["speech.transcribe".to_string()],
             artifact_hashes: Vec::new(),
             installed_at: "2026-06-14T00:00:00Z".to_string(),
             source: "user".to_string(),

@@ -6,8 +6,8 @@
   "tier": "balanced",
   "min_ram_gb": 2.0,
   "use_cases": [
-    "asr.transcribe",
-    "asr.translate"
+    "speech.transcribe",
+    "speech.translate"
   ],
   "artifacts": [
     {

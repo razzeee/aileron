@@ -318,7 +318,7 @@ impl VarlinkInterface for InferenceHandler {
                 instructions,
             ) = match guard.sessions.get(&session_id) {
                 Some(s) => {
-                    if let Err(reason) = ensure_llm_use_case(&s.use_case) {
+                    if let Err(reason) = ensure_language_generation_use_case(&s.use_case) {
                         return call.reply_model_unavailable(reason);
                     }
                     let (profile_id, image_ref, artifact_path, runtime_options) =
@@ -372,7 +372,7 @@ impl VarlinkInterface for InferenceHandler {
             let (app_id, use_case, task, profile_id, image_ref, artifact_path, runtime_options) =
                 match guard.sessions.get(&session_id) {
                     Some(s) => {
-                        let task = match ensure_asr_use_case(&s.use_case) {
+                        let task = match ensure_speech_use_case(&s.use_case) {
                             Ok(task) => task,
                             Err(reason) => return call.reply_model_unavailable(reason),
                         };
@@ -600,7 +600,7 @@ impl VarlinkInterface for InferenceHandler {
                 match guard.sessions.get(&session_id) {
                     Some(s) => {
                         if let Err(reason) =
-                            ensure_exact_use_case(&s.use_case, "llm.embed", "Embed")
+                            ensure_exact_use_case(&s.use_case, "language.embed", "Embed")
                         {
                             return call.reply_model_unavailable(reason);
                         }
@@ -669,7 +669,7 @@ async fn stream_chat_tokens(
     let (app_id, use_case, profile_id, image_ref, artifact_path, runtime_options, instructions) =
         match guard.sessions.get(&session_id) {
             Some(s) => {
-                ensure_exact_use_case(&s.use_case, "llm.chat", "Chat")
+                ensure_exact_use_case(&s.use_case, "language.chat", "Chat")
                     .map_err(GenerationError::ModelUnavailable)?;
                 let (profile_id, image_ref, artifact_path, runtime_options) =
                     profile_runtime(&guard, &s.profile_id)
@@ -761,7 +761,8 @@ async fn stream_tokens(
     let (app_id, use_case, profile_id, image_ref, artifact_path, runtime_options, instructions) =
         match guard.sessions.get(&session_id) {
             Some(s) => {
-                ensure_llm_use_case(&s.use_case).map_err(GenerationError::ModelUnavailable)?;
+                ensure_language_generation_use_case(&s.use_case)
+                    .map_err(GenerationError::ModelUnavailable)?;
                 let (profile_id, image_ref, artifact_path, runtime_options) =
                     profile_runtime(&guard, &s.profile_id)
                         .map_err(GenerationError::ModelUnavailable)?;
@@ -877,7 +878,8 @@ async fn generate_tokens(
     let (app_id, use_case, profile_id, image_ref, artifact_path, runtime_options, instructions) =
         match guard.sessions.get(&session_id) {
             Some(s) => {
-                ensure_llm_use_case(&s.use_case).map_err(GenerationError::ModelUnavailable)?;
+                ensure_language_generation_use_case(&s.use_case)
+                    .map_err(GenerationError::ModelUnavailable)?;
                 let (profile_id, image_ref, artifact_path, runtime_options) =
                     profile_runtime(&guard, &s.profile_id)
                         .map_err(GenerationError::ModelUnavailable)?;
@@ -928,7 +930,7 @@ async fn generate_chat_tokens(
     let (app_id, use_case, profile_id, image_ref, artifact_path, runtime_options, instructions) =
         match guard.sessions.get(&session_id) {
             Some(s) => {
-                ensure_exact_use_case(&s.use_case, "llm.chat", "Chat")
+                ensure_exact_use_case(&s.use_case, "language.chat", "Chat")
                     .map_err(GenerationError::ModelUnavailable)?;
                 let (profile_id, image_ref, artifact_path, runtime_options) =
                     profile_runtime(&guard, &s.profile_id)
@@ -998,7 +1000,7 @@ fn apply_translation_hints(
     instructions: String,
     options: &GenerationOptions,
 ) -> String {
-    if use_case != "llm.translate" {
+    if use_case != "language.translate" {
         return instructions;
     }
 
@@ -1071,14 +1073,14 @@ fn validate_options(options: &GenerationOptions) -> Result<u32, String> {
     Ok(options.maximum_response_tokens as u32)
 }
 
-fn ensure_llm_use_case(use_case: &str) -> Result<(), String> {
-    // `llm.embed` is an llm.* token but produces vectors, not text, so it is
+fn ensure_language_generation_use_case(use_case: &str) -> Result<(), String> {
+    // `language.embed` is a language.* token but produces vectors, not text, so it is
     // not a valid use-case for the text-generation methods.
-    if use_case.starts_with("llm.") && use_case != "llm.embed" {
+    if use_case.starts_with("language.") && use_case != "language.embed" {
         Ok(())
     } else {
         Err(format!(
-            "text generation requires an llm.* use-case, got {use_case}"
+            "text generation requires a language.* use-case, got {use_case}"
         ))
     }
 }
@@ -1095,12 +1097,12 @@ fn ensure_exact_use_case(use_case: &str, expected: &str, method: &str) -> Result
 
 /// Validate the session use-case for the Transcribe method and return the
 /// whisper task to run: "transcribe" (verbatim) or "translate" (to English).
-fn ensure_asr_use_case(use_case: &str) -> Result<&'static str, String> {
+fn ensure_speech_use_case(use_case: &str) -> Result<&'static str, String> {
     match use_case {
-        "asr.transcribe" => Ok("transcribe"),
-        "asr.translate" => Ok("translate"),
+        "speech.transcribe" => Ok("transcribe"),
+        "speech.translate" => Ok("translate"),
         other => Err(format!(
-            "Transcribe requires use-case asr.transcribe or asr.translate, got {other}"
+            "Transcribe requires use-case speech.transcribe or speech.translate, got {other}"
         )),
     }
 }
@@ -1233,27 +1235,30 @@ mod tests {
     }
 
     #[test]
-    fn llm_generation_is_limited_to_llm_use_cases() {
-        assert!(ensure_llm_use_case("llm.chat").is_ok());
+    fn language_generation_is_limited_to_language_use_cases() {
+        assert!(ensure_language_generation_use_case("language.chat").is_ok());
         assert_eq!(
-            ensure_llm_use_case("vision.describe"),
-            Err("text generation requires an llm.* use-case, got vision.describe".to_string())
+            ensure_language_generation_use_case("vision.describe"),
+            Err("text generation requires a language.* use-case, got vision.describe".to_string())
         );
     }
 
     #[test]
-    fn llm_generation_excludes_embed_use_case() {
+    fn language_generation_excludes_embed_use_case() {
         assert_eq!(
-            ensure_llm_use_case("llm.embed"),
-            Err("text generation requires an llm.* use-case, got llm.embed".to_string())
+            ensure_language_generation_use_case("language.embed"),
+            Err("text generation requires a language.* use-case, got language.embed".to_string())
         );
     }
 
     #[test]
-    fn asr_use_case_maps_to_whisper_task() {
-        assert_eq!(ensure_asr_use_case("asr.transcribe"), Ok("transcribe"));
-        assert_eq!(ensure_asr_use_case("asr.translate"), Ok("translate"));
-        assert!(ensure_asr_use_case("llm.chat").is_err());
+    fn speech_use_case_maps_to_whisper_task() {
+        assert_eq!(
+            ensure_speech_use_case("speech.transcribe"),
+            Ok("transcribe")
+        );
+        assert_eq!(ensure_speech_use_case("speech.translate"), Ok("translate"));
+        assert!(ensure_speech_use_case("language.chat").is_err());
     }
 
     #[test]

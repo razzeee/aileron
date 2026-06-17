@@ -5,12 +5,12 @@
   "tier": "small",
   "min_ram_gb": 4.0,
   "use_cases": [
-    "llm.summarize",
-    "llm.chat",
-    "llm.rephrase",
-    "llm.classify",
-    "llm.extract",
-    "llm.analyze"
+    "language.summarize",
+    "language.chat",
+    "language.rephrase",
+    "language.classify",
+    "language.extract",
+    "language.analyze"
   ],
   "artifacts": [
     {

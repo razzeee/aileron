@@ -1,6 +1,6 @@
 # ASR Runtime
 
-This runtime runs whisper.cpp through `pywhispercpp` and implements `asr.transcribe` for Whisper artifacts mounted under `/model`.
+This runtime runs whisper.cpp through `pywhispercpp` and implements `speech.transcribe` for Whisper artifacts mounted under `/model`.
 
 Model weights are not baked into the image. A model manifest downloads and verifies the Whisper artifact, then references this runtime by `runtime_id`.
 
@@ -73,7 +73,7 @@ A model profile points at this runtime and provides the artifact URL/checksum:
   "profile_id": "whisper-small",
   "model_id": "whisper-small",
   "runtime_id": "asr-whisper-cpp",
-  "use_cases": ["asr.transcribe"],
+  "use_cases": ["speech.transcribe"],
   "artifacts": [
     {
       "url": "https://huggingface.co/.../resolve/main/model.bin",
@@ -92,7 +92,7 @@ For ad-hoc Whisper models, use the management UI's **Add Profile...** action, or
 
 ```sh
 varlink call "unix:$XDG_RUNTIME_DIR/aileron.socket/aileron.Models.InstallUrlProfile" \
-    '{"runtime_id":"asr-whisper-cpp","url":"https://huggingface.co/.../resolve/main/model.bin","sha256":"...","use_cases":["asr.transcribe"]}'
+    '{"runtime_id":"asr-whisper-cpp","url":"https://huggingface.co/.../resolve/main/model.bin","sha256":"...","use_cases":["speech.transcribe"]}'
 ```
 
 Aileron derives the filename, model ID, and profile ID from the URL and checksum.
