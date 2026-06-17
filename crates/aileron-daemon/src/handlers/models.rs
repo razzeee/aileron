@@ -718,7 +718,7 @@ fn runtime_image_local_status(image: &StoredRuntimeImage) -> RuntimeImageUpdateC
 
     if remote_tag_is_checkable(&image.image_ref) {
         return RuntimeImageUpdateCheck {
-            available: true,
+            available: false,
             status: if image.digest.is_some() {
                 "installed: update not checked".to_string()
             } else {
@@ -2199,7 +2199,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_tag_runtime_status_keeps_update_action_available_without_remote_check() {
+    fn remote_tag_runtime_status_does_not_report_update_without_remote_check() {
         let image = StoredRuntimeImage {
             image_id: "runtime".to_string(),
             image_ref: "ghcr.io/example/runtime:cpu".to_string(),
@@ -2213,7 +2213,7 @@ mod tests {
 
         let status = runtime_image_local_status(&image);
 
-        assert!(status.available);
+        assert!(!status.available);
         assert_eq!(status.status, "installed: update not checked");
     }
 
