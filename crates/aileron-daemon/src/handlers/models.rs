@@ -717,6 +717,7 @@ fn runtime_image_local_status(image: &StoredRuntimeImage) -> RuntimeImageUpdateC
     }
 
     if remote_tag_is_checkable(&image.image_ref) {
+        // TODO: Compare the remote tag digest and report updates when it changes.
         return RuntimeImageUpdateCheck {
             available: false,
             status: if image.digest.is_some() {

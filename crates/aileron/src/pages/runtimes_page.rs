@@ -173,7 +173,7 @@ fn append_runtime_image_row(
     } else if image.update_status.is_empty() {
         "status unknown".to_string()
     } else {
-        image.update_status.clone()
+        runtime_status_label(&image.update_status).to_string()
     };
 
     let metadata = Label::new(Some(&format!(
@@ -237,6 +237,14 @@ fn runtime_update_action_visible(image: &OciRuntimeImage, has_active_download: b
     image.source != "system"
         && (has_active_download
             || (image.update_available && image.update_status != "installed: update not checked"))
+}
+
+fn runtime_status_label(status: &str) -> &str {
+    if status == "installed: update not checked" {
+        "installed"
+    } else {
+        status
+    }
 }
 
 fn install_is_terminal(install: &InstallStatus) -> bool {
@@ -428,5 +436,11 @@ mod tests {
 
         assert!(!runtime_update_action_visible(&image, false));
         assert!(runtime_update_action_visible(&image, true));
+    }
+
+    #[test]
+    fn runtime_status_label_hides_unchecked_update_wording() {
+        assert_eq!(runtime_status_label("installed: update not checked"), "installed");
+        assert_eq!(runtime_status_label("not checkable"), "not checkable");
     }
 }
