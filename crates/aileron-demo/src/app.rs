@@ -4,10 +4,11 @@ use gtk4::{
     Align, Box, Button, CssProvider, DropDown, Entry, FileDialog, Label, Orientation,
     ScrolledWindow, Spinner, TextBuffer, TextView,
 };
+use libadwaita::prelude::*;
 use libadwaita::{
-    Application, ApplicationWindow, HeaderBar, OverlaySplitView, ToolbarView, ViewStack,
-    ViewSwitcherSidebar,
+    ApplicationWindow, HeaderBar, OverlaySplitView, ToolbarView, ViewStack, ViewSwitcherSidebar,
 };
+use relm4::{ComponentParts, ComponentSender, RelmApp, SimpleComponent};
 use serde::Deserialize;
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -16,19 +17,52 @@ use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use zbus::zvariant::Type;
 
-pub fn build_app() -> Application {
-    let app = Application::builder()
-        .application_id("org.aileron.Demo")
-        .build();
+#[derive(Debug)]
+pub enum AppMsg {}
 
-    app.connect_activate(|app| {
-        build_window(app);
-    });
+pub struct AppModel;
 
-    app
+pub struct AppWidgets;
+
+pub fn run() {
+    libadwaita::init().expect("failed to initialise libadwaita");
+    let app = RelmApp::new("org.aileron.Demo");
+    app.run::<AppModel>(());
 }
 
-fn build_window(app: &Application) {
+impl SimpleComponent for AppModel {
+    type Init = ();
+    type Input = AppMsg;
+    type Output = ();
+    type Widgets = AppWidgets;
+    type Root = ApplicationWindow;
+
+    fn init_root() -> Self::Root {
+        ApplicationWindow::builder()
+            .title("Aileron Demo")
+            .default_width(860)
+            .default_height(700)
+            .build()
+    }
+
+    fn init(
+        (): Self::Init,
+        window: Self::Root,
+        _sender: ComponentSender<Self>,
+    ) -> ComponentParts<Self> {
+        build_window(&window);
+        ComponentParts {
+            model: AppModel,
+            widgets: AppWidgets,
+        }
+    }
+
+    fn update(&mut self, msg: Self::Input, _sender: ComponentSender<Self>) {
+        match msg {}
+    }
+}
+
+fn build_window(window: &ApplicationWindow) {
     let text_box = Box::new(Orientation::Vertical, 12);
     text_box.set_margin_top(12);
     text_box.set_margin_bottom(12);
@@ -295,23 +329,29 @@ fn build_window(app: &Application) {
     // ── Window ────────────────────────────────────────────────────────────────
     let stack = ViewStack::new();
     let (chat_page, chat_entry) = build_chat_page();
-    let text_page = stack.add_titled(&text_box, Some("text"), "Text Tasks");
+    let overview_page = stack.add_titled(
+        &build_lab_overview(&stack),
+        Some("overview"),
+        "Lab Overview",
+    );
+    overview_page.set_icon_name(Some("view-dashboard-symbolic"));
+    let text_page = stack.add_titled(&text_box, Some("text"), "Text Lab");
     text_page.set_icon_name(Some("text-x-generic-symbolic"));
-    let chat_page_meta = stack.add_titled(&chat_page, Some("chat"), "Chat");
+    let chat_page_meta = stack.add_titled(&chat_page, Some("chat"), "Chat Lab");
     chat_page_meta.set_icon_name(Some("user-available-symbolic"));
-    let speech_page = stack.add_titled(&build_speech_page(), Some("speech"), "Speech");
+    let speech_page = stack.add_titled(&build_speech_page(), Some("speech"), "Speech Lab");
     speech_page.set_icon_name(Some("audio-input-microphone-symbolic"));
-    let vision_page = stack.add_titled(&build_vision_page(), Some("vision"), "Vision");
+    let vision_page = stack.add_titled(&build_vision_page(), Some("vision"), "Vision Lab");
     vision_page.set_icon_name(Some("image-x-generic-symbolic"));
     let embed_page = stack.add_titled(&build_embed_page(), Some("embed"), "Embeddings");
     embed_page.set_icon_name(Some("emblem-documents-symbolic"));
-    stack.set_visible_child_name("chat");
+    stack.set_visible_child_name("overview");
 
     let sidebar = ViewSwitcherSidebar::builder().stack(&stack).build();
 
     let split_view = OverlaySplitView::new();
-    split_view.set_min_sidebar_width(150.0);
-    split_view.set_max_sidebar_width(180.0);
+    split_view.set_min_sidebar_width(190.0);
+    split_view.set_max_sidebar_width(240.0);
     split_view.set_show_sidebar(true);
 
     let sidebar_header = HeaderBar::new();
@@ -343,7 +383,7 @@ fn build_window(app: &Application) {
         });
     }
     content_header.pack_start(&show_sidebar_button);
-    content_header.set_title_widget(Some(&Label::new(Some("Aileron Demo"))));
+    content_header.set_title_widget(Some(&Label::new(Some("Capability Lab"))));
     let content_view = ToolbarView::new();
     content_view.add_top_bar(&content_header);
     content_view.set_content(Some(&stack));
@@ -358,16 +398,140 @@ fn build_window(app: &Application) {
     }
     show_sidebar_button.set_visible(false);
 
-    let window = ApplicationWindow::builder()
-        .application(app)
-        .title("Aileron Demo")
-        .default_width(860)
-        .default_height(700)
-        .content(&split_view)
-        .build();
+    window.set_content(Some(&split_view));
+    let _ = chat_entry;
+}
 
-    window.present();
-    chat_entry.grab_focus();
+fn build_lab_overview(stack: &ViewStack) -> gtk4::Widget {
+    let root = Box::new(Orientation::Vertical, 16);
+    root.set_margin_top(18);
+    root.set_margin_bottom(18);
+    root.set_margin_start(18);
+    root.set_margin_end(18);
+
+    root.append(
+        &Label::builder()
+            .label("Try each Aileron portal capability from one local sandboxed app.")
+            .xalign(0.0)
+            .wrap(true)
+            .css_classes(vec!["title-2"])
+            .build(),
+    );
+
+    let cards = Box::new(Orientation::Vertical, 12);
+    cards.append(&lab_card(
+        "Chat Lab",
+        "Run multi-turn llm.chat sessions with explicit local history.",
+        "StreamChat, Chat, CreateSession, EndSession",
+        "Try: ask a follow-up question after the first response.",
+        "Open Chat Lab",
+        "chat",
+        stack,
+    ));
+    cards.append(&lab_card(
+        "Text Lab",
+        "Fetch or paste text, then summarize, translate, rephrase, classify, extract JSON, or analyze.",
+        "StreamResponse, Respond, RespondGuided",
+        "Try: paste an article, classify it, then extract JSON facts.",
+        "Open Text Lab",
+        "text",
+        stack,
+    ));
+    cards.append(&lab_card(
+        "Speech Lab",
+        "Record microphone audio and transcribe it through the ASR portal path.",
+        "Transcribe",
+        "Try: record 5-10 seconds of speech, then transcribe locally.",
+        "Open Speech Lab",
+        "speech",
+        stack,
+    ));
+    cards.append(&lab_card(
+        "Vision Lab",
+        "Choose or paste an image and run description or segmentation through the vision portal path.",
+        "Describe, Segment",
+        "Try: choose a screenshot, describe it, then segment visible objects.",
+        "Open Vision Lab",
+        "vision",
+        stack,
+    ));
+    root.append(&cards);
+
+    root.upcast()
+}
+
+fn lab_card(
+    title: &str,
+    subtitle: &str,
+    methods: &str,
+    example: &str,
+    button_label: &str,
+    page_name: &'static str,
+    stack: &ViewStack,
+) -> Box {
+    let card = Box::new(Orientation::Horizontal, 14);
+    card.add_css_class("card");
+    card.set_height_request(132);
+    card.set_margin_top(2);
+    card.set_margin_bottom(2);
+    card.set_margin_start(2);
+    card.set_margin_end(2);
+
+    let content = Box::new(Orientation::Vertical, 6);
+    content.set_hexpand(true);
+    content.set_margin_top(12);
+    content.set_margin_bottom(12);
+    content.set_margin_start(14);
+    content.set_margin_end(8);
+
+    let title = Label::builder()
+        .label(title)
+        .xalign(0.0)
+        .css_classes(vec!["heading"])
+        .build();
+    let subtitle = Label::builder()
+        .label(subtitle)
+        .xalign(0.0)
+        .wrap(true)
+        .css_classes(vec!["dim-label"])
+        .build();
+    let methods = Label::builder()
+        .label(format!("Portal: {methods}"))
+        .xalign(0.0)
+        .wrap(true)
+        .css_classes(vec!["caption", "dim-label"])
+        .build();
+    let example = Label::builder()
+        .label(example)
+        .xalign(0.0)
+        .wrap(true)
+        .css_classes(vec!["caption"])
+        .build();
+    content.append(&title);
+    content.append(&subtitle);
+    content.append(&methods);
+    content.append(&example);
+
+    let action_box = Box::new(Orientation::Vertical, 0);
+    action_box.set_margin_top(12);
+    action_box.set_margin_bottom(12);
+    action_box.set_margin_end(14);
+    action_box.set_valign(Align::Center);
+    let button = Button::builder()
+        .label(button_label)
+        .css_classes(vec!["suggested-action"])
+        .build();
+    {
+        let stack = stack.clone();
+        button.connect_clicked(move |_| {
+            stack.set_visible_child_name(page_name);
+        });
+    }
+    action_box.append(&button);
+
+    card.append(&content);
+    card.append(&action_box);
+    card
 }
 
 #[derive(Clone)]

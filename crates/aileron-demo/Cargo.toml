@@ -17,6 +17,7 @@ gtk4     = { workspace = true }
 libadwaita = { workspace = true }
 glib     = { workspace = true }
 gio      = { workspace = true }
+relm4    = { workspace = true }
 reqwest  = { workspace = true }
 zbus     = { workspace = true }
 serde    = { workspace = true }

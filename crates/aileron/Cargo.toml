@@ -22,5 +22,6 @@ gtk4            = { workspace = true }
 libadwaita      = { workspace = true }
 glib            = { workspace = true }
 gio             = { workspace = true }
+relm4           = { workspace = true }
 varlink         = { workspace = true }
 chrono          = { workspace = true }

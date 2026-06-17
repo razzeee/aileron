@@ -11,6 +11,7 @@ use gtk4::{
 };
 use libadwaita::prelude::*;
 use libadwaita::{ActionRow, AlertDialog, PreferencesGroup, ViewStack};
+use relm4::{ComponentParts, ComponentSender, SimpleComponent};
 
 const USE_CASES: &[&str] = &[
     "llm.summarize",
@@ -28,7 +29,42 @@ const USE_CASES: &[&str] = &[
     "vision.ocr",
 ];
 
-pub fn build(runtime_images_changed: Rc<dyn Fn()>) -> gtk4::Widget {
+pub struct ModelsPage;
+
+#[derive(Debug)]
+pub enum ModelsMsg {}
+
+pub struct ModelsWidgets;
+
+impl SimpleComponent for ModelsPage {
+    type Init = Rc<dyn Fn()>;
+    type Input = ModelsMsg;
+    type Output = ();
+    type Widgets = ModelsWidgets;
+    type Root = Box;
+
+    fn init_root() -> Self::Root {
+        Box::new(Orientation::Vertical, 0)
+    }
+
+    fn init(
+        runtime_images_changed: Self::Init,
+        root: Self::Root,
+        _sender: ComponentSender<Self>,
+    ) -> ComponentParts<Self> {
+        root.append(&build_widget(runtime_images_changed));
+        ComponentParts {
+            model: ModelsPage,
+            widgets: ModelsWidgets,
+        }
+    }
+
+    fn update(&mut self, msg: Self::Input, _sender: ComponentSender<Self>) {
+        match msg {}
+    }
+}
+
+fn build_widget(runtime_images_changed: Rc<dyn Fn()>) -> gtk4::Widget {
     let root = Box::new(Orientation::Vertical, 12);
     root.set_margin_top(12);
     root.set_margin_bottom(12);
@@ -250,6 +286,7 @@ struct ProfileDetails {
 struct CatalogProfileDetails {
     profile_id: String,
     model_id: String,
+    spdx_license: String,
     runtime_id: String,
     tier: String,
     disk_size_gb: f64,
@@ -468,6 +505,7 @@ fn render_library_list(
         let details = CatalogProfileDetails {
             profile_id: profile.profile_id.clone(),
             model_id: profile.model_id,
+            spdx_license: profile.spdx_license.unwrap_or_default(),
             runtime_id: profile.runtime_id,
             tier: profile.tier,
             disk_size_gb: profile.disk_size_gb,
@@ -510,6 +548,9 @@ fn show_catalog_profile_details(window: Option<&gtk4::Window>, details: &Catalog
     list.set_selection_mode(gtk4::SelectionMode::None);
     list.add_css_class("boxed-list");
     add_detail_row(&list, "Model", &details.model_id);
+    if !details.spdx_license.is_empty() {
+        add_detail_row(&list, "License", &details.spdx_license);
+    }
     add_detail_row(&list, "Runtime", &details.runtime_id);
     add_detail_row(&list, "Tier", &details.tier);
     add_detail_row(&list, "Install Size", &format_size(details.disk_size_gb));
@@ -862,6 +903,7 @@ mod tests {
             profile_id: profile_id.to_string(),
             model_id: profile_id.to_string(),
             llmfit_model_id: String::new(),
+            spdx_license: Some(String::new()),
             runtime_id: "asr-whisper-cpp".to_string(),
             tier: tier.to_string(),
             disk_size_gb,

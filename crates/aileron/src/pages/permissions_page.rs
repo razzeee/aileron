@@ -4,10 +4,51 @@ use gtk4::prelude::*;
 use gtk4::{ListBox, ScrolledWindow};
 use libadwaita::prelude::*;
 use libadwaita::{ActionRow, PreferencesGroup, PreferencesPage, SwitchRow};
+use relm4::{ComponentParts, ComponentSender, SimpleComponent};
 
-pub fn build() -> gtk4::Widget {
-    let page = PreferencesPage::new();
+pub struct PermissionsPage;
 
+#[derive(Debug)]
+pub enum PermissionsMsg {}
+
+pub struct PermissionsWidgets {
+    list_box: ListBox,
+}
+
+impl SimpleComponent for PermissionsPage {
+    type Init = ();
+    type Input = PermissionsMsg;
+    type Output = ();
+    type Widgets = PermissionsWidgets;
+    type Root = PreferencesPage;
+
+    fn init_root() -> Self::Root {
+        PreferencesPage::new()
+    }
+
+    fn init(
+        (): Self::Init,
+        page: Self::Root,
+        _sender: ComponentSender<Self>,
+    ) -> ComponentParts<Self> {
+        let list_box = build_page(&page);
+        refresh_permissions(&list_box);
+        ComponentParts {
+            model: PermissionsPage,
+            widgets: PermissionsWidgets { list_box },
+        }
+    }
+
+    fn update(&mut self, msg: Self::Input, _sender: ComponentSender<Self>) {
+        match msg {}
+    }
+
+    fn update_view(&self, widgets: &mut Self::Widgets, _sender: ComponentSender<Self>) {
+        refresh_permissions(&widgets.list_box);
+    }
+}
+
+fn build_page(page: &PreferencesPage) -> ListBox {
     let group = PreferencesGroup::new();
     group.set_title("App Permissions");
 
@@ -23,10 +64,8 @@ pub fn build() -> gtk4::Widget {
         .build();
     group.add(&scroll);
 
-    refresh_permissions(&list_box);
-
     page.add(&group);
-    page.upcast()
+    list_box
 }
 
 fn refresh_permissions(list_box: &ListBox) {

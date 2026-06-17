@@ -1,4 +1,5 @@
 use std::cell::Cell;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use aileron_varlink::aileron_Models::InstallStatus;
@@ -6,49 +7,93 @@ use gtk4::prelude::*;
 use gtk4::{Box, Button, Label, ListBox, Orientation, ProgressBar, ScrolledWindow, Spinner};
 use libadwaita::prelude::*;
 use libadwaita::{ActionRow, AlertDialog, PreferencesGroup, PreferencesPage};
+use relm4::{ComponentParts, ComponentSender, SimpleComponent};
 
-#[derive(Clone)]
-pub struct DownloadsView {
-    pub widget: gtk4::Widget,
-    list_box: ListBox,
+pub struct DownloadsPage {
     poll_active: Rc<Cell<bool>>,
+    start_poll: bool,
 }
 
-impl DownloadsView {
-    pub fn refresh(&self) {
-        refresh_downloads_list(&self.list_box);
-        if has_active_downloads() {
-            self.start_poll();
-        }
+#[derive(Debug)]
+pub enum DownloadsMsg {
+    Refresh,
+}
+
+pub struct DownloadsWidgets {
+    list_box: ListBox,
+}
+
+impl SimpleComponent for DownloadsPage {
+    type Init = ();
+    type Input = DownloadsMsg;
+    type Output = ();
+    type Widgets = DownloadsWidgets;
+    type Root = PreferencesPage;
+
+    fn init_root() -> Self::Root {
+        PreferencesPage::new()
     }
 
-    fn start_poll(&self) {
-        if self.poll_active.get() {
-            return;
-        }
-        self.poll_active.set(true);
-        refresh_downloads_list(&self.list_box);
+    fn init(
+        (): Self::Init,
+        page: Self::Root,
+        sender: ComponentSender<Self>,
+    ) -> ComponentParts<Self> {
+        let list_box = build_page(&page);
+        refresh_downloads_list(&list_box);
+        let model = DownloadsPage {
+            poll_active: Rc::new(Cell::new(false)),
+            start_poll: has_active_downloads(),
+        };
+        let mut widgets = DownloadsWidgets { list_box };
+        model.update_view(&mut widgets, sender);
+        ComponentParts { model, widgets }
+    }
 
-        let view = self.clone();
-        let mut grace_ticks = 15;
-        glib::timeout_add_seconds_local(2, move || {
-            refresh_downloads_list(&view.list_box);
-            if has_active_downloads() {
-                grace_ticks = 15;
-                glib::ControlFlow::Continue
-            } else if grace_ticks > 0 {
-                grace_ticks -= 1;
-                glib::ControlFlow::Continue
-            } else {
-                view.poll_active.set(false);
-                glib::ControlFlow::Break
+    fn update(&mut self, msg: Self::Input, _sender: ComponentSender<Self>) {
+        match msg {
+            DownloadsMsg::Refresh => {
+                self.start_poll = has_active_downloads();
             }
-        });
+        }
+    }
+
+    fn update_view(&self, widgets: &mut Self::Widgets, sender: ComponentSender<Self>) {
+        refresh_downloads_list(&widgets.list_box);
+        if self.start_poll {
+            start_poll(&widgets.list_box, self.poll_active.clone(), sender);
+        }
     }
 }
 
-pub fn build() -> DownloadsView {
-    let page = PreferencesPage::new();
+fn start_poll(
+    list_box: &ListBox,
+    poll_active: Rc<Cell<bool>>,
+    sender: ComponentSender<DownloadsPage>,
+) {
+    if poll_active.get() {
+        return;
+    }
+    poll_active.set(true);
+    refresh_downloads_list(list_box);
+
+    let mut grace_ticks = 15;
+    glib::timeout_add_seconds_local(2, move || {
+        sender.input(DownloadsMsg::Refresh);
+        if has_active_downloads() {
+            grace_ticks = 15;
+            glib::ControlFlow::Continue
+        } else if grace_ticks > 0 {
+            grace_ticks -= 1;
+            glib::ControlFlow::Continue
+        } else {
+            poll_active.set(false);
+            glib::ControlFlow::Break
+        }
+    });
+}
+
+fn build_page(page: &PreferencesPage) -> ListBox {
     let group = PreferencesGroup::new();
     group.set_title("Downloads");
     group.set_description(Some(
@@ -68,14 +113,7 @@ pub fn build() -> DownloadsView {
         .build();
     group.add(&scroll);
     page.add(&group);
-
-    let view = DownloadsView {
-        widget: page.upcast(),
-        list_box,
-        poll_active: Rc::new(Cell::new(false)),
-    };
-    view.refresh();
-    view
+    list_box
 }
 
 fn refresh_downloads_list(list: &ListBox) {
@@ -119,20 +157,22 @@ fn refresh_downloads_list(list: &ListBox) {
         .into_iter()
         .partition(|install| !is_runtime_download(&install.profile_id));
 
-    if should_group_runtime_with_profile(&profile_installs, &runtime_installs) {
-        list.append(&profile_download_row(
-            &profile_installs[0],
-            Some(&runtime_installs[0]),
-            None,
-        ));
-        return;
-    }
+    let profile_runtime_ids = catalog_profile_runtime_ids();
+    let mut grouped_runtime_downloads = HashSet::new();
 
-    for install in profile_installs {
-        list.append(&profile_download_row(&install, None, None));
+    for install in &profile_installs {
+        list.append(&profile_download_row(install, None, None));
+        for runtime_install in
+            matching_runtime_installs(install, &runtime_installs, &profile_runtime_ids)
+        {
+            grouped_runtime_downloads.insert(runtime_install.profile_id.clone());
+            list.append(&runtime_setup_row(runtime_install, true));
+        }
     }
-    for install in runtime_installs {
-        list.append(&runtime_setup_row(&install, false));
+    for install in &runtime_installs {
+        if !grouped_runtime_downloads.contains(&install.profile_id) {
+            list.append(&runtime_setup_row(install, false));
+        }
     }
 }
 
@@ -267,13 +307,24 @@ fn is_runtime_download(id: &str) -> bool {
     id.starts_with("runtime:")
 }
 
-fn should_group_runtime_with_profile(
-    profile_installs: &[InstallStatus],
-    runtime_installs: &[InstallStatus],
-) -> bool {
-    profile_installs.len() == 1
-        && runtime_installs.len() == 1
-        && is_runtime_setup_status(&profile_installs[0].status)
+fn matching_runtime_installs<'a>(
+    profile_install: &InstallStatus,
+    runtime_installs: &'a [InstallStatus],
+    profile_runtime_ids: &HashMap<String, String>,
+) -> Vec<&'a InstallStatus> {
+    if !is_runtime_setup_status(&profile_install.status) {
+        return Vec::new();
+    }
+    let Some(runtime_id) = profile_runtime_ids.get(&profile_install.profile_id) else {
+        return Vec::new();
+    };
+
+    runtime_installs
+        .iter()
+        .filter(|install| {
+            runtime_download_runtime_id(&install.profile_id).as_deref() == Some(runtime_id.as_str())
+        })
+        .collect()
 }
 
 fn install_is_terminal(install: &InstallStatus) -> bool {
@@ -367,6 +418,38 @@ fn runtime_detail_line(install: &InstallStatus) -> String {
 
 fn runtime_download_image_ref(profile_id: &str) -> &str {
     profile_id.strip_prefix("runtime:").unwrap_or(profile_id)
+}
+
+fn runtime_download_runtime_id(profile_id: &str) -> Option<String> {
+    let image_ref = profile_id.strip_prefix("runtime:")?;
+    let image = image_ref
+        .rsplit_once('/')
+        .map_or(image_ref, |(_, image)| image);
+    let name = image.rsplit_once(':').map_or(image, |(name, _)| name);
+    Some(
+        name.strip_prefix("aileron-runtime-")
+            .unwrap_or(name)
+            .to_string(),
+    )
+}
+
+fn catalog_profile_runtime_ids() -> HashMap<String, String> {
+    use aileron_varlink::aileron_Models::VarlinkClientInterface;
+
+    aileron_ipc::client::connect()
+        .map_err(|e| e.to_string())
+        .and_then(|conn| {
+            let mut client = aileron_varlink::aileron_Models::VarlinkClient::new(conn);
+            client.list_catalog().call().map_err(|e| e.to_string())
+        })
+        .map(|reply| {
+            reply
+                .profiles
+                .into_iter()
+                .map(|profile| (profile.profile_id, profile.runtime_id))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn runtime_phase(status: &str) -> &'static str {
@@ -565,34 +648,64 @@ mod tests {
     }
 
     #[test]
-    fn groups_runtime_with_profile_only_when_association_is_unambiguous() {
-        let runtime_profile = install_status("profile-a", "Preparing runtime image...");
+    fn derives_runtime_id_from_runtime_download_ref() {
+        assert_eq!(
+            runtime_download_runtime_id(
+                "runtime:ghcr.io/razzeee/aileron-runtime-vision-llama-cpp-gemma4:rocm"
+            )
+            .as_deref(),
+            Some("vision-llama-cpp-gemma4")
+        );
+    }
+
+    #[test]
+    fn matches_runtime_downloads_to_profile_runtime_ids() {
+        let profile_a = install_status("profile-a", "Preparing runtime image...");
+        let profile_b = install_status("profile-b", "Preparing runtime image...");
         let downloading_profile = install_status("profile-a", "Downloading model.gguf...");
         let runtime_a = install_status(
-            "runtime:ghcr.io/example/runtime-a:cpu",
+            "runtime:ghcr.io/example/aileron-runtime-runtime-a:cpu",
             "Pulling runtime image...",
         );
         let runtime_b = install_status(
-            "runtime:ghcr.io/example/runtime-b:cpu",
+            "runtime:ghcr.io/example/aileron-runtime-runtime-b:cpu",
             "Pulling runtime image...",
         );
+        let profile_runtime_ids = HashMap::from([
+            ("profile-a".to_string(), "runtime-a".to_string()),
+            ("profile-b".to_string(), "runtime-b".to_string()),
+        ]);
 
-        assert!(should_group_runtime_with_profile(
-            std::slice::from_ref(&runtime_profile),
-            std::slice::from_ref(&runtime_a)
-        ));
-        assert!(!should_group_runtime_with_profile(
-            std::slice::from_ref(&runtime_profile),
-            &[runtime_a.clone(), runtime_b]
-        ));
-        assert!(!should_group_runtime_with_profile(
-            &[runtime_profile.clone(), downloading_profile.clone()],
-            std::slice::from_ref(&runtime_a)
-        ));
-        assert!(!should_group_runtime_with_profile(
-            std::slice::from_ref(&downloading_profile),
-            std::slice::from_ref(&runtime_a)
-        ));
+        assert_eq!(
+            matching_runtime_installs(
+                &profile_a,
+                &[runtime_a.clone(), runtime_b.clone()],
+                &profile_runtime_ids,
+            )
+            .iter()
+            .map(|install| install.profile_id.as_str())
+            .collect::<Vec<_>>(),
+            vec![runtime_a.profile_id.as_str()]
+        );
+        assert_eq!(
+            matching_runtime_installs(
+                &profile_b,
+                &[runtime_a, runtime_b.clone()],
+                &profile_runtime_ids
+            )
+            .iter()
+            .map(|install| install.profile_id.as_str())
+            .collect::<Vec<_>>(),
+            vec![runtime_b.profile_id.as_str()]
+        );
+        assert!(
+            matching_runtime_installs(
+                &downloading_profile,
+                std::slice::from_ref(&runtime_b),
+                &profile_runtime_ids,
+            )
+            .is_empty()
+        );
     }
 
     fn install_status(profile_id: &str, status: &str) -> InstallStatus {
