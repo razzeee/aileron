@@ -41,7 +41,7 @@ impl SimpleComponent for AppModel {
         ApplicationWindow::builder()
             .title("Aileron Demo")
             .default_width(860)
-            .default_height(700)
+            .default_height(560)
             .build()
     }
 
@@ -335,7 +335,8 @@ fn build_window(window: &ApplicationWindow) {
         "Lab Overview",
     );
     overview_page.set_icon_name(Some("view-dashboard-symbolic"));
-    let text_page = stack.add_titled(&text_box, Some("text"), "Text Lab");
+    let text_page_widget = scrollable_page(&text_box);
+    let text_page = stack.add_titled(&text_page_widget, Some("text"), "Text Lab");
     text_page.set_icon_name(Some("text-x-generic-symbolic"));
     let chat_page_meta = stack.add_titled(&chat_page, Some("chat"), "Chat Lab");
     chat_page_meta.set_icon_name(Some("user-available-symbolic"));
@@ -457,7 +458,17 @@ fn build_lab_overview(stack: &ViewStack) -> gtk4::Widget {
     ));
     root.append(&cards);
 
-    root.upcast()
+    scrollable_page(&root)
+}
+
+fn scrollable_page<W: IsA<gtk4::Widget>>(child: &W) -> gtk4::Widget {
+    ScrolledWindow::builder()
+        .child(child)
+        .hscrollbar_policy(gtk4::PolicyType::Never)
+        .hexpand(true)
+        .vexpand(true)
+        .build()
+        .upcast()
 }
 
 fn lab_card(
@@ -764,7 +775,7 @@ fn build_chat_page() -> (gtk4::Widget, Entry) {
         });
     }
 
-    (vbox.upcast(), input_entry)
+    (scrollable_page(&vbox), input_entry)
 }
 
 fn install_chat_css() {
@@ -1135,7 +1146,7 @@ fn build_speech_page() -> gtk4::Widget {
     wire_asr_action(&transcribe_button, "asr.transcribe", "transcribing");
     wire_asr_action(&translate_button, "asr.translate", "translating");
 
-    vbox.upcast()
+    scrollable_page(&vbox)
 }
 
 fn build_vision_page() -> gtk4::Widget {
@@ -1624,7 +1635,7 @@ fn build_vision_page() -> gtk4::Widget {
         });
     }
 
-    vbox.upcast()
+    scrollable_page(&vbox)
 }
 
 fn build_embed_page() -> gtk4::Widget {
@@ -1799,7 +1810,7 @@ fn build_embed_page() -> gtk4::Widget {
         });
     }
 
-    vbox.upcast()
+    scrollable_page(&vbox)
 }
 
 fn fetch_article_text(url: &str) -> anyhow::Result<String> {
