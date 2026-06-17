@@ -321,6 +321,9 @@ impl VarlinkInterface for ModelsHandler {
                     profile_id: profile.profile_id,
                     model_id: profile.model_id,
                     llmfit_model_id: profile.llmfit_model_id,
+                    spdx_license: metadata
+                        .and_then(|model| model.license.clone())
+                        .unwrap_or_default(),
                     runtime_id: profile.runtime_id,
                     tier: tier.clone(),
                     disk_size_gb: profile.disk_size_gb,

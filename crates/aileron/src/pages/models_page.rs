@@ -286,6 +286,7 @@ struct ProfileDetails {
 struct CatalogProfileDetails {
     profile_id: String,
     model_id: String,
+    spdx_license: String,
     runtime_id: String,
     tier: String,
     disk_size_gb: f64,
@@ -504,6 +505,7 @@ fn render_library_list(
         let details = CatalogProfileDetails {
             profile_id: profile.profile_id.clone(),
             model_id: profile.model_id,
+            spdx_license: profile.spdx_license,
             runtime_id: profile.runtime_id,
             tier: profile.tier,
             disk_size_gb: profile.disk_size_gb,
@@ -546,6 +548,9 @@ fn show_catalog_profile_details(window: Option<&gtk4::Window>, details: &Catalog
     list.set_selection_mode(gtk4::SelectionMode::None);
     list.add_css_class("boxed-list");
     add_detail_row(&list, "Model", &details.model_id);
+    if !details.spdx_license.is_empty() {
+        add_detail_row(&list, "License", &details.spdx_license);
+    }
     add_detail_row(&list, "Runtime", &details.runtime_id);
     add_detail_row(&list, "Tier", &details.tier);
     add_detail_row(&list, "Install Size", &format_size(details.disk_size_gb));
@@ -898,6 +903,7 @@ mod tests {
             profile_id: profile_id.to_string(),
             model_id: profile_id.to_string(),
             llmfit_model_id: String::new(),
+            spdx_license: String::new(),
             runtime_id: "asr-whisper-cpp".to_string(),
             tier: tier.to_string(),
             disk_size_gb,
