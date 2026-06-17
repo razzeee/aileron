@@ -192,7 +192,7 @@ fn append_runtime_image_row(
     actions.set_valign(gtk4::Align::Center);
     actions.set_halign(gtk4::Align::End);
 
-    if image.source != "system" && (image.update_available || active_download.is_some()) {
+    if runtime_update_action_visible(&image, active_download.is_some()) {
         let update_button = Button::with_label(if active_download.is_some() {
             "Updating..."
         } else {
@@ -231,6 +231,12 @@ fn append_runtime_image_row(
 
 fn is_active_runtime_download(install: &InstallStatus) -> bool {
     install.profile_id.starts_with("runtime:") && !install_is_terminal(install)
+}
+
+fn runtime_update_action_visible(image: &OciRuntimeImage, has_active_download: bool) -> bool {
+    image.source != "system"
+        && (has_active_download
+            || (image.update_available && image.update_status != "installed: update not checked"))
 }
 
 fn install_is_terminal(install: &InstallStatus) -> bool {
@@ -403,5 +409,24 @@ mod tests {
         assert_eq!(format_bytes(0), "unknown size");
         assert_eq!(format_bytes(512), "512 B");
         assert_eq!(format_bytes(1024 * 1024), "1.0 MB");
+    }
+
+    #[test]
+    fn hides_update_action_for_unchecked_runtime_status() {
+        let image = OciRuntimeImage {
+            image_id: "runtime".to_string(),
+            image_ref: "ghcr.io/example/runtime:cpu".to_string(),
+            runtime_id: "llm-llama-cpp".to_string(),
+            variant: "cpu".to_string(),
+            size_bytes: 1,
+            in_use: true,
+            used_by_profiles: vec!["profile".to_string()],
+            update_available: true,
+            update_status: "installed: update not checked".to_string(),
+            source: "user".to_string(),
+        };
+
+        assert!(!runtime_update_action_visible(&image, false));
+        assert!(runtime_update_action_visible(&image, true));
     }
 }
