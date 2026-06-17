@@ -505,7 +505,7 @@ fn render_library_list(
         let details = CatalogProfileDetails {
             profile_id: profile.profile_id.clone(),
             model_id: profile.model_id,
-            spdx_license: profile.spdx_license,
+            spdx_license: profile.spdx_license.unwrap_or_default(),
             runtime_id: profile.runtime_id,
             tier: profile.tier,
             disk_size_gb: profile.disk_size_gb,
@@ -903,7 +903,7 @@ mod tests {
             profile_id: profile_id.to_string(),
             model_id: profile_id.to_string(),
             llmfit_model_id: String::new(),
-            spdx_license: String::new(),
+            spdx_license: Some(String::new()),
             runtime_id: "asr-whisper-cpp".to_string(),
             tier: tier.to_string(),
             disk_size_gb,

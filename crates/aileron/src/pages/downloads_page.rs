@@ -161,7 +161,7 @@ fn refresh_downloads_list(list: &ListBox) {
     let mut grouped_runtime_downloads = HashSet::new();
 
     for install in &profile_installs {
-        list.append(&profile_download_row(&install, None, None));
+        list.append(&profile_download_row(install, None, None));
         for runtime_install in
             matching_runtime_installs(install, &runtime_installs, &profile_runtime_ids)
         {

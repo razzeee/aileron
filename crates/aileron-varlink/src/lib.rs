@@ -61,3 +61,32 @@ pub use aileron_Inference as inference;
 pub use aileron_Models as models;
 pub use aileron_Permissions as permissions;
 pub use aileron_Sessions as sessions;
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn catalog_profile_info_accepts_missing_license() {
+        let profile: crate::aileron_Models::CatalogProfileInfo =
+            serde_json::from_value(serde_json::json!({
+                "profile_id": "old-daemon-profile",
+                "model_id": "old-daemon-model",
+                "llmfit_model_id": "",
+                "runtime_id": "llm-llama-cpp",
+                "tier": "balanced",
+                "disk_size_gb": 1.0,
+                "min_ram_gb": 1.0,
+                "recommended_ram_gb": 1.0,
+                "min_vram_gb": 0.0,
+                "fit_score": 0.0,
+                "use_case_fit_scores": [],
+                "fit_level": "recommended",
+                "recommended": true,
+                "installing": false,
+                "recommendation_reason": "test",
+                "use_cases": ["llm.chat"]
+            }))
+            .expect("missing spdx_license should decode from older daemons");
+
+        assert_eq!(profile.spdx_license, None);
+    }
+}

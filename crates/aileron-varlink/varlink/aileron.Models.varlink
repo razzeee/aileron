@@ -54,7 +54,7 @@ type CatalogProfileInfo (
     profile_id: string,
     model_id: string,
     llmfit_model_id: string,
-    spdx_license: string,
+    spdx_license: ?string,
     runtime_id: string,
     tier: string,
     disk_size_gb: float,
