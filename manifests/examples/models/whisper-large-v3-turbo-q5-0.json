@@ -6,7 +6,8 @@
   "tier": "small",
   "min_ram_gb": 2.0,
   "use_cases": [
-    "asr.transcribe"
+    "asr.transcribe",
+    "asr.translate"
   ],
   "artifacts": [
     {
