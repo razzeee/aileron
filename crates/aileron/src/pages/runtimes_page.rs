@@ -440,7 +440,10 @@ mod tests {
 
     #[test]
     fn runtime_status_label_hides_unchecked_update_wording() {
-        assert_eq!(runtime_status_label("installed: update not checked"), "installed");
+        assert_eq!(
+            runtime_status_label("installed: update not checked"),
+            "installed"
+        );
         assert_eq!(runtime_status_label("not checkable"), "not checkable");
     }
 }
