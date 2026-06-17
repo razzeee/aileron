@@ -235,10 +235,12 @@ The daemon runs runtimes with a hardened generated OCI runtime configuration:
 
 - no network
 - read-only root filesystem
-- writable tmpfs at `/tmp`
+- writable per-container tmpfs at `/tmp` (`1777`, `noexec`, `nodev`)
 - all Linux capabilities dropped
 - no new privileges
 - PID and memory limits
 - model artifacts mounted read-only at `/model`
+
+`/tmp` is not a host bind mount and is not shared between separate containers. Warm runtime containers are reused for multiple requests to the same profile, so runtimes must create per-request temporary paths and remove request-specific data before replying.
 
 Runtime images should not require mutable state outside `/tmp`, package downloads at startup, background daemons, or external services.

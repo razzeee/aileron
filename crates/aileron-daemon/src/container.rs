@@ -704,7 +704,7 @@ fn runtime_config_json(
             "destination": "/tmp",
             "type": "tmpfs",
             "source": "tmpfs",
-            "options": ["rw", "nosuid", "noexec", "nodev", "size=256m"]
+            "options": ["rw", "nosuid", "noexec", "nodev", "size=256m", "mode=1777"]
         }),
         serde_json::json!({
             "destination": "/dev/shm",
@@ -1258,6 +1258,7 @@ mod tests {
                 && mount["type"] == "tmpfs"
                 && array_contains(&mount["options"], "noexec")
                 && array_contains(&mount["options"], "size=256m")
+                && array_contains(&mount["options"], "mode=1777")
         }));
         assert!(mounts(&config).iter().any(|mount| {
             mount["destination"] == "/dev/shm"
