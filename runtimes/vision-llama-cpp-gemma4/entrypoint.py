@@ -6,7 +6,6 @@ Reads newline-delimited JSON requests from stdin, writes responses to stdout.
 
 Supported request types:
   generate  - stream text tokens using the multimodal model as a text LLM
-  chat  - stream text tokens from explicit chat messages
   generate_structured - return a JSON result constrained to a schema
   describe  - describe a PNG/JPEG image using a llama.cpp multimodal model
   ocr  - extract text from a PNG/JPEG image using a llama.cpp multimodal model
@@ -139,18 +138,6 @@ def handle_generate(llm: Llama, req: dict) -> None:
     send({"id": req_id, "done": True})
 
 
-def handle_chat(llm: Llama, req: dict) -> None:
-    req_id = req["id"]
-    max_tokens = int(req.get("max_tokens", 512))
-    system = req.get("system", DEFAULT_SYSTEM)
-    messages = [{"role": "system", "content": system}]
-    messages.extend(req.get("messages", []))
-
-    stream_chat_or_fallback(llm, req_id, messages, max_tokens)
-
-    send({"id": req_id, "done": True})
-
-
 def handle_generate_structured(llm: Llama, req: dict) -> None:
     req_id = req["id"]
     prompt = req.get("prompt", "")
@@ -165,7 +152,7 @@ def handle_generate_structured(llm: Llama, req: dict) -> None:
     except Exception:
         grammar = LlamaGrammar.from_string("root ::= value\n", verbose=False)
 
-        result_text = llm.create_chat_completion(
+    result_text = llm.create_chat_completion(
         messages=[
             {"role": "system", "content": system},
             {"role": "user", "content": prompt},
@@ -328,7 +315,6 @@ def main() -> None:
         llm=llm,
         handlers={
             "generate": handle_generate,
-            "chat": handle_chat,
             "generate_structured": handle_generate_structured,
             "describe": handle_describe,
             "ocr": handle_ocr,

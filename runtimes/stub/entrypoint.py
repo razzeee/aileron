@@ -7,7 +7,6 @@ of the daemon, portal, and client without any model or GPU.
 
 Behaviour per request type:
   generate            – streams the prompt back as tokens, word by word
-  chat                – streams a deterministic response to the latest user turn
   generate_structured – returns a minimal valid JSON object matching the schema
   embed               – returns a fixed embedding vector
   transcribe          – returns a fixed transcript/translation string
@@ -40,24 +39,6 @@ def handle_generate(req: dict) -> None:
         time.sleep(0.02)                            # simulate inference latency
     if not words:
         send({"id": req_id, "token": "(stub: no prompt provided)", "done": True})
-
-
-def handle_chat(req: dict) -> None:
-    req_id = req["id"]
-    messages = req.get("messages", [])
-    latest_user = next(
-        (message.get("content", "") for message in reversed(messages) if message.get("role") == "user"),
-        "",
-    )
-    text = f"Stub chat response to: {latest_user or '(no user message)'}"
-    words = text.split()
-    for i, word in enumerate(words):
-        is_last = i == len(words) - 1
-        chunk = {"id": req_id, "token": word + (" " if not is_last else "")}
-        if is_last:
-            chunk["done"] = True
-        send(chunk)
-        time.sleep(0.02)
 
 
 def handle_generate_structured(req: dict) -> None:
@@ -165,8 +146,6 @@ def main() -> None:
         try:
             if req_type == "generate":
                 handle_generate(req)
-            elif req_type == "chat":
-                handle_chat(req)
             elif req_type == "generate_structured":
                 handle_generate_structured(req)
             elif req_type == "embed":

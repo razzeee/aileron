@@ -128,6 +128,7 @@ def serve_requests(
                 continue
             handler(llm, req)
         except Exception:
-            sys.stderr.write(traceback.format_exc())
+            reason = traceback.format_exc()
+            sys.stderr.write(reason)
             sys.stderr.flush()
-            send({"id": req_id, "error": "internal_error", "done": True})
+            send({"id": req_id, "error": "internal_error", "reason": reason, "done": True})

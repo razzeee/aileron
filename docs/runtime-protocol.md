@@ -60,28 +60,6 @@ The final response may include a token and `done: true`, or may be an empty fina
 {"id":"request-id","done":true}
 ```
 
-## Chat Generation
-
-Request:
-
-```json
-{
-  "id": "request-id",
-  "type": "chat",
-  "system": "Stable system instructions",
-  "messages": [
-    {"role": "user", "content": "Hello"},
-    {"role": "assistant", "content": "Hi. How can I help?"},
-    {"role": "user", "content": "Explain desktop portals briefly."}
-  ],
-  "max_tokens": 512
-}
-```
-
-The daemon forwards chat messages as structured roles instead of flattening them into a prompt. Apps own conversation history and send the relevant prior turns on each request.
-
-Streaming responses use the same token stream shape as text generation.
-
 ## Structured Generation
 
 Request:

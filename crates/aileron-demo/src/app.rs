@@ -328,7 +328,7 @@ fn build_window(window: &ApplicationWindow) {
 
     // ── Window ────────────────────────────────────────────────────────────────
     let stack = ViewStack::new();
-    let (chat_page, chat_entry) = build_chat_page();
+    let chat_page = build_chat_page();
     let overview_page = stack.add_titled(
         &build_lab_overview(&stack),
         Some("overview"),
@@ -400,7 +400,6 @@ fn build_window(window: &ApplicationWindow) {
     show_sidebar_button.set_visible(false);
 
     window.set_content(Some(&split_view));
-    let _ = chat_entry;
 }
 
 fn build_lab_overview(stack: &ViewStack) -> gtk4::Widget {
@@ -422,9 +421,9 @@ fn build_lab_overview(stack: &ViewStack) -> gtk4::Widget {
     let cards = Box::new(Orientation::Vertical, 12);
     cards.append(&lab_card(
         "Chat Lab",
-        "Run multi-turn language.chat sessions with explicit local history.",
-        "StreamChat, Chat, CreateSession, EndSession",
-        "Try: ask a follow-up question after the first response.",
+        "Run chat-shaped turns through guided language.extract responses with local memory.",
+        "RespondGuided, CreateSession, EndSession",
+        "Try: tell it a preference, then ask a follow-up that uses memory.",
         "Open Chat Lab",
         "chat",
         stack,
@@ -551,7 +550,7 @@ struct ChatMessage {
     content: String,
 }
 
-fn build_chat_page() -> (gtk4::Widget, Entry) {
+fn build_chat_page() -> gtk4::Widget {
     install_chat_css();
 
     let vbox = Box::new(Orientation::Vertical, 12);
@@ -562,7 +561,7 @@ fn build_chat_page() -> (gtk4::Widget, Entry) {
 
     vbox.append(
         &Label::builder()
-            .label("Send a multi-turn local chat through the stateless language.chat API.")
+            .label("Send chat-shaped turns through guided language.extract responses with local memory.")
             .xalign(0.0)
             .wrap(true)
             .build(),
@@ -589,7 +588,7 @@ fn build_chat_page() -> (gtk4::Widget, Entry) {
         .css_classes(vec!["heading"])
         .build();
     let status_detail = Label::builder()
-        .label("Ask a question. The app sends the full message list each turn.")
+        .label("Ask a question. The app sends local history and memory to RespondGuided.")
         .xalign(0.0)
         .wrap(true)
         .build();
@@ -632,10 +631,12 @@ fn build_chat_page() -> (gtk4::Widget, Entry) {
     vbox.append(&input_row);
 
     let history = Rc::new(RefCell::new(Vec::<ChatMessage>::new()));
+    let memory = Rc::new(RefCell::new(Vec::<String>::new()));
     let session_id = Rc::new(RefCell::new(None::<String>));
 
     {
         let history = history.clone();
+        let memory = memory.clone();
         let session_id = session_id.clone();
         let input_entry = input_entry.clone();
         let send_button_for_click = send_button.clone();
@@ -655,8 +656,8 @@ fn build_chat_page() -> (gtk4::Widget, Entry) {
             send_button.set_sensitive(false);
             clear_button.set_sensitive(false);
             status_spinner.start();
-            status_title.set_text("Starting chat turn");
-            status_detail.set_text("Sending message history through StreamChat...");
+            status_title.set_text("Starting guided chat turn");
+            status_detail.set_text("Sending history and memory through RespondGuided...");
 
             history.borrow_mut().push(ChatMessage {
                 role: "user".to_string(),
@@ -665,10 +666,12 @@ fn build_chat_page() -> (gtk4::Widget, Entry) {
             render_chat(&chat_box, &history.borrow(), None);
 
             let messages = history.borrow().clone();
+            let memories = memory.borrow().clone();
             let existing_session = session_id.borrow().clone();
             let (tx, rx) = std::sync::mpsc::channel::<ChatEvent>();
 
             let history_for_rx = history.clone();
+            let memory_for_rx = memory.clone();
             let session_for_rx = session_id.clone();
             let chat_box_for_rx = chat_box.clone();
             let send_button_for_rx = send_button.clone();
@@ -676,24 +679,36 @@ fn build_chat_page() -> (gtk4::Widget, Entry) {
             let status_spinner_for_rx = status_spinner.clone();
             let status_title_for_rx = status_title.clone();
             let status_detail_for_rx = status_detail.clone();
-            let mut assistant_text = String::new();
             glib::timeout_add_local(std::time::Duration::from_millis(16), move || {
                 loop {
                     match rx.try_recv() {
-                        Ok(ChatEvent::SessionCreated(id)) => {
+                        Ok(ChatEvent::SessionReady(id)) => {
                             *session_for_rx.borrow_mut() = Some(id);
-                            status_title_for_rx.set_text("Chat session ready");
-                            status_detail_for_rx.set_text("The language.chat session is active.");
-                        }
-                        Ok(ChatEvent::Token(token)) => {
-                            assistant_text.push_str(&token);
-                            status_title_for_rx.set_text("Streaming response");
-                            status_detail_for_rx.set_text("Appending chat tokens as they arrive.");
-                            render_chat(
-                                &chat_box_for_rx,
-                                &history_for_rx.borrow(),
-                                Some(&assistant_text),
+                            status_title_for_rx.set_text("Guided session ready");
+                            status_detail_for_rx.set_text(
+                                "Reusing this language.extract session for future turns.",
                             );
+                        }
+                        Ok(ChatEvent::Response(response)) => {
+                            let answer = response.answer.trim().to_string();
+                            if !answer.is_empty() {
+                                history_for_rx.borrow_mut().push(ChatMessage {
+                                    role: "assistant".to_string(),
+                                    content: answer,
+                                });
+                            }
+
+                            let memory = response.memory.trim().to_string();
+                            if memory.is_empty() {
+                                status_title_for_rx.set_text("Guided response received");
+                                status_detail_for_rx.set_text("No durable memory was added.");
+                            } else {
+                                memory_for_rx.borrow_mut().push(memory.clone());
+                                status_title_for_rx.set_text("Guided response received");
+                                status_detail_for_rx.set_text(&format!("Added memory: {memory}"));
+                            }
+
+                            render_chat(&chat_box_for_rx, &history_for_rx.borrow(), None);
                         }
                         Ok(ChatEvent::Error(message)) => {
                             status_spinner_for_rx.stop();
@@ -704,17 +719,9 @@ fn build_chat_page() -> (gtk4::Widget, Entry) {
                             return glib::ControlFlow::Break;
                         }
                         Ok(ChatEvent::Done) => {
-                            if !assistant_text.trim().is_empty() {
-                                history_for_rx.borrow_mut().push(ChatMessage {
-                                    role: "assistant".to_string(),
-                                    content: assistant_text.clone(),
-                                });
-                            }
                             render_chat(&chat_box_for_rx, &history_for_rx.borrow(), None);
                             status_spinner_for_rx.stop();
                             status_title_for_rx.set_text("Response complete");
-                            status_detail_for_rx
-                                .set_text("The app kept history locally and sent it explicitly.");
                             send_button_for_rx.set_sensitive(true);
                             clear_button_for_rx.set_sensitive(true);
                             return glib::ControlFlow::Break;
@@ -736,7 +743,7 @@ fn build_chat_page() -> (gtk4::Widget, Entry) {
 
             let error_tx = tx.clone();
             std::thread::spawn(move || {
-                if let Err(e) = chat_stream(existing_session, messages, tx) {
+                if let Err(e) = guided_chat_turn(existing_session, &memories, messages, tx) {
                     eprintln!("[aileron-demo] chat error: {e}");
                     let _ = error_tx.send(ChatEvent::Error(friendly_error(&e)));
                 }
@@ -755,6 +762,7 @@ fn build_chat_page() -> (gtk4::Widget, Entry) {
 
     {
         let history = history.clone();
+        let memory = memory.clone();
         let session_id = session_id.clone();
         let chat_box = chat_box.clone();
         let status_spinner = status_spinner.clone();
@@ -763,19 +771,19 @@ fn build_chat_page() -> (gtk4::Widget, Entry) {
         clear_button.connect_clicked(move |_| {
             if let Some(id) = session_id.borrow_mut().take() {
                 std::thread::spawn(move || {
-                    let _ = end_chat_session(&id);
+                    let _ = end_guided_chat_session(&id);
                 });
             }
             history.borrow_mut().clear();
+            memory.borrow_mut().clear();
             render_chat(&chat_box, &history.borrow(), None);
             status_spinner.stop();
             status_title.set_text("Ready");
-            status_detail
-                .set_text("Chat cleared. The next message creates a fresh language.chat session.");
+            status_detail.set_text("Chat and local memory cleared. The next message starts fresh.");
         });
     }
 
-    (scrollable_page(&vbox), input_entry)
+    scrollable_page(&vbox)
 }
 
 fn install_chat_css() {
@@ -2004,10 +2012,18 @@ enum DemoEvent {
 }
 
 enum ChatEvent {
-    SessionCreated(String),
-    Token(String),
+    SessionReady(String),
+    Response(GuidedChatResponse),
     Error(String),
     Done,
+}
+
+#[derive(Deserialize)]
+struct GuidedChatResponse {
+    answer: String,
+    memory: String,
+    #[allow(dead_code)]
+    confidence: i64,
 }
 
 #[derive(Clone, Copy)]
@@ -2364,6 +2380,12 @@ fn concise_error(message: &str) -> String {
         return "Aileron portal is not installed for D-Bus activation. Install systemd/aileron-portal.service to ~/.config/systemd/user/, run `systemctl --user daemon-reload`, then start `systemctl --user enable --now aileron-portal`.".to_string();
     }
 
+    if message.contains("org.freedesktop.DBus.Error.UnknownInterface")
+        && message.contains("org.freedesktop.impl.portal.Language")
+    {
+        return "The running Aileron portal is older than this demo and does not expose the Language interface. Restart the updated portal with `systemctl --user restart aileron-portal`, or rebuild/reinstall the portal service if it was installed from an older binary.".to_string();
+    }
+
     if message.contains("huggingface.co") && message.contains("ggml-") {
         return "Speech model is missing from the assigned container image. The container tried to download a Whisper model from Hugging Face, but Aileron starts inference containers with networking disabled. Rebuild or assign a Speech image that has the Whisper model baked into /model.".to_string();
     }
@@ -2382,6 +2404,16 @@ mod tests {
         assert_eq!(
             concise_error(error),
             "Aileron portal is not installed for D-Bus activation. Install systemd/aileron-portal.service to ~/.config/systemd/user/, run `systemctl --user daemon-reload`, then start `systemctl --user enable --now aileron-portal`."
+        );
+    }
+
+    #[test]
+    fn explains_stale_portal_language_interface() {
+        let error = "org.freedesktop.DBus.Error.UnknownInterface: Unknown interface 'org.freedesktop.impl.portal.Language'";
+
+        assert_eq!(
+            concise_error(error),
+            "The running Aileron portal is older than this demo and does not expose the Language interface. Restart the updated portal with `systemctl --user restart aileron-portal`, or rebuild/reinstall the portal service if it was installed from an older binary."
         );
     }
 }
@@ -2498,7 +2530,7 @@ fn extract_guided(text: &str, tx: std::sync::mpsc::Sender<DemoEvent>) -> anyhow:
             true,
         ),
     ];
-    let options = (512_i64, 0.2_f64, "default", "", "");
+    let options = (128_i64, 0.2_f64, "default", "", "");
 
     tx.send(DemoEvent::Phase(DemoPhase::WaitingForModel))?;
     tx.send(DemoEvent::Phase(DemoPhase::RequestingGuided))?;
@@ -2618,8 +2650,9 @@ fn respond_text_task(
     Ok(())
 }
 
-fn chat_stream(
+fn guided_chat_turn(
     existing_session: Option<String>,
+    memory: &[String],
     messages: Vec<ChatMessage>,
     tx: std::sync::mpsc::Sender<ChatEvent>,
 ) -> anyhow::Result<()> {
@@ -2629,11 +2662,8 @@ fn chat_stream(
     const PATH: &str = "/org/freedesktop/portal/desktop";
     const IFACE: &str = "org.freedesktop.impl.portal.Language";
 
-    let call_conn = Connection::session()?;
-    let signal_conn = Connection::session()?;
-
-    let proxy = zbus::blocking::Proxy::new(&call_conn, BUS, PATH, IFACE)?;
-    let sig_proxy = zbus::blocking::Proxy::new(&signal_conn, BUS, PATH, IFACE)?;
+    let conn = Connection::session()?;
+    let proxy = zbus::blocking::Proxy::new(&conn, BUS, PATH, IFACE)?;
 
     let session_id = match existing_session {
         Some(id) => id,
@@ -2642,40 +2672,46 @@ fn chat_stream(
                 "CreateSession",
                 &(
                     "org.aileron.Demo",
-                    "language.chat",
-                    "You are a helpful local assistant. Be concise, accurate, and conversational.",
+                    "language.extract",
+                    "You answer chat turns and extract only durable user memory as guided JSON.",
                 ),
             )?;
-            tx.send(ChatEvent::SessionCreated(id.clone()))?;
+            tx.send(ChatEvent::SessionReady(id.clone()))?;
             id
         }
     };
 
-    let mut token_iter = sig_proxy.receive_signal("TokenReceived")?;
-    let dbus_messages: Vec<(String, String)> = messages
-        .into_iter()
-        .map(|message| (message.role, message.content))
-        .collect();
-    let options = (512_i64, 0.7_f64, "default", "", "");
-    let _: () = proxy.call("StreamChat", &(&session_id, dbus_messages, options))?;
-
-    for msg in &mut token_iter {
-        let body = msg.body();
-        let (sig_session, token, done): (String, String, bool) = body.deserialize()?;
-        if sig_session != session_id {
-            continue;
-        }
-        tx.send(ChatEvent::Token(token))?;
-        if done {
-            break;
-        }
-    }
+    let fields = vec![
+        (
+            "answer".to_string(),
+            "string".to_string(),
+            "A concise, helpful answer to the user's latest message".to_string(),
+            true,
+        ),
+        (
+            "memory".to_string(),
+            "string".to_string(),
+            "One durable fact or preference to remember for future turns, or an empty string if there is nothing worth remembering".to_string(),
+            true,
+        ),
+        (
+            "confidence".to_string(),
+            "integer".to_string(),
+            "Confidence score from 0 to 100 for the answer".to_string(),
+            true,
+        ),
+    ];
+    let options = (512_i64, 0.2_f64, "default", "", "");
+    let prompt = guided_chat_prompt(memory, &messages);
+    let content: String = proxy.call("RespondGuided", &(&session_id, &prompt, fields, options))?;
+    let response: GuidedChatResponse = serde_json::from_str(&content)?;
+    tx.send(ChatEvent::Response(response))?;
 
     tx.send(ChatEvent::Done)?;
     Ok(())
 }
 
-fn end_chat_session(session_id: &str) -> anyhow::Result<()> {
+fn end_guided_chat_session(session_id: &str) -> anyhow::Result<()> {
     use zbus::blocking::Connection;
 
     const BUS: &str = "org.freedesktop.impl.portal.desktop.aileron";
@@ -2686,6 +2722,32 @@ fn end_chat_session(session_id: &str) -> anyhow::Result<()> {
     let proxy = zbus::blocking::Proxy::new(&conn, BUS, PATH, IFACE)?;
     let _: () = proxy.call("EndSession", &(session_id,))?;
     Ok(())
+}
+
+fn guided_chat_prompt(memory: &[String], messages: &[ChatMessage]) -> String {
+    let mut prompt = String::from(
+        "Answer the latest user message using the conversation and memory below. Return only the guided JSON fields. Add memory only for durable user facts, preferences, goals, or constraints that would be useful in later turns; otherwise return an empty memory string.\n\nMemory:\n",
+    );
+
+    if memory.is_empty() {
+        prompt.push_str("- None\n");
+    } else {
+        for item in memory.iter().rev().take(12).rev() {
+            prompt.push_str("- ");
+            prompt.push_str(item);
+            prompt.push('\n');
+        }
+    }
+
+    prompt.push_str("\nConversation:\n");
+    for message in messages.iter().rev().take(12).rev() {
+        prompt.push_str(&message.role);
+        prompt.push_str(": ");
+        prompt.push_str(&message.content);
+        prompt.push('\n');
+    }
+
+    prompt
 }
 
 fn transcribe_recording(

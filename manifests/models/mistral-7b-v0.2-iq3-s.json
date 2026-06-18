@@ -6,7 +6,6 @@
   "min_ram_gb": 6.0,
   "use_cases": [
     "language.summarize",
-    "language.chat",
     "language.translate",
     "language.rephrase",
     "language.classify",

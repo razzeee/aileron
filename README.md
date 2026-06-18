@@ -318,7 +318,6 @@ Use-cases describe the task intent and modality; methods describe the operation 
 | `language.classify` | Classify / tag text | llama.cpp |
 | `language.extract` | Extract structured data | llama.cpp |
 | `language.analyze` | Derive mixed structured insights from text | llama.cpp |
-| `language.chat` | Stateless chat turns | llama.cpp |
 | `language.embed` | Compute text embedding vectors | llama.cpp |
 | `speech.transcribe` | Transcribe audio (16 kHz mono f32le, base64) | whisper.cpp |
 | `speech.translate` | Translate spoken audio to English text | whisper.cpp |
@@ -337,7 +336,6 @@ Create sessions, generate text, get structured JSON output, compute embeddings, 
 ```varlink
 type ModelAvailability (is_available: bool, reason: string)
 type GenerationOptions (maximum_response_tokens: int, temperature: float, sampling_mode: string, source_language_hint: string, target_language_hint: string)
-type ChatMessage (role: string, content: string)
 type GuidedField (name: string, kind: string, description: string, required: bool)
 type VisionSegment (label: string, confidence: float, x: float, y: float, width: float, height: float)
 
@@ -346,8 +344,6 @@ method CreateSession(app_id: string, use_case: string, instructions: string) -> 
 method Prewarm(session_id: string, prompt_prefix: string) -> ()
 method Respond(session_id: string, prompt: string, options: GenerationOptions) -> (content: string)
 method StreamResponse(session_id: string, prompt: string, options: GenerationOptions) -> (token: string)
-method Chat(session_id: string, messages: []ChatMessage, options: GenerationOptions) -> (content: string)
-method StreamChat(session_id: string, messages: []ChatMessage, options: GenerationOptions) -> (token: string)
 method RespondGuided(session_id: string, prompt: string, fields: []GuidedField, options: GenerationOptions) -> (content: string)
 method Embed(session_id: string, text: string) -> (embedding: []float)
 method Transcribe(session_id: string, audio: string, language_hint: string) -> (text: string)
@@ -357,7 +353,7 @@ method Segment(session_id: string, image: string) -> (segments: []VisionSegment)
 method EndSession(session_id: string) -> ()
 ```
 
-`instructions` are stored on the session and forwarded to text containers as the container `system` prompt. `ChatMessage.role` is the caller-supplied conversation role, typically `user` or `assistant`. `audio` is raw 16 kHz mono f32le PCM bytes encoded as base64; `Transcribe` returns a verbatim transcript for `speech.transcribe` sessions and an English translation for `speech.translate` sessions. `image` is PNG or JPEG bytes encoded as base64. `Embed` returns the embedding vector for `text`. `VisionSegment` coordinates are normalized `0.0..1.0` rectangles relative to image dimensions.
+`instructions` are stored on the session and forwarded to text containers as the container `system` prompt. `audio` is raw 16 kHz mono f32le PCM bytes encoded as base64; `Transcribe` returns a verbatim transcript for `speech.transcribe` sessions and an English translation for `speech.translate` sessions. `image` is PNG or JPEG bytes encoded as base64. `Embed` returns the embedding vector for `text`. `VisionSegment` coordinates are normalized `0.0..1.0` rectangles relative to image dimensions.
 
 `GenerationOptions.maximum_response_tokens` must be greater than zero and fit in `u32`. `temperature` must be finite and non-negative. `sampling_mode` must be non-empty. `source_language_hint` and `target_language_hint` are optional strings for `language.translate`; pass empty strings when unspecified. Today the daemon validates sampling fields, forwards `maximum_response_tokens` to containers as `max_tokens`, and folds translation hints into the session instructions for `language.translate`.
 
@@ -413,7 +409,7 @@ The portal does not talk to containers directly. It translates D-Bus calls into 
 
 | Interface | Use-case prefix | Methods |
 |---|---|---|
-| `org.freedesktop.impl.portal.Language` | `language.*` | `GetUseCaseAvailability`, `CreateSession`, `Prewarm`, `Respond`, `StreamResponse`, `Chat`, `StreamChat`, `RespondGuided`, `Embed`, `EndSession` |
+| `org.freedesktop.impl.portal.Language` | `language.*` | `GetUseCaseAvailability`, `CreateSession`, `Prewarm`, `Respond`, `StreamResponse`, `RespondGuided`, `Embed`, `EndSession` |
 | `org.freedesktop.impl.portal.Speech` | `speech.*` | `GetUseCaseAvailability`, `CreateSession`, `Prewarm`, `Transcribe`, `EndSession` |
 | `org.freedesktop.impl.portal.Vision` | `vision.*` | `GetUseCaseAvailability`, `CreateSession`, `Prewarm`, `Describe`, `Ocr`, `Segment`, `EndSession` |
 
@@ -434,8 +430,6 @@ The portal does not talk to containers directly. It translates D-Bus calls into 
 |---|---|---|---|
 | `Respond` | `session_id: s, prompt: s, options: (xdsss)` | `content: s` | Returns full generated text |
 | `StreamResponse` | `session_id: s, prompt: s, options: (xdsss)` | `()` | Emits `TokenReceived` signals; final token has `done=true` |
-| `Chat` | `session_id: s, messages: a(ss), options: (xdsss)` | `content: s` | Stateless chat; app sends explicit user/assistant history |
-| `StreamChat` | `session_id: s, messages: a(ss), options: (xdsss)` | `()` | Emits `TokenReceived` signals; final token has `done=true` |
 | `RespondGuided` | `session_id: s, prompt: s, fields: a(sssb), options: (xdsss)` | `content: s` | Language sessions only; returns JSON matching guided output fields |
 | `Embed` | `session_id: s, text: s` | `embedding: ad` | `language.embed` sessions only; returns an embedding vector |
 
@@ -453,14 +447,14 @@ The portal does not talk to containers directly. It translates D-Bus calls into 
 | `Ocr` | `session_id: s, image_b64: s` | `text: s` | `vision.ocr` sessions only; PNG or JPEG, base64; extracts text |
 | `Segment` | `session_id: s, image_b64: s` | `segments: []VisionSegment` | PNG or JPEG, base64; normalized boxes |
 
-These are D-Bus signatures: parentheses define a struct, and `a(...)` means an array of structs. `options: (xdsss)` is `GenerationOptions`: `maximum_response_tokens` as int64, `temperature` as float64, `sampling_mode` as string, `source_language_hint` as string, and `target_language_hint` as string. Empty language hints mean unspecified. The language hints only affect `language.translate`. `messages: a(ss)` is an array of `ChatMessage` structs: role, content. `fields: a(sssb)` is an array of `GuidedField` structs: name, kind, description, required.
+These are D-Bus signatures: parentheses define a struct, and `a(...)` means an array of structs. `options: (xdsss)` is `GenerationOptions`: `maximum_response_tokens` as int64, `temperature` as float64, `sampling_mode` as string, `source_language_hint` as string, and `target_language_hint` as string. Empty language hints mean unspecified. The language hints only affect `language.translate`. `fields: a(sssb)` is an array of `GuidedField` structs: name, kind, description, required.
 
 ### Signals
 
 | Signal | Parameters | Fired when |
 |---|---|---|
 | `ModelLoading` | `message: s` | The portal is about to start a cold backing container; available on each interface |
-| `TokenReceived` | `session_id: s, token: s, done: b` | Each token during `StreamResponse` or `StreamChat` on `Language` |
+| `TokenReceived` | `session_id: s, token: s, done: b` | Each token during `StreamResponse` on `Language` |
 
 D-Bus callers see underlying Varlink failures as `org.freedesktop.DBus.Error.Failed` with the Varlink error text.
 
@@ -494,11 +488,10 @@ Each OCI image implements a simple newline-delimited JSON protocol over stdin/st
 | Field | Type | Used by | Description |
 |---|---|---|---|
 | `id` | string | all requests | Correlation ID generated by the daemon |
-| `type` | string | all requests | One of `generate`, `chat`, `generate_structured`, `transcribe`, `describe`, `segment` |
-| `system` | string | `generate`, `chat`, `generate_structured` | Session instructions from `CreateSession` |
+| `type` | string | all requests | One of `generate`, `generate_structured`, `transcribe`, `describe`, `segment`, `embed` |
+| `system` | string | `generate`, `generate_structured` | Session instructions from `CreateSession` |
 | `prompt` | string | `generate`, `generate_structured`, optionally `describe` | User prompt or image prompt |
-| `messages` | array | `chat` | Explicit chat history as `{ "role": string, "content": string }` objects |
-| `max_tokens` | number | `generate`, `chat`, `generate_structured`, optionally `describe` | Derived from `GenerationOptions.maximum_response_tokens` for text requests |
+| `max_tokens` | number | `generate`, `generate_structured`, optionally `describe` | Derived from `GenerationOptions.maximum_response_tokens` for text requests |
 | `audio` | string | `transcribe` | Base64-encoded raw PCM bytes, 16 kHz mono f32le |
 | `language_hint` | string | `transcribe` | Optional spoken language hint; omitted when unspecified |
 | `image` | string | `describe` | Base64-encoded PNG or JPEG bytes |
@@ -515,16 +508,6 @@ All requests may include an optional `system` field (string) to set the system p
 // response (one line per token, final line has done:true)
 {"id": "uuid", "token": "Here"}
 {"id": "uuid", "token": " is", "done": true}
-```
-
-### Chat generation
-
-```jsonc
-// request
-{"id": "uuid", "type": "chat", "messages": [{"role": "user", "content": "Hello"}], "max_tokens": 512}
-
-// response (one line per token, final line has done:true)
-{"id": "uuid", "token": "Hi", "done": true}
 ```
 
 ### Structured output

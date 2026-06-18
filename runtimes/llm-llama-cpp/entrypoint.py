@@ -6,7 +6,6 @@ Reads newline-delimited JSON requests from stdin, writes responses to stdout.
 
 Supported request types:
   generate            – stream tokens via instructor partial streaming
-  chat                – stream tokens from explicit chat messages
   generate_structured – return a single JSON result constrained to a schema
   embed               – return an embedding vector for the supplied text
 
@@ -94,19 +93,6 @@ def handle_generate(llm: Llama, req: dict) -> None:
     send({"id": req_id, "done": True})
 
 
-def handle_chat(llm: Llama, req: dict) -> None:
-    """Stream tokens from an explicit stateless chat transcript."""
-    req_id = req["id"]
-    max_tokens = int(req.get("max_tokens", 512))
-    system = req.get("system", DEFAULT_SYSTEM)
-    messages = [{"role": "system", "content": system}]
-    messages.extend(req.get("messages", []))
-
-    stream_chat_or_fallback(llm, req_id, messages, max_tokens)
-
-    send({"id": req_id, "done": True})
-
-
 def handle_generate_structured(llm: Llama, req: dict) -> None:
     """Return a single structured JSON result constrained to the caller's schema
     using llama.cpp's native grammar-based sampling."""
@@ -122,7 +108,7 @@ def handle_generate_structured(llm: Llama, req: dict) -> None:
     except Exception:
         grammar = LlamaGrammar.from_string('root ::= value\n', verbose=False)
 
-        result_text = llm.create_chat_completion(
+    result_text = llm.create_chat_completion(
         messages=[
             {"role": "system", "content": system},
             {"role": "user",   "content": prompt},
@@ -169,7 +155,6 @@ def main() -> None:
         llm=llm,
         handlers={
             "generate": handle_generate,
-            "chat": handle_chat,
             "generate_structured": handle_generate_structured,
             "embed": handle_embed,
         },

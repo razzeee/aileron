@@ -2,7 +2,6 @@
   "runtime_id": "llm-llama-cpp",
   "capabilities": [
     "generate",
-    "chat",
     "generate_structured",
     "embed"
   ],

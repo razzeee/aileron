@@ -81,12 +81,6 @@ pub struct Container {
     pub last_used: std::time::Instant,
 }
 
-#[derive(Clone, Serialize)]
-pub struct ChatMessage {
-    pub role: String,
-    pub content: String,
-}
-
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct VisionSegment {
     pub label: String,
@@ -215,59 +209,6 @@ impl Container {
             r#type: "generate".to_string(),
             system: system.map(str::to_string),
             prompt: Some(prompt.to_string()),
-            messages: None,
-            max_tokens: Some(max_tokens),
-            audio: None,
-            task: None,
-            image: None,
-            language_hint: None,
-            response_format: None,
-        };
-        let line = serde_json::to_string(&req)? + "\n";
-        self.stdin.write_all(line.as_bytes())?;
-        self.stdin.flush()?;
-        self.last_used = std::time::Instant::now();
-
-        loop {
-            let mut buf = String::new();
-            let n = self.stdout.read_line(&mut buf)?;
-            if n == 0 {
-                bail!("container stdout closed unexpectedly");
-            }
-            let resp: ContainerResponse = serde_json::from_str(buf.trim())?;
-            if resp.id != id {
-                continue;
-            }
-            if let Some(error) = resp.error {
-                let reason = resp.reason.unwrap_or(error);
-                bail!("container returned error: {reason}");
-            }
-            if let Some(token) = resp.token {
-                on_token(token);
-            }
-            if resp.done.unwrap_or(false) {
-                break;
-            }
-        }
-        Ok(())
-    }
-
-    /// Send a chat request and collect streamed token responses.
-    /// `on_token` is called once per token as it arrives.
-    pub fn chat(
-        &mut self,
-        system: Option<&str>,
-        messages: &[ChatMessage],
-        max_tokens: u32,
-        mut on_token: impl FnMut(String),
-    ) -> Result<()> {
-        let id = Uuid::new_v4().to_string();
-        let req = ContainerRequest {
-            id: id.clone(),
-            r#type: "chat".to_string(),
-            system: system.map(str::to_string),
-            prompt: None,
-            messages: Some(messages.to_vec()),
             max_tokens: Some(max_tokens),
             audio: None,
             task: None,
@@ -325,7 +266,6 @@ impl Container {
             r#type: "generate_structured".to_string(),
             system: system.map(str::to_string),
             prompt: Some(prompt.to_string()),
-            messages: None,
             max_tokens: Some(max_tokens),
             audio: None,
             task: None,
@@ -374,7 +314,6 @@ impl Container {
             r#type: "transcribe".to_string(),
             system: None,
             prompt: None,
-            messages: None,
             max_tokens: None,
             audio: Some(base64_encode(&audio)),
             task: Some(task.to_string()),
@@ -399,7 +338,6 @@ impl Container {
             r#type: "describe".to_string(),
             system: None,
             prompt: None,
-            messages: None,
             max_tokens: None,
             audio: None,
             task: None,
@@ -422,7 +360,6 @@ impl Container {
             r#type: "ocr".to_string(),
             system: None,
             prompt: None,
-            messages: None,
             max_tokens: None,
             audio: None,
             task: None,
@@ -446,7 +383,6 @@ impl Container {
             r#type: "segment".to_string(),
             system: None,
             prompt: None,
-            messages: None,
             max_tokens: None,
             audio: None,
             task: None,
@@ -484,7 +420,6 @@ impl Container {
             r#type: "embed".to_string(),
             system: None,
             prompt: Some(text.to_string()),
-            messages: None,
             max_tokens: None,
             audio: None,
             task: None,
@@ -1183,8 +1118,6 @@ struct ContainerRequest {
     system: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     prompt: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    messages: Option<Vec<ChatMessage>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]

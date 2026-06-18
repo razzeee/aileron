@@ -6,7 +6,6 @@
   "tier": "small",
   "use_cases": [
     "language.summarize",
-    "language.chat",
     "language.translate",
     "language.rephrase",
     "language.classify",

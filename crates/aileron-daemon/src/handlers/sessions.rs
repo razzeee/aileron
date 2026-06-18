@@ -110,7 +110,7 @@ mod tests {
         Session {
             session_id: session_id.to_string(),
             app_id: "org.aileron.Test".to_string(),
-            use_case: "language.chat".to_string(),
+            use_case: "language.extract".to_string(),
             profile_id: profile_id.to_string(),
             instructions: "be concise".to_string(),
             started_at: chrono::Utc::now(),
@@ -129,7 +129,7 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].session_id, "session-a");
         assert_eq!(sessions[0].app_id, "org.aileron.Test");
-        assert_eq!(sessions[0].use_case, "language.chat");
+        assert_eq!(sessions[0].use_case, "language.extract");
         assert_eq!(sessions[0].profile_id, "profile-a");
         assert!(!sessions[0].started_at.is_empty());
     }

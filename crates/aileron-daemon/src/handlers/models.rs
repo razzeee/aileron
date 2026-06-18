@@ -581,9 +581,7 @@ fn use_case_fit_scores(
 
 fn fit_category(use_case: &str) -> Option<&'static str> {
     match use_case {
-        "language.summarize" | "language.translate" | "language.rephrase" | "language.chat" => {
-            Some("Chat")
-        }
+        "language.summarize" | "language.translate" | "language.rephrase" => Some("Text"),
         "language.analyze" => Some("Reasoning"),
         "language.classify" | "language.extract" => Some("General"),
         "language.embed" => Some("Embeddings"),

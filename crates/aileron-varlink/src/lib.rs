@@ -83,7 +83,7 @@ mod tests {
                 "recommended": true,
                 "installing": false,
                 "recommendation_reason": "test",
-                "use_cases": ["language.chat"]
+                "use_cases": ["language.extract"]
             }))
             .expect("missing spdx_license should decode from older daemons");
 

@@ -15,11 +15,6 @@ type GenerationOptions (
   target_language_hint: string
 )
 
-type ChatMessage (
-  role: string,
-  content: string
-)
-
 type GuidedField (
   name: string,
   kind: string,
@@ -50,12 +45,6 @@ method Respond(session_id: string, prompt: string, options: GenerationOptions) -
 
 # Stream response tokens. Session must have been created with a language.* use_case.
 method StreamResponse(session_id: string, prompt: string, options: GenerationOptions) -> (token: string)
-
-# Generate a chat response from explicit conversation messages. Session must use language.chat.
-method Chat(session_id: string, messages: []ChatMessage, options: GenerationOptions) -> (content: string)
-
-# Stream chat response tokens from explicit conversation messages. Session must use language.chat.
-method StreamChat(session_id: string, messages: []ChatMessage, options: GenerationOptions) -> (token: string)
 
 # Generate JSON matching field guides converted to a JSON Schema object.
 # Session must have been created with a language.* use_case.

@@ -9,14 +9,15 @@
   "tier": "balanced",
   "use_cases": [
     "language.summarize",
-    "language.chat",
     "language.translate",
     "language.rephrase",
     "language.classify",
     "language.extract",
     "language.analyze",
+    "language.embed",
     "vision.describe",
-    "vision.segment"
+    "vision.segment",
+    "vision.ocr"
   ],
   "artifacts": [
     {

@@ -20,7 +20,6 @@ const USE_CASES: &[&str] = &[
     "language.classify",
     "language.extract",
     "language.analyze",
-    "language.chat",
     "language.embed",
     "speech.transcribe",
     "speech.translate",

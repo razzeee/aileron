@@ -12,10 +12,12 @@ const USE_CASES: &[&str] = &[
     "language.classify",
     "language.extract",
     "language.analyze",
-    "language.chat",
+    "language.embed",
     "speech.transcribe",
+    "speech.translate",
     "vision.describe",
     "vision.segment",
+    "vision.ocr",
 ];
 
 #[derive(Default)]
@@ -135,7 +137,7 @@ fn build_page(page: &PreferencesPage, sender: ComponentSender<OverviewPage>) -> 
 
     let metrics = Box::new(Orientation::Horizontal, 12);
     metrics.set_homogeneous(true);
-    let (readiness_card, readiness_value) = metric_card("Task readiness", "0 / 10");
+    let (readiness_card, readiness_value) = metric_card("Task readiness", "0 / 12");
     let (downloads_card, downloads_value) = metric_card("Downloads", "0");
     let (runtimes_card, runtimes_value) = metric_card("Runtime images", "0");
     let (sessions_card, sessions_value) = metric_card("Active sessions", "0");
@@ -206,17 +208,7 @@ fn load_summary() -> OverviewSummary {
             let mut client = aileron_varlink::aileron_Models::VarlinkClient::new(conn);
             match client.list().call() {
                 Ok(reply) => {
-                    summary.ready_tasks = USE_CASES
-                        .iter()
-                        .filter(|use_case| {
-                            reply.profiles.iter().any(|profile| {
-                                profile
-                                    .assigned_use_cases
-                                    .iter()
-                                    .any(|assigned| assigned == **use_case)
-                            })
-                        })
-                        .count();
+                    summary.ready_tasks = ready_task_count(&reply.profiles);
                 }
                 Err(e) => summary.errors.push(format!("Profiles unavailable: {e}")),
             }
@@ -276,6 +268,58 @@ fn load_summary() -> OverviewSummary {
 
 fn install_is_terminal(install: &InstallStatus) -> bool {
     install.status.starts_with("Failed:") || install.status == "Completed"
+}
+
+fn ready_task_count(profiles: &[aileron_varlink::aileron_Models::ProfileInfo]) -> usize {
+    USE_CASES
+        .iter()
+        .filter(|use_case| {
+            profiles.iter().any(|profile| {
+                profile
+                    .use_cases
+                    .iter()
+                    .any(|supported| supported == **use_case)
+                    && profile
+                        .assigned_use_cases
+                        .iter()
+                        .any(|assigned| assigned == **use_case)
+            })
+        })
+        .count()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aileron_varlink::aileron_Models::ProfileInfo;
+
+    fn profile(use_cases: &[&str], assigned_use_cases: &[&str]) -> ProfileInfo {
+        ProfileInfo {
+            profile_id: "profile".to_string(),
+            model_id: "model".to_string(),
+            runtime_id: "runtime".to_string(),
+            artifact_path: "/tmp/model".to_string(),
+            use_cases: use_cases.iter().map(|value| value.to_string()).collect(),
+            runtime_images: Vec::new(),
+            assigned_use_cases: assigned_use_cases
+                .iter()
+                .map(|value| value.to_string())
+                .collect(),
+            installed_at: String::new(),
+            size_bytes: 0,
+            source: "user".to_string(),
+        }
+    }
+
+    #[test]
+    fn ready_task_count_requires_assignment_and_profile_support() {
+        let profiles = vec![profile(
+            &["speech.transcribe"],
+            &["speech.transcribe", "speech.translate"],
+        )];
+
+        assert_eq!(ready_task_count(&profiles), 1);
+    }
 }
 
 fn append_detail(list: &ListBox, title: &str, subtitle: &str) {
