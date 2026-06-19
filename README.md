@@ -282,7 +282,7 @@ Install the `varlink` CLI with: `cargo install varlink-cli`
 aileron
 ```
 
-In the **Models** page, click **Add Profile...**, choose one of the available runtime IDs, and provide the model file URL, SHA-256, and use-cases. Aileron derives the filename, model ID, and profile ID. Installed profiles can then be assigned to use-case tokens. Assign the same language profile to multiple language task tokens when one model backs several operations, for example `language.summarize` for free-text summaries and `language.analyze` for guided structured analysis.
+In the **Models** page, click **Add Profile...**, choose one of the available runtime IDs, and provide the model file URL, SHA-256, and use-cases. Aileron derives the filename, model ID, and profile ID. Installed profiles can then be assigned to the use-case tokens they declare. Assign the same language profile to multiple declared language task tokens when one model backs several operations, for example `language.summarize` for free-text summaries and `language.analyze` for guided structured analysis.
 
 ### 2. Grant permission to an app
 
@@ -306,7 +306,7 @@ Paste or fetch an article URL, then click **Summarize**. Tokens stream into the 
 
 ## Use-case tokens
 
-Use-case tokens are the daemon's routing and policy keys. A token maps to one assigned profile, permissions are granted per app and token, and warm containers are pooled per profile. Assigning the same profile to multiple tokens is valid.
+Use-case tokens are the daemon's routing and policy keys. A token maps to one assigned profile, permissions are granted per app and token, and warm containers are pooled per profile. Assigning the same profile to multiple declared tokens is valid.
 
 Use-cases describe the task intent and modality; methods describe the operation shape. `Respond` and `RespondGuided` are text-generation operations for `language.*` sessions (except `language.embed`). `Embed` is for `language.embed`. `Transcribe` serves both `speech.transcribe` and `speech.translate` (the daemon runs the whisper transcribe or translate-to-English task based on the session use-case). `Describe` is for `vision.describe`, `Ocr` is for `vision.ocr`, and `Segment` is for `vision.segment`. There is intentionally no separate `language.guided` token: guided generation is an output constraint for a real language task use-case, not a task intent of its own. Use `language.analyze` when one guided response combines multiple analytical intents, such as summary, extraction, and classification fields.
 
@@ -381,9 +381,14 @@ method InstallManifest(profile_id: string) -> (progress: InstallProgress, auto_a
 method InstallUrlProfile(runtime_id: string, url: string, sha256: string, mmproj_url: string, mmproj_sha256: string, use_cases: []string) -> (progress: InstallProgress, auto_assigned: []string, conflicts: []UseCaseConflict)
 method DeleteProfile(profile_id: string, force: bool) -> ()
 method AssignUseCase(profile_id: string, use_case: string) -> ()
+
+error ProfileNotFound(profile_id: string)
+error ProfileInUse(profile_id: string)
+error InstallFailed(profile_id: string, reason: string)
+error UnsupportedUseCase(profile_id: string, use_case: string)
 ```
 
-`InstallManifest` installs a packaged catalog profile, downloads and verifies declared artifacts, resolves the host variant through runtime manifests, and pulls the selected OCI runtime image with `skopeo`. `InstallUrlProfile` is the ad-hoc import path; pass empty `mmproj_url` and `mmproj_sha256` for single-artifact profiles.
+`InstallManifest` installs a packaged catalog profile, downloads and verifies declared artifacts, resolves the host variant through runtime manifests, and pulls the selected OCI runtime image with `skopeo`. `InstallUrlProfile` is the ad-hoc import path; pass empty `mmproj_url` and `mmproj_sha256` for single-artifact profiles. `AssignUseCase` only accepts use-case tokens listed by the target profile.
 
 ### `aileron.Permissions`
 

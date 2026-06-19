@@ -1970,6 +1970,7 @@ fn refresh_model_list(lists: &ModelLists) {
                 let assign_btn = Button::with_label("Assign");
                 assign_btn.set_valign(gtk4::Align::Center);
                 let profile_id_assign = model.profile_id.clone();
+                let supported_use_cases = model.use_cases.clone();
                 let current_use_cases = model.assigned_use_cases.clone();
                 let lists_assign = lists.clone();
                 assign_btn.connect_clicked(move |btn| {
@@ -1986,16 +1987,16 @@ fn refresh_model_list(lists: &ModelLists) {
                     dialog.set_default_response(Some("assign"));
                     dialog.set_close_response("cancel");
 
-                    // Build a checkbox for each use-case, pre-checked if already assigned.
+                    // Build a checkbox for each use-case this profile declares.
                     let vbox = Box::new(Orientation::Vertical, 4);
                     vbox.set_margin_top(12);
-                    let checkboxes: Vec<(CheckButton, &str)> = USE_CASES
+                    let checkboxes: Vec<(CheckButton, String)> = supported_use_cases
                         .iter()
-                        .map(|&uc| {
+                        .map(|uc| {
                             let cb = CheckButton::with_label(uc);
-                            cb.set_active(current_use_cases.contains(&uc.to_string()));
+                            cb.set_active(current_use_cases.contains(uc));
                             vbox.append(&cb);
-                            (cb, uc)
+                            (cb, uc.clone())
                         })
                         .collect();
                     dialog.set_extra_child(Some(&vbox));
@@ -2009,7 +2010,7 @@ fn refresh_model_list(lists: &ModelLists) {
                         let selected: Vec<String> = checkboxes
                             .iter()
                             .filter(|(cb, _)| cb.is_active())
-                            .map(|(_, uc)| uc.to_string())
+                            .map(|(_, uc)| uc.clone())
                             .collect();
                         let profile_id3 = profile_id2.clone();
                         let lists3 = lists2.clone();

@@ -43,7 +43,7 @@ Avoid treating model names as application requirements. A user may satisfy `lang
 
 ## Recommended Flow
 
-1. Check availability for the use case.
+1. Check availability for all use cases.
 2. Create a session with stable instructions.
 3. Optionally prewarm on the same portal interface before the first visible operation.
 4. Send task input through the appropriate method.

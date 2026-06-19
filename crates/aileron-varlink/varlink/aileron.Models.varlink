@@ -145,9 +145,11 @@ method InstallUrlProfile(
 method DeleteProfile(profile_id: string, force: bool) -> ()
 
 # Assign a use-case token to an installed profile.
+# The profile must list the token in ProfileInfo.use_cases.
 # Only one profile may be assigned per use-case at a time; replaces any existing assignment.
 method AssignUseCase(profile_id: string, use_case: string) -> ()
 
 error ProfileNotFound(profile_id: string)
 error ProfileInUse(profile_id: string)
 error InstallFailed(profile_id: string, reason: string)
+error UnsupportedUseCase(profile_id: string, use_case: string)

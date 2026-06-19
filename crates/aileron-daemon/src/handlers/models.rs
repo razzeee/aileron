@@ -477,8 +477,11 @@ impl VarlinkInterface for ModelsHandler {
     ) -> varlink::Result<()> {
         self.rt.block_on(async {
             let mut guard = self.state.0.lock().await;
-            if guard.profiles.get(&profile_id).is_none() {
+            let Some(profile) = guard.profiles.get(&profile_id) else {
                 return call.reply_profile_not_found(profile_id);
+            };
+            if !profile_supports_use_case(profile, &use_case) {
+                return call.reply_unsupported_use_case(profile_id, use_case);
             }
             guard
                 .assignments
@@ -506,6 +509,13 @@ fn fit_level(
     } else {
         "unknown"
     }
+}
+
+fn profile_supports_use_case(profile: &Profile, use_case: &str) -> bool {
+    profile
+        .use_cases
+        .iter()
+        .any(|supported| supported == use_case)
 }
 
 struct CatalogFit<'a> {
@@ -2023,6 +2033,30 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
+
+    fn profile_with_use_cases(use_cases: &[&str]) -> Profile {
+        Profile {
+            profile_id: "profile".to_string(),
+            model_id: "model".to_string(),
+            runtime_id: "runtime".to_string(),
+            runtime_options: HashMap::new(),
+            artifact_path: PathBuf::from("/tmp/model"),
+            runtime_images: Vec::new(),
+            use_cases: use_cases.iter().map(|value| value.to_string()).collect(),
+            artifact_hashes: Vec::new(),
+            installed_at: "2026-06-19T00:00:00Z".to_string(),
+            source: "user".to_string(),
+        }
+    }
+
+    #[test]
+    fn profile_supports_only_declared_use_cases() {
+        let profile = profile_with_use_cases(&["language.summarize", "language.embed"]);
+
+        assert!(profile_supports_use_case(&profile, "language.summarize"));
+        assert!(profile_supports_use_case(&profile, "language.embed"));
+        assert!(!profile_supports_use_case(&profile, "vision.describe"));
+    }
 
     #[test]
     fn sums_profile_artifact_directory_size() {
