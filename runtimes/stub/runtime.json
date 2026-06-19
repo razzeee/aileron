@@ -1,6 +1,6 @@
 {
   "runtime_id": "stub",
-  "capabilities": ["generate", "generate_structured", "generate_structured_stream", "embed", "transcribe", "describe", "ocr", "segment"],
+  "capabilities": ["generate", "predict_next", "generate_structured", "generate_structured_stream", "embed", "transcribe", "describe", "ocr", "segment"],
   "variants": ["cpu"],
   "artifact_layout": {}
 }

@@ -2,6 +2,7 @@
   "runtime_id": "llm-llama-cpp",
   "capabilities": [
     "generate",
+    "predict_next",
     "generate_structured",
     "generate_structured_stream",
     "embed"

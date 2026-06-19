@@ -60,6 +60,28 @@ The final response may include a token and `done: true`, or may be an empty fina
 {"id":"request-id","done":true}
 ```
 
+## Inline Prediction
+
+Request:
+
+```json
+{
+  "id": "request-id",
+  "type": "predict_next",
+  "prompt": "The lighthouse",
+  "choices": 3,
+  "max_tokens": 4
+}
+```
+
+`prompt` is the raw text prefix typed by the user. `choices` is optional and should be clamped by runtimes to a small value; the daemon caps app requests at 3. Runtimes should avoid chat templates or assistant-style instructions and return short word-like completions.
+
+Response:
+
+```json
+{"id":"request-id","completions":[" keeper"," stood"," beam"],"done":true}
+```
+
 ## Structured Generation
 
 Request:

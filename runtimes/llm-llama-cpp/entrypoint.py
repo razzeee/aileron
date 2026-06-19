@@ -6,6 +6,7 @@ Reads newline-delimited JSON requests from stdin, writes responses to stdout.
 
 Supported request types:
   generate            – stream tokens via instructor partial streaming
+  predict_next        – return short raw text completion choices for inline typing
   generate_structured – return a single JSON result constrained to a schema
   embed               – return an embedding vector for the supplied text
 
@@ -20,6 +21,7 @@ GPU auto-detection order (highest priority first):
 import json
 import os
 import sys
+import inspect
 
 from llama_cpp import Llama
 from jsonschema import ValidationError
@@ -91,6 +93,96 @@ def handle_generate(llm: Llama, req: dict) -> None:
     ], max_tokens)
 
     send({"id": req_id, "done": True})
+
+
+def handle_predict_next(llm: Llama, req: dict) -> None:
+    """Return short raw text completion choices for inline typing.
+
+    This intentionally avoids chat templates and instructions so the model predicts
+    directly from the caller's prefix, closer to next-token completion behavior.
+    """
+    req_id = req["id"]
+    prefix = req.get("prompt", "")
+    max_tokens = int(req.get("max_tokens", 4))
+    choices = max(1, min(3, int(req.get("choices", 1))))
+    base_temperature = float(req.get("temperature", 0.0))
+
+    completions = create_completion_choices(
+        llm,
+        prefix=prefix,
+        choices=choices,
+        max_tokens=max_tokens,
+        base_temperature=base_temperature,
+    )
+
+    send({"id": req_id, "completions": completions, "done": True})
+
+
+def create_completion_choices(
+    llm: Llama,
+    prefix: str,
+    choices: int,
+    max_tokens: int,
+    base_temperature: float,
+) -> list[str]:
+    completions = []
+    supports_n = "n" in inspect.signature(llm.create_completion).parameters
+
+    if supports_n:
+        reply = llm.create_completion(
+            prompt=prefix,
+            max_tokens=max_tokens,
+            temperature=base_temperature,
+            n=choices,
+            stream=False,
+            stop=["\n", "\t"],
+        )
+        add_cleaned_completions(prefix, reply, completions, choices)
+        return completions
+
+    for temperature in [base_temperature, max(base_temperature, 0.4), max(base_temperature, 0.8)]:
+        reply = llm.create_completion(
+            prompt=prefix,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            stream=False,
+            stop=["\n", "\t"],
+        )
+        add_cleaned_completions(prefix, reply, completions, choices)
+        if len(completions) >= choices:
+            break
+
+    return completions
+
+
+def add_cleaned_completions(prefix: str, reply: dict, completions: list[str], limit: int) -> None:
+    for choice in reply.get("choices", []):
+        completion = clean_inline_completion(prefix, choice.get("text", ""))
+        if completion and completion not in completions:
+            completions.append(completion)
+        if len(completions) >= limit:
+            break
+
+
+def clean_inline_completion(prefix: str, raw: str) -> str:
+    suffix_mode = bool(prefix) and (prefix[-1].isalnum() or prefix[-1] in "_-")
+    text = raw.strip() if suffix_mode else raw.lstrip()
+    out = []
+    started = False
+    for ch in text:
+        is_word = ch.isalnum() or ch in "_-'"
+        if is_word:
+            started = True
+            out.append(ch)
+        elif suffix_mode and not started:
+            continue
+        else:
+            break
+
+    completion = "".join(out)
+    if completion and not suffix_mode and not prefix.endswith((" ", "\n", "\t")):
+        completion = " " + completion
+    return completion[:20]
 
 
 def handle_generate_structured(llm: Llama, req: dict) -> None:
@@ -185,6 +277,7 @@ def main() -> None:
         llm=llm,
         handlers={
             "generate": handle_generate,
+            "predict_next": handle_predict_next,
             "generate_structured": handle_generate_structured,
             "generate_structured_stream": handle_generate_structured_stream,
             "embed": handle_embed,

@@ -10,7 +10,7 @@ use libadwaita::{
 };
 use relm4::{ComponentParts, ComponentSender, RelmApp, SimpleComponent};
 use serde::{Deserialize, Serialize};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::rc::Rc;
@@ -338,6 +338,9 @@ fn build_window(window: &ApplicationWindow) {
     let text_page_widget = scrollable_page(&text_box);
     let text_page = stack.add_titled(&text_page_widget, Some("text"), "Text Lab");
     text_page.set_icon_name(Some("text-x-generic-symbolic"));
+    let prediction_page =
+        stack.add_titled(&build_prediction_page(), Some("predict"), "Prediction Lab");
+    prediction_page.set_icon_name(Some("insert-text-symbolic"));
     let chat_page_meta = stack.add_titled(&chat_page, Some("chat"), "Chat Lab");
     chat_page_meta.set_icon_name(Some("user-available-symbolic"));
     let tool_page = stack.add_titled(&build_tool_page(), Some("tools"), "Tool Lab");
@@ -437,6 +440,15 @@ fn build_lab_overview(stack: &ViewStack) -> gtk4::Widget {
         "Try: paste an article, classify it, then extract JSON facts.",
         "Open Text Lab",
         "text",
+        stack,
+    ));
+    cards.append(&lab_card(
+        "Prediction Lab",
+        "Type a sentence and preview a short ghost continuation from the local language model.",
+        "PredictNext",
+        "Try: The old lighthouse keeper opened the door and",
+        "Open Prediction Lab",
+        "predict",
         stack,
     ));
     cards.append(&lab_card(
@@ -553,6 +565,270 @@ fn lab_card(
     card.append(&content);
     card.append(&action_box);
     card
+}
+
+fn build_prediction_page() -> gtk4::Widget {
+    let vbox = Box::new(Orientation::Vertical, 12);
+    vbox.set_margin_top(12);
+    vbox.set_margin_bottom(12);
+    vbox.set_margin_start(12);
+    vbox.set_margin_end(12);
+
+    vbox.append(
+        &Label::builder()
+            .label("Type normally. After a short pause, the app asks the current language model for only the current word ending or the next word.")
+            .xalign(0.0)
+            .wrap(true)
+            .build(),
+    );
+
+    let input = Entry::builder()
+        .placeholder_text("Start typing a sentence...")
+        .hexpand(true)
+        .build();
+    vbox.append(&input);
+
+    let status_row = Box::new(Orientation::Horizontal, 12);
+    status_row.add_css_class("card");
+    status_row.set_height_request(72);
+
+    let status_spinner = Spinner::new();
+    status_spinner.set_spinning(false);
+    status_spinner.set_margin_start(14);
+    status_spinner.set_valign(Align::Center);
+    status_row.append(&status_spinner);
+
+    let status_text = Box::new(Orientation::Vertical, 2);
+    status_text.set_valign(Align::Center);
+    status_text.set_margin_top(10);
+    status_text.set_margin_bottom(10);
+    status_text.set_margin_end(14);
+    let status_title = Label::builder()
+        .label("Ready")
+        .xalign(0.0)
+        .css_classes(vec!["heading"])
+        .build();
+    let status_detail = Label::builder()
+        .label("Pause after typing to request an inline prediction.")
+        .xalign(0.0)
+        .wrap(true)
+        .build();
+    status_text.append(&status_title);
+    status_text.append(&status_detail);
+    status_row.append(&status_text);
+    vbox.append(&status_row);
+
+    vbox.append(&Label::builder().label("Ghost preview").xalign(0.0).build());
+    let preview = Label::builder()
+        .label("Your text will appear here.")
+        .xalign(0.0)
+        .wrap(true)
+        .wrap_mode(gtk4::pango::WrapMode::WordChar)
+        .selectable(true)
+        .css_classes(vec!["card"])
+        .build();
+    preview.set_margin_top(2);
+    preview.set_margin_bottom(2);
+    preview.set_margin_start(2);
+    preview.set_margin_end(2);
+    vbox.append(&preview);
+
+    let choices_label = Label::builder()
+        .label("Choices will appear here.")
+        .xalign(0.0)
+        .wrap(true)
+        .css_classes(vec!["dim-label"])
+        .build();
+    vbox.append(&choices_label);
+
+    let clear_button = Button::with_label("Clear");
+    clear_button.set_halign(Align::Start);
+    vbox.append(&clear_button);
+
+    let active_seq = Rc::new(Cell::new(0_u64));
+    let session_id = Rc::new(RefCell::new(None::<String>));
+    let (tx, rx) = std::sync::mpsc::channel::<PredictionEvent>();
+
+    {
+        let input = input.clone();
+        let preview = preview.clone();
+        let choices_label = choices_label.clone();
+        let status_spinner = status_spinner.clone();
+        let status_title = status_title.clone();
+        let status_detail = status_detail.clone();
+        let active_seq = active_seq.clone();
+        let session_id = session_id.clone();
+        glib::timeout_add_local(std::time::Duration::from_millis(16), move || {
+            loop {
+                match rx.try_recv() {
+                    Ok(PredictionEvent::SessionReady { seq, id }) => {
+                        if seq == active_seq.get() {
+                            *session_id.borrow_mut() = Some(id);
+                        } else {
+                            std::thread::spawn(move || {
+                                let _ = end_prediction_session(&id);
+                            });
+                        }
+                    }
+                    Ok(PredictionEvent::Busy(seq)) => {
+                        if seq == active_seq.get() {
+                            status_spinner.start();
+                            status_title.set_text("Predicting");
+                            status_detail
+                                .set_text("Requesting a short continuation through PredictNext...");
+                        }
+                    }
+                    Ok(PredictionEvent::Suggestion {
+                        seq,
+                        input_text,
+                        suggestions,
+                    }) => {
+                        if seq != active_seq.get() || input.text().as_str() != input_text {
+                            continue;
+                        }
+                        status_spinner.stop();
+                        if suggestions.is_empty() {
+                            status_title.set_text("No prediction");
+                            status_detail
+                                .set_text("The model did not return a usable continuation.");
+                            set_prediction_preview(&preview, &input_text, "");
+                            set_prediction_choices(&choices_label, &[]);
+                        } else {
+                            status_title.set_text("Prediction ready");
+                            status_detail.set_text("Dim text shows the first prediction; alternatives are listed below.");
+                            set_prediction_preview(&preview, &input_text, &suggestions[0]);
+                            set_prediction_choices(&choices_label, &suggestions);
+                        }
+                    }
+                    Ok(PredictionEvent::Error { seq, message }) => {
+                        if seq == active_seq.get() {
+                            status_spinner.stop();
+                            status_title.set_text("Prediction failed");
+                            status_detail.set_text(&message);
+                        }
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        status_spinner.stop();
+                        status_title.set_text("Prediction interrupted");
+                        status_detail.set_text("The prediction channel closed unexpectedly.");
+                        return glib::ControlFlow::Break;
+                    }
+                }
+            }
+            glib::ControlFlow::Continue
+        });
+    }
+
+    {
+        let preview = preview.clone();
+        let choices_label = choices_label.clone();
+        let status_spinner = status_spinner.clone();
+        let status_title = status_title.clone();
+        let status_detail = status_detail.clone();
+        let active_seq = active_seq.clone();
+        let session_id = session_id.clone();
+        let tx = tx.clone();
+        input.connect_changed(move |entry| {
+            let seq = active_seq.get() + 1;
+            active_seq.set(seq);
+            let input_text = entry.text().to_string();
+            set_prediction_preview(&preview, &input_text, "");
+            set_prediction_choices(&choices_label, &[]);
+
+            if input_text.trim().is_empty() {
+                status_spinner.stop();
+                status_title.set_text("Ready");
+                status_detail.set_text("Pause after typing to request an inline prediction.");
+                return;
+            }
+
+            status_spinner.stop();
+            status_title.set_text("Waiting for pause");
+            status_detail.set_text("Typing is debounced to avoid sending every keystroke.");
+
+            let tx = tx.clone();
+            let active_seq = active_seq.clone();
+            let session_id = session_id.clone();
+            glib::timeout_add_local_once(std::time::Duration::from_millis(250), move || {
+                if seq != active_seq.get() {
+                    return;
+                }
+
+                let tx_for_error = tx.clone();
+                let _ = tx.send(PredictionEvent::Busy(seq));
+                let existing_session = session_id.borrow().clone();
+                std::thread::spawn(move || {
+                    match predict_inline_completion(existing_session, &input_text) {
+                        Ok((session, suggestions)) => {
+                            let _ = tx_for_error
+                                .send(PredictionEvent::SessionReady { seq, id: session });
+                            let _ = tx_for_error.send(PredictionEvent::Suggestion {
+                                seq,
+                                input_text,
+                                suggestions,
+                            });
+                        }
+                        Err(e) => {
+                            eprintln!("[aileron-demo] prediction error: {e}");
+                            let _ = tx_for_error.send(PredictionEvent::Error {
+                                seq,
+                                message: friendly_error(&e),
+                            });
+                        }
+                    }
+                });
+            });
+        });
+    }
+
+    {
+        let input = input.clone();
+        let session_id = session_id.clone();
+        clear_button.connect_clicked(move |_| {
+            input.set_text("");
+            if let Some(id) = session_id.borrow_mut().take() {
+                std::thread::spawn(move || {
+                    let _ = end_prediction_session(&id);
+                });
+            }
+        });
+    }
+
+    scrollable_page(&vbox)
+}
+
+fn set_prediction_preview(label: &Label, input: &str, suggestion: &str) {
+    if input.is_empty() {
+        label.set_label("Your text will appear here.");
+        return;
+    }
+
+    let escaped_input = glib::markup_escape_text(input);
+    let escaped_suggestion = glib::markup_escape_text(suggestion);
+    if suggestion.is_empty() {
+        label.set_markup(&escaped_input);
+    } else {
+        label.set_markup(&format!(
+            "{escaped_input}<span alpha=\"55%\">{escaped_suggestion}</span>"
+        ));
+    }
+}
+
+fn set_prediction_choices(label: &Label, suggestions: &[String]) {
+    if suggestions.is_empty() {
+        label.set_text("Choices will appear here.");
+        return;
+    }
+
+    let choices = suggestions
+        .iter()
+        .take(3)
+        .enumerate()
+        .map(|(index, suggestion)| format!("{}. {}", index + 1, suggestion.trim()))
+        .collect::<Vec<_>>()
+        .join("   ");
+    label.set_text(&choices);
 }
 
 fn build_tool_page() -> gtk4::Widget {
@@ -2191,6 +2467,23 @@ enum ChatEvent {
     Done,
 }
 
+enum PredictionEvent {
+    SessionReady {
+        seq: u64,
+        id: String,
+    },
+    Busy(u64),
+    Suggestion {
+        seq: u64,
+        input_text: String,
+        suggestions: Vec<String>,
+    },
+    Error {
+        seq: u64,
+        message: String,
+    },
+}
+
 #[derive(Deserialize)]
 struct GuidedChatResponse {
     answer: String,
@@ -2843,6 +3136,143 @@ fn respond_text_task(
     let _: () = proxy.call("EndSession", &(&session_id,))?;
     tx.send(DemoEvent::Done)?;
     Ok(())
+}
+
+fn predict_inline_completion(
+    existing_session: Option<String>,
+    input: &str,
+) -> anyhow::Result<(String, Vec<String>)> {
+    use zbus::blocking::Connection;
+
+    const BUS: &str = "org.freedesktop.impl.portal.desktop.aileron";
+    const PATH: &str = "/org/freedesktop/portal/desktop";
+    const IFACE: &str = "org.freedesktop.impl.portal.Language";
+
+    let conn = Connection::session()?;
+    let proxy = zbus::blocking::Proxy::new(&conn, BUS, PATH, IFACE)?;
+    let session_id = match existing_session {
+        Some(id) => id,
+        None => {
+            let id: String = proxy.call(
+                "CreateSession",
+                &(
+                    "org.aileron.Demo",
+                    "language.rephrase",
+                    "Inline typing prediction session.",
+                ),
+            )?;
+            let _: () = proxy.call("Prewarm", &(&id, ""))?;
+            id
+        }
+    };
+
+    let prompt_input = if input.chars().count() > 2048 {
+        input
+            .chars()
+            .rev()
+            .take(2048)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<String>()
+    } else {
+        input.to_string()
+    };
+    let options = (4_i64, 0.0_f64, "greedy", "", "");
+    let completions: Vec<String> =
+        proxy.call("PredictNext", &(&session_id, &prompt_input, 3_i64, options))?;
+    let mut cleaned = Vec::new();
+    for completion in completions {
+        let completion = clean_prediction(input, &completion);
+        if !completion.trim().is_empty() && !cleaned.contains(&completion) {
+            cleaned.push(completion);
+        }
+        if cleaned.len() == 3 {
+            break;
+        }
+    }
+    Ok((session_id, cleaned))
+}
+
+fn end_prediction_session(session_id: &str) -> anyhow::Result<()> {
+    use zbus::blocking::Connection;
+
+    const BUS: &str = "org.freedesktop.impl.portal.desktop.aileron";
+    const PATH: &str = "/org/freedesktop/portal/desktop";
+    const IFACE: &str = "org.freedesktop.impl.portal.Language";
+
+    let conn = Connection::session()?;
+    let proxy = zbus::blocking::Proxy::new(&conn, BUS, PATH, IFACE)?;
+    let _: () = proxy.call("EndSession", &(session_id,))?;
+    Ok(())
+}
+
+fn clean_prediction(input: &str, raw: &str) -> String {
+    let mut suggestion = raw
+        .trim()
+        .trim_matches(['"', '\'', '`'])
+        .replace(['\r', '\n'], " ");
+    while suggestion.contains("  ") {
+        suggestion = suggestion.replace("  ", " ");
+    }
+
+    if let Some(stripped) = suggestion.strip_prefix(input) {
+        suggestion = stripped.trim_start().to_string();
+    }
+    if suggestion.to_ascii_lowercase().starts_with("continuation:") {
+        suggestion = suggestion["continuation:".len()..].trim_start().to_string();
+    }
+    if suggestion.to_ascii_lowercase().starts_with("completion:") {
+        suggestion = suggestion["completion:".len()..].trim_start().to_string();
+    }
+
+    let suffix_mode = input
+        .chars()
+        .last()
+        .is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-');
+    suggestion = one_prediction_unit(&suggestion, suffix_mode);
+
+    let mut out = String::new();
+    for ch in suggestion.chars() {
+        if out.chars().count() >= 96 {
+            break;
+        }
+        out.push(ch);
+    }
+
+    if out.is_empty() {
+        return out;
+    }
+    let input_ends_with_space = input.chars().last().is_some_and(char::is_whitespace);
+    let out_starts_with_space = out.chars().next().is_some_and(char::is_whitespace);
+    if !suffix_mode
+        && !input_ends_with_space
+        && !out_starts_with_space
+        && !out.starts_with(['.', ',', ';', ':', '!', '?'])
+    {
+        out.insert(0, ' ');
+    }
+    out
+}
+
+fn one_prediction_unit(raw: &str, suffix_mode: bool) -> String {
+    let trimmed = raw.trim_start();
+    let mut out = String::new();
+    let mut started = false;
+
+    for ch in trimmed.chars() {
+        let is_word = ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' || ch == '\'';
+        if is_word {
+            started = true;
+            out.push(ch);
+        } else if suffix_mode && !started {
+            continue;
+        } else {
+            break;
+        }
+    }
+
+    out
 }
 
 fn guided_chat_turn(

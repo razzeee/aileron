@@ -181,6 +181,33 @@ impl LanguagePortalBackend {
         Ok(reply.content)
     }
 
+    async fn predict_next(
+        &self,
+        session_id: &str,
+        prefix: &str,
+        count: i64,
+        options: GenerationOptionsDbus,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> zbus::fdo::Result<Vec<String>> {
+        use aileron_varlink::aileron_Inference::VarlinkClientInterface;
+
+        self.emit_loading_if_cold(session_id, &emitter).await?;
+        let conn =
+            aileron_ipc::client::connect().map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn);
+        let reply = client
+            .predict_next(
+                session_id.to_string(),
+                prefix.to_string(),
+                count,
+                options.into_varlink(),
+            )
+            .call()
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        self.mark_warm(session_id);
+        Ok(reply.completions)
+    }
+
     async fn stream_response(
         &self,
         session_id: &str,

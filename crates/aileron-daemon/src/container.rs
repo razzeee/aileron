@@ -231,20 +231,10 @@ impl Container {
         mut on_token: impl FnMut(String),
     ) -> Result<()> {
         let id = Uuid::new_v4().to_string();
-        let req = ContainerRequest {
-            id: id.clone(),
-            r#type: "generate".to_string(),
-            system: system.map(str::to_string),
-            prompt: Some(prompt.to_string()),
-            max_tokens: Some(max_tokens),
-            audio: None,
-            task: None,
-            image: None,
-            language_hint: None,
-            response_format: None,
-            tools: None,
-            tool_results: None,
-        };
+        let mut req = ContainerRequest::new(id.clone(), "generate");
+        req.system = system.map(str::to_string);
+        req.prompt = Some(prompt.to_string());
+        req.max_tokens = Some(max_tokens);
         let line = serde_json::to_string(&req)? + "\n";
         self.stdin.write_all(line.as_bytes())?;
         self.stdin.flush()?;
@@ -274,6 +264,56 @@ impl Container {
         Ok(())
     }
 
+    /// Send a raw inline prediction request and return runtime-cleaned completions.
+    pub fn predict_next(
+        &mut self,
+        prefix: &str,
+        count: u32,
+        max_tokens: u32,
+        temperature: f64,
+    ) -> Result<Vec<String>> {
+        let id = Uuid::new_v4().to_string();
+        let mut req = ContainerRequest::new(id.clone(), "predict_next");
+        req.prompt = Some(prefix.to_string());
+        req.max_tokens = Some(max_tokens);
+        req.choices = Some(count);
+        req.temperature = Some(temperature);
+        let line = serde_json::to_string(&req)? + "\n";
+        self.stdin.write_all(line.as_bytes())?;
+        self.stdin.flush()?;
+        self.last_used = std::time::Instant::now();
+
+        loop {
+            let mut buf = String::new();
+            let n = self.stdout.read_line(&mut buf)?;
+            if n == 0 {
+                bail!("container stdout closed unexpectedly");
+            }
+            let resp: ContainerResponse = serde_json::from_str(buf.trim())?;
+            if resp.id != id {
+                continue;
+            }
+            if let Some(error) = resp.error {
+                let reason = resp.reason.unwrap_or_else(|| error.clone());
+                bail!("container returned error {error}: {reason}");
+            }
+            if resp.done.unwrap_or(false) {
+                return Ok(limit_completions(
+                    resp.completions
+                        .or_else(|| resp.completion.map(|c| vec![c]))
+                        .unwrap_or_default(),
+                    count,
+                ));
+            }
+            if let Some(completions) = resp.completions {
+                return Ok(limit_completions(completions, count));
+            }
+            if let Some(completion) = resp.completion {
+                return Ok(limit_completions(vec![completion], count));
+            }
+        }
+    }
+
     /// Send a structured-output request.
     ///
     /// `schema` must be a valid JSON Schema object (as a `serde_json::Value`).
@@ -290,23 +330,14 @@ impl Container {
         schema: &Value,
     ) -> Result<String> {
         let id = Uuid::new_v4().to_string();
-        let req = ContainerRequest {
-            id: id.clone(),
-            r#type: "generate_structured".to_string(),
-            system: system.map(str::to_string),
-            prompt: Some(prompt.to_string()),
-            max_tokens: Some(max_tokens),
-            audio: None,
-            task: None,
-            image: None,
-            language_hint: None,
-            response_format: Some(ResponseFormat {
-                r#type: "json_schema".to_string(),
-                schema: schema.clone(),
-            }),
-            tools: None,
-            tool_results: None,
-        };
+        let mut req = ContainerRequest::new(id.clone(), "generate_structured");
+        req.system = system.map(str::to_string);
+        req.prompt = Some(prompt.to_string());
+        req.max_tokens = Some(max_tokens);
+        req.response_format = Some(ResponseFormat {
+            r#type: "json_schema".to_string(),
+            schema: schema.clone(),
+        });
         let line = serde_json::to_string(&req)? + "\n";
         self.stdin.write_all(line.as_bytes())?;
         self.stdin.flush()?;
@@ -339,26 +370,19 @@ impl Container {
         tool_results: Vec<ToolResult>,
     ) -> Result<GuidedToolResponse> {
         let id = Uuid::new_v4().to_string();
-        let req = ContainerRequest {
-            id: id.clone(),
-            r#type: "generate_structured".to_string(),
-            system: system.map(str::to_string),
-            prompt: prompt.map(str::to_string),
-            max_tokens: Some(max_tokens),
-            audio: None,
-            task: None,
-            image: None,
-            language_hint: None,
-            response_format: Some(ResponseFormat {
-                r#type: "json_schema".to_string(),
-                schema: schema.clone(),
-            }),
-            tools: if tools.is_empty() { None } else { Some(tools) },
-            tool_results: if tool_results.is_empty() {
-                None
-            } else {
-                Some(tool_results)
-            },
+        let mut req = ContainerRequest::new(id.clone(), "generate_structured");
+        req.system = system.map(str::to_string);
+        req.prompt = prompt.map(str::to_string);
+        req.max_tokens = Some(max_tokens);
+        req.response_format = Some(ResponseFormat {
+            r#type: "json_schema".to_string(),
+            schema: schema.clone(),
+        });
+        req.tools = if tools.is_empty() { None } else { Some(tools) };
+        req.tool_results = if tool_results.is_empty() {
+            None
+        } else {
+            Some(tool_results)
         };
         let line = serde_json::to_string(&req)? + "\n";
         self.stdin.write_all(line.as_bytes())?;
@@ -408,23 +432,14 @@ impl Container {
         mut on_snapshot: impl FnMut(String, bool),
     ) -> Result<()> {
         let id = Uuid::new_v4().to_string();
-        let req = ContainerRequest {
-            id: id.clone(),
-            r#type: "generate_structured_stream".to_string(),
-            system: system.map(str::to_string),
-            prompt: Some(prompt.to_string()),
-            max_tokens: Some(max_tokens),
-            audio: None,
-            task: None,
-            image: None,
-            language_hint: None,
-            response_format: Some(ResponseFormat {
-                r#type: "json_schema".to_string(),
-                schema: schema.clone(),
-            }),
-            tools: None,
-            tool_results: None,
-        };
+        let mut req = ContainerRequest::new(id.clone(), "generate_structured_stream");
+        req.system = system.map(str::to_string);
+        req.prompt = Some(prompt.to_string());
+        req.max_tokens = Some(max_tokens);
+        req.response_format = Some(ResponseFormat {
+            r#type: "json_schema".to_string(),
+            schema: schema.clone(),
+        });
         let line = serde_json::to_string(&req)? + "\n";
         self.stdin.write_all(line.as_bytes())?;
         self.stdin.flush()?;
@@ -466,22 +481,12 @@ impl Container {
         task: &str,
     ) -> Result<String> {
         let id = Uuid::new_v4().to_string();
-        let req = ContainerRequest {
-            id: id.clone(),
-            r#type: "transcribe".to_string(),
-            system: None,
-            prompt: None,
-            max_tokens: None,
-            audio: Some(base64_encode(&audio)),
-            task: Some(task.to_string()),
-            image: None,
-            language_hint: language_hint
-                .filter(|hint| !hint.is_empty())
-                .map(str::to_string),
-            response_format: None,
-            tools: None,
-            tool_results: None,
-        };
+        let mut req = ContainerRequest::new(id.clone(), "transcribe");
+        req.audio = Some(base64_encode(&audio));
+        req.task = Some(task.to_string());
+        req.language_hint = language_hint
+            .filter(|hint| !hint.is_empty())
+            .map(str::to_string);
         let line = serde_json::to_string(&req)? + "\n";
         self.stdin.write_all(line.as_bytes())?;
         self.stdin.flush()?;
@@ -492,20 +497,8 @@ impl Container {
     /// Send a vision describe request and return the full description.
     pub fn describe(&mut self, image: Vec<u8>) -> Result<String> {
         let id = Uuid::new_v4().to_string();
-        let req = ContainerRequest {
-            id: id.clone(),
-            r#type: "describe".to_string(),
-            system: None,
-            prompt: None,
-            max_tokens: None,
-            audio: None,
-            task: None,
-            image: Some(base64_encode(&image)),
-            language_hint: None,
-            response_format: None,
-            tools: None,
-            tool_results: None,
-        };
+        let mut req = ContainerRequest::new(id.clone(), "describe");
+        req.image = Some(base64_encode(&image));
         let line = serde_json::to_string(&req)? + "\n";
         self.stdin.write_all(line.as_bytes())?;
         self.stdin.flush()?;
@@ -516,20 +509,8 @@ impl Container {
     /// Send a vision OCR request and return the extracted text.
     pub fn ocr(&mut self, image: Vec<u8>) -> Result<String> {
         let id = Uuid::new_v4().to_string();
-        let req = ContainerRequest {
-            id: id.clone(),
-            r#type: "ocr".to_string(),
-            system: None,
-            prompt: None,
-            max_tokens: None,
-            audio: None,
-            task: None,
-            image: Some(base64_encode(&image)),
-            language_hint: None,
-            response_format: None,
-            tools: None,
-            tool_results: None,
-        };
+        let mut req = ContainerRequest::new(id.clone(), "ocr");
+        req.image = Some(base64_encode(&image));
         let line = serde_json::to_string(&req)? + "\n";
         self.stdin.write_all(line.as_bytes())?;
         self.stdin.flush()?;
@@ -541,20 +522,8 @@ impl Container {
     pub fn segment(&mut self, image: Vec<u8>) -> Result<Vec<VisionSegment>> {
         let id = Uuid::new_v4().to_string();
         let schema = vision_segment_schema();
-        let req = ContainerRequest {
-            id: id.clone(),
-            r#type: "segment".to_string(),
-            system: None,
-            prompt: None,
-            max_tokens: None,
-            audio: None,
-            task: None,
-            image: Some(base64_encode(&image)),
-            language_hint: None,
-            response_format: None,
-            tools: None,
-            tool_results: None,
-        };
+        let mut req = ContainerRequest::new(id.clone(), "segment");
+        req.image = Some(base64_encode(&image));
         let line = serde_json::to_string(&req)? + "\n";
         self.stdin.write_all(line.as_bytes())?;
         self.stdin.flush()?;
@@ -580,20 +549,8 @@ impl Container {
     /// Send an embedding request and return the embedding vector.
     pub fn embed(&mut self, text: &str) -> Result<Vec<f32>> {
         let id = Uuid::new_v4().to_string();
-        let req = ContainerRequest {
-            id: id.clone(),
-            r#type: "embed".to_string(),
-            system: None,
-            prompt: Some(text.to_string()),
-            max_tokens: None,
-            audio: None,
-            task: None,
-            image: None,
-            language_hint: None,
-            response_format: None,
-            tools: None,
-            tool_results: None,
-        };
+        let mut req = ContainerRequest::new(id.clone(), "embed");
+        req.prompt = Some(text.to_string());
         let line = serde_json::to_string(&req)? + "\n";
         self.stdin.write_all(line.as_bytes())?;
         self.stdin.flush()?;
@@ -662,6 +619,11 @@ fn structured_response_result(resp: ContainerResponse, schema: &Value) -> Result
         bail!("container sent done without a result field");
     }
     Ok(None)
+}
+
+fn limit_completions(mut completions: Vec<String>, count: u32) -> Vec<String> {
+    completions.truncate(count as usize);
+    completions
 }
 
 #[derive(Deserialize)]
@@ -1288,6 +1250,10 @@ struct ContainerRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    choices: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     audio: Option<String>,
     /// Present only for `transcribe` requests: "transcribe" (verbatim) or
     /// "translate" (translate speech to English).
@@ -1306,6 +1272,27 @@ struct ContainerRequest {
     tool_results: Option<Vec<ToolResult>>,
 }
 
+impl ContainerRequest {
+    fn new(id: String, request_type: &str) -> Self {
+        Self {
+            id,
+            r#type: request_type.to_string(),
+            system: None,
+            prompt: None,
+            max_tokens: None,
+            choices: None,
+            temperature: None,
+            audio: None,
+            task: None,
+            image: None,
+            language_hint: None,
+            response_format: None,
+            tools: None,
+            tool_results: None,
+        }
+    }
+}
+
 /// Instructs the container to constrain output to a JSON Schema.
 #[derive(Serialize)]
 struct ResponseFormat {
@@ -1318,6 +1305,10 @@ struct ContainerResponse {
     id: String,
     /// Present in streaming token responses.
     token: Option<String>,
+    /// Present in inline prediction responses.
+    completion: Option<String>,
+    /// Present in inline prediction responses with multiple choices.
+    completions: Option<Vec<String>>,
     /// Present in structured output responses (the full JSON string).
     result: Option<String>,
     /// Present in structured streaming responses.
@@ -1689,6 +1680,8 @@ mod tests {
         let resp = ContainerResponse {
             id: "request-1".to_string(),
             token: None,
+            completion: None,
+            completions: None,
             result: None,
             snapshot: None,
             tool_calls: None,
@@ -1709,6 +1702,8 @@ mod tests {
         let resp = ContainerResponse {
             id: "request-1".to_string(),
             token: None,
+            completion: None,
+            completions: None,
             result: Some(r#"{"name":"Ada"}"#.to_string()),
             snapshot: None,
             tool_calls: None,

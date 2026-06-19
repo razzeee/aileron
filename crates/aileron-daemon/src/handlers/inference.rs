@@ -9,7 +9,7 @@ use crate::state::SharedState;
 // VarlinkCallError is a supertrait; its methods reach us via Call_* dyn objects.
 use aileron_varlink::aileron_Inference::{
     Call_CreateSession, Call_Describe, Call_Embed, Call_EndSession, Call_GetUseCaseAvailability,
-    Call_Ocr, Call_Prewarm, Call_Respond, Call_RespondGuided, Call_Segment,
+    Call_Ocr, Call_PredictNext, Call_Prewarm, Call_Respond, Call_RespondGuided, Call_Segment,
     Call_StreamGuidedResponse, Call_StreamResponse, Call_SubmitToolResultsGuided, Call_Transcribe,
     GenerationOptions, GuidedField, ModelAvailability, ToolCall, ToolDefinition, ToolResult,
     VarlinkCallError, VarlinkInterface, VisionSegment,
@@ -198,6 +198,30 @@ impl VarlinkInterface for InferenceHandler {
         self.rt.block_on(async {
             match stream_tokens(&self.state, call, session_id, prompt, options).await {
                 Ok(()) => Ok(()),
+                Err(GenerationError::SessionNotFound(id)) => call.reply_session_not_found(id),
+                Err(GenerationError::ModelUnavailable(reason)) => {
+                    call.reply_model_unavailable(reason)
+                }
+                Err(GenerationError::InvalidOptions(reason)) => {
+                    call.reply_invalid_generation_options(reason)
+                }
+                Err(GenerationError::Failed(reason)) => reply_generation_failure(call, reason),
+                Err(GenerationError::Reply(e)) => Err(e),
+            }
+        })
+    }
+
+    fn predict_next(
+        &self,
+        call: &mut dyn Call_PredictNext,
+        session_id: String,
+        prefix: String,
+        count: i64,
+        options: GenerationOptions,
+    ) -> varlink::Result<()> {
+        self.rt.block_on(async {
+            match predict_next_completions(&self.state, session_id, prefix, count, options).await {
+                Ok(completions) => call.reply(completions),
                 Err(GenerationError::SessionNotFound(id)) => call.reply_session_not_found(id),
                 Err(GenerationError::ModelUnavailable(reason)) => {
                     call.reply_model_unavailable(reason)
@@ -917,6 +941,61 @@ async fn generate_tokens(
             sink.push_token(token)
         })
         .map_err(|e| GenerationError::Failed(e.to_string()))
+}
+
+async fn predict_next_completions(
+    state: &SharedState,
+    session_id: String,
+    prefix: String,
+    count: i64,
+    options: GenerationOptions,
+) -> Result<Vec<String>, GenerationError> {
+    let max_tokens = validate_options(&options).map_err(GenerationError::InvalidOptions)?;
+    let count = validate_prediction_count(count).map_err(GenerationError::InvalidOptions)?;
+    let mut guard = state.0.lock().await;
+
+    let (app_id, use_case, profile_id, image_ref, artifact_path, runtime_options) =
+        match guard.sessions.get(&session_id) {
+            Some(s) => {
+                ensure_language_generation_use_case(&s.use_case)
+                    .map_err(GenerationError::ModelUnavailable)?;
+                let (profile_id, image_ref, artifact_path, runtime_options) =
+                    profile_runtime(&guard, &s.profile_id)
+                        .map_err(GenerationError::ModelUnavailable)?;
+                (
+                    s.app_id.clone(),
+                    s.use_case.clone(),
+                    profile_id,
+                    image_ref,
+                    artifact_path,
+                    runtime_options,
+                )
+            }
+            None => return Err(GenerationError::SessionNotFound(session_id)),
+        };
+
+    let _ = guard.permissions.touch(&app_id, &use_case);
+    let container = guard
+        .containers
+        .get_or_spawn(
+            &profile_id,
+            &image_ref,
+            &artifact_path,
+            &runtime_options,
+            |_| {},
+        )
+        .map_err(|e| GenerationError::Failed(e.to_string()))?;
+
+    container
+        .predict_next(&prefix, count, max_tokens, options.temperature)
+        .map_err(|e| GenerationError::Failed(e.to_string()))
+}
+
+fn validate_prediction_count(count: i64) -> Result<u32, String> {
+    if count < 1 {
+        return Err("prediction count must be greater than zero".to_string());
+    }
+    Ok(count.min(3) as u32)
 }
 
 async fn stream_guided_snapshots(

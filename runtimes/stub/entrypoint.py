@@ -7,6 +7,7 @@ of the daemon, portal, and client without any model or GPU.
 
 Behaviour per request type:
   generate            – streams the prompt back as tokens, word by word
+  predict_next        – returns deterministic inline completion choices
   generate_structured – returns a minimal valid JSON object matching the schema
   embed               – returns a fixed embedding vector
   transcribe          – returns a fixed transcript/translation string
@@ -39,6 +40,15 @@ def handle_generate(req: dict) -> None:
         time.sleep(0.02)                            # simulate inference latency
     if not words:
         send({"id": req_id, "token": "(stub: no prompt provided)", "done": True})
+
+
+def handle_predict_next(req: dict) -> None:
+    req_id = req["id"]
+    prompt = req.get("prompt", "")
+    choices = max(1, min(3, int(req.get("choices", 1))))
+    suffix_mode = bool(prompt) and (prompt[-1].isalnum() or prompt[-1] in "_-")
+    candidates = ["bed", "bing", "ble"] if suffix_mode else [" stub", " demo", " local"]
+    send({"id": req_id, "completions": candidates[:choices], "done": True})
 
 
 def handle_generate_structured(req: dict) -> None:
@@ -167,6 +177,8 @@ def main() -> None:
         try:
             if req_type == "generate":
                 handle_generate(req)
+            elif req_type == "predict_next":
+                handle_predict_next(req)
             elif req_type == "generate_structured":
                 handle_generate_structured(req)
             elif req_type == "generate_structured_stream":
