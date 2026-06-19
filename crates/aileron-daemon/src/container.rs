@@ -91,6 +91,33 @@ pub struct VisionSegment {
     pub height: f64,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ToolDefinition {
+    pub name: String,
+    pub description: String,
+    pub schema_json: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments_json: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ToolResult {
+    pub id: String,
+    pub content: String,
+    pub content_json: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct GuidedToolResponse {
+    pub content: String,
+    pub tool_calls: Vec<ToolCall>,
+}
+
 impl Container {
     /// Spawn a hardened OCI runtime bundle for the given image and block until the
     /// entrypoint signals it is ready by writing `ready` to stderr.
@@ -215,6 +242,8 @@ impl Container {
             image: None,
             language_hint: None,
             response_format: None,
+            tools: None,
+            tool_results: None,
         };
         let line = serde_json::to_string(&req)? + "\n";
         self.stdin.write_all(line.as_bytes())?;
@@ -275,6 +304,8 @@ impl Container {
                 r#type: "json_schema".to_string(),
                 schema: schema.clone(),
             }),
+            tools: None,
+            tool_results: None,
         };
         let line = serde_json::to_string(&req)? + "\n";
         self.stdin.write_all(line.as_bytes())?;
@@ -296,6 +327,132 @@ impl Container {
                 return Ok(result);
             }
         }
+    }
+
+    pub fn generate_structured_with_tools(
+        &mut self,
+        system: Option<&str>,
+        prompt: Option<&str>,
+        max_tokens: u32,
+        schema: &Value,
+        tools: Vec<ToolDefinition>,
+        tool_results: Vec<ToolResult>,
+    ) -> Result<GuidedToolResponse> {
+        let id = Uuid::new_v4().to_string();
+        let req = ContainerRequest {
+            id: id.clone(),
+            r#type: "generate_structured".to_string(),
+            system: system.map(str::to_string),
+            prompt: prompt.map(str::to_string),
+            max_tokens: Some(max_tokens),
+            audio: None,
+            task: None,
+            image: None,
+            language_hint: None,
+            response_format: Some(ResponseFormat {
+                r#type: "json_schema".to_string(),
+                schema: schema.clone(),
+            }),
+            tools: if tools.is_empty() { None } else { Some(tools) },
+            tool_results: if tool_results.is_empty() {
+                None
+            } else {
+                Some(tool_results)
+            },
+        };
+        let line = serde_json::to_string(&req)? + "\n";
+        self.stdin.write_all(line.as_bytes())?;
+        self.stdin.flush()?;
+        self.last_used = std::time::Instant::now();
+
+        loop {
+            let mut buf = String::new();
+            let n = self.stdout.read_line(&mut buf)?;
+            if n == 0 {
+                bail!("container stdout closed unexpectedly");
+            }
+            let resp: ContainerResponse = serde_json::from_str(buf.trim())?;
+            if resp.id != id {
+                continue;
+            }
+            if let Some(error) = resp.error {
+                let reason = resp.reason.unwrap_or_else(|| error.clone());
+                bail!("container returned error {error}: {reason}");
+            }
+            if let Some(tool_calls) = resp.tool_calls {
+                return Ok(GuidedToolResponse {
+                    content: resp.result.unwrap_or_default(),
+                    tool_calls,
+                });
+            }
+            if let Some(result) = resp.result {
+                validate_json_schema(&result, schema)?;
+                return Ok(GuidedToolResponse {
+                    content: result,
+                    tool_calls: Vec::new(),
+                });
+            }
+            if resp.done.unwrap_or(false) {
+                bail!("container sent done without a result or tool_calls field");
+            }
+        }
+    }
+
+    /// Send a structured-output request and stream schema-valid snapshots.
+    pub fn stream_structured(
+        &mut self,
+        system: Option<&str>,
+        prompt: &str,
+        max_tokens: u32,
+        schema: &Value,
+        mut on_snapshot: impl FnMut(String, bool),
+    ) -> Result<()> {
+        let id = Uuid::new_v4().to_string();
+        let req = ContainerRequest {
+            id: id.clone(),
+            r#type: "generate_structured_stream".to_string(),
+            system: system.map(str::to_string),
+            prompt: Some(prompt.to_string()),
+            max_tokens: Some(max_tokens),
+            audio: None,
+            task: None,
+            image: None,
+            language_hint: None,
+            response_format: Some(ResponseFormat {
+                r#type: "json_schema".to_string(),
+                schema: schema.clone(),
+            }),
+            tools: None,
+            tool_results: None,
+        };
+        let line = serde_json::to_string(&req)? + "\n";
+        self.stdin.write_all(line.as_bytes())?;
+        self.stdin.flush()?;
+        self.last_used = std::time::Instant::now();
+
+        loop {
+            let mut buf = String::new();
+            let n = self.stdout.read_line(&mut buf)?;
+            if n == 0 {
+                bail!("container stdout closed unexpectedly");
+            }
+            let resp: ContainerResponse = serde_json::from_str(buf.trim())?;
+            if resp.id != id {
+                continue;
+            }
+            if let Some(error) = resp.error {
+                let reason = resp.reason.unwrap_or_else(|| error.clone());
+                bail!("container returned error {error}: {reason}");
+            }
+            if let Some(snapshot) = resp.snapshot.or(resp.result) {
+                validate_json_schema(&snapshot, schema)?;
+                on_snapshot(snapshot, resp.done.unwrap_or(false));
+            }
+            if resp.done.unwrap_or(false) {
+                break;
+            }
+        }
+        Ok(())
     }
 
     /// Send a transcribe request and return the full transcript.
@@ -322,6 +479,8 @@ impl Container {
                 .filter(|hint| !hint.is_empty())
                 .map(str::to_string),
             response_format: None,
+            tools: None,
+            tool_results: None,
         };
         let line = serde_json::to_string(&req)? + "\n";
         self.stdin.write_all(line.as_bytes())?;
@@ -344,6 +503,8 @@ impl Container {
             image: Some(base64_encode(&image)),
             language_hint: None,
             response_format: None,
+            tools: None,
+            tool_results: None,
         };
         let line = serde_json::to_string(&req)? + "\n";
         self.stdin.write_all(line.as_bytes())?;
@@ -366,6 +527,8 @@ impl Container {
             image: Some(base64_encode(&image)),
             language_hint: None,
             response_format: None,
+            tools: None,
+            tool_results: None,
         };
         let line = serde_json::to_string(&req)? + "\n";
         self.stdin.write_all(line.as_bytes())?;
@@ -389,6 +552,8 @@ impl Container {
             image: Some(base64_encode(&image)),
             language_hint: None,
             response_format: None,
+            tools: None,
+            tool_results: None,
         };
         let line = serde_json::to_string(&req)? + "\n";
         self.stdin.write_all(line.as_bytes())?;
@@ -426,6 +591,8 @@ impl Container {
             image: None,
             language_hint: None,
             response_format: None,
+            tools: None,
+            tool_results: None,
         };
         let line = serde_json::to_string(&req)? + "\n";
         self.stdin.write_all(line.as_bytes())?;
@@ -1133,6 +1300,10 @@ struct ContainerRequest {
     /// Present only for `generate_structured` requests.
     #[serde(skip_serializing_if = "Option::is_none")]
     response_format: Option<ResponseFormat>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<ToolDefinition>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_results: Option<Vec<ToolResult>>,
 }
 
 /// Instructs the container to constrain output to a JSON Schema.
@@ -1149,6 +1320,10 @@ struct ContainerResponse {
     token: Option<String>,
     /// Present in structured output responses (the full JSON string).
     result: Option<String>,
+    /// Present in structured streaming responses.
+    snapshot: Option<String>,
+    /// Present when the model requests app-mediated tool execution.
+    tool_calls: Option<Vec<ToolCall>>,
     /// Present in embedding responses.
     embedding: Option<Vec<f32>>,
     error: Option<String>,
@@ -1515,6 +1690,8 @@ mod tests {
             id: "request-1".to_string(),
             token: None,
             result: None,
+            snapshot: None,
+            tool_calls: None,
             embedding: None,
             error: Some("schema_validation_failed".to_string()),
             reason: Some("expected object".to_string()),
@@ -1533,6 +1710,8 @@ mod tests {
             id: "request-1".to_string(),
             token: None,
             result: Some(r#"{"name":"Ada"}"#.to_string()),
+            snapshot: None,
+            tool_calls: None,
             embedding: None,
             error: None,
             reason: None,

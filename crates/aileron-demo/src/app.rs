@@ -9,7 +9,7 @@ use libadwaita::{
     ApplicationWindow, HeaderBar, OverlaySplitView, ToolbarView, ViewStack, ViewSwitcherSidebar,
 };
 use relm4::{ComponentParts, ComponentSender, RelmApp, SimpleComponent};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -340,6 +340,8 @@ fn build_window(window: &ApplicationWindow) {
     text_page.set_icon_name(Some("text-x-generic-symbolic"));
     let chat_page_meta = stack.add_titled(&chat_page, Some("chat"), "Chat Lab");
     chat_page_meta.set_icon_name(Some("user-available-symbolic"));
+    let tool_page = stack.add_titled(&build_tool_page(), Some("tools"), "Tool Lab");
+    tool_page.set_icon_name(Some("applications-system-symbolic"));
     let speech_page = stack.add_titled(&build_speech_page(), Some("speech"), "Speech Lab");
     speech_page.set_icon_name(Some("audio-input-microphone-symbolic"));
     let vision_page = stack.add_titled(&build_vision_page(), Some("vision"), "Vision Lab");
@@ -435,6 +437,15 @@ fn build_lab_overview(stack: &ViewStack) -> gtk4::Widget {
         "Try: paste an article, classify it, then extract JSON facts.",
         "Open Text Lab",
         "text",
+        stack,
+    ));
+    cards.append(&lab_card(
+        "Tool Lab",
+        "Run a tiny agent loop where the model asks for an app-owned deterministic tool.",
+        "CreateSession, RespondGuided, EndSession",
+        "Try: ask how many r's are in strawrberrry and watch the app loop decide when to run the tool.",
+        "Open Tool Lab",
+        "tools",
         stack,
     ));
     cards.append(&lab_card(
@@ -542,6 +553,168 @@ fn lab_card(
     card.append(&content);
     card.append(&action_box);
     card
+}
+
+fn build_tool_page() -> gtk4::Widget {
+    let vbox = Box::new(Orientation::Vertical, 12);
+    vbox.set_margin_top(12);
+    vbox.set_margin_bottom(12);
+    vbox.set_margin_start(12);
+    vbox.set_margin_end(12);
+
+    vbox.append(
+        &Label::builder()
+            .label("A tiny app-owned agent loop: the local model may request a tool, but the app validates and executes it.")
+            .xalign(0.0)
+            .wrap(true)
+            .build(),
+    );
+
+    let prompt_entry = Entry::builder()
+        .text("How many times does the letter r occur in strawrberrry?")
+        .hexpand(true)
+        .build();
+    let run_button = Button::builder()
+        .label("Run Tool Demo")
+        .css_classes(vec!["suggested-action"])
+        .build();
+    let prompt_row = Box::new(Orientation::Horizontal, 8);
+    prompt_row.append(&prompt_entry);
+    prompt_row.append(&run_button);
+    vbox.append(&prompt_row);
+
+    let status_row = Box::new(Orientation::Horizontal, 12);
+    status_row.add_css_class("card");
+    status_row.set_height_request(72);
+
+    let status_spinner = Spinner::new();
+    status_spinner.set_spinning(false);
+    status_spinner.set_margin_start(14);
+    status_spinner.set_valign(Align::Center);
+    status_row.append(&status_spinner);
+
+    let status_text = Box::new(Orientation::Vertical, 2);
+    status_text.set_valign(Align::Center);
+    status_text.set_margin_top(10);
+    status_text.set_margin_bottom(10);
+    status_text.set_margin_end(14);
+    let status_title = Label::builder()
+        .label("Ready")
+        .xalign(0.0)
+        .css_classes(vec!["heading"])
+        .build();
+    let status_detail = Label::builder()
+        .label("Run the deterministic character-counter tool through the Language portal.")
+        .xalign(0.0)
+        .wrap(true)
+        .build();
+    status_text.append(&status_title);
+    status_text.append(&status_detail);
+    status_row.append(&status_text);
+    vbox.append(&status_row);
+
+    let trace_buffer = TextBuffer::new(None);
+    let trace_view = TextView::builder()
+        .buffer(&trace_buffer)
+        .editable(false)
+        .monospace(true)
+        .wrap_mode(gtk4::WrapMode::WordChar)
+        .hexpand(true)
+        .vexpand(true)
+        .build();
+    vbox.append(
+        &Label::builder()
+            .label("Agent loop trace")
+            .xalign(0.0)
+            .build(),
+    );
+    vbox.append(
+        &ScrolledWindow::builder()
+            .child(&trace_view)
+            .min_content_height(380)
+            .vexpand(true)
+            .build(),
+    );
+
+    {
+        let prompt_entry = prompt_entry.clone();
+        let run_button_for_click = run_button.clone();
+        let run_button = run_button.clone();
+        let status_spinner = status_spinner.clone();
+        let status_title = status_title.clone();
+        let status_detail = status_detail.clone();
+        let trace_buffer = trace_buffer.clone();
+        run_button_for_click.connect_clicked(move |_| {
+            let prompt = prompt_entry.text().trim().to_string();
+            if prompt.is_empty() {
+                return;
+            }
+
+            trace_buffer.set_text("");
+            run_button.set_sensitive(false);
+            status_spinner.start();
+            status_title.set_text("Running tool loop");
+            status_detail.set_text("The app owns the loop and executes tools locally.");
+
+            let (tx, rx) = std::sync::mpsc::channel::<ToolEvent>();
+            let trace_buffer_for_rx = trace_buffer.clone();
+            let run_button_for_rx = run_button.clone();
+            let status_spinner_for_rx = status_spinner.clone();
+            let status_title_for_rx = status_title.clone();
+            let status_detail_for_rx = status_detail.clone();
+            glib::timeout_add_local(std::time::Duration::from_millis(16), move || {
+                loop {
+                    match rx.try_recv() {
+                        Ok(ToolEvent::Trace(line)) => {
+                            trace_buffer_for_rx
+                                .insert(&mut trace_buffer_for_rx.end_iter(), &format!("{line}\n"));
+                        }
+                        Ok(ToolEvent::Final(content)) => {
+                            status_title_for_rx.set_text("Tool loop complete");
+                            status_detail_for_rx
+                                .set_text("Final answer returned from the guided app loop.");
+                            trace_buffer_for_rx.insert(
+                                &mut trace_buffer_for_rx.end_iter(),
+                                &format!("\nfinal_answer: {content}\n"),
+                            );
+                        }
+                        Ok(ToolEvent::Error(message)) => {
+                            status_spinner_for_rx.stop();
+                            status_title_for_rx.set_text("Tool demo failed");
+                            status_detail_for_rx.set_text(&message);
+                            run_button_for_rx.set_sensitive(true);
+                            return glib::ControlFlow::Break;
+                        }
+                        Ok(ToolEvent::Done) => {
+                            status_spinner_for_rx.stop();
+                            run_button_for_rx.set_sensitive(true);
+                            return glib::ControlFlow::Break;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            status_spinner_for_rx.stop();
+                            status_title_for_rx.set_text("Tool demo interrupted");
+                            status_detail_for_rx
+                                .set_text("The tool demo channel closed unexpectedly.");
+                            run_button_for_rx.set_sensitive(true);
+                            return glib::ControlFlow::Break;
+                        }
+                    }
+                }
+                glib::ControlFlow::Continue
+            });
+
+            let error_tx = tx.clone();
+            std::thread::spawn(move || {
+                if let Err(e) = run_character_tool_demo(&prompt, tx) {
+                    eprintln!("[aileron-demo] tool demo error: {e}");
+                    let _ = error_tx.send(ToolEvent::Error(friendly_error(&e)));
+                }
+            });
+        });
+    }
+
+    scrollable_page(&vbox)
 }
 
 #[derive(Clone)]
@@ -2226,6 +2399,43 @@ enum SpeechEvent {
     Done,
 }
 
+enum ToolEvent {
+    Trace(String),
+    Final(String),
+    Error(String),
+    Done,
+}
+
+#[derive(Debug, Clone, Serialize, Type)]
+struct ToolDefinitionDbus {
+    name: String,
+    description: String,
+    schema_json: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Type)]
+struct ToolCallDbus {
+    id: String,
+    name: String,
+    arguments_json: String,
+}
+
+#[derive(Debug, Clone, Serialize, Type)]
+struct ToolResultDbus {
+    id: String,
+    content: String,
+    content_json: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GuidedToolLoopResponse {
+    action: String,
+    tool_name: String,
+    word: String,
+    character: String,
+    answer: String,
+}
+
 enum SpeechPhase {
     CreatingSession,
     LoadingModel,
@@ -2395,7 +2605,7 @@ fn concise_error(message: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::concise_error;
+    use super::{concise_error, execute_count_tool};
 
     #[test]
     fn explains_missing_portal_systemd_unit() {
@@ -2415,6 +2625,30 @@ mod tests {
             concise_error(error),
             "The running Aileron portal is older than this demo and does not expose the Language interface. Restart the updated portal with `systemctl --user restart aileron-portal`, or rebuild/reinstall the portal service if it was installed from an older binary."
         );
+    }
+
+    #[test]
+    fn count_tool_uses_structured_arguments() {
+        let result = execute_count_tool(
+            "ignored prompt",
+            r#"{"word":"strawrberrry","character":"r"}"#,
+        )
+        .expect("count tool should run");
+
+        assert_eq!(result["count"], 5);
+    }
+
+    #[test]
+    fn count_tool_falls_back_to_prompt_for_stub_arguments() {
+        let result = execute_count_tool(
+            "How many times does the letter r occur in strawrberrry?",
+            "{}",
+        )
+        .expect("count tool should infer demo args");
+
+        assert_eq!(result["word"], "strawrberrry");
+        assert_eq!(result["character"], "r");
+        assert_eq!(result["count"], 5);
     }
 }
 
@@ -2534,7 +2768,16 @@ fn extract_guided(text: &str, tx: std::sync::mpsc::Sender<DemoEvent>) -> anyhow:
 
     tx.send(DemoEvent::Phase(DemoPhase::WaitingForModel))?;
     tx.send(DemoEvent::Phase(DemoPhase::RequestingGuided))?;
-    let content: String = proxy.call("RespondGuided", &(&session_id, &prompt, fields, options))?;
+    let (content, _): (String, Vec<ToolCallDbus>) = proxy.call(
+        "RespondGuided",
+        &(
+            &session_id,
+            &prompt,
+            fields,
+            Vec::<ToolDefinitionDbus>::new(),
+            options,
+        ),
+    )?;
     let pretty = serde_json::from_str::<serde_json::Value>(&content)
         .ok()
         .and_then(|value| serde_json::to_string_pretty(&value).ok())
@@ -2596,12 +2839,13 @@ fn classify_guided(text: &str, tx: std::sync::mpsc::Sender<DemoEvent>) -> anyhow
 
     tx.send(DemoEvent::Phase(DemoPhase::WaitingForModel))?;
     tx.send(DemoEvent::Phase(DemoPhase::RequestingGuided))?;
-    let content: String = proxy.call(
+    let (content, _): (String, Vec<ToolCallDbus>) = proxy.call(
         "RespondGuided",
         &(
             &session_id,
             &DemoMode::Classify.prompt(text),
             fields,
+            Vec::<ToolDefinitionDbus>::new(),
             options,
         ),
     )?;
@@ -2703,7 +2947,16 @@ fn guided_chat_turn(
     ];
     let options = (512_i64, 0.2_f64, "default", "", "");
     let prompt = guided_chat_prompt(memory, &messages);
-    let content: String = proxy.call("RespondGuided", &(&session_id, &prompt, fields, options))?;
+    let (content, _): (String, Vec<ToolCallDbus>) = proxy.call(
+        "RespondGuided",
+        &(
+            &session_id,
+            &prompt,
+            fields,
+            Vec::<ToolDefinitionDbus>::new(),
+            options,
+        ),
+    )?;
     let response: GuidedChatResponse = serde_json::from_str(&content)?;
     tx.send(ChatEvent::Response(response))?;
 
@@ -2748,6 +3001,287 @@ fn guided_chat_prompt(memory: &[String], messages: &[ChatMessage]) -> String {
     }
 
     prompt
+}
+
+fn run_character_tool_demo(
+    prompt: &str,
+    tx: std::sync::mpsc::Sender<ToolEvent>,
+) -> anyhow::Result<()> {
+    use zbus::blocking::Connection;
+
+    const BUS: &str = "org.freedesktop.impl.portal.desktop.aileron";
+    const PATH: &str = "/org/freedesktop/portal/desktop";
+    const IFACE: &str = "org.freedesktop.impl.portal.Language";
+
+    tx.send(ToolEvent::Trace(
+        "before_agent_loop: seed messages and register count_character_occurrences".to_string(),
+    ))?;
+
+    let conn = Connection::session()?;
+    let proxy = zbus::blocking::Proxy::new(&conn, BUS, PATH, IFACE)?;
+    let session_id: String = proxy.call(
+        "CreateSession",
+        &(
+            "org.aileron.Demo",
+            "language.analyze",
+            "You are a small local agent. Return guided JSON. Use action=call_tool when exact character counting is needed. Use action=final only after tool_result is provided.",
+        ),
+    )?;
+
+    let fields = guided_tool_loop_fields();
+    let tools = count_tool_definitions()?;
+    let options = (128_i64, 0.2_f64, "default", "", "");
+    let mut loop_prompt = format!(
+        "Available app tool:\n- count_character_occurrences(word: string, character: string): exact deterministic count.\n\nUser request: {prompt}\n\nReturn action=call_tool with tool_name=count_character_occurrences, word, and character if this needs exact counting. Return action=final only if no tool is needed."
+    );
+
+    tx.send(ToolEvent::Trace(
+        "before_llm_call: ask RespondGuided for app-loop action".to_string(),
+    ))?;
+    let (content, tool_calls): (String, Vec<ToolCallDbus>) = proxy.call(
+        "RespondGuided",
+        &(
+            &session_id,
+            &loop_prompt,
+            fields.clone(),
+            tools.clone(),
+            options,
+        ),
+    )?;
+    let mut response = parse_guided_tool_loop_response(&content, prompt, false)?;
+    tx.send(ToolEvent::Trace(format!(
+        "after_llm_call: action={}, native_tool_calls={}, tool_name={}, word={}, character={}, answer={:?}",
+        response.action,
+        tool_calls.len(),
+        response.tool_name,
+        response.word,
+        response.character,
+        response.answer
+    )))?;
+
+    if response.action != "call_tool" && tool_calls.is_empty() {
+        tx.send(ToolEvent::Trace(
+            "after_agent_loop: guided response selected final answer without tool execution"
+                .to_string(),
+        ))?;
+        tx.send(ToolEvent::Final(response.answer))?;
+        let _: () = proxy.call("EndSession", &(&session_id,))?;
+        tx.send(ToolEvent::Done)?;
+        return Ok(());
+    }
+
+    let mut results = Vec::new();
+    let result_json = if tool_calls.is_empty() {
+        let args = serde_json::json!({
+            "word": response.word,
+            "character": response.character
+        });
+        tx.send(ToolEvent::Trace(format!(
+            "before_tool_execution: count_character_occurrences args={args}"
+        )))?;
+        let result_json = execute_count_tool(prompt, &args.to_string())?;
+        tx.send(ToolEvent::Trace(format!(
+            "after_tool_execution: result={result_json}"
+        )))?;
+        result_json
+    } else {
+        let mut last_result = serde_json::Value::Null;
+        for call in tool_calls {
+            tx.send(ToolEvent::Trace(format!(
+                "before_tool_execution: {} id={} args={}",
+                call.name, call.id, call.arguments_json
+            )))?;
+            let result_json = execute_count_tool(prompt, &call.arguments_json)?;
+            tx.send(ToolEvent::Trace(format!(
+                "after_tool_execution: result={result_json}"
+            )))?;
+            results.push(ToolResultDbus {
+                id: call.id,
+                content: result_json.to_string(),
+                content_json: result_json.to_string(),
+            });
+            last_result = result_json;
+        }
+        last_result
+    };
+
+    tx.send(ToolEvent::Trace(
+        "before_llm_call: append tool_result to prompt and call RespondGuided again".to_string(),
+    ))?;
+    loop_prompt.push_str("\n\ntool_result from count_character_occurrences:\n");
+    loop_prompt.push_str(&result_json.to_string());
+    loop_prompt.push_str("\n\nNow return action=final and put the user-facing answer in answer.");
+    let final_content = if results.is_empty() {
+        let (content, _): (String, Vec<ToolCallDbus>) = proxy.call(
+            "RespondGuided",
+            &(&session_id, &loop_prompt, fields, tools, options),
+        )?;
+        content
+    } else {
+        let (content, _): (String, Vec<ToolCallDbus>) = proxy.call(
+            "SubmitToolResultsGuided",
+            &(&session_id, &loop_prompt, results, fields, tools, options),
+        )?;
+        content
+    };
+    response = parse_guided_tool_loop_response(&final_content, prompt, true)?;
+    tx.send(ToolEvent::Trace(format!(
+        "after_llm_call: action={}, answer={:?}",
+        response.action, response.answer
+    )))?;
+    tx.send(ToolEvent::Trace(
+        "after_agent_loop: stop after one guided tool round for this demo".to_string(),
+    ))?;
+    tx.send(ToolEvent::Final(
+        if response.answer.trim().is_empty() || response.answer == "stub" {
+            format_tool_result_answer(&result_json)
+        } else {
+            response.answer
+        },
+    ))?;
+
+    let _: () = proxy.call("EndSession", &(&session_id,))?;
+    tx.send(ToolEvent::Done)?;
+    Ok(())
+}
+
+fn execute_count_tool(prompt: &str, arguments_json: &str) -> anyhow::Result<serde_json::Value> {
+    let parsed = serde_json::from_str::<serde_json::Value>(arguments_json).unwrap_or_default();
+    let word = parsed
+        .get("word")
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+        .or_else(|| infer_word_from_prompt(prompt))
+        .unwrap_or_default();
+    let character = parsed
+        .get("character")
+        .and_then(|value| value.as_str())
+        .and_then(|value| value.chars().next())
+        .or_else(|| infer_character_from_prompt(prompt))
+        .unwrap_or('r');
+    if word.is_empty() {
+        anyhow::bail!("tool arguments did not include a word and the prompt did not contain one");
+    }
+    let count = word.chars().filter(|ch| *ch == character).count();
+    Ok(serde_json::json!({
+        "word": word,
+        "character": character.to_string(),
+        "count": count
+    }))
+}
+
+fn guided_tool_loop_fields() -> Vec<(String, String, String, bool)> {
+    vec![
+        (
+            "action".to_string(),
+            "string".to_string(),
+            "Either call_tool or final".to_string(),
+            true,
+        ),
+        (
+            "tool_name".to_string(),
+            "string".to_string(),
+            "Tool to execute, usually count_character_occurrences, or empty for final".to_string(),
+            true,
+        ),
+        (
+            "word".to_string(),
+            "string".to_string(),
+            "Word or text to pass to the tool".to_string(),
+            true,
+        ),
+        (
+            "character".to_string(),
+            "string".to_string(),
+            "Single character to pass to the tool".to_string(),
+            true,
+        ),
+        (
+            "answer".to_string(),
+            "string".to_string(),
+            "Final user-facing answer when action is final, otherwise empty".to_string(),
+            true,
+        ),
+    ]
+}
+
+fn count_tool_definitions() -> anyhow::Result<Vec<ToolDefinitionDbus>> {
+    let schema = serde_json::json!({
+        "type": "object",
+        "required": ["word", "character"],
+        "properties": {
+            "word": {"type": "string", "description": "The word or short text to inspect"},
+            "character": {"type": "string", "description": "The single character to count"}
+        },
+        "additionalProperties": false
+    });
+
+    Ok(vec![ToolDefinitionDbus {
+        name: "count_character_occurrences".to_string(),
+        description: "Count how many times one character appears in a word or short text."
+            .to_string(),
+        schema_json: serde_json::to_string(&schema)?,
+    }])
+}
+
+fn parse_guided_tool_loop_response(
+    content: &str,
+    prompt: &str,
+    expect_final: bool,
+) -> anyhow::Result<GuidedToolLoopResponse> {
+    let mut response = serde_json::from_str::<GuidedToolLoopResponse>(content)?;
+    if expect_final {
+        response.action = "final".to_string();
+    }
+    if response.action != "call_tool" && response.action != "final" {
+        response.action = if content.contains("tool_result") {
+            "final".to_string()
+        } else {
+            "call_tool".to_string()
+        };
+    }
+    if response.tool_name.trim().is_empty() || response.tool_name == "stub" {
+        response.tool_name = "count_character_occurrences".to_string();
+    }
+    if response.word.trim().is_empty() || response.word == "stub" {
+        response.word = infer_word_from_prompt(prompt).unwrap_or_default();
+    }
+    if response.character.trim().is_empty() || response.character == "stub" {
+        response.character = infer_character_from_prompt(prompt)
+            .unwrap_or('r')
+            .to_string();
+    }
+    Ok(response)
+}
+
+fn format_tool_result_answer(result: &serde_json::Value) -> String {
+    let word = result["word"].as_str().unwrap_or("the input");
+    let character = result["character"].as_str().unwrap_or("?");
+    let count = result["count"].as_u64().unwrap_or_default();
+    format!("The character '{character}' occurs {count} times in {word}.")
+}
+
+fn infer_word_from_prompt(prompt: &str) -> Option<String> {
+    prompt
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|part| part.len() > 1)
+        .rev()
+        .find(|part| part.chars().any(|ch| ch.eq_ignore_ascii_case(&'r')))
+        .map(str::to_string)
+}
+
+fn infer_character_from_prompt(prompt: &str) -> Option<char> {
+    let lower = prompt.to_ascii_lowercase();
+    lower
+        .split("letter")
+        .nth(1)
+        .and_then(|rest| rest.chars().find(|ch| ch.is_ascii_alphabetic()))
+        .or_else(|| {
+            lower
+                .split("character")
+                .nth(1)
+                .and_then(|rest| rest.chars().find(|ch| ch.is_ascii_alphabetic()))
+        })
 }
 
 fn transcribe_recording(

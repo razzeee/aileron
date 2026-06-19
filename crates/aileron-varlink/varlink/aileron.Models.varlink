@@ -16,6 +16,7 @@ type ProfileInfo (
     # these from runtime manifests; imported profiles carry their own refs.
     runtime_images: []RuntimeImage,
     use_cases: []string,
+    specializations: ?[]string,
     assigned_use_cases: []string,
     size_bytes: int,
     installed_at: string,
@@ -67,7 +68,8 @@ type CatalogProfileInfo (
     recommended: bool,
     installing: bool,
     recommendation_reason: string,
-    use_cases: []string
+    use_cases: []string,
+    specializations: ?[]string
 )
 
 method List() -> (profiles: []ProfileInfo)

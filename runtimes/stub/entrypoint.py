@@ -43,6 +43,19 @@ def handle_generate(req: dict) -> None:
 
 def handle_generate_structured(req: dict) -> None:
     req_id = req["id"]
+    tools = req.get("tools", [])
+    if tools and not req.get("tool_results"):
+        send({
+            "id": req_id,
+            "tool_calls": [{
+                "id": "stub-tool-call-1",
+                "name": tools[0].get("name", "stub_tool"),
+                "arguments_json": "{}",
+            }],
+            "done": True,
+        })
+        return
+
     schema = req.get("response_format", {}).get("schema", {})
 
     # Build the simplest possible object that satisfies the schema's
@@ -50,6 +63,14 @@ def handle_generate_structured(req: dict) -> None:
     result = _stub_object(schema)
     result_str = json.dumps(result)
     send({"id": req_id, "result": result_str, "done": True})
+
+
+def handle_generate_structured_stream(req: dict) -> None:
+    req_id = req["id"]
+    schema = req.get("response_format", {}).get("schema", {})
+    result_str = json.dumps(_stub_object(schema))
+    send({"id": req_id, "snapshot": result_str})
+    send({"id": req_id, "snapshot": result_str, "done": True})
 
 
 def _stub_object(schema: dict) -> object:
@@ -148,6 +169,8 @@ def main() -> None:
                 handle_generate(req)
             elif req_type == "generate_structured":
                 handle_generate_structured(req)
+            elif req_type == "generate_structured_stream":
+                handle_generate_structured_stream(req)
             elif req_type == "embed":
                 handle_embed(req)
             elif req_type == "transcribe":

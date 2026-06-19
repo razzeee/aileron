@@ -38,6 +38,8 @@ pub struct ModelManifest {
     pub runtime_images: Vec<RuntimeImage>,
     pub use_cases: Vec<String>,
     #[serde(default)]
+    pub specializations: Vec<String>,
+    #[serde(default)]
     pub artifacts: Vec<ManifestArtifact>,
 }
 
@@ -62,6 +64,7 @@ impl ModelManifest {
             artifact_path,
             runtime_images: self.runtime_images,
             use_cases: self.use_cases,
+            specializations: self.specializations,
             artifact_hashes: self
                 .artifacts
                 .into_iter()
@@ -93,6 +96,7 @@ pub struct CatalogProfileInfo {
     pub disk_size_gb: f64,
     pub min_ram_gb: f64,
     pub use_cases: Vec<String>,
+    pub specializations: Vec<String>,
 }
 
 impl RuntimeManifestStore {
@@ -236,6 +240,7 @@ pub fn list_catalog_profiles() -> Result<Vec<CatalogProfileInfo>> {
                 disk_size_gb,
                 min_ram_gb: manifest.min_ram_gb,
                 use_cases: manifest.use_cases,
+                specializations: manifest.specializations,
             });
         }
     }
@@ -538,6 +543,7 @@ mod tests {
             min_ram_gb: 0.0,
             runtime_images: Vec::new(),
             use_cases: vec!["language.summarize".to_string()],
+            specializations: Vec::new(),
             artifacts: vec![ManifestArtifact {
                 role: "model".to_string(),
                 url: "https://example.invalid/model.gguf".to_string(),

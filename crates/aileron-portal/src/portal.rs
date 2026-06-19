@@ -90,6 +90,27 @@ struct GuidedFieldDbus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
+struct ToolDefinitionDbus {
+    name: String,
+    description: String,
+    schema_json: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+struct ToolCallDbus {
+    id: String,
+    name: String,
+    arguments_json: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+struct ToolResultDbus {
+    id: String,
+    content: String,
+    content_json: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
 struct VisionSegmentDbus {
     label: String,
     confidence: f64,
@@ -214,14 +235,79 @@ impl LanguagePortalBackend {
         done: bool,
     ) -> zbus::Result<()>;
 
-    async fn respond_guided(
+    async fn stream_guided_response(
         &self,
         session_id: &str,
         prompt: &str,
         fields: Vec<GuidedFieldDbus>,
         options: GenerationOptionsDbus,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
-    ) -> zbus::fdo::Result<String> {
+    ) -> zbus::fdo::Result<()> {
+        use aileron_varlink::aileron_Inference::VarlinkClientInterface;
+
+        self.emit_loading_if_cold(session_id, &emitter).await?;
+        let session_id = session_id.to_string();
+        let conn =
+            aileron_ipc::client::connect().map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn);
+        let mut call = client.stream_guided_response(
+            session_id.clone(),
+            prompt.to_string(),
+            fields
+                .into_iter()
+                .map(GuidedFieldDbus::into_varlink)
+                .collect(),
+            options.into_varlink(),
+        );
+        let iter = call
+            .more()
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+
+        let mut pending_snapshot: Option<String> = None;
+        for reply in iter {
+            let snapshot = reply
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?
+                .snapshot_json;
+
+            if let Some(previous) = pending_snapshot.replace(snapshot) {
+                LanguagePortalBackend::guided_snapshot_received(
+                    &emitter,
+                    &session_id,
+                    &previous,
+                    false,
+                )
+                .await
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            }
+        }
+
+        if let Some(snapshot) = pending_snapshot {
+            LanguagePortalBackend::guided_snapshot_received(&emitter, &session_id, &snapshot, true)
+                .await
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        }
+
+        self.mark_warm(&session_id);
+        Ok(())
+    }
+
+    #[zbus(signal)]
+    async fn guided_snapshot_received(
+        emitter: &SignalEmitter<'_>,
+        session_id: &str,
+        snapshot_json: &str,
+        done: bool,
+    ) -> zbus::Result<()>;
+
+    async fn respond_guided(
+        &self,
+        session_id: &str,
+        prompt: &str,
+        fields: Vec<GuidedFieldDbus>,
+        tools: Vec<ToolDefinitionDbus>,
+        options: GenerationOptionsDbus,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> zbus::fdo::Result<(String, Vec<ToolCallDbus>)> {
         use aileron_varlink::aileron_Inference::VarlinkClientInterface;
 
         self.emit_loading_if_cold(session_id, &emitter).await?;
@@ -236,12 +322,70 @@ impl LanguagePortalBackend {
                     .into_iter()
                     .map(GuidedFieldDbus::into_varlink)
                     .collect(),
+                tools
+                    .into_iter()
+                    .map(ToolDefinitionDbus::into_varlink)
+                    .collect(),
                 options.into_varlink(),
             )
             .call()
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         self.mark_warm(session_id);
-        Ok(reply.content)
+        Ok((
+            reply.content,
+            reply
+                .tool_calls
+                .into_iter()
+                .map(ToolCallDbus::from_varlink)
+                .collect(),
+        ))
+    }
+
+    async fn submit_tool_results_guided(
+        &self,
+        session_id: &str,
+        prompt: &str,
+        results: Vec<ToolResultDbus>,
+        fields: Vec<GuidedFieldDbus>,
+        tools: Vec<ToolDefinitionDbus>,
+        options: GenerationOptionsDbus,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> zbus::fdo::Result<(String, Vec<ToolCallDbus>)> {
+        use aileron_varlink::aileron_Inference::VarlinkClientInterface;
+
+        self.emit_loading_if_cold(session_id, &emitter).await?;
+        let conn =
+            aileron_ipc::client::connect().map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn);
+        let reply = client
+            .submit_tool_results_guided(
+                session_id.to_string(),
+                prompt.to_string(),
+                results
+                    .into_iter()
+                    .map(ToolResultDbus::into_varlink)
+                    .collect(),
+                fields
+                    .into_iter()
+                    .map(GuidedFieldDbus::into_varlink)
+                    .collect(),
+                tools
+                    .into_iter()
+                    .map(ToolDefinitionDbus::into_varlink)
+                    .collect(),
+                options.into_varlink(),
+            )
+            .call()
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        self.mark_warm(session_id);
+        Ok((
+            reply.content,
+            reply
+                .tool_calls
+                .into_iter()
+                .map(ToolCallDbus::from_varlink)
+                .collect(),
+        ))
     }
 
     async fn embed(&self, session_id: &str, text: &str) -> zbus::fdo::Result<Vec<f64>> {
@@ -645,6 +789,36 @@ impl GuidedFieldDbus {
             kind: self.kind,
             description: self.description,
             required: self.required,
+        }
+    }
+}
+
+impl ToolDefinitionDbus {
+    fn into_varlink(self) -> aileron_varlink::aileron_Inference::ToolDefinition {
+        aileron_varlink::aileron_Inference::ToolDefinition {
+            name: self.name,
+            description: self.description,
+            schema_json: self.schema_json,
+        }
+    }
+}
+
+impl ToolCallDbus {
+    fn from_varlink(call: aileron_varlink::aileron_Inference::ToolCall) -> Self {
+        Self {
+            id: call.id,
+            name: call.name,
+            arguments_json: call.arguments_json,
+        }
+    }
+}
+
+impl ToolResultDbus {
+    fn into_varlink(self) -> aileron_varlink::aileron_Inference::ToolResult {
+        aileron_varlink::aileron_Inference::ToolResult {
+            id: self.id,
+            content: self.content,
+            content_json: self.content_json,
         }
     }
 }

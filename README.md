@@ -337,6 +337,9 @@ Create sessions, generate text, get structured JSON output, compute embeddings, 
 type ModelAvailability (is_available: bool, code: string, reason: string)
 type GenerationOptions (maximum_response_tokens: int, temperature: float, sampling_mode: string, source_language_hint: string, target_language_hint: string)
 type GuidedField (name: string, kind: string, description: string, required: bool)
+type ToolDefinition (name: string, description: string, schema_json: string)
+type ToolCall (id: string, name: string, arguments_json: string)
+type ToolResult (id: string, content: string, content_json: string)
 type VisionSegment (label: string, confidence: float, x: float, y: float, width: float, height: float)
 
 method GetUseCaseAvailability(app_id: string, use_case: string) -> (availability: ModelAvailability)
@@ -344,7 +347,9 @@ method CreateSession(app_id: string, use_case: string, instructions: string) -> 
 method Prewarm(session_id: string, prompt_prefix: string) -> ()
 method Respond(session_id: string, prompt: string, options: GenerationOptions) -> (content: string)
 method StreamResponse(session_id: string, prompt: string, options: GenerationOptions) -> (token: string)
-method RespondGuided(session_id: string, prompt: string, fields: []GuidedField, options: GenerationOptions) -> (content: string)
+method RespondGuided(session_id: string, prompt: string, fields: []GuidedField, tools: []ToolDefinition, options: GenerationOptions) -> (content: string, tool_calls: []ToolCall)
+method StreamGuidedResponse(session_id: string, prompt: string, fields: []GuidedField, options: GenerationOptions) -> (snapshot_json: string)
+method SubmitToolResultsGuided(session_id: string, prompt: string, results: []ToolResult, fields: []GuidedField, tools: []ToolDefinition, options: GenerationOptions) -> (content: string, tool_calls: []ToolCall)
 method Embed(session_id: string, text: string) -> (embedding: []float)
 method Transcribe(session_id: string, audio: string, language_hint: string) -> (text: string)
 method Describe(session_id: string, image: string) -> (text: string)
@@ -357,7 +362,9 @@ method EndSession(session_id: string) -> ()
 
 `GenerationOptions.maximum_response_tokens` must be greater than zero and fit in `u32`. `temperature` must be finite and non-negative. `sampling_mode` must be non-empty. `source_language_hint` and `target_language_hint` are optional strings for `language.translate`; pass empty strings when unspecified. Today the daemon validates sampling fields, forwards `maximum_response_tokens` to containers as `max_tokens`, and folds translation hints into the session instructions for `language.translate`.
 
-`GuidedField.kind` supports `string`, `number`, `integer`, `boolean`, and `string_array`. The daemon converts guided fields into a JSON Schema object with `additionalProperties: false`, sends it to the container as `response_format.schema`, then validates the returned JSON before replying.
+`GuidedField.kind` supports `string`, `number`, `integer`, `boolean`, and `string_array`. The daemon converts guided fields into a JSON Schema object with `additionalProperties: false`, sends it to the container as `response_format.schema`, then validates the returned JSON before replying. `StreamGuidedResponse` returns validated JSON snapshots rather than token deltas.
+
+Tool calls are app-mediated and per request: `RespondGuided` may return `ToolCall` objects when the app supplies tool definitions, the app executes or rejects them under its own policy, and `SubmitToolResultsGuided` continues generation with the same guided schema. The daemon and runtime do not execute tools. Aileron does not retain daemon-side transcripts; apps own conversation history and pass relevant context explicitly.
 
 `ModelAvailability.code` is stable and machine-readable. Known values are `available`, `permission_denied`, `no_profile_assigned`, `profile_not_installed`, `artifact_missing`, `runtime_unsupported`, `runtime_missing`, `hardware_unsupported`, and `busy`. `reason` is human-readable detail.
 
@@ -416,7 +423,7 @@ The portal does not talk to containers directly. It translates D-Bus calls into 
 
 | Interface | Use-case prefix | Methods |
 |---|---|---|
-| `org.freedesktop.impl.portal.Language` | `language.*` | `GetUseCaseAvailability`, `CreateSession`, `Prewarm`, `Respond`, `StreamResponse`, `RespondGuided`, `Embed`, `EndSession` |
+| `org.freedesktop.impl.portal.Language` | `language.*` | `GetUseCaseAvailability`, `CreateSession`, `Prewarm`, `Respond`, `StreamResponse`, `RespondGuided`, `StreamGuidedResponse`, `SubmitToolResultsGuided`, `Embed`, `EndSession` |
 | `org.freedesktop.impl.portal.Speech` | `speech.*` | `GetUseCaseAvailability`, `CreateSession`, `Prewarm`, `Transcribe`, `EndSession` |
 | `org.freedesktop.impl.portal.Vision` | `vision.*` | `GetUseCaseAvailability`, `CreateSession`, `Prewarm`, `Describe`, `Ocr`, `Segment`, `EndSession` |
 
@@ -437,7 +444,9 @@ The portal does not talk to containers directly. It translates D-Bus calls into 
 |---|---|---|---|
 | `Respond` | `session_id: s, prompt: s, options: (xdsss)` | `content: s` | Returns full generated text |
 | `StreamResponse` | `session_id: s, prompt: s, options: (xdsss)` | `()` | Emits `TokenReceived` signals; final token has `done=true` |
-| `RespondGuided` | `session_id: s, prompt: s, fields: a(sssb), options: (xdsss)` | `content: s` | Language sessions only; returns JSON matching guided output fields |
+| `RespondGuided` | `session_id: s, prompt: s, fields: a(sssb), tools: a(sss), options: (xdsss)` | `(content: s, tool_calls: a(sss))` | Language sessions only; returns JSON matching guided output fields or requested tool calls |
+| `StreamGuidedResponse` | `session_id: s, prompt: s, fields: a(sssb), options: (xdsss)` | `()` | Emits `GuidedSnapshotReceived` signals; final snapshot has `done=true` |
+| `SubmitToolResultsGuided` | `session_id: s, prompt: s, results: a(sss), fields: a(sssb), tools: a(sss), options: (xdsss)` | `(content: s, tool_calls: a(sss))` | Continues guided generation after the app executes or rejects tool calls; prompt carries app-owned context |
 | `Embed` | `session_id: s, text: s` | `embedding: ad` | `language.embed` sessions only; returns an embedding vector |
 
 ### Speech Methods
@@ -454,7 +463,7 @@ The portal does not talk to containers directly. It translates D-Bus calls into 
 | `Ocr` | `session_id: s, image_b64: s` | `text: s` | `vision.ocr` sessions only; PNG or JPEG, base64; extracts text |
 | `Segment` | `session_id: s, image_b64: s` | `segments: []VisionSegment` | PNG or JPEG, base64; normalized boxes |
 
-These are D-Bus signatures: parentheses define a struct, and `a(...)` means an array of structs. `options: (xdsss)` is `GenerationOptions`: `maximum_response_tokens` as int64, `temperature` as float64, `sampling_mode` as string, `source_language_hint` as string, and `target_language_hint` as string. Empty language hints mean unspecified. The language hints only affect `language.translate`. `fields: a(sssb)` is an array of `GuidedField` structs: name, kind, description, required.
+These are D-Bus signatures: parentheses define a struct, and `a(...)` means an array of structs. `options: (xdsss)` is `GenerationOptions`: `maximum_response_tokens` as int64, `temperature` as float64, `sampling_mode` as string, `source_language_hint` as string, and `target_language_hint` as string. Empty language hints mean unspecified. The language hints only affect `language.translate`. `fields: a(sssb)` is an array of `GuidedField` structs: name, kind, description, required. Tool structs are `a(sss)`: definitions are name, description, schema JSON; calls are id, name, arguments JSON; results are id, content, content JSON.
 
 ### Signals
 
@@ -462,6 +471,7 @@ These are D-Bus signatures: parentheses define a struct, and `a(...)` means an a
 |---|---|---|
 | `ModelLoading` | `message: s` | The portal is about to start a cold backing container; available on each interface |
 | `TokenReceived` | `session_id: s, token: s, done: b` | Each token during `StreamResponse` on `Language` |
+| `GuidedSnapshotReceived` | `session_id: s, snapshot_json: s, done: b` | Each validated JSON snapshot during `StreamGuidedResponse` on `Language` |
 
 D-Bus callers see underlying Varlink failures as `org.freedesktop.DBus.Error.Failed` with the Varlink error text.
 
@@ -495,14 +505,16 @@ Each OCI image implements a simple newline-delimited JSON protocol over stdin/st
 | Field | Type | Used by | Description |
 |---|---|---|---|
 | `id` | string | all requests | Correlation ID generated by the daemon |
-| `type` | string | all requests | One of `generate`, `generate_structured`, `transcribe`, `describe`, `segment`, `embed` |
-| `system` | string | `generate`, `generate_structured` | Session instructions from `CreateSession` |
-| `prompt` | string | `generate`, `generate_structured`, optionally `describe` | User prompt or image prompt |
-| `max_tokens` | number | `generate`, `generate_structured`, optionally `describe` | Derived from `GenerationOptions.maximum_response_tokens` for text requests |
+| `type` | string | all requests | One of `generate`, `generate_structured`, `generate_structured_stream`, `transcribe`, `describe`, `segment`, `embed` |
+| `system` | string | `generate`, structured generation, tool generation | Session instructions from `CreateSession` |
+| `prompt` | string | `generate`, structured generation, tool generation, optionally `describe` | User prompt or image prompt |
+| `max_tokens` | number | text, structured, and tool generation | Derived from `GenerationOptions.maximum_response_tokens` for text requests |
 | `audio` | string | `transcribe` | Base64-encoded raw PCM bytes, 16 kHz mono f32le |
 | `language_hint` | string | `transcribe` | Optional spoken language hint; omitted when unspecified |
 | `image` | string | `describe` | Base64-encoded PNG or JPEG bytes |
-| `response_format` | object | `generate_structured` | `{ "type": "json_schema", "schema": ... }` |
+| `response_format` | object | structured generation | `{ "type": "json_schema", "schema": ... }` |
+| `tools` | array | `generate_structured` | Optional tool definitions with `name`, `description`, and `schema_json` |
+| `tool_results` | array | `generate_structured` | Optional app-provided tool results with `id`, `content`, and `content_json` |
 
 All requests may include an optional `system` field (string) to set the system prompt. The entrypoint defaults to: _"You are a helpful assistant. Always respond in the same language as the user's message."_
 

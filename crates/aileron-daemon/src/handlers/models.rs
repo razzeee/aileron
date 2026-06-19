@@ -74,6 +74,7 @@ impl VarlinkInterface for ModelsHandler {
                             })
                             .collect(),
                         use_cases: profile.use_cases.clone(),
+                        specializations: Some(profile.specializations.clone()),
                         assigned_use_cases,
                         size_bytes: profile_artifact_size_bytes(&profile.artifact_path),
                         installed_at: profile.installed_at.clone(),
@@ -350,6 +351,7 @@ impl VarlinkInterface for ModelsHandler {
                         variant,
                     }),
                     use_cases: profile.use_cases,
+                    specializations: Some(profile.specializations),
                 }
             })
             .collect();
@@ -410,6 +412,7 @@ impl VarlinkInterface for ModelsHandler {
                 min_ram_gb: 0.0,
                 runtime_images: Vec::new(),
                 use_cases,
+                specializations: Vec::new(),
                 artifacts,
             };
             let (auto_assigned, conflicts) =
@@ -2043,6 +2046,7 @@ mod tests {
             artifact_path: PathBuf::from("/tmp/model"),
             runtime_images: Vec::new(),
             use_cases: use_cases.iter().map(|value| value.to_string()).collect(),
+            specializations: Vec::new(),
             artifact_hashes: Vec::new(),
             installed_at: "2026-06-19T00:00:00Z".to_string(),
             source: "user".to_string(),

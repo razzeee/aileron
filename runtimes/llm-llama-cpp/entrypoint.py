@@ -101,6 +101,13 @@ def handle_generate_structured(llm: Llama, req: dict) -> None:
     max_tokens = int(req.get("max_tokens", 1024))
     schema     = req.get("response_format", {}).get("schema", {})
     system     = req.get("system", DEFAULT_SYSTEM)
+    tool_results = req.get("tool_results", [])
+    if tool_results:
+        rendered = []
+        for result in tool_results:
+            content = result.get("content_json") or result.get("content") or ""
+            rendered.append(f"{result.get('id', 'tool')}: {content}")
+        prompt = prompt + "\n\nTool results:\n" + "\n".join(rendered)
 
     try:
         from llama_cpp import LlamaGrammar
@@ -127,6 +134,29 @@ def handle_generate_structured(llm: Llama, req: dict) -> None:
         return
 
     send({"id": req_id, "result": result_text, "done": True})
+
+
+def handle_generate_structured_stream(llm: Llama, req: dict) -> None:
+    req_id = req["id"]
+    captured = []
+
+    def capture(obj: dict) -> None:
+        if obj.get("id") == req_id and "result" in obj:
+            captured.append(obj["result"])
+
+    global send
+    real_send = send
+    try:
+        send = capture
+        handle_generate_structured(llm, req)
+    finally:
+        send = real_send
+
+    if not captured:
+        real_send({"id": req_id, "error": "schema_validation_failed", "reason": "no structured result", "done": True})
+        return
+    real_send({"id": req_id, "snapshot": captured[0]})
+    real_send({"id": req_id, "snapshot": captured[0], "done": True})
 
 
 def handle_embed(llm: Llama, req: dict) -> None:
@@ -156,6 +186,7 @@ def main() -> None:
         handlers={
             "generate": handle_generate,
             "generate_structured": handle_generate_structured,
+            "generate_structured_stream": handle_generate_structured_stream,
             "embed": handle_embed,
         },
         log_prefix="aileron-llm",

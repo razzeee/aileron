@@ -9,9 +9,10 @@ use crate::state::SharedState;
 // VarlinkCallError is a supertrait; its methods reach us via Call_* dyn objects.
 use aileron_varlink::aileron_Inference::{
     Call_CreateSession, Call_Describe, Call_Embed, Call_EndSession, Call_GetUseCaseAvailability,
-    Call_Ocr, Call_Prewarm, Call_Respond, Call_RespondGuided, Call_Segment, Call_StreamResponse,
-    Call_Transcribe, GenerationOptions, GuidedField, ModelAvailability, VarlinkCallError,
-    VarlinkInterface, VisionSegment,
+    Call_Ocr, Call_Prewarm, Call_Respond, Call_RespondGuided, Call_Segment,
+    Call_StreamGuidedResponse, Call_StreamResponse, Call_SubmitToolResultsGuided, Call_Transcribe,
+    GenerationOptions, GuidedField, ModelAvailability, ToolCall, ToolDefinition, ToolResult,
+    VarlinkCallError, VarlinkInterface, VisionSegment,
 };
 
 pub struct InferenceHandler {
@@ -119,58 +120,15 @@ impl VarlinkInterface for InferenceHandler {
         instructions: String,
     ) -> varlink::Result<()> {
         self.rt.block_on(async {
-            let mut guard = self.state.0.lock().await;
-
-            if !guard.config.allow_all {
-                match guard.permissions.check(&app_id, &use_case) {
-                    Some(true) => {}
-                    Some(false) => return call.reply_permission_denied(app_id, use_case),
-                    None => {
-                        if guard.config.auto_grant {
-                            tracing::info!(
-                                "auto-granting {app_id} / {use_case} (AILERON_AUTO_GRANT)"
-                            );
-                            if let Err(e) =
-                                guard
-                                    .permissions
-                                    .set(app_id.clone(), use_case.clone(), true)
-                            {
-                                tracing::warn!("failed to persist auto-grant: {e}");
-                            }
-                        } else {
-                            if let Err(e) = guard.permissions.deny_if_missing(&app_id, &use_case) {
-                                tracing::warn!("failed to persist denied permission: {e}");
-                            }
-                            return call.reply_permission_denied(app_id, use_case);
-                        }
-                    }
+            match create_session_record(&self.state, app_id, use_case, instructions).await {
+                Ok(session_id) => call.reply(session_id),
+                Err(CreateSessionError::PermissionDenied(app_id, use_case)) => {
+                    call.reply_permission_denied(app_id, use_case)
+                }
+                Err(CreateSessionError::ModelUnavailable(reason)) => {
+                    call.reply_model_unavailable(reason)
                 }
             }
-
-            let profile_id = match guard.assignments.get(&use_case) {
-                Some(profile_id) => profile_id.to_string(),
-                None => {
-                    return call
-                        .reply_model_unavailable(format!("no profile assigned for {use_case}"));
-                }
-            };
-            if guard.profiles.get(&profile_id).is_none() {
-                return call.reply_model_unavailable(format!(
-                    "assigned profile {profile_id} is not installed"
-                ));
-            }
-
-            let session_id = Uuid::new_v4().to_string();
-            let session = crate::state::Session {
-                session_id: session_id.clone(),
-                app_id,
-                use_case,
-                profile_id,
-                instructions,
-                started_at: chrono::Utc::now(),
-            };
-            guard.sessions.insert(session_id.clone(), session);
-            call.reply(session_id)
         })
     }
 
@@ -259,6 +217,7 @@ impl VarlinkInterface for InferenceHandler {
         session_id: String,
         prompt: String,
         fields: Vec<GuidedField>,
+        tools: Vec<ToolDefinition>,
         options: GenerationOptions,
     ) -> varlink::Result<()> {
         self.rt.block_on(async {
@@ -319,8 +278,16 @@ impl VarlinkInterface for InferenceHandler {
                 }
             };
 
-            match container.generate_structured(Some(&instructions), &prompt, max_tokens, &schema) {
-                Ok(result) => call.reply(result),
+            let runtime_tools = tools.into_iter().map(varlink_tool_definition).collect();
+            match container.generate_structured_with_tools(
+                Some(&instructions),
+                Some(&prompt),
+                max_tokens,
+                &schema,
+                runtime_tools,
+                Vec::new(),
+            ) {
+                Ok(result) => call.reply(result.content, varlink_tool_calls(result.tool_calls)),
                 Err(e) => {
                     tracing::error!("RespondGuided failed: {e:#}");
                     call.reply_guided_generation_failed(e.to_string())
@@ -622,6 +589,70 @@ impl VarlinkInterface for InferenceHandler {
         })
     }
 
+    fn stream_guided_response(
+        &self,
+        call: &mut dyn Call_StreamGuidedResponse,
+        session_id: String,
+        prompt: String,
+        fields: Vec<GuidedField>,
+        options: GenerationOptions,
+    ) -> varlink::Result<()> {
+        self.rt.block_on(async {
+            match stream_guided_snapshots(&self.state, call, session_id, prompt, fields, options)
+                .await
+            {
+                Ok(()) => Ok(()),
+                Err(GenerationError::SessionNotFound(id)) => call.reply_session_not_found(id),
+                Err(GenerationError::ModelUnavailable(reason)) => {
+                    call.reply_model_unavailable(reason)
+                }
+                Err(GenerationError::InvalidOptions(reason)) => {
+                    call.reply_invalid_generation_options(reason)
+                }
+                Err(GenerationError::Failed(reason)) => call.reply_guided_generation_failed(reason),
+                Err(GenerationError::Reply(e)) => Err(e),
+            }
+        })
+    }
+
+    fn submit_tool_results_guided(
+        &self,
+        call: &mut dyn Call_SubmitToolResultsGuided,
+        session_id: String,
+        prompt: String,
+        results: Vec<ToolResult>,
+        fields: Vec<GuidedField>,
+        tools: Vec<ToolDefinition>,
+        options: GenerationOptions,
+    ) -> varlink::Result<()> {
+        self.rt.block_on(async {
+            match submit_guided_tool_results(
+                &self.state,
+                session_id,
+                prompt,
+                results,
+                fields,
+                tools,
+                options,
+            )
+            .await
+            {
+                Ok(response) => {
+                    call.reply(response.content, varlink_tool_calls(response.tool_calls))
+                }
+                Err(GenerationError::SessionNotFound(id)) => call.reply_session_not_found(id),
+                Err(GenerationError::ModelUnavailable(reason)) => {
+                    call.reply_model_unavailable(reason)
+                }
+                Err(GenerationError::InvalidOptions(reason)) => {
+                    call.reply_invalid_generation_options(reason)
+                }
+                Err(GenerationError::Failed(reason)) => call.reply_guided_generation_failed(reason),
+                Err(GenerationError::Reply(e)) => Err(e),
+            }
+        })
+    }
+
     fn end_session(
         &self,
         call: &mut dyn Call_EndSession,
@@ -635,6 +666,68 @@ impl VarlinkInterface for InferenceHandler {
             call.reply()
         })
     }
+}
+
+enum CreateSessionError {
+    PermissionDenied(String, String),
+    ModelUnavailable(String),
+}
+
+async fn create_session_record(
+    state: &SharedState,
+    app_id: String,
+    use_case: String,
+    instructions: String,
+) -> Result<String, CreateSessionError> {
+    let mut guard = state.0.lock().await;
+
+    if !guard.config.allow_all {
+        match guard.permissions.check(&app_id, &use_case) {
+            Some(true) => {}
+            Some(false) => return Err(CreateSessionError::PermissionDenied(app_id, use_case)),
+            None => {
+                if guard.config.auto_grant {
+                    tracing::info!("auto-granting {app_id} / {use_case} (AILERON_AUTO_GRANT)");
+                    if let Err(e) = guard
+                        .permissions
+                        .set(app_id.clone(), use_case.clone(), true)
+                    {
+                        tracing::warn!("failed to persist auto-grant: {e}");
+                    }
+                } else {
+                    if let Err(e) = guard.permissions.deny_if_missing(&app_id, &use_case) {
+                        tracing::warn!("failed to persist denied permission: {e}");
+                    }
+                    return Err(CreateSessionError::PermissionDenied(app_id, use_case));
+                }
+            }
+        }
+    }
+
+    let profile_id = guard
+        .assignments
+        .get(&use_case)
+        .ok_or_else(|| {
+            CreateSessionError::ModelUnavailable(format!("no profile assigned for {use_case}"))
+        })?
+        .to_string();
+    if guard.profiles.get(&profile_id).is_none() {
+        return Err(CreateSessionError::ModelUnavailable(format!(
+            "assigned profile {profile_id} is not installed"
+        )));
+    }
+
+    let session_id = Uuid::new_v4().to_string();
+    let session = crate::state::Session {
+        session_id: session_id.clone(),
+        app_id,
+        use_case,
+        profile_id,
+        instructions,
+        started_at: chrono::Utc::now(),
+    };
+    guard.sessions.insert(session_id.clone(), session);
+    Ok(session_id)
 }
 
 async fn stream_tokens(
@@ -824,6 +917,187 @@ async fn generate_tokens(
             sink.push_token(token)
         })
         .map_err(|e| GenerationError::Failed(e.to_string()))
+}
+
+async fn stream_guided_snapshots(
+    state: &SharedState,
+    call: &mut dyn Call_StreamGuidedResponse,
+    session_id: String,
+    prompt: String,
+    fields: Vec<GuidedField>,
+    options: GenerationOptions,
+) -> Result<(), GenerationError> {
+    let max_tokens = validate_options(&options).map_err(GenerationError::InvalidOptions)?;
+    let schema = guided_fields_schema(&fields).map_err(GenerationError::Failed)?;
+    let mut guard = state.0.lock().await;
+
+    let (app_id, use_case, profile_id, image_ref, artifact_path, runtime_options, instructions) =
+        match guard.sessions.get(&session_id) {
+            Some(s) => {
+                ensure_language_generation_use_case(&s.use_case)
+                    .map_err(GenerationError::ModelUnavailable)?;
+                let (profile_id, image_ref, artifact_path, runtime_options) =
+                    profile_runtime(&guard, &s.profile_id)
+                        .map_err(GenerationError::ModelUnavailable)?;
+                (
+                    s.app_id.clone(),
+                    s.use_case.clone(),
+                    profile_id,
+                    image_ref,
+                    artifact_path,
+                    runtime_options,
+                    s.instructions.clone(),
+                )
+            }
+            None => return Err(GenerationError::SessionNotFound(session_id)),
+        };
+
+    let _ = guard.permissions.touch(&app_id, &use_case);
+    let container = guard
+        .containers
+        .get_or_spawn(
+            &profile_id,
+            &image_ref,
+            &artifact_path,
+            &runtime_options,
+            |_| {},
+        )
+        .map_err(|e| GenerationError::Failed(e.to_string()))?;
+
+    let wants_more = call.wants_more();
+    let mut pending_snapshot: Option<String> = None;
+    let mut final_snapshot = String::new();
+    let mut reply_error: Option<varlink::Error> = None;
+    let result = container.stream_structured(
+        Some(&instructions),
+        &prompt,
+        max_tokens,
+        &schema,
+        |snapshot, done| {
+            final_snapshot = snapshot.clone();
+            if !wants_more {
+                pending_snapshot = Some(snapshot);
+                return;
+            }
+            if reply_error.is_some() {
+                return;
+            }
+            if let Some(previous) = pending_snapshot.replace(snapshot) {
+                call.set_continues(true);
+                if let Err(e) = call.reply(previous) {
+                    reply_error = Some(e);
+                }
+            }
+            if done {
+                call.set_continues(false);
+            }
+        },
+    );
+
+    if let Some(e) = reply_error {
+        return Err(GenerationError::Reply(e));
+    }
+    if let Err(e) = result {
+        if wants_more {
+            call.set_continues(false);
+        }
+        return Err(GenerationError::Failed(e.to_string()));
+    }
+    if final_snapshot.is_empty() {
+        return Err(GenerationError::Failed(
+            "model returned no guided snapshots".to_string(),
+        ));
+    }
+    if wants_more {
+        call.set_continues(false);
+    }
+    call.reply(pending_snapshot.unwrap_or(final_snapshot))
+        .map_err(GenerationError::Reply)
+}
+
+async fn submit_guided_tool_results(
+    state: &SharedState,
+    session_id: String,
+    prompt: String,
+    results: Vec<ToolResult>,
+    fields: Vec<GuidedField>,
+    tools: Vec<ToolDefinition>,
+    options: GenerationOptions,
+) -> Result<crate::container::GuidedToolResponse, GenerationError> {
+    let max_tokens = validate_options(&options).map_err(GenerationError::InvalidOptions)?;
+    let schema = guided_fields_schema(&fields).map_err(GenerationError::Failed)?;
+    let mut guard = state.0.lock().await;
+
+    let (app_id, use_case, profile_id, image_ref, artifact_path, runtime_options, instructions) =
+        match guard.sessions.get(&session_id) {
+            Some(s) => {
+                ensure_language_generation_use_case(&s.use_case)
+                    .map_err(GenerationError::ModelUnavailable)?;
+                let (profile_id, image_ref, artifact_path, runtime_options) =
+                    profile_runtime(&guard, &s.profile_id)
+                        .map_err(GenerationError::ModelUnavailable)?;
+                (
+                    s.app_id.clone(),
+                    s.use_case.clone(),
+                    profile_id,
+                    image_ref,
+                    artifact_path,
+                    runtime_options,
+                    s.instructions.clone(),
+                )
+            }
+            None => return Err(GenerationError::SessionNotFound(session_id)),
+        };
+
+    let _ = guard.permissions.touch(&app_id, &use_case);
+    let container = guard
+        .containers
+        .get_or_spawn(
+            &profile_id,
+            &image_ref,
+            &artifact_path,
+            &runtime_options,
+            |_| {},
+        )
+        .map_err(|e| GenerationError::Failed(e.to_string()))?;
+
+    container
+        .generate_structured_with_tools(
+            Some(&instructions),
+            Some(&prompt),
+            max_tokens,
+            &schema,
+            tools.into_iter().map(varlink_tool_definition).collect(),
+            results.into_iter().map(varlink_tool_result).collect(),
+        )
+        .map_err(|e| GenerationError::Failed(e.to_string()))
+}
+
+fn varlink_tool_definition(tool: ToolDefinition) -> crate::container::ToolDefinition {
+    crate::container::ToolDefinition {
+        name: tool.name,
+        description: tool.description,
+        schema_json: tool.schema_json,
+    }
+}
+
+fn varlink_tool_result(result: ToolResult) -> crate::container::ToolResult {
+    crate::container::ToolResult {
+        id: result.id,
+        content: result.content,
+        content_json: result.content_json,
+    }
+}
+
+fn varlink_tool_calls(calls: Vec<crate::container::ToolCall>) -> Vec<ToolCall> {
+    calls
+        .into_iter()
+        .map(|call| ToolCall {
+            id: call.id,
+            name: call.name,
+            arguments_json: call.arguments_json,
+        })
+        .collect()
 }
 
 fn apply_translation_hints(

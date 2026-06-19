@@ -932,6 +932,7 @@ mod tests {
             installing: false,
             recommendation_reason: String::new(),
             use_cases: vec!["speech.transcribe".to_string()],
+            specializations: Some(Vec::new()),
         }
     }
 }

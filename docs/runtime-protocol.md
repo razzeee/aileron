@@ -94,6 +94,98 @@ Response:
 
 The daemon-side validator supports the schema subset used by guided generation: `type`, `required`, `properties`, `items`, `minItems`, `maxItems`, `minLength`, `maxLength`, `minimum`, `maximum`, `enum`, and `additionalProperties: false`. `$ref`, `allOf`, `anyOf`, and `oneOf` are intentionally unsupported.
 
+## Structured Snapshot Streaming
+
+Request:
+
+```json
+{
+  "id": "request-id",
+  "type": "generate_structured_stream",
+  "system": "Stable system instructions",
+  "prompt": "Extract a contact record",
+  "max_tokens": 1024,
+  "response_format": {
+    "type": "json_schema",
+    "schema": {
+      "type": "object",
+      "required": ["name"],
+      "properties": {
+        "name": {"type": "string"}
+      }
+    }
+  }
+}
+```
+
+Response:
+
+```json
+{"id":"request-id","snapshot":"{\"name\":\"Ada\"}"}
+{"id":"request-id","snapshot":"{\"name\":\"Ada Lovelace\"}","done":true}
+```
+
+`snapshot` is a string containing JSON. Every snapshot must satisfy the requested schema because the daemon validates each one before forwarding it. Runtimes that cannot produce true partial structured output may emit the same valid object once as an initial snapshot and once as the final snapshot.
+
+## Tool Calling
+
+Tool execution is app-mediated. Runtimes may request tool calls, but the daemon never executes them; it forwards calls to the app-facing API and later forwards app-supplied results back to the runtime.
+
+Initial guided request with tools:
+
+```json
+{
+  "id": "request-id",
+  "type": "generate_structured",
+  "system": "Stable system instructions",
+  "prompt": "What is on my calendar?",
+  "max_tokens": 512,
+  "response_format": {
+    "type": "json_schema",
+    "schema": {"type":"object","properties":{"answer":{"type":"string"}}}
+  },
+  "tools": [
+    {
+      "name": "calendar_lookup",
+      "description": "Look up calendar events",
+      "schema_json": "{\"type\":\"object\",\"properties\":{}}"
+    }
+  ]
+}
+```
+
+Response requesting app tool execution:
+
+```json
+{"id":"request-id","tool_calls":[{"id":"call-1","name":"calendar_lookup","arguments_json":"{}"}],"done":true}
+```
+
+Continuation request with app-provided results:
+
+```json
+{
+  "id": "request-id",
+  "type": "generate_structured",
+  "prompt": "What is on my calendar? Use the tool result to answer.",
+  "max_tokens": 512,
+  "response_format": {
+    "type": "json_schema",
+    "schema": {"type":"object","properties":{"answer":{"type":"string"}}}
+  },
+  "tool_results": [
+    {"id":"call-1","content":"Team sync at 10:00","content_json":""}
+  ]
+}
+```
+
+Final response:
+
+```json
+{"id":"request-id","result":"{\"answer\":\"You have team sync at 10:00.\"}","done":true}
+```
+
+`arguments_json` and `content_json` are JSON strings. Tool calling is attached to guided structured generation so the final answer can still be constrained by the requested schema. Runtimes should preserve tool call IDs so apps can correlate results.
+
 ## Embeddings
 
 Request:

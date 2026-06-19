@@ -73,6 +73,18 @@ Use guided generation when the app needs structured data. The portal API accepts
 
 This is appropriate for extraction, classification, and form-filling workflows. It is not a replacement for validating untrusted data in the app; keep normal app-side validation.
 
+Use `StreamGuidedResponse` when the UI benefits from progressive structured updates. It emits JSON snapshots instead of token deltas; each snapshot is validated against the same guided schema before the daemon returns it.
+
+## Tool Calling
+
+Use guided tool calls when the model should ask the app for app-local data or actions. Pass tool definitions to `RespondGuided`, execute or reject any returned `ToolCall` objects in the app, then send results back with `SubmitToolResultsGuided` using the same guided fields.
+
+The daemon and runtime never execute tools. Tool execution stays app-mediated so sandbox policy, user confirmation, and app-specific authorization remain under the app's control.
+
+## Conversation History
+
+Aileron sessions do not retain conversation transcripts. Apps own chat history, trim it according to their UI and privacy policy, and include relevant context explicitly in prompts or tool results.
+
 ## Embeddings
 
 Use `language.embed` with `Embed` to turn text into a fixed-length vector for semantic search, clustering, deduplication, or retrieval-augmented generation. `Embed` returns the embedding as a list of floats. Embed documents and queries with the same assigned profile so the vectors share a space

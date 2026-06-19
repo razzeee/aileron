@@ -300,6 +300,7 @@ mod tests {
             runtime_id: "runtime".to_string(),
             artifact_path: "/tmp/model".to_string(),
             use_cases: use_cases.iter().map(|value| value.to_string()).collect(),
+            specializations: Some(Vec::new()),
             runtime_images: Vec::new(),
             assigned_use_cases: assigned_use_cases
                 .iter()

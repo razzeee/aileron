@@ -35,6 +35,8 @@ pub struct Profile {
     pub runtime_images: Vec<RuntimeImage>,
     pub use_cases: Vec<String>,
     #[serde(default)]
+    pub specializations: Vec<String>,
+    #[serde(default)]
     pub artifact_hashes: Vec<ArtifactHash>,
     pub installed_at: String,
     #[serde(default = "default_source")]
@@ -268,6 +270,7 @@ mod tests {
             artifact_path: PathBuf::from("/tmp/model"),
             runtime_images,
             use_cases: vec!["speech.transcribe".to_string()],
+            specializations: Vec::new(),
             artifact_hashes: Vec::new(),
             installed_at: "2026-06-14T00:00:00Z".to_string(),
             source: "user".to_string(),

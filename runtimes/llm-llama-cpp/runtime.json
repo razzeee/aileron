@@ -3,6 +3,7 @@
   "capabilities": [
     "generate",
     "generate_structured",
+    "generate_structured_stream",
     "embed"
   ],
   "variants": [

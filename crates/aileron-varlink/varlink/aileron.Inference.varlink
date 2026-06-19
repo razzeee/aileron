@@ -23,6 +23,24 @@ type GuidedField (
   required: bool
 )
 
+type ToolDefinition (
+  name: string,
+  description: string,
+  schema_json: string
+)
+
+type ToolCall (
+  id: string,
+  name: string,
+  arguments_json: string
+)
+
+type ToolResult (
+  id: string,
+  content: string,
+  content_json: string
+)
+
 type VisionSegment (
   label: string,
   confidence: float,
@@ -49,7 +67,13 @@ method StreamResponse(session_id: string, prompt: string, options: GenerationOpt
 
 # Generate JSON matching field guides converted to a JSON Schema object.
 # Session must have been created with a language.* use_case.
-method RespondGuided(session_id: string, prompt: string, fields: []GuidedField, options: GenerationOptions) -> (content: string)
+method RespondGuided(session_id: string, prompt: string, fields: []GuidedField, tools: []ToolDefinition, options: GenerationOptions) -> (content: string, tool_calls: []ToolCall)
+
+# Stream schema-valid guided output snapshots. The final reply has continues=false.
+method StreamGuidedResponse(session_id: string, prompt: string, fields: []GuidedField, options: GenerationOptions) -> (snapshot_json: string)
+
+# Continue guided generation after the app executes or rejects requested tools.
+method SubmitToolResultsGuided(session_id: string, prompt: string, results: []ToolResult, fields: []GuidedField, tools: []ToolDefinition, options: GenerationOptions) -> (content: string, tool_calls: []ToolCall)
 
 # Compute embedding vectors for text. Session must have been created with use_case: language.embed
 # embedding: the embedding vector for the supplied text
