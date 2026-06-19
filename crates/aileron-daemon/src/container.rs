@@ -232,8 +232,8 @@ impl Container {
                 continue;
             }
             if let Some(error) = resp.error {
-                let reason = resp.reason.unwrap_or(error);
-                bail!("container returned error: {reason}");
+                let reason = resp.reason.unwrap_or_else(|| error.clone());
+                bail!("container returned error {error}: {reason}");
             }
             if let Some(token) = resp.token {
                 on_token(token);
@@ -443,8 +443,8 @@ impl Container {
                 continue;
             }
             if let Some(error) = resp.error {
-                let reason = resp.reason.unwrap_or(error);
-                bail!("container returned error: {reason}");
+                let reason = resp.reason.unwrap_or_else(|| error.clone());
+                bail!("container returned error {error}: {reason}");
             }
             if let Some(embedding) = resp.embedding {
                 return Ok(embedding);
@@ -468,8 +468,8 @@ impl Container {
                 continue;
             }
             if let Some(error) = resp.error {
-                let reason = resp.reason.unwrap_or(error);
-                bail!("container returned error: {reason}");
+                let reason = resp.reason.unwrap_or_else(|| error.clone());
+                bail!("container returned error {error}: {reason}");
             }
             if let Some(token) = resp.token {
                 result.push_str(&token);
@@ -484,8 +484,8 @@ impl Container {
 
 fn structured_response_result(resp: ContainerResponse, schema: &Value) -> Result<Option<String>> {
     if let Some(error) = resp.error {
-        let reason = resp.reason.unwrap_or(error);
-        bail!("container returned error: {reason}");
+        let reason = resp.reason.unwrap_or_else(|| error.clone());
+        bail!("container returned error {error}: {reason}");
     }
     if let Some(result) = resp.result {
         validate_json_schema(&result, schema)?;

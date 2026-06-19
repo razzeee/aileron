@@ -25,25 +25,31 @@ impl InferenceHandler {
     }
 }
 
-fn io_err(_msg: impl std::fmt::Display) -> varlink::Error {
-    varlink::Error::from(varlink::ErrorKind::Io(std::io::ErrorKind::Other))
-}
-
 impl VarlinkInterface for InferenceHandler {
     fn get_use_case_availability(
         &self,
         call: &mut dyn Call_GetUseCaseAvailability,
-        _app_id: String,
+        app_id: String,
         use_case: String,
     ) -> varlink::Result<()> {
         self.rt.block_on(async {
             let (image_ref, artifact_path, oci_store) = {
                 let guard = self.state.0.lock().await;
+                if !guard.config.allow_all
+                    && matches!(guard.permissions.check(&app_id, &use_case), Some(false))
+                {
+                    return call.reply(ModelAvailability {
+                        is_available: false,
+                        code: "permission_denied".to_string(),
+                        reason: format!("{app_id} is denied permission for {use_case}"),
+                    });
+                }
                 let profile_id = match guard.assignments.get(&use_case) {
                     Some(profile_id) => profile_id,
                     None => {
                         return call.reply(ModelAvailability {
                             is_available: false,
+                            code: "no_profile_assigned".to_string(),
                             reason: format!("no profile assigned for {use_case}"),
                         });
                     }
@@ -53,6 +59,7 @@ impl VarlinkInterface for InferenceHandler {
                     None => {
                         return call.reply(ModelAvailability {
                             is_available: false,
+                            code: "profile_not_installed".to_string(),
                             reason: format!("assigned profile {profile_id} is not installed"),
                         });
                     }
@@ -62,6 +69,7 @@ impl VarlinkInterface for InferenceHandler {
                     None => {
                         return call.reply(ModelAvailability {
                             is_available: false,
+                            code: "runtime_unsupported".to_string(),
                             reason: format!(
                                 "runtime {} does not support {}",
                                 profile.runtime_id,
@@ -80,6 +88,7 @@ impl VarlinkInterface for InferenceHandler {
             if !artifact_path.exists() {
                 return call.reply(ModelAvailability {
                     is_available: false,
+                    code: "artifact_missing".to_string(),
                     reason: format!("artifact path {} is missing", artifact_path.display()),
                 });
             }
@@ -88,6 +97,11 @@ impl VarlinkInterface for InferenceHandler {
 
             call.reply(ModelAvailability {
                 is_available: runtime_exists,
+                code: if runtime_exists {
+                    "available".to_string()
+                } else {
+                    "runtime_missing".to_string()
+                },
                 reason: if runtime_exists {
                     "available".to_string()
                 } else {
@@ -210,7 +224,7 @@ impl VarlinkInterface for InferenceHandler {
                 Err(GenerationError::InvalidOptions(reason)) => {
                     call.reply_invalid_generation_options(reason)
                 }
-                Err(GenerationError::Failed(reason)) => call.reply_generation_failed(reason),
+                Err(GenerationError::Failed(reason)) => reply_generation_failure(call, reason),
                 Err(GenerationError::Reply(e)) => Err(e),
             }
         })
@@ -233,7 +247,7 @@ impl VarlinkInterface for InferenceHandler {
                 Err(GenerationError::InvalidOptions(reason)) => {
                     call.reply_invalid_generation_options(reason)
                 }
-                Err(GenerationError::Failed(reason)) => call.reply_generation_failed(reason),
+                Err(GenerationError::Failed(reason)) => reply_generation_failure(call, reason),
                 Err(GenerationError::Reply(e)) => Err(e),
             }
         })
@@ -351,7 +365,10 @@ impl VarlinkInterface for InferenceHandler {
                 };
 
             let _ = guard.permissions.touch(&app_id, &use_case);
-            let audio_bytes = base64_decode(&audio).map_err(io_err)?;
+            let audio_bytes = match base64_decode(&audio) {
+                Ok(bytes) => bytes,
+                Err(reason) => return call.reply_invalid_input(reason),
+            };
             let container = match guard.containers.get_or_spawn(
                 &profile_id,
                 &image_ref,
@@ -405,7 +422,10 @@ impl VarlinkInterface for InferenceHandler {
                 };
 
             let _ = guard.permissions.touch(&app_id, &use_case);
-            let image_bytes = base64_decode(&image).map_err(io_err)?;
+            let image_bytes = match base64_decode(&image) {
+                Ok(bytes) => bytes,
+                Err(reason) => return call.reply_invalid_input(reason),
+            };
             let container = match guard.containers.get_or_spawn(
                 &profile_id,
                 &image_ref,
@@ -458,7 +478,10 @@ impl VarlinkInterface for InferenceHandler {
                 };
 
             let _ = guard.permissions.touch(&app_id, &use_case);
-            let image_bytes = base64_decode(&image).map_err(io_err)?;
+            let image_bytes = match base64_decode(&image) {
+                Ok(bytes) => bytes,
+                Err(reason) => return call.reply_invalid_input(reason),
+            };
             let container = match guard.containers.get_or_spawn(
                 &profile_id,
                 &image_ref,
@@ -512,7 +535,10 @@ impl VarlinkInterface for InferenceHandler {
                 };
 
             let _ = guard.permissions.touch(&app_id, &use_case);
-            let image_bytes = base64_decode(&image).map_err(io_err)?;
+            let image_bytes = match base64_decode(&image) {
+                Ok(bytes) => bytes,
+                Err(reason) => return call.reply_invalid_input(reason),
+            };
             let container = match guard.containers.get_or_spawn(
                 &profile_id,
                 &image_ref,
@@ -710,6 +736,27 @@ enum GenerationError {
     InvalidOptions(String),
     Failed(String),
     Reply(varlink::Error),
+}
+
+fn reply_generation_failure(
+    call: &mut dyn VarlinkCallError,
+    reason: String,
+) -> varlink::Result<()> {
+    match runtime_error_code(&reason) {
+        Some("context_window_exceeded") => call.reply_context_window_exceeded(reason),
+        Some("unsupported_language") => call.reply_unsupported_language(reason),
+        Some("safety_refusal") => call.reply_safety_refusal(reason),
+        Some("request_cancelled") => call.reply_request_cancelled(reason),
+        Some("invalid_input") => call.reply_invalid_input(reason),
+        _ => call.reply_generation_failed(reason),
+    }
+}
+
+fn runtime_error_code(reason: &str) -> Option<&str> {
+    reason
+        .strip_prefix("container returned error ")
+        .and_then(|rest| rest.split_once(':'))
+        .map(|(code, _)| code.trim())
 }
 
 trait TokenSink {

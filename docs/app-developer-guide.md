@@ -99,12 +99,16 @@ Design UI as if local model access is a user-controlled capability, not a hidden
 
 An unavailable use case is normal. The user may not have installed a matching profile, the runtime image may be unavailable for the hardware, or policy may deny the app.
 
+Availability responses include a stable `code` and a human-readable `reason`. Apps should branch on `code`, not parse `reason`. Common codes are `available`, `permission_denied`, `no_profile_assigned`, `profile_not_installed`, `artifact_missing`, `runtime_unsupported`, `runtime_missing`, `hardware_unsupported`, and `busy`.
+
 Recommended behavior:
 
 - Disable or soften the model-backed feature entry point.
 - Explain that a local model profile is required.
 - Offer a non-AI fallback when possible.
 - Avoid model-specific instructions in the app UI.
+
+Handle specific inference errors when useful. `ContextWindowExceeded` can prompt the user to shorten input, `UnsupportedLanguage` can ask for another language, `SafetyRefusal` should be shown as a refusal rather than a crash, `RequestCancelled` should leave UI state clean, and `InvalidInput` means the app should fix or reject the submitted payload.
 
 ## Development And Testing
 

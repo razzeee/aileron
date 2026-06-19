@@ -4,6 +4,7 @@ interface aileron.Inference
 
 type ModelAvailability (
   is_available: bool,
+  code: string,
   reason: string
 )
 
@@ -82,3 +83,8 @@ error ModelUnavailable(reason: string)
 error InvalidGenerationOptions(reason: string)
 error GuidedGenerationFailed(reason: string)
 error GenerationFailed(reason: string)
+error ContextWindowExceeded(reason: string)
+error UnsupportedLanguage(reason: string)
+error SafetyRefusal(reason: string)
+error RequestCancelled(reason: string)
+error InvalidInput(reason: string)

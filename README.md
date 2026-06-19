@@ -334,7 +334,7 @@ The daemon exposes four interfaces over `$XDG_RUNTIME_DIR/aileron.socket`.
 Create sessions, generate text, get structured JSON output, compute embeddings, transcribe and translate audio, describe and OCR images.
 
 ```varlink
-type ModelAvailability (is_available: bool, reason: string)
+type ModelAvailability (is_available: bool, code: string, reason: string)
 type GenerationOptions (maximum_response_tokens: int, temperature: float, sampling_mode: string, source_language_hint: string, target_language_hint: string)
 type GuidedField (name: string, kind: string, description: string, required: bool)
 type VisionSegment (label: string, confidence: float, x: float, y: float, width: float, height: float)
@@ -359,7 +359,9 @@ method EndSession(session_id: string) -> ()
 
 `GuidedField.kind` supports `string`, `number`, `integer`, `boolean`, and `string_array`. The daemon converts guided fields into a JSON Schema object with `additionalProperties: false`, sends it to the container as `response_format.schema`, then validates the returned JSON before replying.
 
-Inference errors are represented as Varlink errors: `PermissionDenied`, `SessionNotFound`, `ModelUnavailable`, `InvalidGenerationOptions`, `GuidedGenerationFailed`, and `GenerationFailed`.
+`ModelAvailability.code` is stable and machine-readable. Known values are `available`, `permission_denied`, `no_profile_assigned`, `profile_not_installed`, `artifact_missing`, `runtime_unsupported`, `runtime_missing`, `hardware_unsupported`, and `busy`. `reason` is human-readable detail.
+
+Inference errors are represented as Varlink errors: `PermissionDenied`, `SessionNotFound`, `ModelUnavailable`, `InvalidGenerationOptions`, `GuidedGenerationFailed`, `GenerationFailed`, `ContextWindowExceeded`, `UnsupportedLanguage`, `SafetyRefusal`, `RequestCancelled`, and `InvalidInput`.
 
 ### `aileron.Models`
 
@@ -419,7 +421,7 @@ The portal does not talk to containers directly. It translates D-Bus calls into 
 
 | Method | Parameters | Returns | Notes |
 |---|---|---|---|
-| `GetUseCaseAvailability` | `app_id: s, use_case: s` | `(is_available: b, reason: s)` | Checks whether an assigned profile has local artifacts and a runtime image |
+| `GetUseCaseAvailability` | `app_id: s, use_case: s` | `(is_available: b, code: s, reason: s)` | Checks whether an assigned profile has local artifacts and a runtime image |
 | `CreateSession` | `app_id: s, use_case: s, instructions: s` | `session_id: s` | Creates a session bound to the assigned profile; does not start the container by itself |
 | `Prewarm` | `session_id: s, prompt_prefix: s` | `()` | Starts the backing container before the first user-visible operation; pass an empty prefix when no text prefix applies |
 | `EndSession` | `session_id: s` | `()` | Ends the session; the per-profile container remains pooled until idle timeout |

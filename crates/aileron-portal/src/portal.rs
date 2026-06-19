@@ -68,6 +68,7 @@ impl VisionPortalBackend {
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 struct ModelAvailabilityDbus {
     is_available: bool,
+    code: String,
     reason: String,
 }
 
@@ -445,6 +446,7 @@ fn get_use_case_availability_impl(
 
     Ok(ModelAvailabilityDbus {
         is_available: reply.availability.is_available,
+        code: reply.availability.code,
         reason: reply.availability.reason,
     })
 }

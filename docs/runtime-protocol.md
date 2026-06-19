@@ -205,7 +205,7 @@ Runtimes should use stable, machine-readable `error` codes and put details in `r
 }
 ```
 
-The daemon surfaces runtime errors as inference failures. A runtime should prefer a clear error over malformed JSON, closed stdout, or hanging forever.
+The daemon maps these runtime error codes to specific app-facing inference errors when possible: `context_window_exceeded`, `unsupported_language`, `safety_refusal`, `request_cancelled`, and `invalid_input`. Unknown runtime codes are surfaced as generic inference failures. A runtime should prefer a clear error over malformed JSON, closed stdout, or hanging forever.
 
 ## Security Assumptions
 
