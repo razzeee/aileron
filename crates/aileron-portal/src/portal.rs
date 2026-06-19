@@ -341,6 +341,7 @@ impl LanguagePortalBackend {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn submit_tool_results_guided(
         &self,
         session_id: &str,

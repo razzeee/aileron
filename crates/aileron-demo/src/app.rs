@@ -2603,55 +2603,6 @@ fn concise_error(message: &str) -> String {
     message.to_string()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{concise_error, execute_count_tool};
-
-    #[test]
-    fn explains_missing_portal_systemd_unit() {
-        let error = "org.freedesktop.DBus.Error.NameHasNoOwner: Could not activate remote peer 'org.freedesktop.impl.portal.desktop.aileron': activation request failed: unknown unit";
-
-        assert_eq!(
-            concise_error(error),
-            "Aileron portal is not installed for D-Bus activation. Install systemd/aileron-portal.service to ~/.config/systemd/user/, run `systemctl --user daemon-reload`, then start `systemctl --user enable --now aileron-portal`."
-        );
-    }
-
-    #[test]
-    fn explains_stale_portal_language_interface() {
-        let error = "org.freedesktop.DBus.Error.UnknownInterface: Unknown interface 'org.freedesktop.impl.portal.Language'";
-
-        assert_eq!(
-            concise_error(error),
-            "The running Aileron portal is older than this demo and does not expose the Language interface. Restart the updated portal with `systemctl --user restart aileron-portal`, or rebuild/reinstall the portal service if it was installed from an older binary."
-        );
-    }
-
-    #[test]
-    fn count_tool_uses_structured_arguments() {
-        let result = execute_count_tool(
-            "ignored prompt",
-            r#"{"word":"strawrberrry","character":"r"}"#,
-        )
-        .expect("count tool should run");
-
-        assert_eq!(result["count"], 5);
-    }
-
-    #[test]
-    fn count_tool_falls_back_to_prompt_for_stub_arguments() {
-        let result = execute_count_tool(
-            "How many times does the letter r occur in strawrberrry?",
-            "{}",
-        )
-        .expect("count tool should infer demo args");
-
-        assert_eq!(result["word"], "strawrberrry");
-        assert_eq!(result["character"], "r");
-        assert_eq!(result["count"], 5);
-    }
-}
-
 /// Call `StreamResponse` on the portal and forward tokens via `tx`.
 /// Sends `Some(token)` for each token, then `None` when done.
 fn summarize_streaming(text: &str, tx: std::sync::mpsc::Sender<DemoEvent>) -> anyhow::Result<()> {
@@ -3523,4 +3474,53 @@ fn base64_encode(data: &[u8]) -> String {
     }
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{concise_error, execute_count_tool};
+
+    #[test]
+    fn explains_missing_portal_systemd_unit() {
+        let error = "org.freedesktop.DBus.Error.NameHasNoOwner: Could not activate remote peer 'org.freedesktop.impl.portal.desktop.aileron': activation request failed: unknown unit";
+
+        assert_eq!(
+            concise_error(error),
+            "Aileron portal is not installed for D-Bus activation. Install systemd/aileron-portal.service to ~/.config/systemd/user/, run `systemctl --user daemon-reload`, then start `systemctl --user enable --now aileron-portal`."
+        );
+    }
+
+    #[test]
+    fn explains_stale_portal_language_interface() {
+        let error = "org.freedesktop.DBus.Error.UnknownInterface: Unknown interface 'org.freedesktop.impl.portal.Language'";
+
+        assert_eq!(
+            concise_error(error),
+            "The running Aileron portal is older than this demo and does not expose the Language interface. Restart the updated portal with `systemctl --user restart aileron-portal`, or rebuild/reinstall the portal service if it was installed from an older binary."
+        );
+    }
+
+    #[test]
+    fn count_tool_uses_structured_arguments() {
+        let result = execute_count_tool(
+            "ignored prompt",
+            r#"{"word":"strawrberrry","character":"r"}"#,
+        )
+        .expect("count tool should run");
+
+        assert_eq!(result["count"], 5);
+    }
+
+    #[test]
+    fn count_tool_falls_back_to_prompt_for_stub_arguments() {
+        let result = execute_count_tool(
+            "How many times does the letter r occur in strawrberrry?",
+            "{}",
+        )
+        .expect("count tool should infer demo args");
+
+        assert_eq!(result["word"], "strawrberrry");
+        assert_eq!(result["character"], "r");
+        assert_eq!(result["count"], 5);
+    }
 }

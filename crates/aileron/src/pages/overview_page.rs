@@ -288,6 +288,19 @@ fn ready_task_count(profiles: &[aileron_varlink::aileron_Models::ProfileInfo]) -
         .count()
 }
 
+fn append_detail(list: &ListBox, title: &str, subtitle: &str) {
+    let row = ActionRow::new();
+    row.set_title(title);
+    row.set_subtitle(subtitle);
+    list.append(&row);
+}
+
+fn clear_list(list: &ListBox) {
+    while let Some(child) = list.first_child() {
+        list.remove(&child);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -320,18 +333,5 @@ mod tests {
         )];
 
         assert_eq!(ready_task_count(&profiles), 1);
-    }
-}
-
-fn append_detail(list: &ListBox, title: &str, subtitle: &str) {
-    let row = ActionRow::new();
-    row.set_title(title);
-    row.set_subtitle(subtitle);
-    list.append(&row);
-}
-
-fn clear_list(list: &ListBox) {
-    while let Some(child) = list.first_child() {
-        list.remove(&child);
     }
 }

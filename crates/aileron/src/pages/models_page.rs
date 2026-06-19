@@ -739,204 +739,6 @@ fn join_or_none(values: &[String]) -> String {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn formats_install_failed_reason() {
-        let message = install_error_message(
-            "aileron.Models.InstallFailed: Some(InstallFailed_Args { profile_id: \"x\", reason: \"local runtime image is not built: localhost/example:cpu\", })",
-        );
-
-        assert!(message.contains("The required local runtime image is missing"));
-        assert!(message.contains("localhost/example:cpu"));
-        assert!(!message.contains("InstallFailed_Args"));
-    }
-
-    #[test]
-    fn asr_recommendation_prefers_large_v3_turbo_over_smaller_medium() {
-        let assigned = HashSet::new();
-        let turbo = catalog_profile("whisper-large-v3-turbo-q5-0", "balanced", 0.54);
-        let medium = catalog_profile("whisper-medium-q5-0", "balanced", 0.50);
-
-        assert_eq!(
-            compare_candidates(&turbo, &medium, &assigned, "speech.transcribe"),
-            std::cmp::Ordering::Less
-        );
-    }
-
-    #[test]
-    fn fit_score_label_is_neutral() {
-        assert_eq!(fit_score_label(86.2).as_deref(), Some("86/100"));
-        assert_eq!(fit_score_label(0.0), None);
-    }
-
-    #[test]
-    fn formats_small_profile_sizes_as_mb() {
-        assert_eq!(format_size(0.0177), "18 MB");
-        assert_eq!(format_size(1.88), "1.9 GB");
-    }
-
-    #[test]
-    fn formats_installed_profile_sizes_from_bytes() {
-        assert_eq!(format_profile_size(0), "unknown size");
-        assert_eq!(format_profile_size(512), "512 B");
-        assert_eq!(format_profile_size(18 * 1024 * 1024), "18 MB");
-        assert_eq!(format_profile_size(2 * 1024 * 1024 * 1024), "2.0 GB");
-    }
-
-    #[test]
-    fn readiness_sort_key_bubbles_non_ready_tasks() {
-        assert!(readiness_sort_key("Missing") < readiness_sort_key("Ready"));
-        assert!(readiness_sort_key("Installed") < readiness_sort_key("Ready"));
-        assert!(readiness_sort_key("Installing") < readiness_sort_key("Ready"));
-        assert_eq!(readiness_sort_key("Ready"), 1);
-    }
-
-    #[test]
-    fn recommendation_uses_task_specific_fit_score() {
-        let assigned = HashSet::new();
-        let mut chat_better = catalog_profile("chat-better", "balanced", 2.0);
-        chat_better.recommended = true;
-        chat_better.fit_level = "recommended".to_string();
-        chat_better.fit_score = 50.0;
-        chat_better.use_cases = vec![
-            "language.summarize".to_string(),
-            "language.analyze".to_string(),
-        ];
-        chat_better.use_case_fit_scores = vec![
-            aileron_varlink::aileron_Models::UseCaseFitScore {
-                use_case: "language.summarize".to_string(),
-                score: 90.0,
-            },
-            aileron_varlink::aileron_Models::UseCaseFitScore {
-                use_case: "language.analyze".to_string(),
-                score: 60.0,
-            },
-        ];
-
-        let mut reasoning_better = catalog_profile("reasoning-better", "balanced", 2.0);
-        reasoning_better.recommended = true;
-        reasoning_better.fit_level = "recommended".to_string();
-        reasoning_better.fit_score = 50.0;
-        reasoning_better.use_cases = vec![
-            "language.summarize".to_string(),
-            "language.analyze".to_string(),
-        ];
-        reasoning_better.use_case_fit_scores = vec![
-            aileron_varlink::aileron_Models::UseCaseFitScore {
-                use_case: "language.summarize".to_string(),
-                score: 70.0,
-            },
-            aileron_varlink::aileron_Models::UseCaseFitScore {
-                use_case: "language.analyze".to_string(),
-                score: 95.0,
-            },
-        ];
-
-        assert_eq!(
-            compare_candidates(
-                &chat_better,
-                &reasoning_better,
-                &assigned,
-                "language.summarize"
-            ),
-            std::cmp::Ordering::Less
-        );
-        assert_eq!(
-            compare_candidates(
-                &chat_better,
-                &reasoning_better,
-                &assigned,
-                "language.analyze"
-            ),
-            std::cmp::Ordering::Greater
-        );
-    }
-
-    #[test]
-    fn ready_task_can_surface_better_catalog_candidate() {
-        let mut current = catalog_profile("current", "balanced", 2.0);
-        current.recommended = true;
-        current.fit_level = "recommended".to_string();
-        current.fit_score = 70.0;
-        current.use_cases = vec!["language.summarize".to_string()];
-        current.use_case_fit_scores = vec![aileron_varlink::aileron_Models::UseCaseFitScore {
-            use_case: "language.summarize".to_string(),
-            score: 70.0,
-        }];
-
-        let mut better = catalog_profile("better", "balanced", 5.0);
-        better.recommended = true;
-        better.fit_level = "recommended".to_string();
-        better.fit_score = 90.0;
-        better.use_cases = vec!["language.summarize".to_string()];
-        better.use_case_fit_scores = vec![aileron_varlink::aileron_Models::UseCaseFitScore {
-            use_case: "language.summarize".to_string(),
-            score: 90.0,
-        }];
-
-        let catalog = vec![current, better];
-
-        assert_eq!(
-            better_catalog_candidate(&catalog, "current", "language.summarize")
-                .map(|profile| profile.profile_id.as_str()),
-            Some("better")
-        );
-    }
-
-    #[test]
-    fn installed_unassigned_task_can_still_surface_better_candidate() {
-        let mut installed = catalog_profile("installed", "balanced", 2.0);
-        installed.recommended = true;
-        installed.fit_level = "recommended".to_string();
-        installed.fit_score = 60.0;
-        installed.use_cases = vec!["language.summarize".to_string()];
-
-        let mut better = catalog_profile("better", "balanced", 5.0);
-        better.recommended = true;
-        better.fit_level = "recommended".to_string();
-        better.fit_score = 90.0;
-        better.use_cases = vec!["language.summarize".to_string()];
-
-        let catalog = vec![installed, better];
-
-        assert_eq!(
-            better_catalog_candidate(&catalog, "installed", "language.summarize")
-                .map(|profile| profile.profile_id.as_str()),
-            Some("better")
-        );
-    }
-
-    fn catalog_profile(
-        profile_id: &str,
-        tier: &str,
-        disk_size_gb: f64,
-    ) -> aileron_varlink::aileron_Models::CatalogProfileInfo {
-        aileron_varlink::aileron_Models::CatalogProfileInfo {
-            profile_id: profile_id.to_string(),
-            model_id: profile_id.to_string(),
-            llmfit_model_id: String::new(),
-            spdx_license: Some(String::new()),
-            runtime_id: "asr-whisper-cpp".to_string(),
-            tier: tier.to_string(),
-            disk_size_gb,
-            min_ram_gb: 1.0,
-            recommended_ram_gb: 1.0,
-            min_vram_gb: 0.0,
-            fit_score: 0.0,
-            use_case_fit_scores: Vec::new(),
-            fit_level: "fits_minimum".to_string(),
-            recommended: false,
-            installing: false,
-            recommendation_reason: String::new(),
-            use_cases: vec!["speech.transcribe".to_string()],
-            specializations: Some(Vec::new()),
-        }
-    }
-}
-
 fn selected_use_cases(checks: &[(CheckButton, &str)]) -> Vec<String> {
     checks
         .iter()
@@ -2143,4 +1945,202 @@ fn show_pull_result_dialog(
     });
 
     dialog.present(window);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn formats_install_failed_reason() {
+        let message = install_error_message(
+            "aileron.Models.InstallFailed: Some(InstallFailed_Args { profile_id: \"x\", reason: \"local runtime image is not built: localhost/example:cpu\", })",
+        );
+
+        assert!(message.contains("The required local runtime image is missing"));
+        assert!(message.contains("localhost/example:cpu"));
+        assert!(!message.contains("InstallFailed_Args"));
+    }
+
+    #[test]
+    fn asr_recommendation_prefers_large_v3_turbo_over_smaller_medium() {
+        let assigned = HashSet::new();
+        let turbo = catalog_profile("whisper-large-v3-turbo-q5-0", "balanced", 0.54);
+        let medium = catalog_profile("whisper-medium-q5-0", "balanced", 0.50);
+
+        assert_eq!(
+            compare_candidates(&turbo, &medium, &assigned, "speech.transcribe"),
+            std::cmp::Ordering::Less
+        );
+    }
+
+    #[test]
+    fn fit_score_label_is_neutral() {
+        assert_eq!(fit_score_label(86.2).as_deref(), Some("86/100"));
+        assert_eq!(fit_score_label(0.0), None);
+    }
+
+    #[test]
+    fn formats_small_profile_sizes_as_mb() {
+        assert_eq!(format_size(0.0177), "18 MB");
+        assert_eq!(format_size(1.88), "1.9 GB");
+    }
+
+    #[test]
+    fn formats_installed_profile_sizes_from_bytes() {
+        assert_eq!(format_profile_size(0), "unknown size");
+        assert_eq!(format_profile_size(512), "512 B");
+        assert_eq!(format_profile_size(18 * 1024 * 1024), "18 MB");
+        assert_eq!(format_profile_size(2 * 1024 * 1024 * 1024), "2.0 GB");
+    }
+
+    #[test]
+    fn readiness_sort_key_bubbles_non_ready_tasks() {
+        assert!(readiness_sort_key("Missing") < readiness_sort_key("Ready"));
+        assert!(readiness_sort_key("Installed") < readiness_sort_key("Ready"));
+        assert!(readiness_sort_key("Installing") < readiness_sort_key("Ready"));
+        assert_eq!(readiness_sort_key("Ready"), 1);
+    }
+
+    #[test]
+    fn recommendation_uses_task_specific_fit_score() {
+        let assigned = HashSet::new();
+        let mut chat_better = catalog_profile("chat-better", "balanced", 2.0);
+        chat_better.recommended = true;
+        chat_better.fit_level = "recommended".to_string();
+        chat_better.fit_score = 50.0;
+        chat_better.use_cases = vec![
+            "language.summarize".to_string(),
+            "language.analyze".to_string(),
+        ];
+        chat_better.use_case_fit_scores = vec![
+            aileron_varlink::aileron_Models::UseCaseFitScore {
+                use_case: "language.summarize".to_string(),
+                score: 90.0,
+            },
+            aileron_varlink::aileron_Models::UseCaseFitScore {
+                use_case: "language.analyze".to_string(),
+                score: 60.0,
+            },
+        ];
+
+        let mut reasoning_better = catalog_profile("reasoning-better", "balanced", 2.0);
+        reasoning_better.recommended = true;
+        reasoning_better.fit_level = "recommended".to_string();
+        reasoning_better.fit_score = 50.0;
+        reasoning_better.use_cases = vec![
+            "language.summarize".to_string(),
+            "language.analyze".to_string(),
+        ];
+        reasoning_better.use_case_fit_scores = vec![
+            aileron_varlink::aileron_Models::UseCaseFitScore {
+                use_case: "language.summarize".to_string(),
+                score: 70.0,
+            },
+            aileron_varlink::aileron_Models::UseCaseFitScore {
+                use_case: "language.analyze".to_string(),
+                score: 95.0,
+            },
+        ];
+
+        assert_eq!(
+            compare_candidates(
+                &chat_better,
+                &reasoning_better,
+                &assigned,
+                "language.summarize"
+            ),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_candidates(
+                &chat_better,
+                &reasoning_better,
+                &assigned,
+                "language.analyze"
+            ),
+            std::cmp::Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn ready_task_can_surface_better_catalog_candidate() {
+        let mut current = catalog_profile("current", "balanced", 2.0);
+        current.recommended = true;
+        current.fit_level = "recommended".to_string();
+        current.fit_score = 70.0;
+        current.use_cases = vec!["language.summarize".to_string()];
+        current.use_case_fit_scores = vec![aileron_varlink::aileron_Models::UseCaseFitScore {
+            use_case: "language.summarize".to_string(),
+            score: 70.0,
+        }];
+
+        let mut better = catalog_profile("better", "balanced", 5.0);
+        better.recommended = true;
+        better.fit_level = "recommended".to_string();
+        better.fit_score = 90.0;
+        better.use_cases = vec!["language.summarize".to_string()];
+        better.use_case_fit_scores = vec![aileron_varlink::aileron_Models::UseCaseFitScore {
+            use_case: "language.summarize".to_string(),
+            score: 90.0,
+        }];
+
+        let catalog = vec![current, better];
+
+        assert_eq!(
+            better_catalog_candidate(&catalog, "current", "language.summarize")
+                .map(|profile| profile.profile_id.as_str()),
+            Some("better")
+        );
+    }
+
+    #[test]
+    fn installed_unassigned_task_can_still_surface_better_candidate() {
+        let mut installed = catalog_profile("installed", "balanced", 2.0);
+        installed.recommended = true;
+        installed.fit_level = "recommended".to_string();
+        installed.fit_score = 60.0;
+        installed.use_cases = vec!["language.summarize".to_string()];
+
+        let mut better = catalog_profile("better", "balanced", 5.0);
+        better.recommended = true;
+        better.fit_level = "recommended".to_string();
+        better.fit_score = 90.0;
+        better.use_cases = vec!["language.summarize".to_string()];
+
+        let catalog = vec![installed, better];
+
+        assert_eq!(
+            better_catalog_candidate(&catalog, "installed", "language.summarize")
+                .map(|profile| profile.profile_id.as_str()),
+            Some("better")
+        );
+    }
+
+    fn catalog_profile(
+        profile_id: &str,
+        tier: &str,
+        disk_size_gb: f64,
+    ) -> aileron_varlink::aileron_Models::CatalogProfileInfo {
+        aileron_varlink::aileron_Models::CatalogProfileInfo {
+            profile_id: profile_id.to_string(),
+            model_id: profile_id.to_string(),
+            llmfit_model_id: String::new(),
+            spdx_license: Some(String::new()),
+            runtime_id: "asr-whisper-cpp".to_string(),
+            tier: tier.to_string(),
+            disk_size_gb,
+            min_ram_gb: 1.0,
+            recommended_ram_gb: 1.0,
+            min_vram_gb: 0.0,
+            fit_score: 0.0,
+            use_case_fit_scores: Vec::new(),
+            fit_level: "fits_minimum".to_string(),
+            recommended: false,
+            installing: false,
+            recommendation_reason: String::new(),
+            use_cases: vec!["speech.transcribe".to_string()],
+            specializations: Some(Vec::new()),
+        }
+    }
 }
