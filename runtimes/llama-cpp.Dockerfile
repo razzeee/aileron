@@ -14,7 +14,6 @@ ARG APT_PACKAGES="build-essential cmake git ninja-build"
 ARG CMAKE_ARGS=""
 ARG CUDA_DOCKER_ARCH=""
 ARG FORCE_CMAKE=""
-ARG HSA_OVERRIDE_GFX_VERSION=""
 ARG LDFLAGS=""
 ARG ROCM_PATH="/opt/rocm"
 
@@ -25,7 +24,6 @@ ENV LDFLAGS="${LDFLAGS}"
 ENV PIP_BREAK_SYSTEM_PACKAGES=1
 ENV ROCM_PATH="${ROCM_PATH}"
 ENV PATH="${ROCM_PATH}/bin:${PATH}"
-ENV HSA_OVERRIDE_GFX_VERSION="${HSA_OVERRIDE_GFX_VERSION}"
 
 RUN apt-get update && apt-get install -y --no-install-recommends ${APT_PACKAGES} \
     && rm -rf /var/lib/apt/lists/* \
@@ -52,11 +50,9 @@ ARG RUNTIME_DESCRIPTION="Aileron llama.cpp runtime for local inference."
 ARG ENTRYPOINT_PATH
 ARG RUNTIME_APT_PACKAGES="libgomp1"
 ARG ROCM_PATH="/opt/rocm"
-ARG HSA_OVERRIDE_GFX_VERSION=""
 
 ENV ROCM_PATH="${ROCM_PATH}"
 ENV PATH="${ROCM_PATH}/bin:${PATH}"
-ENV HSA_OVERRIDE_GFX_VERSION="${HSA_OVERRIDE_GFX_VERSION}"
 
 RUN apt-get update && apt-get install -y --no-install-recommends ${RUNTIME_APT_PACKAGES} \
     && rm -rf /var/lib/apt/lists/* \

@@ -414,7 +414,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resolves_detected_variant_with_cpu_fallback() {
+    fn resolves_detected_variant_without_cpu_fallback() {
         let runtime = RuntimeManifest {
             runtime_id: "llm-llama-cpp".to_string(),
             images: HashMap::from([
@@ -430,10 +430,7 @@ mod tests {
             manifests.resolve("llm-llama-cpp", Variant::Cuda),
             Some("example/llm:cuda")
         );
-        assert_eq!(
-            manifests.resolve("llm-llama-cpp", Variant::Vulkan),
-            Some("example/llm:cpu")
-        );
+        assert_eq!(manifests.resolve("llm-llama-cpp", Variant::Vulkan), None);
     }
 
     #[test]

@@ -793,7 +793,6 @@ fn runtime_config_json(
         add_device_mount(&mut mounts, "/dev/kfd");
         add_device_mount(&mut mounts, "/dev/dri");
         add_readonly_mount(&mut mounts, "/sys");
-        env.push("HSA_OVERRIDE_GFX_VERSION=10.3.0".to_string());
         env.push("N_GPU_LAYERS=-1".to_string());
         env.push("AILERON_DEVICE=rocm".to_string());
     } else if image_ref_uses_tag(image_ref, "vulkan") {
@@ -1388,7 +1387,11 @@ mod tests {
         assert_device_mount_has_no_nodev(&config, "/dev/kfd");
         assert_device_mount_has_no_nodev(&config, "/dev/dri");
         assert!(mount_destinations(&config).contains(&"/sys"));
-        assert!(env(&config).contains(&"HSA_OVERRIDE_GFX_VERSION=10.3.0"));
+        assert!(
+            !env(&config)
+                .iter()
+                .any(|item| item.starts_with("HSA_OVERRIDE_GFX_VERSION="))
+        );
         assert!(env(&config).contains(&"N_GPU_LAYERS=-1"));
         assert!(env(&config).contains(&"AILERON_DEVICE=rocm"));
     }

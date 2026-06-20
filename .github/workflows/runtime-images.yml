@@ -64,9 +64,8 @@ jobs:
               FINAL_IMAGE=rocm/dev-ubuntu-22.04:7.2.4
               RUNTIME_APT_PACKAGES=python3 libgomp1 hipblas-dev rocblas-dev
               APT_PACKAGES=python3 python3-pip python3-dev build-essential cmake git ninja-build hipblas-dev rocblas-dev
-              CMAKE_ARGS=-DGGML_HIP=on -DAMDGPU_TARGETS=gfx1030
+              CMAKE_ARGS=-DGGML_HIP=on -DAMDGPU_TARGETS=gfx1030;gfx1031;gfx1032;gfx1100;gfx1101;gfx1102;gfx1103;gfx1150;gfx1151;gfx1152;gfx1153
               FORCE_CMAKE=1
-              HSA_OVERRIDE_GFX_VERSION=10.3.0
               PIP_INSTALL_ARGS=--no-binary llama-cpp-python
               RUNTIME_ID=llm-llama-cpp
               RUNTIME_VARIANT=rocm
@@ -128,9 +127,8 @@ jobs:
               FINAL_IMAGE=rocm/dev-ubuntu-22.04:7.2.4
               RUNTIME_APT_PACKAGES=python3 libgomp1 hipblas-dev rocblas-dev
               APT_PACKAGES=python3 python3-pip python3-dev build-essential cmake git ninja-build hipblas-dev rocblas-dev
-              CMAKE_ARGS=-DGGML_HIP=on -DAMDGPU_TARGETS=gfx1030
+              CMAKE_ARGS=-DGGML_HIP=on -DAMDGPU_TARGETS=gfx1030;gfx1031;gfx1032;gfx1100;gfx1101;gfx1102;gfx1103;gfx1150;gfx1151;gfx1152;gfx1153
               FORCE_CMAKE=1
-              HSA_OVERRIDE_GFX_VERSION=10.3.0
               PIP_INSTALL_ARGS=--no-binary llama-cpp-python
               RUNTIME_ID=vision-llama-cpp-gemma4
               RUNTIME_VARIANT=rocm

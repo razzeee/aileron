@@ -8,9 +8,9 @@
 /// Detection order (highest priority first):
 ///   1. `AILERON_VARIANT` env var — explicit override
 ///   2. CUDA  — `nvidia-smi` reports a GPU
-///   3. ROCm  — `rocm-smi` reports a GPU
+///   3. ROCm  — ROCm userspace reports a GPU
 ///   4. Vulkan — `vulkaninfo` reports a device
-///   5. CPU   — fallback
+///   5. CPU   — no accelerator detected
 use tracing::info;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,9 +34,9 @@ impl Variant {
     pub fn fallback_tags(&self) -> &'static [&'static str] {
         match self {
             Variant::Cpu => &["cpu"],
-            Variant::Cuda => &["cuda", "vulkan", "cpu"],
-            Variant::Rocm => &["rocm", "vulkan", "cpu"],
-            Variant::Vulkan => &["vulkan", "cpu"],
+            Variant::Cuda => &["cuda", "vulkan"],
+            Variant::Rocm => &["rocm", "vulkan"],
+            Variant::Vulkan => &["vulkan"],
         }
     }
 }
@@ -126,23 +126,13 @@ fn has_cuda() -> bool {
 }
 
 fn has_rocm() -> bool {
-    has_rocm_device_node()
-        || run("rocm-smi", &["--showproductname"])
-            .map(|out| {
-                let lower = out.to_lowercase();
-                lower.contains("gpu") || lower.contains("radeon") || lower.contains("gfx")
-            })
-            .unwrap_or(false)
-}
-
-#[cfg(target_os = "linux")]
-fn has_rocm_device_node() -> bool {
-    std::path::Path::new("/dev/kfd").exists()
-}
-
-#[cfg(not(target_os = "linux"))]
-fn has_rocm_device_node() -> bool {
-    false
+    run("rocm-smi", &["--showproductname"])
+        .or_else(|| run("rocminfo", &[]))
+        .map(|out| {
+            let lower = out.to_lowercase();
+            lower.contains("gpu") || lower.contains("radeon") || lower.contains("gfx")
+        })
+        .unwrap_or(false)
 }
 
 fn has_vulkan() -> bool {

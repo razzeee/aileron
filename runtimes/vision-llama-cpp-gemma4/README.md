@@ -60,7 +60,7 @@ podman build \
     -f runtimes/llama-cpp.Dockerfile \
     --build-arg BASE_IMAGE=rocm/dev-ubuntu-22.04:7.2.4-complete \
     --build-arg APT_PACKAGES="python3 python3-pip python3-dev build-essential cmake git ninja-build" \
-    --build-arg CMAKE_ARGS="-DGGML_HIP=on" \
+    --build-arg CMAKE_ARGS="-DGGML_HIP=on -DAMDGPU_TARGETS=gfx1030;gfx1031;gfx1032;gfx1100;gfx1101;gfx1102;gfx1103;gfx1150;gfx1151;gfx1152;gfx1153" \
     --build-arg RUNTIME_ID=vision-llama-cpp-gemma4 \
     --build-arg ENTRYPOINT_PATH=runtimes/vision-llama-cpp-gemma4/entrypoint.py \
     --build-arg INSTALL_SOURCE=git \

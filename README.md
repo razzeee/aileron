@@ -619,11 +619,11 @@ The daemon probes the host once at startup and selects the best available runtim
 | Detection | Variant tag | How |
 |---|---|---|
 | `nvidia-smi` reports a GPU | `:cuda` | NVIDIA CUDA |
-| `rocm-smi` reports a GPU | `:rocm` | AMD ROCm |
+| `rocm-smi` or `rocminfo` reports a GPU | `:rocm` | AMD ROCm |
 | `vulkaninfo` reports a device | `:vulkan` | Any Vulkan GPU |
-| Nothing found | `:cpu` | CPU fallback |
+| Nothing found | `:cpu` | CPU-only runtime |
 
-Runtime manifests declare explicit runtime images per variant. If the detected variant is unsupported, the daemon may fall back to the runtime's CPU image. If the selected image is missing locally, availability reports unavailable. Override detection with `AILERON_VARIANT=cpu|cuda|rocm|vulkan`.
+Runtime manifests declare explicit runtime images per variant. If the detected CUDA or ROCm variant is unsupported, the daemon may fall back to a Vulkan image when present, but it does not fall back to CPU. If the selected accelerator image is missing locally, availability reports unavailable. Override detection with `AILERON_VARIANT=cpu|cuda|rocm|vulkan`.
 
 ## Container security
 

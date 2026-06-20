@@ -58,9 +58,8 @@ podman build \
     -f runtimes/llama-cpp.Dockerfile \
     --build-arg BASE_IMAGE=rocm/dev-ubuntu-22.04:7.2.4-complete \
     --build-arg APT_PACKAGES="python3 python3-pip python3-dev build-essential cmake git ninja-build" \
-    --build-arg CMAKE_ARGS="-DGGML_HIP=on -DAMDGPU_TARGETS=gfx1030" \
+    --build-arg CMAKE_ARGS="-DGGML_HIP=on -DAMDGPU_TARGETS=gfx1030;gfx1031;gfx1032;gfx1100;gfx1101;gfx1102;gfx1103;gfx1150;gfx1151;gfx1152;gfx1153" \
     --build-arg FORCE_CMAKE=1 \
-    --build-arg HSA_OVERRIDE_GFX_VERSION=10.3.0 \
     --build-arg PIP_INSTALL_ARGS="--no-binary llama-cpp-python" \
     --build-arg RUNTIME_ID=llm-llama-cpp \
     --build-arg ENTRYPOINT_PATH=runtimes/llm-llama-cpp/entrypoint.py \

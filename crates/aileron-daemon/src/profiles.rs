@@ -278,7 +278,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_image_for_prefers_vulkan_before_cpu_for_accelerators() {
+    fn runtime_image_for_uses_vulkan_fallback_for_accelerators() {
         let profile = profile_with_runtime_images(vec![
             RuntimeImage {
                 variant: "cpu".to_string(),
