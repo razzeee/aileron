@@ -850,3 +850,127 @@ impl ToolResultDbus {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hegel::TestCase;
+    use hegel::generators as gs;
+
+    #[hegel::test]
+    fn use_case_prefix_accepts_matching_interface_prefix(tc: TestCase) {
+        let (prefix, interface) = tc.draw(gs::sampled_from(vec![
+            ("language.", "Language"),
+            ("speech.", "Speech"),
+            ("vision.", "Vision"),
+        ]));
+        let suffix = tc.draw(gs::sampled_from(vec!["summarize", "translate", "describe"]));
+        let use_case = format!("{prefix}{suffix}");
+
+        assert!(ensure_use_case_prefix(&use_case, prefix, interface).is_ok());
+    }
+
+    #[hegel::test]
+    fn use_case_prefix_rejects_mismatched_interface_prefix(tc: TestCase) {
+        let (prefix, interface, use_case) = tc.draw(gs::sampled_from(vec![
+            ("language.", "Language", "speech.transcribe"),
+            ("speech.", "Speech", "vision.describe"),
+            ("vision.", "Vision", "language.summarize"),
+        ]));
+
+        let err = ensure_use_case_prefix(use_case, prefix, interface)
+            .expect_err("mismatched prefix should fail");
+
+        assert!(err.to_string().contains(interface));
+        assert!(err.to_string().contains(prefix));
+        assert!(err.to_string().contains(use_case));
+    }
+
+    #[hegel::test]
+    fn generation_options_conversion_preserves_generated_fields(tc: TestCase) {
+        let maximum_response_tokens = tc.draw(gs::integers::<i64>().min_value(1).max_value(4096));
+        let temperature_tenths = tc.draw(gs::integers::<i64>().min_value(0).max_value(20));
+        let sampling_mode = tc.draw(gs::sampled_from(vec![
+            "default".to_string(),
+            "greedy".to_string(),
+            "creative".to_string(),
+        ]));
+        let options = GenerationOptionsDbus {
+            maximum_response_tokens,
+            temperature: temperature_tenths as f64 / 10.0,
+            sampling_mode: sampling_mode.clone(),
+            source_language_hint: "en".to_string(),
+            target_language_hint: "es".to_string(),
+        };
+
+        let converted = options.into_varlink();
+
+        assert_eq!(converted.maximum_response_tokens, maximum_response_tokens);
+        assert_eq!(converted.temperature, temperature_tenths as f64 / 10.0);
+        assert_eq!(converted.sampling_mode, sampling_mode);
+        assert_eq!(converted.source_language_hint, "en");
+        assert_eq!(converted.target_language_hint, "es");
+    }
+
+    #[hegel::test]
+    fn guided_field_conversion_preserves_generated_fields(tc: TestCase) {
+        let required = tc.draw(gs::booleans());
+        let field = GuidedFieldDbus {
+            name: "answer".to_string(),
+            kind: "string".to_string(),
+            description: "generated answer".to_string(),
+            required,
+        };
+
+        let converted = field.into_varlink();
+
+        assert_eq!(converted.name, "answer");
+        assert_eq!(converted.kind, "string");
+        assert_eq!(converted.description, "generated answer");
+        assert_eq!(converted.required, required);
+    }
+
+    #[test]
+    fn tool_definition_and_result_conversion_preserve_fields() {
+        let definition = ToolDefinitionDbus {
+            name: "count".to_string(),
+            description: "Count things".to_string(),
+            schema_json: "{}".to_string(),
+        }
+        .into_varlink();
+        let result = ToolResultDbus {
+            id: "tool-1".to_string(),
+            content: "done".to_string(),
+            content_json: "{}".to_string(),
+        }
+        .into_varlink();
+
+        assert_eq!(definition.name, "count");
+        assert_eq!(definition.description, "Count things");
+        assert_eq!(definition.schema_json, "{}");
+        assert_eq!(result.id, "tool-1");
+        assert_eq!(result.content, "done");
+        assert_eq!(result.content_json, "{}");
+    }
+
+    #[test]
+    fn tool_call_conversion_preserves_varlink_fields() {
+        let call = ToolCallDbus::from_varlink(aileron_varlink::aileron_Inference::ToolCall {
+            id: "tool-1".to_string(),
+            name: "count".to_string(),
+            arguments_json: "{}".to_string(),
+        });
+
+        assert_eq!(call.id, "tool-1");
+        assert_eq!(call.name, "count");
+        assert_eq!(call.arguments_json, "{}");
+    }
+
+    #[test]
+    fn permission_denied_detection_matches_error_text() {
+        assert!(is_permission_denied(&"aileron.Inference.PermissionDenied"));
+        assert!(!is_permission_denied(
+            &"aileron.Inference.ProfileUnavailable"
+        ));
+    }
+}

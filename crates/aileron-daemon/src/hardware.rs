@@ -170,6 +170,20 @@ fn has_dri_render_node_in(dir: &std::path::Path) -> bool {
 mod tests {
     #[cfg(target_os = "linux")]
     use super::*;
+    use hegel::TestCase;
+    use hegel::generators as gs;
+
+    #[hegel::test]
+    fn fallback_tags_always_include_detected_variant(tc: TestCase) {
+        let variant = tc.draw(gs::sampled_from(vec![
+            Variant::Cpu,
+            Variant::Cuda,
+            Variant::Rocm,
+            Variant::Vulkan,
+        ]));
+
+        assert!(variant.fallback_tags().contains(&variant.as_tag()));
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

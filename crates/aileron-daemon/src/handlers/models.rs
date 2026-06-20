@@ -2034,6 +2034,8 @@ async fn download_artifacts_to_temp(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hegel::TestCase;
+    use hegel::generators as gs;
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
 
@@ -2060,6 +2062,32 @@ mod tests {
         assert!(profile_supports_use_case(&profile, "language.summarize"));
         assert!(profile_supports_use_case(&profile, "language.embed"));
         assert!(!profile_supports_use_case(&profile, "vision.describe"));
+    }
+
+    #[hegel::test]
+    fn profile_supports_exactly_generated_declared_use_cases(tc: TestCase) {
+        let declared = tc.draw(
+            gs::vecs(gs::sampled_from(vec![
+                "language.summarize".to_string(),
+                "language.extract".to_string(),
+                "speech.transcribe".to_string(),
+                "vision.describe".to_string(),
+            ]))
+            .max_size(4),
+        );
+        let requested = tc.draw(gs::sampled_from(vec![
+            "language.summarize".to_string(),
+            "language.extract".to_string(),
+            "speech.transcribe".to_string(),
+            "vision.describe".to_string(),
+        ]));
+        let declared_refs = declared.iter().map(String::as_str).collect::<Vec<_>>();
+        let profile = profile_with_use_cases(&declared_refs);
+
+        assert_eq!(
+            profile_supports_use_case(&profile, &requested),
+            declared.iter().any(|use_case| use_case == &requested)
+        );
     }
 
     #[test]
@@ -2108,6 +2136,34 @@ mod tests {
 
         assert!(usage.used_by(&cpu).is_empty());
         assert_eq!(usage.used_by(&vulkan), vec!["whisper".to_string()]);
+    }
+
+    #[test]
+    fn runtime_image_match_refs_filters_and_dedupes_names() {
+        let image = StoredRuntimeImage {
+            image_id: "image".to_string(),
+            image_ref: "example/runtime:cpu".to_string(),
+            names: vec![
+                "<none>:<none>".to_string(),
+                "example/runtime:cpu".to_string(),
+                "localhost/runtime:cpu".to_string(),
+                "localhost/runtime:cpu".to_string(),
+                String::new(),
+            ],
+            runtime_id: "runtime".to_string(),
+            variant: "cpu".to_string(),
+            digest: None,
+            size_bytes: 1,
+            source: "user".to_string(),
+        };
+
+        assert_eq!(
+            image.match_refs(),
+            vec![
+                "example/runtime:cpu".to_string(),
+                "localhost/runtime:cpu".to_string()
+            ]
+        );
     }
 
     #[test]
@@ -2242,6 +2298,54 @@ mod tests {
         assert!(!remote_tag_is_checkable("ghcr.io/example/runtime"));
     }
 
+    #[hegel::test]
+    fn remote_tag_check_accepts_generated_remote_tagged_refs(tc: TestCase) {
+        let registry = tc.draw(gs::sampled_from(vec![
+            "ghcr.io".to_string(),
+            "registry.example:5000".to_string(),
+        ]));
+        let runtime = tc.draw(gs::sampled_from(vec![
+            "llm".to_string(),
+            "asr".to_string(),
+            "vision".to_string(),
+        ]));
+        let tag = tc.draw(gs::sampled_from(vec![
+            "cpu".to_string(),
+            "cuda".to_string(),
+            "rocm".to_string(),
+            "vulkan".to_string(),
+        ]));
+
+        assert!(remote_tag_is_checkable(&format!(
+            "{registry}/example/{runtime}:{tag}"
+        )));
+    }
+
+    #[hegel::test]
+    fn remote_tag_check_rejects_generated_local_digest_and_untagged_refs(tc: TestCase) {
+        let runtime = tc.draw(gs::sampled_from(vec![
+            "llm".to_string(),
+            "asr".to_string(),
+            "vision".to_string(),
+        ]));
+        let tag = tc.draw(gs::sampled_from(vec![
+            "cpu".to_string(),
+            "cuda".to_string(),
+            "rocm".to_string(),
+            "vulkan".to_string(),
+        ]));
+
+        assert!(!remote_tag_is_checkable(&format!(
+            "localhost/{runtime}:{tag}"
+        )));
+        assert!(!remote_tag_is_checkable(&format!(
+            "ghcr.io/example/{runtime}@sha256:abc"
+        )));
+        assert!(!remote_tag_is_checkable(&format!(
+            "ghcr.io/example/{runtime}"
+        )));
+    }
+
     #[test]
     fn remote_tag_runtime_status_does_not_report_update_without_remote_check() {
         let image = StoredRuntimeImage {
@@ -2285,6 +2389,18 @@ mod tests {
         assert_eq!(skopeo_progress_percent("Copying blob abc 42%"), Some(42));
         assert_eq!(skopeo_progress_percent("Copying blob abc 42.6%"), Some(43));
         assert_eq!(skopeo_progress_percent("Copying blob abc"), None);
+    }
+
+    #[hegel::test]
+    fn skopeo_progress_percent_rounds_and_clamps_generated_values(tc: TestCase) {
+        let tenths = tc.draw(gs::integers::<i64>().min_value(0).max_value(1500));
+        let percent = tenths as f64 / 10.0;
+        let expected = percent.round().clamp(0.0, 100.0) as u64;
+
+        assert_eq!(
+            skopeo_progress_percent(&format!("Copying blob sha256:abc {percent:.1}%")),
+            Some(expected)
+        );
     }
 
     #[test]
@@ -2419,6 +2535,51 @@ Writing manifest to image destination\n";
         assert_eq!(
             image_ref_with_digest("runtime:cpu", "sha256:def"),
             Some("runtime@sha256:def".to_string())
+        );
+    }
+
+    #[test]
+    fn transport_ref_preserves_explicit_transport_and_wraps_plain_refs() {
+        assert_eq!(
+            transport_ref("docker://ghcr.io/example/runtime:cpu"),
+            "docker://ghcr.io/example/runtime:cpu"
+        );
+        assert_eq!(
+            transport_ref("ghcr.io/example/runtime:cpu"),
+            "docker://ghcr.io/example/runtime:cpu"
+        );
+    }
+
+    #[test]
+    fn runtime_download_key_prefixes_image_ref() {
+        assert_eq!(
+            runtime_download_key("ghcr.io/example/runtime:cpu"),
+            "runtime:ghcr.io/example/runtime:cpu"
+        );
+    }
+
+    #[hegel::test]
+    fn image_ref_with_digest_replaces_generated_tag_after_last_slash(tc: TestCase) {
+        let registry = tc.draw(gs::sampled_from(vec![
+            "ghcr.io".to_string(),
+            "registry.example:5000".to_string(),
+        ]));
+        let name = tc.draw(gs::sampled_from(vec![
+            "runtime".to_string(),
+            "aileron-runtime-llm".to_string(),
+        ]));
+        let tag = tc.draw(gs::sampled_from(vec![
+            "cpu".to_string(),
+            "cuda".to_string(),
+        ]));
+        let digest = tc.draw(gs::sampled_from(vec![
+            "sha256:abc".to_string(),
+            "sha256:def".to_string(),
+        ]));
+
+        assert_eq!(
+            image_ref_with_digest(&format!("{registry}/ns/{name}:{tag}"), &digest),
+            Some(format!("{registry}/ns/{name}@{digest}"))
         );
     }
 

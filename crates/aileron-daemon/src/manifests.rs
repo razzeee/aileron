@@ -412,6 +412,8 @@ fn validate_non_empty(field: &str, value: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hegel::TestCase;
+    use hegel::generators as gs;
 
     #[test]
     fn resolves_detected_variant_without_cpu_fallback() {
@@ -454,6 +456,135 @@ mod tests {
             manifests.resolve("asr-whisper-cpp", Variant::Cuda),
             Some("example/asr:vulkan")
         );
+    }
+
+    #[test]
+    fn load_from_dirs_reads_runtime_manifests_and_sorts_results() {
+        let dir = test_dir("runtime-manifest-load");
+        let runtimes_dir = dir.join("runtimes");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&runtimes_dir).expect("create runtimes dir");
+        std::fs::write(
+            runtimes_dir.join("z-runtime.json"),
+            r#"{"runtime_id":"z-runtime","images":{"vulkan":"example/z:vulkan","cpu":"example/z:cpu"}}"#,
+        )
+        .expect("write runtime manifest");
+        std::fs::write(
+            runtimes_dir.join("a-runtime.json"),
+            r#"{"runtime_id":"a-runtime","images":{"cpu":"example/a:cpu"}}"#,
+        )
+        .expect("write runtime manifest");
+        std::fs::write(runtimes_dir.join("ignored.txt"), "not json").expect("write ignored file");
+
+        let store = RuntimeManifestStore::load_from_dirs(vec![dir.clone()]).expect("load runtimes");
+        let all = store.all();
+
+        assert_eq!(
+            all.iter()
+                .map(|runtime| runtime.runtime_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a-runtime", "z-runtime"]
+        );
+        assert_eq!(
+            store
+                .images_for("z-runtime")
+                .into_iter()
+                .map(|image| image.variant)
+                .collect::<Vec<_>>(),
+            vec!["cpu", "vulkan"]
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn model_manifest_into_profile_preserves_install_fields() {
+        let manifest = ModelManifest {
+            profile_id: "profile".to_string(),
+            model_id: "model".to_string(),
+            llmfit_model_id: "llmfit".to_string(),
+            runtime_id: "runtime".to_string(),
+            runtime_options: HashMap::from([("VISION_HANDLER".to_string(), "gemma4".to_string())]),
+            tier: "balanced".to_string(),
+            disk_size_gb: 1.0,
+            min_ram_gb: 2.0,
+            runtime_images: vec![RuntimeImage {
+                variant: "cpu".to_string(),
+                image_ref: "example/runtime:cpu".to_string(),
+            }],
+            use_cases: vec!["vision.describe".to_string()],
+            specializations: vec!["ocr".to_string()],
+            artifacts: vec![ManifestArtifact {
+                role: "model".to_string(),
+                url: "https://example.invalid/model.gguf".to_string(),
+                filename: "model.gguf".to_string(),
+                sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .to_string(),
+                size_bytes: 123,
+            }],
+        };
+        let artifact_path = PathBuf::from("/tmp/model");
+
+        let profile = manifest.into_profile(artifact_path.clone());
+
+        assert_eq!(profile.profile_id, "profile");
+        assert_eq!(profile.artifact_path, artifact_path);
+        assert_eq!(profile.runtime_options["VISION_HANDLER"], "gemma4");
+        assert_eq!(profile.artifact_hashes[0].filename, "model.gguf");
+        assert_eq!(profile.source, "user");
+        assert!(!profile.installed_at.is_empty());
+    }
+
+    #[hegel::test]
+    fn resolve_uses_first_available_variant_fallback(tc: TestCase) {
+        let requested = tc.draw(gs::sampled_from(vec![
+            Variant::Cpu,
+            Variant::Cuda,
+            Variant::Rocm,
+            Variant::Vulkan,
+        ]));
+        let available = tc.draw(
+            gs::vecs(gs::sampled_from(vec![
+                "cpu".to_string(),
+                "cuda".to_string(),
+                "rocm".to_string(),
+                "vulkan".to_string(),
+            ]))
+            .max_size(4),
+        );
+        let runtime = RuntimeManifest {
+            runtime_id: "runtime".to_string(),
+            images: available
+                .iter()
+                .map(|tag| (tag.clone(), format!("example/runtime:{tag}")))
+                .collect(),
+        };
+        let manifests = RuntimeManifestStore {
+            runtimes: HashMap::from([("runtime".to_string(), runtime)]),
+        };
+        let expected = requested
+            .fallback_tags()
+            .iter()
+            .find(|tag| available.iter().any(|available| available == *tag))
+            .map(|tag| format!("example/runtime:{tag}"));
+
+        assert_eq!(manifests.resolve("runtime", requested), expected.as_deref());
+    }
+
+    #[hegel::test]
+    fn accepts_64_character_hex_sha256_values(tc: TestCase) {
+        let value = tc.draw(gs::integers::<u64>());
+        let sha256 = format!("{value:064x}");
+
+        validate_sha256(&sha256).expect("generated sha256 should be valid");
+    }
+
+    #[hegel::test]
+    fn rejects_wrong_length_sha256_values(tc: TestCase) {
+        let len = tc.draw(gs::integers::<usize>().max_value(63));
+        let sha256 = "a".repeat(len);
+
+        assert!(validate_sha256(&sha256).is_err());
     }
 
     #[test]
@@ -758,5 +889,13 @@ mod tests {
         let err = parse_model_manifest_json(data).expect_err("unknown tier should fail");
 
         assert!(err.to_string().contains("unsupported model tier"));
+    }
+
+    fn test_dir(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "aileron-{name}-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ))
     }
 }

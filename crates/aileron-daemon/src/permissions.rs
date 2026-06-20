@@ -118,6 +118,8 @@ impl PermissionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hegel::TestCase;
+    use hegel::generators as gs;
 
     #[test]
     fn denied_first_use_is_listed_for_later_approval() {
@@ -129,6 +131,28 @@ mod tests {
             store.check("org.aileron.Demo", "language.extract"),
             Some(false)
         );
+    }
+
+    #[hegel::test]
+    fn denied_first_use_round_trips_generated_permission_key(tc: TestCase) {
+        let app_id = tc.draw(gs::sampled_from(vec![
+            "org.aileron.Demo".to_string(),
+            "org.example.App".to_string(),
+            "dev.test.Client".to_string(),
+        ]));
+        let use_case = tc.draw(gs::sampled_from(vec![
+            "language.extract".to_string(),
+            "speech.transcribe".to_string(),
+            "vision.describe".to_string(),
+        ]));
+        let mut store = PermissionStore::default();
+
+        assert!(store.insert_denied_if_missing(&app_id, &use_case));
+
+        assert_eq!(store.check(&app_id, &use_case), Some(false));
+        assert_eq!(store.list().len(), 1);
+        assert_eq!(store.list()[0].0, app_id);
+        assert_eq!(store.list()[0].1, use_case);
     }
 
     #[test]
@@ -147,6 +171,26 @@ mod tests {
         assert_eq!(
             store.check("org.aileron.Demo", "language.extract"),
             Some(true)
+        );
+    }
+
+    #[hegel::test]
+    fn denied_first_use_preserves_generated_existing_decision(tc: TestCase) {
+        let allowed = tc.draw(gs::booleans());
+        let mut store = PermissionStore::default();
+        store.0.insert(
+            PermissionStore::key("org.aileron.Demo", "language.extract"),
+            PermissionEntry {
+                allowed,
+                last_used: None,
+            },
+        );
+
+        assert!(!store.insert_denied_if_missing("org.aileron.Demo", "language.extract"));
+
+        assert_eq!(
+            store.check("org.aileron.Demo", "language.extract"),
+            Some(allowed)
         );
     }
 }

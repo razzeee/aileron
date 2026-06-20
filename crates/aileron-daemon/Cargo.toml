@@ -30,6 +30,7 @@ ocirender       = { workspace = true }
 
 [dev-dependencies]
 criterion = "0.7"
+hegeltest = { workspace = true }
 tempfile = "3"
 
 [[bench]]

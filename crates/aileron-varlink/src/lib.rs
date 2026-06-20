@@ -64,6 +64,9 @@ pub use aileron_Sessions as sessions;
 
 #[cfg(test)]
 mod tests {
+    use hegel::TestCase;
+    use hegel::generators as gs;
+
     #[test]
     fn catalog_profile_info_accepts_missing_license() {
         let profile: crate::aileron_Models::CatalogProfileInfo =
@@ -88,5 +91,44 @@ mod tests {
             .expect("missing spdx_license should decode from older daemons");
 
         assert_eq!(profile.spdx_license, None);
+    }
+
+    #[hegel::test]
+    fn catalog_profile_info_decodes_optional_license(tc: TestCase) {
+        let include_license = tc.draw(gs::booleans());
+        let license = tc.draw(gs::sampled_from(vec![
+            "MIT".to_string(),
+            "Apache-2.0".to_string(),
+            "GPL-3.0-or-later".to_string(),
+        ]));
+        let mut value = serde_json::json!({
+            "profile_id": "profile",
+            "model_id": "model",
+            "llmfit_model_id": "",
+            "runtime_id": "llm-llama-cpp",
+            "tier": "balanced",
+            "disk_size_gb": 1.0,
+            "min_ram_gb": 1.0,
+            "recommended_ram_gb": 1.0,
+            "min_vram_gb": 0.0,
+            "fit_score": 0.0,
+            "use_case_fit_scores": [],
+            "fit_level": "recommended",
+            "recommended": true,
+            "installing": false,
+            "recommendation_reason": "test",
+            "use_cases": ["language.extract"]
+        });
+        if include_license {
+            value["spdx_license"] = serde_json::Value::String(license.clone());
+        }
+
+        let profile: crate::aileron_Models::CatalogProfileInfo =
+            serde_json::from_value(value).expect("catalog profile should decode");
+
+        assert_eq!(
+            profile.spdx_license.as_deref(),
+            include_license.then_some(license.as_str())
+        );
     }
 }

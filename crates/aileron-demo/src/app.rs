@@ -3927,7 +3927,11 @@ fn base64_encode(data: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{concise_error, execute_count_tool};
+    use super::{
+        DemoMode, base64_encode, concise_error, execute_count_tool, parse_guided_tool_loop_response,
+    };
+    use hegel::TestCase;
+    use hegel::generators as gs;
 
     #[test]
     fn explains_missing_portal_systemd_unit() {
@@ -3960,6 +3964,30 @@ mod tests {
         assert_eq!(result["count"], 5);
     }
 
+    #[hegel::test]
+    fn count_tool_counts_generated_structured_arguments(tc: TestCase) {
+        let mut chars =
+            tc.draw(gs::vecs(gs::sampled_from(vec!['a', 'b', 'e', 'r', 'z'])).max_size(32));
+        if chars.is_empty() {
+            chars.push('r');
+        }
+        let word = chars.iter().collect::<String>();
+        let character = tc.draw(gs::sampled_from(vec!['a', 'b', 'e', 'r', 'z']));
+        let arguments = serde_json::json!({
+            "word": word,
+            "character": character.to_string(),
+        })
+        .to_string();
+
+        let result =
+            execute_count_tool("ignored prompt", &arguments).expect("count tool should run");
+        let expected = word.chars().filter(|ch| *ch == character).count() as u64;
+
+        assert_eq!(result["word"], word);
+        assert_eq!(result["character"], character.to_string());
+        assert_eq!(result["count"].as_u64(), Some(expected));
+    }
+
     #[test]
     fn count_tool_falls_back_to_prompt_for_stub_arguments() {
         let result = execute_count_tool(
@@ -3971,5 +3999,65 @@ mod tests {
         assert_eq!(result["word"], "strawrberrry");
         assert_eq!(result["character"], "r");
         assert_eq!(result["count"], 5);
+    }
+
+    #[hegel::test]
+    fn guided_tool_loop_stub_fields_are_inferred_from_prompt(tc: TestCase) {
+        let word = tc.draw(gs::sampled_from(vec![
+            "strawberry".to_string(),
+            "raspberry".to_string(),
+            "cranberry".to_string(),
+        ]));
+        let character = tc.draw(gs::sampled_from(vec!['r', 'e', 'a']));
+        let prompt = format!("How many times does the letter {character} occur in {word}?");
+        let response = parse_guided_tool_loop_response(
+            r#"{"action":"call_tool","tool_name":"stub","word":"stub","character":"stub","answer":""}"#,
+            &prompt,
+            false,
+        )
+        .expect("stub response should be repaired");
+
+        assert_eq!(response.action, "call_tool");
+        assert_eq!(response.tool_name, "count_character_occurrences");
+        assert_eq!(response.word, word);
+        assert_eq!(response.character, character.to_string());
+    }
+
+    #[hegel::test]
+    fn base64_encoding_uses_expected_length_alphabet_and_padding(tc: TestCase) {
+        let data = tc.draw(gs::binary().max_size(128));
+        let encoded = base64_encode(&data);
+
+        assert_eq!(encoded.len(), data.len().div_ceil(3) * 4);
+        assert!(
+            encoded
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '+' || ch == '/' || ch == '=')
+        );
+        match data.len() % 3 {
+            0 => assert!(!encoded.ends_with('=')),
+            1 => assert!(encoded.ends_with("==")),
+            2 => assert!(encoded.ends_with('=')),
+            _ => unreachable!(),
+        }
+    }
+
+    #[hegel::test]
+    fn demo_prompts_include_generated_input_prefix(tc: TestCase) {
+        let mode = match tc.draw(gs::integers::<u8>().max_value(5)) {
+            0 => DemoMode::Summarize,
+            1 => DemoMode::Translate,
+            2 => DemoMode::Rephrase,
+            3 => DemoMode::Classify,
+            4 => DemoMode::Extract,
+            _ => DemoMode::Analyze,
+        };
+        let text = tc.draw(gs::sampled_from(vec![
+            "short input".to_string(),
+            "local models should stay private".to_string(),
+            "Aileron routes tasks by use-case".to_string(),
+        ]));
+
+        assert!(mode.prompt(&text).contains(&text));
     }
 }
