@@ -2,7 +2,7 @@
 use gtk4::prelude::*;
 use gtk4::{Button, ListBox, ScrolledWindow};
 use libadwaita::prelude::*;
-use libadwaita::{ActionRow, PreferencesGroup, PreferencesPage};
+use libadwaita::{ActionRow, AlertDialog, PreferencesGroup, PreferencesPage};
 use relm4::{ComponentParts, ComponentSender, SimpleComponent};
 
 pub struct ActivityPage;
@@ -53,7 +53,7 @@ impl SimpleComponent for ActivityPage {
 
 fn build_page(page: &PreferencesPage, sender: ComponentSender<ActivityPage>) -> ListBox {
     let group = PreferencesGroup::new();
-    group.set_title("Active Sessions");
+    group.set_title("Active sessions");
     group.set_description(Some("Refreshes automatically every 2 seconds."));
 
     let list_box = ListBox::new();
@@ -89,7 +89,8 @@ fn refresh_sessions(list_box: &ListBox) {
         Ok(_c) => _c,
         Err(_) => {
             let row = ActionRow::new();
-            row.set_title("Daemon not reachable");
+            row.set_title("Sessions unavailable");
+            row.set_subtitle("Start aileron-daemon, then refresh this page.");
             list_box.append(&row);
             return;
         }
@@ -114,13 +115,9 @@ fn refresh_sessions(list_box: &ListBox) {
                 kill_btn.set_valign(gtk4::Align::Center);
                 let session_id = session.session_id.clone();
                 let list_box_ref = list_box.clone();
-                kill_btn.connect_clicked(move |_| {
-                    use aileron_varlink::aileron_Sessions::VarlinkClientInterface;
-                    if let Ok(conn) = aileron_ipc::client::connect() {
-                        let mut c = aileron_varlink::aileron_Sessions::VarlinkClient::new(conn);
-                        let _ = c.kill_session(session_id.clone()).call();
-                    }
-                    refresh_sessions(&list_box_ref);
+                kill_btn.connect_clicked(move |btn| {
+                    let window = btn.root().and_then(|r| r.downcast::<gtk4::Window>().ok());
+                    confirm_kill_session(&session_id, &list_box_ref, window.as_ref());
                 });
                 row.add_suffix(&kill_btn);
                 list_box.append(&row);
@@ -128,8 +125,34 @@ fn refresh_sessions(list_box: &ListBox) {
         }
         Err(_) => {
             let row = ActionRow::new();
-            row.set_title("No active sessions");
+            row.set_title("Sessions unavailable");
             list_box.append(&row);
         }
     }
+}
+
+fn confirm_kill_session(session_id: &str, list_box: &ListBox, window: Option<&gtk4::Window>) {
+    let dialog = AlertDialog::builder()
+        .heading("Kill session?")
+        .body("This immediately stops the selected app session.")
+        .build();
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("kill", "Kill");
+    dialog.set_response_appearance("kill", libadwaita::ResponseAppearance::Destructive);
+    dialog.set_close_response("cancel");
+
+    let session_id = session_id.to_string();
+    let list_box = list_box.clone();
+    dialog.connect_response(None, move |_, response| {
+        if response != "kill" {
+            return;
+        }
+        use aileron_varlink::aileron_Sessions::VarlinkClientInterface;
+        if let Ok(conn) = aileron_ipc::client::connect() {
+            let mut c = aileron_varlink::aileron_Sessions::VarlinkClient::new(conn);
+            let _ = c.kill_session(session_id.clone()).call();
+        }
+        refresh_sessions(&list_box);
+    });
+    dialog.present(window);
 }

@@ -50,7 +50,7 @@ impl SimpleComponent for PermissionsPage {
 
 fn build_page(page: &PreferencesPage) -> ListBox {
     let group = PreferencesGroup::new();
-    group.set_title("App Permissions");
+    group.set_title("App permissions");
 
     let list_box = ListBox::new();
     list_box.set_selection_mode(gtk4::SelectionMode::None);
@@ -78,7 +78,8 @@ fn refresh_permissions(list_box: &ListBox) {
         Ok(c) => c,
         Err(e) => {
             let row = ActionRow::new();
-            row.set_title(&format!("Error: {e}"));
+            row.set_title("Permissions unavailable");
+            row.set_subtitle(&e.to_string());
             list_box.append(&row);
             return;
         }
@@ -125,7 +126,8 @@ fn refresh_permissions(list_box: &ListBox) {
         }
         Err(e) => {
             let row = ActionRow::new();
-            row.set_title(&format!("Error: {e}"));
+            row.set_title("Permissions unavailable");
+            row.set_subtitle(&e.to_string());
             list_box.append(&row);
         }
     }

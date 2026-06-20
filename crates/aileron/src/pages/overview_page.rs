@@ -119,7 +119,7 @@ impl SimpleComponent for OverviewPage {
 
 fn build_page(page: &PreferencesPage, sender: ComponentSender<OverviewPage>) -> OverviewWidgets {
     let group = PreferencesGroup::new();
-    group.set_title("Operations Overview");
+    group.set_title("Operations overview");
     group.set_description(Some(
         "A status-first snapshot of model readiness, downloads, runtimes, permissions, and sessions.",
     ));

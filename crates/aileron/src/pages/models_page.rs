@@ -5,12 +5,11 @@ use std::rc::Rc;
 
 use aileron_varlink::aileron_Models::InstallStatus;
 use gtk4::prelude::*;
-use gtk4::{
-    Box, Button, CheckButton, Entry, Grid, Label, ListBox, Orientation, ProgressBar,
-    ScrolledWindow, ToggleButton,
-};
+use gtk4::{Box, Button, CheckButton, Label, ListBox, Orientation, ProgressBar, ScrolledWindow};
 use libadwaita::prelude::*;
-use libadwaita::{ActionRow, AlertDialog, PreferencesGroup, ViewStack};
+use libadwaita::{
+    ActionRow, AlertDialog, EntryRow, PreferencesGroup, ViewStack, ViewSwitcher, ViewSwitcherPolicy,
+};
 use relm4::{ComponentParts, ComponentSender, SimpleComponent};
 
 const USE_CASES: &[&str] = &[
@@ -74,9 +73,12 @@ fn build_widget(runtime_images_changed: Rc<dyn Fn()>) -> gtk4::Widget {
     stack.set_hexpand(true);
     stack.set_vexpand(true);
 
-    let nav = Box::new(Orientation::Horizontal, 6);
-    nav.set_halign(gtk4::Align::Center);
-    root.append(&nav);
+    let switcher = ViewSwitcher::builder()
+        .stack(&stack)
+        .policy(ViewSwitcherPolicy::Wide)
+        .halign(gtk4::Align::Center)
+        .build();
+    root.append(&switcher);
     root.append(&stack);
 
     let tasks_page = Box::new(Orientation::Vertical, 12);
@@ -94,9 +96,9 @@ fn build_widget(runtime_images_changed: Rc<dyn Fn()>) -> gtk4::Widget {
 
     // ── Installed profiles group ──────────────────────────────────────────────
     let models_group = PreferencesGroup::new();
-    models_group.set_title("Installed Profiles");
+    models_group.set_title("Installed profiles");
 
-    let import_button = Button::with_label("Add Profile...");
+    let import_button = Button::with_label("Add profile...");
     import_button.add_css_class("suggested-action");
 
     let header = Box::new(Orientation::Horizontal, 8);
@@ -108,7 +110,7 @@ fn build_widget(runtime_images_changed: Rc<dyn Fn()>) -> gtk4::Widget {
     list_box.add_css_class("boxed-list");
 
     let readiness_group = PreferencesGroup::new();
-    readiness_group.set_title("Task Readiness");
+    readiness_group.set_title("Task readiness");
     readiness_group.set_description(Some(
         "Install and assign one profile for each task you want apps to use.",
     ));
@@ -118,7 +120,7 @@ fn build_widget(runtime_images_changed: Rc<dyn Fn()>) -> gtk4::Widget {
     readiness_box.add_css_class("boxed-list");
 
     let library_group = PreferencesGroup::new();
-    library_group.set_title("Profile Library");
+    library_group.set_title("Profile library");
     library_group.set_description(Some(
         "Install manifest-backed profiles. Nothing is downloaded until you click Install.",
     ));
@@ -193,44 +195,15 @@ fn build_widget(runtime_images_changed: Rc<dyn Fn()>) -> gtk4::Widget {
         start_install_poll(&lists);
     }
 
-    stack.add_titled(&tasks_page, Some("tasks"), "Tasks");
-    stack.add_titled(&library_page, Some("profile-library"), "Profile Library");
-    stack.add_titled(&installed_page, Some("installed"), "Installed");
-
-    let tasks_button = nav_button("Tasks", "tasks", &stack, None);
-    tasks_button.set_active(true);
-    nav.append(&tasks_button);
-    let library_button = nav_button(
-        "Profile Library",
-        "profile-library",
-        &stack,
-        Some(&tasks_button),
-    );
-    nav.append(&library_button);
-    let installed_button = nav_button("Installed", "installed", &stack, Some(&tasks_button));
-    nav.append(&installed_button);
+    let tasks_page = stack.add_titled(&tasks_page, Some("tasks"), "Tasks");
+    tasks_page.set_icon_name(Some("checkbox-checked-symbolic"));
+    let library_page = stack.add_titled(&library_page, Some("profile-library"), "Library");
+    library_page.set_icon_name(Some("folder-symbolic"));
+    let installed_page = stack.add_titled(&installed_page, Some("installed"), "Installed");
+    installed_page.set_icon_name(Some("view-list-symbolic"));
+    stack.set_visible_child_name("tasks");
 
     root.upcast()
-}
-
-fn nav_button(
-    label: &str,
-    page_name: &'static str,
-    stack: &ViewStack,
-    group: Option<&ToggleButton>,
-) -> ToggleButton {
-    let button = ToggleButton::with_label(label);
-    button.add_css_class("flat");
-    if let Some(group) = group {
-        button.set_group(Some(group));
-    }
-    let stack = stack.clone();
-    button.connect_toggled(move |button| {
-        if button.is_active() {
-            stack.set_visible_child_name(page_name);
-        }
-    });
-    button
 }
 
 #[derive(Clone)]
@@ -300,51 +273,29 @@ struct CatalogProfileDetails {
     use_cases: Vec<String>,
 }
 
-fn form_entry(title: &str, placeholder: &str) -> (Box, Entry) {
-    let row = Box::new(Orientation::Vertical, 4);
-    let label = Label::new(Some(title));
-    label.set_halign(gtk4::Align::Start);
-    label.add_css_class("heading");
-    let entry = Entry::builder()
-        .placeholder_text(placeholder)
-        .hexpand(true)
-        .build();
-    row.append(&label);
-    row.append(&entry);
-    (row, entry)
+fn form_entry(title: &str) -> EntryRow {
+    EntryRow::builder().title(title).build()
 }
 
 fn show_url_install_dialog(window: Option<&gtk4::Window>, lists: ModelLists) {
     let runtimes = available_runtime_ids();
-    let runtime_row = Box::new(Orientation::Vertical, 4);
-    let runtime_label = Label::new(Some("Runtime"));
-    runtime_label.set_halign(gtk4::Align::Start);
-    runtime_label.add_css_class("heading");
-    let runtime_id = Entry::builder()
-        .placeholder_text("llm-llama-cpp")
-        .hexpand(true)
-        .build();
+    let runtime_id = form_entry("Runtime");
     if let Some(runtime) = runtimes.first() {
         runtime_id.set_text(runtime);
     }
-    runtime_row.append(&runtime_label);
-    runtime_row.append(&runtime_id);
 
-    let (url_row, url) = form_entry("Model file URL", "https://example.com/path/model.gguf");
-    let (sha_row, sha256) = form_entry("SHA-256", "...");
-    let (mmproj_url_row, mmproj_url) = form_entry(
-        "Vision projector URL (optional)",
-        "https://example.com/path/mmproj.gguf",
-    );
-    let (mmproj_sha_row, mmproj_sha256) = form_entry("Vision projector SHA-256", "...");
+    let url = form_entry("Model file URL");
+    let sha256 = form_entry("SHA-256");
+    let mmproj_url = form_entry("Vision projector URL (optional)");
+    let mmproj_sha256 = form_entry("Vision projector SHA-256 (optional)");
 
-    let use_case_grid = Grid::builder().column_spacing(18).row_spacing(8).build();
+    let use_case_box = Box::new(Orientation::Vertical, 6);
     let use_case_checks: Vec<(CheckButton, &str)> = USE_CASES
         .iter()
-        .enumerate()
-        .map(|(index, &use_case)| {
+        .map(|&use_case| {
             let check = CheckButton::with_label(use_case);
-            use_case_grid.attach(&check, (index % 2) as i32, (index / 2) as i32, 1, 1);
+            check.set_halign(gtk4::Align::Start);
+            use_case_box.append(&check);
             (check, use_case)
         })
         .collect();
@@ -358,25 +309,26 @@ fn show_url_install_dialog(window: Option<&gtk4::Window>, lists: ModelLists) {
     runtime_hint.set_xalign(0.0);
     runtime_hint.add_css_class("dim-label");
 
-    let fields = Box::new(Orientation::Vertical, 12);
-    fields.set_margin_top(12);
+    let fields = Box::new(Orientation::Vertical, 18);
+    fields.set_margin_top(6);
     fields.set_margin_bottom(6);
-    fields.set_margin_start(6);
-    fields.set_margin_end(6);
-    fields.append(&runtime_row);
+
+    let form_group = PreferencesGroup::new();
+    form_group.add(&runtime_id);
+    form_group.add(&url);
+    form_group.add(&sha256);
+    form_group.add(&mmproj_url);
+    form_group.add(&mmproj_sha256);
+    fields.append(&form_group);
     fields.append(&runtime_hint);
-    fields.append(&url_row);
-    fields.append(&sha_row);
-    fields.append(&mmproj_url_row);
-    fields.append(&mmproj_sha_row);
     let use_case_label = Label::new(Some("Use-cases"));
     use_case_label.set_halign(gtk4::Align::Start);
     use_case_label.add_css_class("heading");
     fields.append(&use_case_label);
-    fields.append(&use_case_grid);
+    fields.append(&use_case_box);
 
     let dialog = AlertDialog::builder()
-        .heading("Add Profile")
+        .heading("Add profile")
         .body("Create an installed profile from a model file URL and runtime.")
         .build();
     dialog.add_response("cancel", "Cancel");
@@ -419,7 +371,7 @@ fn refresh_library_list(lists: &ModelLists) {
         library.remove(&child);
     }
     let row = ActionRow::new();
-    row.set_title("Loading Profile Library...");
+    row.set_title("Loading profile library");
     row.set_subtitle("Scoring profiles against this machine.");
     library.append(&row);
 
@@ -436,7 +388,7 @@ fn refresh_library_list(lists: &ModelLists) {
                 })
         })
         .await
-        .map_err(|_| "Profile Library task failed".to_string())
+        .map_err(|_| "Profile library task failed".to_string())
         .and_then(|result| result);
 
         render_library_list(&lists, profiles);
@@ -456,7 +408,7 @@ fn render_library_list(
         Ok(reply) => reply.profiles,
         Err(reason) => {
             let row = ActionRow::new();
-            row.set_title("Profile Library unavailable");
+            row.set_title("Profile library unavailable");
             row.set_subtitle(&reason);
             library.append(&row);
             return;
@@ -552,7 +504,7 @@ fn show_catalog_profile_details(window: Option<&gtk4::Window>, details: &Catalog
     }
     add_detail_row(&list, "Runtime", &details.runtime_id);
     add_detail_row(&list, "Tier", &details.tier);
-    add_detail_row(&list, "Install Size", &format_size(details.disk_size_gb));
+    add_detail_row(&list, "Install size", &format_size(details.disk_size_gb));
     add_detail_row(
         &list,
         "Minimum RAM",
@@ -568,7 +520,7 @@ fn show_catalog_profile_details(window: Option<&gtk4::Window>, details: &Catalog
     if details.min_vram_gb > 0.0 {
         add_detail_row(
             &list,
-            "Published VRAM Target",
+            "Published VRAM target",
             &format!("{:.1} GB", details.min_vram_gb),
         );
     }
@@ -587,7 +539,7 @@ fn show_catalog_profile_details(window: Option<&gtk4::Window>, details: &Catalog
     add_detail_row(&list, "Reason", &details.recommendation_reason);
     add_detail_row(
         &list,
-        "Supported Use-Cases",
+        "Supported use-cases",
         &join_or_none(&details.use_cases),
     );
 
@@ -615,16 +567,16 @@ fn show_profile_details(window: Option<&gtk4::Window>, details: &ProfileDetails)
     add_detail_row(&list, "Model", &details.model_id);
     add_detail_row(&list, "Runtime", &details.runtime_id);
     add_detail_row(&list, "Source", &details.source);
-    add_detail_row(&list, "Artifact Directory", &details.artifact_path);
-    add_detail_row(&list, "Runtime Images", &details.runtime_images.join("\n"));
+    add_detail_row(&list, "Artifact directory", &details.artifact_path);
+    add_detail_row(&list, "Runtime images", &details.runtime_images.join("\n"));
     add_detail_row(
         &list,
-        "Supported Use-Cases",
+        "Supported use-cases",
         &join_or_none(&details.use_cases),
     );
     add_detail_row(
         &list,
-        "Assigned Use-Cases",
+        "Assigned use-cases",
         &join_or_none(&details.assigned_use_cases),
     );
 
@@ -829,7 +781,7 @@ fn install_url_profile(
 
         match result {
             Ok(Ok((auto_assigned, conflicts))) => {
-                if !auto_assigned.is_empty() || !conflicts.is_empty() {
+                if !conflicts.is_empty() {
                     show_pull_result_dialog(window.as_ref(), auto_assigned, conflicts, lists);
                 }
             }
@@ -872,7 +824,7 @@ fn install_catalog_profile(profile_id: String, lists: ModelLists, window: Option
 
         match result {
             Ok(Ok((auto_assigned, conflicts))) => {
-                if !auto_assigned.is_empty() || !conflicts.is_empty() {
+                if !conflicts.is_empty() {
                     show_pull_result_dialog(window.as_ref(), auto_assigned, conflicts, lists);
                 }
             }
@@ -936,7 +888,7 @@ fn delete_profile(
                 .body("This profile is assigned or has active sessions. Delete it anyway?")
                 .build();
             dialog.add_response("cancel", "Cancel");
-            dialog.add_response("delete", "Delete Anyway");
+            dialog.add_response("delete", "Delete anyway");
             dialog.set_response_appearance("delete", libadwaita::ResponseAppearance::Destructive);
             dialog.set_close_response("cancel");
 
@@ -1012,7 +964,7 @@ fn refresh_readiness_list(lists: &ModelLists) {
         list_box.remove(&child);
     }
     let row = ActionRow::new();
-    row.set_title("Loading Tasks...");
+    row.set_title("Loading tasks");
     row.set_subtitle("Checking installed and recommended profiles.");
     list_box.append(&row);
 
@@ -1456,7 +1408,7 @@ fn download_row(install: &InstallStatus, lists: &ModelLists, window: Option<gtk4
     details.append(&progress);
     row.append(&details);
 
-    let cancel = Button::with_label("Cancel");
+    let cancel = Button::with_label("Cancel download");
     cancel.set_valign(gtk4::Align::Center);
     if install_is_terminal(install) {
         return row;
@@ -1465,11 +1417,10 @@ fn download_row(install: &InstallStatus, lists: &ModelLists, window: Option<gtk4
     let profile_id = install.profile_id.clone();
     let lists_for_cancel = lists.clone();
     cancel.connect_clicked(move |btn| {
-        btn.set_sensitive(false);
         let window = window
             .clone()
             .or_else(|| btn.root().and_then(|r| r.downcast::<gtk4::Window>().ok()));
-        cancel_install(profile_id.clone(), lists_for_cancel.clone(), window);
+        confirm_cancel_install(profile_id.clone(), lists_for_cancel.clone(), window);
     });
     row.append(&cancel);
     row
@@ -1559,6 +1510,29 @@ fn cancel_install(profile_id: String, lists: ModelLists, window: Option<gtk4::Wi
         }
         Err(reason) => show_message(window.as_ref(), "Cancel failed", &reason),
     }
+}
+
+fn confirm_cancel_install(profile_id: String, lists: ModelLists, window: Option<gtk4::Window>) {
+    let dialog = AlertDialog::builder()
+        .heading("Cancel download?")
+        .body("The current profile download will stop. You can start it again later.")
+        .build();
+    dialog.add_response("keep", "Keep downloading");
+    dialog.add_response("cancel", "Cancel download");
+    dialog.set_response_appearance("cancel", libadwaita::ResponseAppearance::Destructive);
+    dialog.set_close_response("keep");
+
+    let window_for_response = window.clone();
+    dialog.connect_response(None, move |_, response| {
+        if response == "cancel" {
+            cancel_install(
+                profile_id.clone(),
+                lists.clone(),
+                window_for_response.clone(),
+            );
+        }
+    });
+    dialog.present(window.as_ref());
 }
 
 fn candidate_rank(
@@ -1855,7 +1829,7 @@ fn refresh_model_list(lists: &ModelLists) {
                 let lists_ref = lists.clone();
                 delete_btn.connect_clicked(move |btn| {
                     let window = btn.root().and_then(|r| r.downcast::<gtk4::Window>().ok());
-                    delete_profile(profile_id.clone(), false, lists_ref.clone(), window);
+                    confirm_delete_profile(profile_id.clone(), lists_ref.clone(), window);
                 });
                 row.add_suffix(&delete_btn);
                 list_box.append(&row);
@@ -1872,7 +1846,31 @@ fn refresh_model_list(lists: &ModelLists) {
     }
 }
 
-/// Show auto-assignment feedback and present a conflict resolution dialog.
+fn confirm_delete_profile(profile_id: String, lists: ModelLists, window: Option<gtk4::Window>) {
+    let dialog = AlertDialog::builder()
+        .heading("Delete profile?")
+        .body("This removes the installed profile from Aileron.")
+        .build();
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("delete", "Delete");
+    dialog.set_response_appearance("delete", libadwaita::ResponseAppearance::Destructive);
+    dialog.set_close_response("cancel");
+
+    let window_for_response = window.clone();
+    dialog.connect_response(None, move |_, response| {
+        if response == "delete" {
+            delete_profile(
+                profile_id.clone(),
+                false,
+                lists.clone(),
+                window_for_response.clone(),
+            );
+        }
+    });
+    dialog.present(window.as_ref());
+}
+
+/// Present conflict resolution only when assigning tasks requires a user decision.
 fn show_pull_result_dialog(
     window: Option<&gtk4::Window>,
     auto_assigned: Vec<String>,
@@ -1880,42 +1878,49 @@ fn show_pull_result_dialog(
     lists: ModelLists,
 ) {
     if conflicts.is_empty() {
-        // Just a toast-style info dialog for auto-assignments.
-        let msg = format!("Auto-assigned: {}", auto_assigned.join(", "));
-        let dialog = AlertDialog::builder()
-            .heading("Model assigned")
-            .body(&msg)
-            .build();
-        dialog.add_response("ok", "OK");
-        dialog.set_default_response(Some("ok"));
-        dialog.present(window);
         return;
     }
 
-    // Build conflict resolution dialog — one row per conflict.
     let dialog = AlertDialog::builder()
-        .heading("Use-case conflicts")
-        .body("These use-cases are already assigned. Reassign to the new model?")
+        .heading("Reassign tasks?")
+        .body("Some tasks are already assigned to another profile. Choose whether to keep the current assignments or move them to the newly installed profile.")
         .build();
-    dialog.add_response("cancel", "Keep existing");
-    dialog.add_response("reassign", "Reassign all");
+    dialog.add_response("keep", "Keep current assignments");
+    dialog.add_response("reassign", "Reassign tasks");
     dialog.set_response_appearance("reassign", libadwaita::ResponseAppearance::Suggested);
-    dialog.set_default_response(Some("reassign"));
-    dialog.set_close_response("cancel");
+    dialog.set_default_response(Some("keep"));
+    dialog.set_close_response("keep");
 
-    let vbox = Box::new(Orientation::Vertical, 6);
+    let vbox = Box::new(Orientation::Vertical, 12);
     vbox.set_margin_top(12);
-    for c in &conflicts {
-        let row_label = Label::builder()
-            .label(format!(
-                "<b>{}</b>\n<small>{} → {}</small>",
-                c.use_case, c.current_profile, c.new_profile
-            ))
-            .use_markup(true)
-            .xalign(0.0)
-            .build();
-        vbox.append(&row_label);
+    vbox.set_margin_bottom(6);
+
+    if !auto_assigned.is_empty() {
+        let assigned_group = PreferencesGroup::new();
+        assigned_group.set_title("Assigned automatically");
+        assigned_group.set_description(Some(
+            "These tasks were assigned to the installed profile and need no action.",
+        ));
+        for use_case in &auto_assigned {
+            let row = ActionRow::new();
+            row.set_title(use_case);
+            assigned_group.add(&row);
+        }
+        vbox.append(&assigned_group);
     }
+
+    let conflict_group = PreferencesGroup::new();
+    conflict_group.set_title("Needs review");
+    for c in &conflicts {
+        let row = ActionRow::new();
+        row.set_title(&c.use_case);
+        row.set_subtitle(&format!(
+            "Current: {} · New: {}",
+            c.current_profile, c.new_profile
+        ));
+        conflict_group.add(&row);
+    }
+    vbox.append(&conflict_group);
     dialog.set_extra_child(Some(&vbox));
 
     dialog.connect_response(None, move |_, response| {

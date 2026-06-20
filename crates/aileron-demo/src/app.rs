@@ -7,6 +7,7 @@ use gtk4::{
 use libadwaita::prelude::*;
 use libadwaita::{
     ApplicationWindow, HeaderBar, OverlaySplitView, ToolbarView, ViewStack, ViewSwitcherSidebar,
+    WindowTitle,
 };
 use relm4::{ComponentParts, ComponentSender, RelmApp, SimpleComponent};
 use serde::{Deserialize, Serialize};
@@ -332,22 +333,22 @@ fn build_window(window: &ApplicationWindow) {
     let overview_page = stack.add_titled(
         &build_lab_overview(&stack),
         Some("overview"),
-        "Lab Overview",
+        "Lab overview",
     );
     overview_page.set_icon_name(Some("view-dashboard-symbolic"));
     let text_page_widget = scrollable_page(&text_box);
-    let text_page = stack.add_titled(&text_page_widget, Some("text"), "Text Lab");
+    let text_page = stack.add_titled(&text_page_widget, Some("text"), "Text lab");
     text_page.set_icon_name(Some("text-x-generic-symbolic"));
     let prediction_page =
-        stack.add_titled(&build_prediction_page(), Some("predict"), "Prediction Lab");
+        stack.add_titled(&build_prediction_page(), Some("predict"), "Prediction lab");
     prediction_page.set_icon_name(Some("insert-text-symbolic"));
-    let chat_page_meta = stack.add_titled(&chat_page, Some("chat"), "Chat Lab");
+    let chat_page_meta = stack.add_titled(&chat_page, Some("chat"), "Chat lab");
     chat_page_meta.set_icon_name(Some("user-available-symbolic"));
-    let tool_page = stack.add_titled(&build_tool_page(), Some("tools"), "Tool Lab");
+    let tool_page = stack.add_titled(&build_tool_page(), Some("tools"), "Tool lab");
     tool_page.set_icon_name(Some("applications-system-symbolic"));
-    let speech_page = stack.add_titled(&build_speech_page(), Some("speech"), "Speech Lab");
+    let speech_page = stack.add_titled(&build_speech_page(), Some("speech"), "Speech lab");
     speech_page.set_icon_name(Some("audio-input-microphone-symbolic"));
-    let vision_page = stack.add_titled(&build_vision_page(), Some("vision"), "Vision Lab");
+    let vision_page = stack.add_titled(&build_vision_page(), Some("vision"), "Vision lab");
     vision_page.set_icon_name(Some("image-x-generic-symbolic"));
     let embed_page = stack.add_titled(&build_embed_page(), Some("embed"), "Embeddings");
     embed_page.set_icon_name(Some("emblem-documents-symbolic"));
@@ -363,7 +364,7 @@ fn build_window(window: &ApplicationWindow) {
     let sidebar_header = HeaderBar::new();
     let hide_sidebar_button = Button::builder()
         .icon_name("sidebar-show-symbolic")
-        .tooltip_text("Toggle Sidebar")
+        .tooltip_text("Toggle sidebar")
         .build();
     {
         let split_view = split_view.clone();
@@ -380,7 +381,7 @@ fn build_window(window: &ApplicationWindow) {
     let content_header = HeaderBar::new();
     let show_sidebar_button = Button::builder()
         .icon_name("sidebar-show-symbolic")
-        .tooltip_text("Toggle Sidebar")
+        .tooltip_text("Toggle sidebar")
         .build();
     {
         let split_view = split_view.clone();
@@ -389,7 +390,25 @@ fn build_window(window: &ApplicationWindow) {
         });
     }
     content_header.pack_start(&show_sidebar_button);
-    content_header.set_title_widget(Some(&Label::new(Some("Capability Lab"))));
+    let title = WindowTitle::builder()
+        .title("Lab overview")
+        .subtitle("Aileron demo")
+        .build();
+    let title_for_stack = title.clone();
+    stack.connect_visible_child_name_notify(move |stack| {
+        title_for_stack.set_title(match stack.visible_child_name().as_deref() {
+            Some("overview") => "Lab overview",
+            Some("text") => "Text lab",
+            Some("predict") => "Prediction lab",
+            Some("chat") => "Chat lab",
+            Some("tools") => "Tool lab",
+            Some("speech") => "Speech lab",
+            Some("vision") => "Vision lab",
+            Some("embed") => "Embeddings",
+            _ => "Aileron demo",
+        });
+    });
+    content_header.set_title_widget(Some(&title));
     let content_view = ToolbarView::new();
     content_view.add_top_bar(&content_header);
     content_view.set_content(Some(&stack));

@@ -5,7 +5,7 @@ use aileron_varlink::aileron_Models::{InstallStatus, OciRuntimeImage};
 use gtk4::prelude::*;
 use gtk4::{Box, Button, Label, ListBox, Orientation, ScrolledWindow};
 use libadwaita::prelude::*;
-use libadwaita::{ActionRow, PreferencesGroup, PreferencesPage};
+use libadwaita::{ActionRow, AlertDialog, PreferencesGroup, PreferencesPage};
 use relm4::{ComponentParts, ComponentSender, SimpleComponent};
 
 pub struct RuntimesPage;
@@ -56,7 +56,7 @@ impl SimpleComponent for RuntimesPage {
 
 fn build_page(page: &PreferencesPage) -> ListBox {
     let group = PreferencesGroup::new();
-    group.set_title("OCI Runtime Images");
+    group.set_title("OCI runtime images");
     group.set_description(Some(
         "Aileron only manages OCI images labeled as Aileron runtimes.",
     ));
@@ -64,7 +64,7 @@ fn build_page(page: &PreferencesPage) -> ListBox {
     let actions = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
     actions.set_halign(gtk4::Align::End);
     actions.set_valign(gtk4::Align::Center);
-    let prune_button = Button::with_label("Remove Unused");
+    let prune_button = Button::with_label("Remove unused");
     prune_button.add_css_class("destructive-action");
     prune_button.set_valign(gtk4::Align::Center);
     prune_button.set_tooltip_text(Some(
@@ -87,8 +87,9 @@ fn build_page(page: &PreferencesPage) -> ListBox {
 
     {
         let list_box = list_box.clone();
-        prune_button.connect_clicked(move |_| {
-            prune_unused_runtime_images(&list_box);
+        prune_button.connect_clicked(move |btn| {
+            let window = btn.root().and_then(|r| r.downcast::<gtk4::Window>().ok());
+            confirm_prune_unused_runtime_images(&list_box, window.as_ref());
         });
     }
 
@@ -99,7 +100,7 @@ fn build_page(page: &PreferencesPage) -> ListBox {
 
 fn refresh_runtime_images(list_box: &ListBox) {
     clear_list(list_box);
-    append_message(list_box, "Loading runtime images...");
+    append_message(list_box, "Loading runtime images");
 
     let list_box = list_box.clone();
     glib::spawn_future_local(async move {
@@ -224,7 +225,7 @@ fn append_runtime_image_row(
 
     if runtime_update_action_visible(&image, active_download.is_some()) {
         let update_button = Button::with_label(if active_download.is_some() {
-            "Updating..."
+            "Updating"
         } else {
             "Update"
         });
@@ -234,7 +235,7 @@ fn append_runtime_image_row(
         let image_ref = image.image_ref.clone();
         update_button.connect_clicked(move |button| {
             button.set_sensitive(false);
-            button.set_label("Updating...");
+            button.set_label("Updating");
             update_runtime_image(&list_box, &image_ref);
         });
         actions.append(&update_button);
@@ -246,8 +247,9 @@ fn append_runtime_image_row(
         remove_button.set_sensitive(active_download.is_none());
         let list_box = list_box.clone();
         let image_id = image.image_id.clone();
-        remove_button.connect_clicked(move |_| {
-            remove_runtime_image(&list_box, &image_id);
+        remove_button.connect_clicked(move |btn| {
+            let window = btn.root().and_then(|r| r.downcast::<gtk4::Window>().ok());
+            confirm_remove_runtime_image(&list_box, &image_id, window.as_ref());
         });
         actions.append(&remove_button);
     }
@@ -287,7 +289,7 @@ fn runtime_download_image_ref(profile_id: &str) -> &str {
 
 fn update_runtime_image(list_box: &ListBox, image_ref: &str) {
     clear_list(list_box);
-    append_message(list_box, "Updating runtime image...");
+    append_message(list_box, "Updating runtime image");
 
     let list_box = list_box.clone();
     let image_ref = image_ref.to_string();
@@ -322,7 +324,7 @@ fn update_runtime_image(list_box: &ListBox, image_ref: &str) {
 
 fn prune_unused_runtime_images(list_box: &ListBox) {
     clear_list(list_box);
-    append_message(list_box, "Removing unused runtime images...");
+    append_message(list_box, "Removing unused runtime images");
 
     let list_box = list_box.clone();
     glib::spawn_future_local(async move {
@@ -354,9 +356,28 @@ fn prune_unused_runtime_images(list_box: &ListBox) {
     });
 }
 
+fn confirm_prune_unused_runtime_images(list_box: &ListBox, window: Option<&gtk4::Window>) {
+    let dialog = AlertDialog::builder()
+        .heading("Remove unused runtime images?")
+        .body("This removes Aileron runtime images that are not used by any installed profile.")
+        .build();
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("remove", "Remove");
+    dialog.set_response_appearance("remove", libadwaita::ResponseAppearance::Destructive);
+    dialog.set_close_response("cancel");
+
+    let list_box = list_box.clone();
+    dialog.connect_response(None, move |_, response| {
+        if response == "remove" {
+            prune_unused_runtime_images(&list_box);
+        }
+    });
+    dialog.present(window);
+}
+
 fn remove_runtime_image(list_box: &ListBox, image_id: &str) {
     clear_list(list_box);
-    append_message(list_box, "Removing runtime image...");
+    append_message(list_box, "Removing runtime image");
 
     let list_box = list_box.clone();
     let image_id = image_id.to_string();
@@ -387,6 +408,26 @@ fn remove_runtime_image(list_box: &ListBox, image_id: &str) {
             }
         }
     });
+}
+
+fn confirm_remove_runtime_image(list_box: &ListBox, image_id: &str, window: Option<&gtk4::Window>) {
+    let dialog = AlertDialog::builder()
+        .heading("Remove runtime image?")
+        .body("This removes the selected runtime image from local storage.")
+        .build();
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("remove", "Remove");
+    dialog.set_response_appearance("remove", libadwaita::ResponseAppearance::Destructive);
+    dialog.set_close_response("cancel");
+
+    let list_box = list_box.clone();
+    let image_id = image_id.to_string();
+    dialog.connect_response(None, move |_, response| {
+        if response == "remove" {
+            remove_runtime_image(&list_box, &image_id);
+        }
+    });
+    dialog.present(window);
 }
 
 fn append_message(list_box: &ListBox, message: &str) {

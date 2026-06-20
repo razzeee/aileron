@@ -1,6 +1,7 @@
 use libadwaita::prelude::*;
 use libadwaita::{
     ApplicationWindow, HeaderBar, OverlaySplitView, ToolbarView, ViewStack, ViewSwitcherSidebar,
+    WindowTitle,
 };
 use relm4::{
     Component, ComponentController, ComponentParts, ComponentSender, Controller, RelmApp,
@@ -105,22 +106,22 @@ fn build_window(
     let stack = ViewStack::new();
 
     let overview_page = stack.add_titled(overview.widget(), Some("overview"), "Overview");
-    overview_page.set_icon_name(Some("view-dashboard-symbolic"));
+    overview_page.set_icon_name(Some("view-grid-symbolic"));
 
     let models_page = stack.add_titled(models.widget(), Some("profiles"), "Profiles");
-    models_page.set_icon_name(Some("drive-harddisk-symbolic"));
+    models_page.set_icon_name(Some("preferences-system-symbolic"));
 
     let runtimes_page = stack.add_titled(runtimes.widget(), Some("runtimes"), "Runtimes");
-    runtimes_page.set_icon_name(Some("package-x-generic-symbolic"));
+    runtimes_page.set_icon_name(Some("applications-system-symbolic"));
 
     let perms_page = stack.add_titled(permissions.widget(), Some("permissions"), "Permissions");
     perms_page.set_icon_name(Some("system-lock-screen-symbolic"));
 
     let downloads_page = stack.add_titled(downloads.widget(), Some("downloads"), "Downloads");
-    downloads_page.set_icon_name(Some("emblem-downloads-symbolic"));
+    downloads_page.set_icon_name(Some("folder-download-symbolic"));
 
     let activity_page = stack.add_titled(activity.widget(), Some("activity"), "Activity");
-    activity_page.set_icon_name(Some("emblem-synchronizing-symbolic"));
+    activity_page.set_icon_name(Some("media-playlist-repeat-symbolic"));
     stack.set_visible_child_name("overview");
 
     let downloads_sender = downloads.sender().clone();
@@ -154,7 +155,23 @@ fn build_window(
     sidebar_view.set_content(Some(&sidebar));
 
     let header = HeaderBar::new();
-    header.set_title_widget(Some(&gtk4::Label::new(Some("Operations Console"))));
+    let title = WindowTitle::builder()
+        .title("Overview")
+        .subtitle("Aileron")
+        .build();
+    let title_for_stack = title.clone();
+    stack.connect_visible_child_name_notify(move |stack| {
+        title_for_stack.set_title(match stack.visible_child_name().as_deref() {
+            Some("overview") => "Overview",
+            Some("profiles") => "Profiles",
+            Some("runtimes") => "Runtimes",
+            Some("permissions") => "Permissions",
+            Some("downloads") => "Downloads",
+            Some("activity") => "Activity",
+            _ => "Aileron",
+        });
+    });
+    header.set_title_widget(Some(&title));
 
     let toolbar_view = ToolbarView::new();
     toolbar_view.add_top_bar(&header);

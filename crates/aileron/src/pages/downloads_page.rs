@@ -243,16 +243,15 @@ fn profile_download_row(
         return row;
     }
 
-    let cancel = Button::with_label("Cancel");
+    let cancel = Button::with_label("Cancel download");
     cancel.set_valign(gtk4::Align::Center);
     cancel.set_sensitive(!install.cancel_requested);
     let profile_id = install.profile_id.clone();
     cancel.connect_clicked(move |btn| {
-        btn.set_sensitive(false);
         let window = window
             .clone()
             .or_else(|| btn.root().and_then(|r| r.downcast::<gtk4::Window>().ok()));
-        cancel_install(&profile_id, window);
+        confirm_cancel_install(&profile_id, window);
     });
     row.append(&cancel);
     row
@@ -546,6 +545,26 @@ fn cancel_install(profile_id: &str, window: Option<gtk4::Window>) {
         dialog.set_default_response(Some("ok"));
         dialog.present(window.as_ref());
     }
+}
+
+fn confirm_cancel_install(profile_id: &str, window: Option<gtk4::Window>) {
+    let dialog = AlertDialog::builder()
+        .heading("Cancel download?")
+        .body("The current download or runtime setup will stop. You can start it again later.")
+        .build();
+    dialog.add_response("keep", "Keep downloading");
+    dialog.add_response("cancel", "Cancel download");
+    dialog.set_response_appearance("cancel", libadwaita::ResponseAppearance::Destructive);
+    dialog.set_close_response("keep");
+
+    let profile_id = profile_id.to_string();
+    let window_for_response = window.clone();
+    dialog.connect_response(None, move |_, response| {
+        if response == "cancel" {
+            cancel_install(&profile_id, window_for_response.clone());
+        }
+    });
+    dialog.present(window.as_ref());
 }
 
 fn clear_list(list: &ListBox) {
