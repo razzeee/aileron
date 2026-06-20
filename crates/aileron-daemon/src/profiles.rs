@@ -329,6 +329,7 @@ mod tests {
             gs::vecs(gs::sampled_from(vec![
                 "cpu".to_string(),
                 "cuda".to_string(),
+                "gpu".to_string(),
                 "rocm".to_string(),
                 "vulkan".to_string(),
             ]))
@@ -348,7 +349,14 @@ mod tests {
             .fallback_tags()
             .iter()
             .find(|tag| available.iter().any(|available| available == *tag))
-            .map(|tag| format!("example/runtime:{tag}"));
+            .map(|tag| format!("example/runtime:{tag}"))
+            .or_else(|| {
+                if available.len() == 1 && available[0] == "cpu" {
+                    Some("example/runtime:cpu".to_string())
+                } else {
+                    None
+                }
+            });
 
         assert_eq!(profile.runtime_image_for(variant), expected.as_deref());
     }

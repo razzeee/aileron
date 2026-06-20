@@ -92,6 +92,7 @@ RUN dnf install -y \
         python3-jsonschema \
         vulkan-loader \
         vulkan-tools \
+    && ln -s /usr/bin/python3 /usr/local/bin/python \
     && dnf clean all
 
 COPY --from=gpu-builder /out/llama-server /usr/local/bin/llama-server
