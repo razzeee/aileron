@@ -199,3 +199,46 @@ jobs:
           OUTPUT=$(echo "$REQUEST" | podman run --rm -i aileron/stub:ci)
           echo "Output: $OUTPUT"
           echo "$OUTPUT" | grep -q '"done": true'
+
+  llamafile-runtime:
+    name: Llamafile runtime — unit tests + image build
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install container runtime deps
+        run: sudo apt-get install -y --no-install-recommends podman
+
+      - name: Install Python test deps
+        run: python3 -m pip install --user jsonschema
+
+      - name: Python unit tests
+        run: python3 -m unittest runtimes/llm-llamafile/test_entrypoint.py
+
+      - name: Build llamafile runtime image
+        run: >
+          podman build
+          -f runtimes/llamafile.Dockerfile
+          --build-arg RUNTIME_ID=llm-llamafile
+          --build-arg RUNTIME_VARIANT=cpu
+          --build-arg RUNTIME_STAGE=cpu
+          -t aileron/llm-llamafile:ci
+          .
+
+      - name: Build llamafile Vulkan runtime image
+        run: >
+          podman build
+          -f runtimes/llamafile.Dockerfile
+          --build-arg RUNTIME_ID=llm-llamafile
+          --build-arg RUNTIME_VARIANT=vulkan
+          --build-arg RUNTIME_STAGE=gpu
+          --build-arg RUNTIME_DESCRIPTION="Aileron llamafile Vulkan runtime for local text generation."
+          -t aileron/llm-llamafile:vulkan-ci
+          .
+
+      - name: Image smoke test — Python entrypoint imports
+        run: podman run --rm --entrypoint python aileron/llm-llamafile:ci -m py_compile /entrypoint.py
+
+      - name: Vulkan image smoke test — Python entrypoint imports
+        run: podman run --rm --entrypoint python aileron/llm-llamafile:vulkan-ci -m py_compile /entrypoint.py

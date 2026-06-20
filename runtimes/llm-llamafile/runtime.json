@@ -1,0 +1,21 @@
+{
+  "runtime_id": "llm-llamafile",
+  "capabilities": [
+    "generate",
+    "predict_next"
+  ],
+  "implemented_capabilities": [
+    "generate",
+    "predict_next",
+    "generate_structured",
+    "generate_structured_stream",
+    "embed"
+  ],
+  "variants": [
+    "cpu",
+    "vulkan"
+  ],
+  "artifact_layout": {
+    "model": "/model/model.gguf"
+  }
+}

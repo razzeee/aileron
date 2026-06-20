@@ -137,6 +137,7 @@ impl RuntimeManifestStore {
             .fallback_tags()
             .iter()
             .find_map(|variant| runtime.images.get(*variant).map(String::as_str))
+            .or_else(|| cpu_only_image(&runtime.images))
     }
 
     pub fn images_for(&self, runtime_id: &str) -> Vec<RuntimeImage> {
@@ -171,6 +172,14 @@ impl RuntimeManifestStore {
             .collect();
         runtimes.sort_by(|a, b| a.runtime_id.cmp(&b.runtime_id));
         runtimes
+    }
+}
+
+fn cpu_only_image(images: &HashMap<String, String>) -> Option<&str> {
+    if images.len() == 1 {
+        images.get("cpu").map(String::as_str)
+    } else {
+        None
     }
 }
 
@@ -390,7 +399,7 @@ fn validate_sha256(value: &str) -> Result<()> {
 
 fn validate_variant(value: &str) -> Result<()> {
     match value {
-        "cpu" | "cuda" | "rocm" | "vulkan" => Ok(()),
+        "cpu" | "cuda" | "rocm" | "vulkan" | "gpu" => Ok(()),
         other => bail!("unsupported runtime variant: {other}"),
     }
 }
@@ -436,6 +445,30 @@ mod tests {
     }
 
     #[test]
+    fn resolves_cpu_only_runtime_on_accelerator_hosts() {
+        let runtime = RuntimeManifest {
+            runtime_id: "llm-llamafile".to_string(),
+            images: HashMap::from([("cpu".to_string(), "example/llamafile:cpu".to_string())]),
+        };
+        let manifests = RuntimeManifestStore {
+            runtimes: HashMap::from([("llm-llamafile".to_string(), runtime)]),
+        };
+
+        assert_eq!(
+            manifests.resolve("llm-llamafile", Variant::Cuda),
+            Some("example/llamafile:cpu")
+        );
+        assert_eq!(
+            manifests.resolve("llm-llamafile", Variant::Rocm),
+            Some("example/llamafile:cpu")
+        );
+        assert_eq!(
+            manifests.resolve("llm-llamafile", Variant::Vulkan),
+            Some("example/llamafile:cpu")
+        );
+    }
+
+    #[test]
     fn resolves_accelerator_variant_with_vulkan_fallback() {
         let runtime = RuntimeManifest {
             runtime_id: "asr-whisper-cpp".to_string(),
@@ -456,6 +489,58 @@ mod tests {
             manifests.resolve("asr-whisper-cpp", Variant::Cuda),
             Some("example/asr:vulkan")
         );
+    }
+
+    #[test]
+    fn resolves_generic_gpu_before_vulkan_fallback() {
+        let runtime = RuntimeManifest {
+            runtime_id: "llm-generic".to_string(),
+            images: HashMap::from([
+                ("cpu".to_string(), "example/llm:cpu".to_string()),
+                ("gpu".to_string(), "example/llm:gpu".to_string()),
+                ("vulkan".to_string(), "example/llm:vulkan".to_string()),
+            ]),
+        };
+        let manifests = RuntimeManifestStore {
+            runtimes: HashMap::from([("llm-generic".to_string(), runtime)]),
+        };
+
+        assert_eq!(
+            manifests.resolve("llm-generic", Variant::Cuda),
+            Some("example/llm:gpu")
+        );
+        assert_eq!(
+            manifests.resolve("llm-generic", Variant::Rocm),
+            Some("example/llm:gpu")
+        );
+        assert_eq!(
+            manifests.resolve("llm-generic", Variant::Vulkan),
+            Some("example/llm:vulkan")
+        );
+        assert_eq!(
+            manifests.resolve("llm-generic", Variant::Cpu),
+            Some("example/llm:cpu")
+        );
+    }
+
+    #[test]
+    fn resolves_exact_accelerator_before_generic_gpu() {
+        let runtime = RuntimeManifest {
+            runtime_id: "llm-generic".to_string(),
+            images: HashMap::from([
+                ("gpu".to_string(), "example/llm:gpu".to_string()),
+                ("cuda".to_string(), "example/llm:cuda".to_string()),
+            ]),
+        };
+        let manifests = RuntimeManifestStore {
+            runtimes: HashMap::from([("llm-generic".to_string(), runtime)]),
+        };
+
+        assert_eq!(
+            manifests.resolve("llm-generic", Variant::Cuda),
+            Some("example/llm:cuda")
+        );
+        assert_eq!(manifests.resolve("llm-generic", Variant::Cpu), None);
     }
 
     #[test]
@@ -552,12 +637,13 @@ mod tests {
             ]))
             .max_size(4),
         );
+        let images: HashMap<_, _> = available
+            .iter()
+            .map(|tag| (tag.clone(), format!("example/runtime:{tag}")))
+            .collect();
         let runtime = RuntimeManifest {
             runtime_id: "runtime".to_string(),
-            images: available
-                .iter()
-                .map(|tag| (tag.clone(), format!("example/runtime:{tag}")))
-                .collect(),
+            images: images.clone(),
         };
         let manifests = RuntimeManifestStore {
             runtimes: HashMap::from([("runtime".to_string(), runtime)]),
@@ -565,8 +651,14 @@ mod tests {
         let expected = requested
             .fallback_tags()
             .iter()
-            .find(|tag| available.iter().any(|available| available == *tag))
-            .map(|tag| format!("example/runtime:{tag}"));
+            .find_map(|tag| images.get(*tag).cloned())
+            .or_else(|| {
+                if images.len() == 1 {
+                    images.get("cpu").cloned()
+                } else {
+                    None
+                }
+            });
 
         assert_eq!(manifests.resolve("runtime", requested), expected.as_deref());
     }
@@ -689,6 +781,7 @@ mod tests {
     fn validates_example_model_manifests() {
         for data in [
             include_str!("../../../manifests/examples/models/llama3.2-3b-instruct-q4-k-m.json"),
+            include_str!("../../../manifests/examples/models/tinyllama-1.1b-f16-llamafile.json"),
             include_str!("../../../manifests/examples/models/whisper-large-v3-turbo-q5-0.json"),
             include_str!("../../../manifests/examples/models/gemma-4-e4b-it-q4-k-xl.json"),
         ] {

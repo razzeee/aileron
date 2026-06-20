@@ -124,12 +124,27 @@ impl ProfileStore {
 
 impl Profile {
     pub fn runtime_image_for(&self, detected: Variant) -> Option<&str> {
-        detected.fallback_tags().iter().find_map(|variant| {
+        detected
+            .fallback_tags()
+            .iter()
+            .find_map(|variant| {
+                self.runtime_images
+                    .iter()
+                    .find(|img| img.variant == *variant)
+                    .map(|img| img.image_ref.as_str())
+            })
+            .or_else(|| self.cpu_only_runtime_image())
+    }
+
+    fn cpu_only_runtime_image(&self) -> Option<&str> {
+        if self.runtime_images.len() == 1 {
             self.runtime_images
                 .iter()
-                .find(|img| img.variant == *variant)
+                .find(|img| img.variant == "cpu")
                 .map(|img| img.image_ref.as_str())
-        })
+        } else {
+            None
+        }
     }
 }
 
@@ -401,6 +416,51 @@ mod tests {
         assert!(!system_artifacts_match(&dir, &artifacts).expect("hash artifacts"));
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn runtime_image_for_uses_generic_gpu_before_vulkan_fallback() {
+        let profile = profile_with_runtime_images(vec![
+            RuntimeImage {
+                variant: "gpu".to_string(),
+                image_ref: "example/asr:gpu".to_string(),
+            },
+            RuntimeImage {
+                variant: "vulkan".to_string(),
+                image_ref: "example/asr:vulkan".to_string(),
+            },
+        ]);
+
+        assert_eq!(
+            profile.runtime_image_for(Variant::Cuda),
+            Some("example/asr:gpu")
+        );
+        assert_eq!(
+            profile.runtime_image_for(Variant::Rocm),
+            Some("example/asr:gpu")
+        );
+        assert_eq!(
+            profile.runtime_image_for(Variant::Vulkan),
+            Some("example/asr:vulkan")
+        );
+        assert_eq!(profile.runtime_image_for(Variant::Cpu), None);
+    }
+
+    #[test]
+    fn runtime_image_for_uses_cpu_only_image_on_accelerator_hosts() {
+        let profile = profile_with_runtime_images(vec![RuntimeImage {
+            variant: "cpu".to_string(),
+            image_ref: "example/runtime:cpu".to_string(),
+        }]);
+
+        assert_eq!(
+            profile.runtime_image_for(Variant::Vulkan),
+            Some("example/runtime:cpu")
+        );
+        assert_eq!(
+            profile.runtime_image_for(Variant::Cuda),
+            Some("example/runtime:cpu")
+        );
     }
 
     #[test]

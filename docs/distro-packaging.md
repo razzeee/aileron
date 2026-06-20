@@ -82,7 +82,7 @@ Recommended package split:
 | `aileron-runtimes-*` | optional runtime manifests or pre-rendered rootfs trees | Use this when the distro wants offline runtime availability or curated image refs |
 | `aileron-models-*` | optional model manifests and model weights when license/size policy allows | Keep large or restricted models opt-in |
 
-Runtime manifests are small JSON files that map runtime IDs to OCI image refs. A distro can ship upstream runtime manifests as-is, replace image refs with distro-hosted registry refs, or split hardware families into separate packages. For example, a conservative base package can include only CPU runtime manifests, while separate packages add CUDA, ROCm, or Vulkan runtime manifests.
+Runtime manifests are small JSON files that map runtime IDs to OCI image refs. A distro can ship upstream runtime manifests as-is, replace image refs with distro-hosted registry refs, or split hardware families into separate packages. For example, a conservative base package can include CPU-only runtime manifests, while separate packages add CUDA, ROCm, Vulkan, or generic GPU runtime manifests. A manifest with exactly one `cpu` image is treated as portable and can resolve on accelerator-detected hosts; mixed CPU/accelerator manifests require an accelerator-compatible image for the detected variant, its generic `gpu` fallback, or its Vulkan fallback.
 
 Model catalog manifests are also small JSON files. They describe downloadable artifacts, checksums, sizes, use-cases, and runtime IDs. Shipping a model manifest does not install the model weights. It only makes the profile visible in the management UI and available to `InstallManifest`; the user still chooses to download it.
 

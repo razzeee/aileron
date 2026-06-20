@@ -65,6 +65,8 @@ use serde_json::Value;
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use crate::hardware::Variant;
+
 /// A running container for a single use-case.
 pub struct Container {
     #[allow(dead_code)]
@@ -131,6 +133,7 @@ impl Container {
     /// privileges, PID limit, memory limit, and `/model` mounted read-only.
     pub fn spawn(
         image_ref: &str,
+        detected_variant: Variant,
         artifact_path: &Path,
         runtime_options: &HashMap<String, String>,
         memory_limit: &str,
@@ -141,6 +144,7 @@ impl Container {
         info!("spawning OCI runtime for {}", image_ref);
         let bundle = OciRuntimeManager::new(oci_store, system_oci_store).prepare_bundle(
             image_ref,
+            detected_variant,
             artifact_path,
             runtime_options,
             memory_limit,
@@ -677,6 +681,7 @@ impl OciRuntimeManager {
     fn prepare_bundle(
         &self,
         image_ref: &str,
+        detected_variant: Variant,
         artifact_path: &Path,
         runtime_options: &HashMap<String, String>,
         memory_limit: &str,
@@ -702,6 +707,7 @@ impl OciRuntimeManager {
             .with_context(|| format!("failed to create OCI bundle at {}", bundle_dir.display()))?;
         let config = runtime_config_json(
             image_ref,
+            detected_variant,
             &rootfs,
             artifact_path,
             runtime_options,
@@ -748,6 +754,7 @@ fn runtime_rootfs_path_from_stores(
 
 fn runtime_config_json(
     image_ref: &str,
+    detected_variant: Variant,
     rootfs: &Path,
     artifact_path: &Path,
     runtime_options: &HashMap<String, String>,
@@ -784,22 +791,17 @@ fn runtime_config_json(
         }),
     ];
 
-    if image_ref_uses_tag(image_ref, "cuda") {
-        add_cuda_mounts(&mut mounts);
-        add_readonly_mount(&mut mounts, "/sys");
-        env.push("N_GPU_LAYERS=-1".to_string());
-        env.push("AILERON_DEVICE=cuda".to_string());
-    } else if image_ref_uses_tag(image_ref, "rocm") {
-        add_device_mount(&mut mounts, "/dev/kfd");
-        add_device_mount(&mut mounts, "/dev/dri");
-        add_readonly_mount(&mut mounts, "/sys");
-        env.push("N_GPU_LAYERS=-1".to_string());
-        env.push("AILERON_DEVICE=rocm".to_string());
-    } else if image_ref_uses_tag(image_ref, "vulkan") {
-        add_device_mount(&mut mounts, "/dev/dri");
-        add_readonly_mount(&mut mounts, "/sys");
-        env.push("N_GPU_LAYERS=-1".to_string());
-        env.push("AILERON_DEVICE=vulkan".to_string());
+    let generic_gpu = image_ref_uses_tag(image_ref, "gpu");
+    if image_ref_uses_tag(image_ref, "cuda") || generic_gpu && detected_variant == Variant::Cuda {
+        expose_cuda(&mut mounts, &mut env);
+    } else if image_ref_uses_tag(image_ref, "rocm")
+        || generic_gpu && detected_variant == Variant::Rocm
+    {
+        expose_rocm(&mut mounts, &mut env);
+    } else if image_ref_uses_tag(image_ref, "vulkan")
+        || generic_gpu && detected_variant == Variant::Vulkan
+    {
+        expose_vulkan(&mut mounts, &mut env);
     }
 
     let mut runtime_options: Vec<_> = runtime_options.iter().collect();
@@ -865,6 +867,28 @@ fn runtime_config_json(
             }
         }
     }))
+}
+
+fn expose_cuda(mounts: &mut Vec<Value>, env: &mut Vec<String>) {
+    add_cuda_mounts(mounts);
+    add_readonly_mount(mounts, "/sys");
+    env.push("N_GPU_LAYERS=-1".to_string());
+    env.push("AILERON_DEVICE=cuda".to_string());
+}
+
+fn expose_rocm(mounts: &mut Vec<Value>, env: &mut Vec<String>) {
+    add_device_mount(mounts, "/dev/kfd");
+    add_device_mount(mounts, "/dev/dri");
+    add_readonly_mount(mounts, "/sys");
+    env.push("N_GPU_LAYERS=-1".to_string());
+    env.push("AILERON_DEVICE=rocm".to_string());
+}
+
+fn expose_vulkan(mounts: &mut Vec<Value>, env: &mut Vec<String>) {
+    add_device_mount(mounts, "/dev/dri");
+    add_readonly_mount(mounts, "/sys");
+    env.push("N_GPU_LAYERS=-1".to_string());
+    env.push("AILERON_DEVICE=vulkan".to_string());
 }
 
 fn add_device_mount(mounts: &mut Vec<Value>, path: &str) {
@@ -1172,6 +1196,7 @@ impl ContainerPool {
         &mut self,
         profile_id: &str,
         image_ref: &str,
+        detected_variant: Variant,
         artifact_path: &Path,
         runtime_options: &HashMap<String, String>,
         on_status: impl FnMut(String) + Send + 'static,
@@ -1191,6 +1216,7 @@ impl ContainerPool {
         if !self.containers.contains_key(profile_id) {
             let c = Container::spawn(
                 image_ref,
+                detected_variant,
                 artifact_path,
                 runtime_options,
                 &self.memory_limit,
@@ -1331,6 +1357,7 @@ mod tests {
     fn oci_config_preserves_core_sandbox_settings() {
         let config = runtime_config_json(
             "localhost/aileron/summarize:cpu",
+            Variant::Cpu,
             Path::new("/store/rootfs/runtime"),
             Path::new("/models/foo"),
             &HashMap::new(),
@@ -1377,6 +1404,7 @@ mod tests {
     fn oci_config_exposes_rocm_devices_for_rocm_tag() {
         let config = runtime_config_json(
             "localhost/aileron/summarize:rocm",
+            Variant::Rocm,
             Path::new("/store/rootfs/runtime"),
             Path::new("/models/foo"),
             &HashMap::new(),
@@ -1402,6 +1430,7 @@ mod tests {
     fn oci_config_exposes_cuda_env_for_cuda_tag() {
         let config = runtime_config_json(
             "localhost/aileron/summarize:cuda",
+            Variant::Cuda,
             Path::new("/store/rootfs/runtime"),
             Path::new("/models/foo"),
             &HashMap::new(),
@@ -1421,6 +1450,7 @@ mod tests {
     fn oci_config_exposes_vulkan_device_for_vulkan_tag() {
         let config = runtime_config_json(
             "localhost/aileron/summarize:vulkan",
+            Variant::Vulkan,
             Path::new("/store/rootfs/runtime"),
             Path::new("/models/foo"),
             &HashMap::new(),
@@ -1437,9 +1467,51 @@ mod tests {
     }
 
     #[test]
+    fn oci_config_exposes_detected_accelerator_for_generic_gpu_tag() {
+        let cuda = runtime_config_json(
+            "localhost/aileron/summarize:gpu",
+            Variant::Cuda,
+            Path::new("/store/rootfs/runtime"),
+            Path::new("/models/foo"),
+            &HashMap::new(),
+            "8g",
+        )
+        .expect("build CUDA generic GPU config");
+        assert!(mount_destinations(&cuda).contains(&"/sys"));
+        assert!(env(&cuda).contains(&"AILERON_DEVICE=cuda"));
+
+        let rocm = runtime_config_json(
+            "localhost/aileron/summarize:gpu",
+            Variant::Rocm,
+            Path::new("/store/rootfs/runtime"),
+            Path::new("/models/foo"),
+            &HashMap::new(),
+            "8g",
+        )
+        .expect("build ROCm generic GPU config");
+        assert!(device_mounts(&rocm).contains(&"/dev/kfd"));
+        assert!(device_mounts(&rocm).contains(&"/dev/dri"));
+        assert!(env(&rocm).contains(&"AILERON_DEVICE=rocm"));
+
+        let vulkan = runtime_config_json(
+            "localhost/aileron/summarize:gpu",
+            Variant::Vulkan,
+            Path::new("/store/rootfs/runtime"),
+            Path::new("/models/foo"),
+            &HashMap::new(),
+            "8g",
+        )
+        .expect("build Vulkan generic GPU config");
+        assert!(device_mounts(&vulkan).contains(&"/dev/dri"));
+        assert!(!device_mounts(&vulkan).contains(&"/dev/kfd"));
+        assert!(env(&vulkan).contains(&"AILERON_DEVICE=vulkan"));
+    }
+
+    #[test]
     fn oci_config_does_not_expose_gpu_devices_for_cpu_tag() {
         let config = runtime_config_json(
             "localhost/aileron/summarize:cpu",
+            Variant::Cpu,
             Path::new("/store/rootfs/runtime"),
             Path::new("/models/foo"),
             &HashMap::new(),
@@ -1477,6 +1549,7 @@ mod tests {
         for image_ref in refs {
             let config = runtime_config_json(
                 image_ref,
+                variant_for_image_ref(image_ref),
                 Path::new("/store/rootfs/runtime"),
                 Path::new("/models/foo"),
                 &HashMap::new(),
@@ -1516,6 +1589,7 @@ mod tests {
 
         let config = runtime_config_json(
             "localhost/aileron/vision:cpu",
+            Variant::Cpu,
             Path::new("/store/rootfs/runtime"),
             Path::new("/models/foo"),
             &runtime_options,
@@ -1534,6 +1608,7 @@ mod tests {
 
         let config = runtime_config_json(
             "localhost/aileron/llm:cuda",
+            Variant::Cuda,
             Path::new("/store/rootfs/runtime"),
             Path::new("/models/foo"),
             &runtime_options,
@@ -1931,6 +2006,7 @@ mod tests {
 
         let mut container = Container::spawn(
             &image_ref,
+            Variant::Cpu,
             &artifact_path,
             &HashMap::new(),
             "512m",
@@ -1991,5 +2067,17 @@ mod tests {
         assert!(!segments.is_empty());
 
         let _ = std::fs::remove_dir_all(&artifact_path);
+    }
+
+    fn variant_for_image_ref(image_ref: &str) -> Variant {
+        if image_ref_uses_tag(image_ref, "cuda") {
+            Variant::Cuda
+        } else if image_ref_uses_tag(image_ref, "rocm") {
+            Variant::Rocm
+        } else if image_ref_uses_tag(image_ref, "vulkan") {
+            Variant::Vulkan
+        } else {
+            Variant::Cpu
+        }
     }
 }

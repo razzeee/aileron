@@ -7,7 +7,9 @@ on:
       - ".github/workflows/runtime-images.yml"
       - "runtimes/_llama_cpp_common/**"
       - "runtimes/llama-cpp.Dockerfile"
+      - "runtimes/llamafile.Dockerfile"
       - "runtimes/llm-llama-cpp/**"
+      - "runtimes/llm-llamafile/**"
       - "runtimes/vision-llama-cpp-gemma4/**"
       - "runtimes/asr-whisper-cpp/**"
       - "runtimes/stub/**"
@@ -207,6 +209,7 @@ jobs:
             variant: cpu
             context: runtimes/asr-whisper-cpp
             file: runtimes/asr-whisper-cpp/Dockerfile
+            build_args: ""
           - runtime_id: asr-whisper-cpp
             image_name: aileron-runtime-asr-whisper-cpp
             description: Aileron Whisper.cpp runtime for local speech transcription.
@@ -214,6 +217,7 @@ jobs:
             variant: cuda
             context: runtimes/asr-whisper-cpp
             file: runtimes/asr-whisper-cpp/Dockerfile.cuda
+            build_args: ""
           - runtime_id: asr-whisper-cpp
             image_name: aileron-runtime-asr-whisper-cpp
             description: Aileron Whisper.cpp runtime for local speech transcription.
@@ -221,6 +225,7 @@ jobs:
             variant: vulkan
             context: runtimes/asr-whisper-cpp
             file: runtimes/asr-whisper-cpp/Dockerfile.vulkan
+            build_args: ""
           - runtime_id: stub
             image_name: aileron-runtime-stub
             description: Aileron stub runtime for development and protocol testing.
@@ -228,6 +233,30 @@ jobs:
             variant: cpu
             context: runtimes/stub
             file: runtimes/stub/Dockerfile
+            build_args: ""
+          - runtime_id: llm-llamafile
+            image_name: aileron-runtime-llm-llamafile
+            description: Aileron llamafile runtime for local text generation.
+            documentation_path: runtimes/llm-llamafile/README.md
+            variant: cpu
+            context: .
+            file: runtimes/llamafile.Dockerfile
+            build_args: |
+              RUNTIME_ID=llm-llamafile
+              RUNTIME_VARIANT=cpu
+              RUNTIME_STAGE=cpu
+          - runtime_id: llm-llamafile
+            image_name: aileron-runtime-llm-llamafile
+            description: Aileron llamafile Vulkan runtime for local text generation.
+            documentation_path: runtimes/llm-llamafile/README.md
+            variant: vulkan
+            context: .
+            file: runtimes/llamafile.Dockerfile
+            build_args: |
+              RUNTIME_ID=llm-llamafile
+              RUNTIME_VARIANT=vulkan
+              RUNTIME_STAGE=gpu
+              RUNTIME_DESCRIPTION=Aileron llamafile Vulkan runtime for local text generation.
     steps:
       - uses: actions/checkout@v6
 
@@ -250,6 +279,7 @@ jobs:
           context: ${{ matrix.context }}
           file: ${{ matrix.file }}
           push: true
+          build-args: ${{ matrix.build_args }}
           tags: |
             ghcr.io/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image_name }}:${{ matrix.variant }}
             ghcr.io/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image_name }}:${{ github.sha }}-${{ matrix.variant }}

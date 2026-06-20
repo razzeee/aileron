@@ -60,6 +60,7 @@ Reusable runtime images live in `runtimes/`. Model artifacts are installed separ
 | Directory | Description |
 |---|---|
 | `runtimes/llm-llama-cpp/` | llama-cpp-python runtime for text generation and structured output |
+| `runtimes/llm-llamafile/` | llamafile runtime wrapper for GGUF text models |
 | `runtimes/asr-whisper-cpp/` | pywhispercpp runtime for audio transcription |
 | `runtimes/vision-llama-cpp-gemma4/` | llama-cpp-python Gemma 4 multimodal runtime for image description |
 | `runtimes/stub/` | no-ML test runtime implementing the stdio protocol |
@@ -164,6 +165,7 @@ Runtime images can be built with any OCI/Docker-compatible builder. The daemon p
 | Runtime | Details |
 |---|---|
 | `runtimes/llm-llama-cpp/` | [LLM runtime README](runtimes/llm-llama-cpp/README.md) |
+| `runtimes/llm-llamafile/` | [Llamafile runtime README](runtimes/llm-llamafile/README.md) |
 | `runtimes/asr-whisper-cpp/` | [ASR runtime README](runtimes/asr-whisper-cpp/README.md) |
 | `runtimes/vision-llama-cpp-gemma4/` | [Vision runtime README](runtimes/vision-llama-cpp-gemma4/README.md) |
 | `runtimes/stub/` | [Stub runtime README](runtimes/stub/README.md) |
@@ -197,6 +199,8 @@ Model manifests live under `models/` and reference a reusable runtime by ID:
 ```
 
 The optional `artifacts[].role` field identifies what a file is for runtimes that need more than one artifact. Single-file profiles usually use `model`; llama.cpp vision profiles commonly use both `model` and `mmproj`. Artifact roles must be unique within a manifest when present.
+
+A model profile selects exactly one runtime through `runtime_id`. To offer the same GGUF with both `llm-llama-cpp` and `llm-llamafile`, provide two model manifests with different `profile_id` values, the same `model_id`, and the same `artifacts` entries, but different `runtime_id` values. Both runtimes receive the selected profile's artifact directory mounted at `/model`, so the file still appears as `/model/model.gguf` in either container. See `manifests/examples/models/tinyllama-1.1b-f16-llamafile.json` for a llamafile profile that reuses the TinyLlama GGUF artifact.
 
 The `artifacts[].size_bytes` field is the preferred source for the user-facing install/download size, because it lives next to the exact URL and SHA-256 it describes. `disk_size_gb` is still accepted as fallback catalog metadata when exact artifact byte sizes are unavailable. The optional `llmfit_model_id` field should be the Hugging Face model name used by `llmfit-core`; when present, Aileron uses llmfit metadata to show a simple fit label and RAM/VRAM requirements for the current PC. If it is absent or unknown, Aileron falls back to the manifest's `min_ram_gb` metadata. These fields do not trigger automatic downloads or automatic reassignment.
 
@@ -623,7 +627,7 @@ The daemon probes the host once at startup and selects the best available runtim
 | `vulkaninfo` reports a device | `:vulkan` | Any Vulkan GPU |
 | Nothing found | `:cpu` | CPU-only runtime |
 
-Runtime manifests declare explicit runtime images per variant. If the detected CUDA or ROCm variant is unsupported, the daemon may fall back to a Vulkan image when present, but it does not fall back to CPU. If the selected accelerator image is missing locally, availability reports unavailable. Override detection with `AILERON_VARIANT=cpu|cuda|rocm|vulkan`.
+Runtime manifests declare explicit runtime images per variant. If the detected accelerator variant is unsupported, the daemon may fall back to a generic `gpu` image and then to a Vulkan image when present. Generic `gpu` is a manifest fallback key, not a detected hardware variant; a selected `:gpu` image receives mounts and `AILERON_DEVICE` for the actual detected accelerator (`cuda`, `rocm`, or `vulkan`). Mixed CPU/accelerator manifests do not fall back to CPU from an accelerator host; if the selected accelerator image is missing locally, availability reports unavailable. The exception is a CPU-only runtime manifest with exactly one `cpu` image, which is treated as portable and can run on accelerator-detected hosts without accelerator mounts or GPU environment variables. Override detection with `AILERON_VARIANT=cpu|cuda|rocm|vulkan`.
 
 ## Container security
 

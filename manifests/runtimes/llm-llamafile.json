@@ -1,0 +1,7 @@
+{
+  "runtime_id": "llm-llamafile",
+  "images": {
+    "cpu": "ghcr.io/razzeee/aileron-runtime-llm-llamafile:cpu",
+    "vulkan": "ghcr.io/razzeee/aileron-runtime-llm-llamafile:vulkan"
+  }
+}

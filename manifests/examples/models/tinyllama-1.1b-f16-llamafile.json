@@ -1,0 +1,21 @@
+{
+  "profile_id": "tinyllama-1.1b-f16-llamafile",
+  "model_id": "tinyllama-1.1b-f16",
+  "llmfit_model_id": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+  "runtime_id": "llm-llamafile",
+  "tier": "small",
+  "min_ram_gb": 2.0,
+  "use_cases": [
+    "language.summarize",
+    "language.rephrase"
+  ],
+  "artifacts": [
+    {
+      "role": "model",
+      "url": "https://huggingface.co/ggml-org/models-moved/resolve/main/tinyllama-1.1b/ggml-model-f16.gguf",
+      "filename": "model.gguf",
+      "sha256": "92982a0b96adfe5a8cea15ed6272bd11282f9a257eca74e40225becc6ae61c71",
+      "size_bytes": 2201990016
+    }
+  ]
+}
