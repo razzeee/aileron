@@ -8,6 +8,8 @@ use libadwaita::prelude::*;
 use libadwaita::{ActionRow, AlertDialog, PreferencesGroup, PreferencesPage};
 use relm4::{ComponentParts, ComponentSender, SimpleComponent};
 
+use super::{install_is_terminal_status, source_label};
+
 pub struct RuntimesPage;
 
 #[derive(Debug)]
@@ -280,7 +282,7 @@ fn runtime_status_label(status: &str) -> &str {
 }
 
 fn install_is_terminal(install: &InstallStatus) -> bool {
-    install.status.starts_with("Failed:") || install.status == "Completed"
+    install_is_terminal_status(&install.status)
 }
 
 fn runtime_download_image_ref(profile_id: &str) -> &str {
@@ -471,21 +473,35 @@ fn format_bytes(bytes: i64) -> String {
     }
 }
 
-fn source_label(source: &str) -> &'static str {
-    match source {
-        "system" => "System",
-        "user" => "User",
-        _ => "Unknown source",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hegel::TestCase;
+    use hegel::generators as gs;
+
+    #[hegel::test]
+    fn formats_non_positive_runtime_image_sizes_as_unknown(tc: TestCase) {
+        let bytes = tc.draw(gs::integers::<i64>().max_value(0));
+
+        assert_eq!(format_bytes(bytes), "unknown size");
+    }
+
+    #[hegel::test]
+    fn formats_runtime_image_sizes_with_expected_units(tc: TestCase) {
+        let bytes = tc.draw(gs::integers::<i64>().min_value(1).max_value(i64::MAX / 2));
+        let formatted = format_bytes(bytes);
+
+        assert!(
+            [" B", " KB", " MB", " GB", " TB"]
+                .iter()
+                .any(|unit| formatted.ends_with(unit)),
+            "unexpected formatted size: {formatted}"
+        );
+        assert!(!formatted.contains("unknown"));
+    }
 
     #[test]
-    fn formats_runtime_image_sizes() {
-        assert_eq!(format_bytes(0), "unknown size");
+    fn formats_runtime_image_size_boundaries() {
         assert_eq!(format_bytes(512), "512 B");
         assert_eq!(format_bytes(1024 * 1024), "1.0 MB");
     }

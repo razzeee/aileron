@@ -5,6 +5,8 @@ use libadwaita::prelude::*;
 use libadwaita::{ActionRow, PreferencesGroup, PreferencesPage};
 use relm4::{ComponentParts, ComponentSender, SimpleComponent};
 
+use super::install_is_terminal_status;
+
 const USE_CASES: &[&str] = &[
     "language.summarize",
     "language.translate",
@@ -267,7 +269,7 @@ fn load_summary() -> OverviewSummary {
 }
 
 fn install_is_terminal(install: &InstallStatus) -> bool {
-    install.status.starts_with("Failed:") || install.status == "Completed"
+    install_is_terminal_status(&install.status)
 }
 
 fn ready_task_count(profiles: &[aileron_varlink::aileron_Models::ProfileInfo]) -> usize {
@@ -305,6 +307,8 @@ fn clear_list(list: &ListBox) {
 mod tests {
     use super::*;
     use aileron_varlink::aileron_Models::ProfileInfo;
+    use hegel::TestCase;
+    use hegel::generators as gs;
 
     fn profile(use_cases: &[&str], assigned_use_cases: &[&str]) -> ProfileInfo {
         ProfileInfo {
@@ -333,5 +337,40 @@ mod tests {
         )];
 
         assert_eq!(ready_task_count(&profiles), 1);
+    }
+
+    #[hegel::test]
+    fn ready_task_count_matches_generated_supported_assigned_intersection(tc: TestCase) {
+        let supported = tc.draw(
+            gs::vecs(gs::sampled_from(
+                USE_CASES
+                    .iter()
+                    .map(|use_case| use_case.to_string())
+                    .collect::<Vec<_>>(),
+            ))
+            .max_size(USE_CASES.len()),
+        );
+        let assigned = tc.draw(
+            gs::vecs(gs::sampled_from(
+                USE_CASES
+                    .iter()
+                    .map(|use_case| use_case.to_string())
+                    .collect::<Vec<_>>(),
+            ))
+            .max_size(USE_CASES.len()),
+        );
+        let supported_refs = supported.iter().map(String::as_str).collect::<Vec<_>>();
+        let assigned_refs = assigned.iter().map(String::as_str).collect::<Vec<_>>();
+        let expected = USE_CASES
+            .iter()
+            .filter(|use_case| {
+                supported_refs.contains(use_case) && assigned_refs.contains(use_case)
+            })
+            .count();
+
+        assert_eq!(
+            ready_task_count(&[profile(&supported_refs, &assigned_refs)]),
+            expected
+        );
     }
 }

@@ -12,6 +12,8 @@ use libadwaita::{
 };
 use relm4::{ComponentParts, ComponentSender, SimpleComponent};
 
+use super::{format_duration, format_speed, install_is_terminal_status, source_label};
+
 const USE_CASES: &[&str] = &[
     "language.summarize",
     "language.translate",
@@ -665,14 +667,6 @@ fn format_profile_size(bytes: i64) -> String {
     }
 
     format!("{gib:.1} GB")
-}
-
-fn source_label(source: &str) -> &'static str {
-    match source {
-        "system" => "System",
-        "user" => "User",
-        _ => "Unknown source",
-    }
 }
 
 fn assignment_count(use_cases: &[String]) -> String {
@@ -1427,7 +1421,7 @@ fn download_row(install: &InstallStatus, lists: &ModelLists, window: Option<gtk4
 }
 
 fn install_is_terminal(install: &InstallStatus) -> bool {
-    install.status.starts_with("Failed:") || install.status == "Completed"
+    install_is_terminal_status(&install.status)
 }
 
 fn download_subtitle(
@@ -1464,29 +1458,6 @@ fn download_subtitle(
         )
     } else {
         format!("{prefix} · size unknown{speed}")
-    }
-}
-
-fn format_speed(bytes_per_second: i64) -> String {
-    let bytes_per_second = bytes_per_second as f64;
-    if bytes_per_second >= 1_000_000_000.0 {
-        format!("{:.1} GB/s", bytes_per_second / 1_000_000_000.0)
-    } else if bytes_per_second >= 1_000_000.0 {
-        format!("{:.1} MB/s", bytes_per_second / 1_000_000.0)
-    } else if bytes_per_second >= 1_000.0 {
-        format!("{:.1} KB/s", bytes_per_second / 1_000.0)
-    } else {
-        format!("{} B/s", bytes_per_second as i64)
-    }
-}
-
-fn format_duration(seconds: i64) -> String {
-    if seconds < 60 {
-        format!("{seconds}s")
-    } else if seconds < 3600 {
-        format!("{}m {}s", seconds / 60, seconds % 60)
-    } else {
-        format!("{}h {}m", seconds / 3600, (seconds % 3600) / 60)
     }
 }
 
@@ -1955,6 +1926,8 @@ fn show_pull_result_dialog(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hegel::TestCase;
+    use hegel::generators as gs;
 
     #[test]
     fn formats_install_failed_reason() {
@@ -1965,6 +1938,20 @@ mod tests {
         assert!(message.contains("The required local runtime image is missing"));
         assert!(message.contains("localhost/example:cpu"));
         assert!(!message.contains("InstallFailed_Args"));
+    }
+
+    #[hegel::test]
+    fn extracts_generated_varlink_reason(tc: TestCase) {
+        let reason = tc.draw(gs::sampled_from(vec![
+            "install cancelled".to_string(),
+            "local runtime image is not built: localhost/example:cpu".to_string(),
+            "runtime image download already running".to_string(),
+        ]));
+        let message = format!(
+            "aileron.Models.InstallFailed: Some(InstallFailed_Args {{ profile_id: \"x\", reason: \"{reason}\", }})"
+        );
+
+        assert_eq!(extract_varlink_reason(&message), Some(reason.as_str()));
     }
 
     #[test]
@@ -1985,6 +1972,17 @@ mod tests {
         assert_eq!(fit_score_label(0.0), None);
     }
 
+    #[hegel::test]
+    fn fit_score_label_matches_generated_positive_rule(tc: TestCase) {
+        let tenths = tc.draw(gs::integers::<i64>().min_value(-1000).max_value(1000));
+        let score = tenths as f64 / 10.0;
+
+        assert_eq!(
+            fit_score_label(score),
+            (score > 0.0).then(|| format!("{score:.0}/100"))
+        );
+    }
+
     #[test]
     fn formats_small_profile_sizes_as_mb() {
         assert_eq!(format_size(0.0177), "18 MB");
@@ -1997,6 +1995,51 @@ mod tests {
         assert_eq!(format_profile_size(512), "512 B");
         assert_eq!(format_profile_size(18 * 1024 * 1024), "18 MB");
         assert_eq!(format_profile_size(2 * 1024 * 1024 * 1024), "2.0 GB");
+    }
+
+    #[hegel::test]
+    fn assignment_count_matches_generated_count(tc: TestCase) {
+        let count = tc.draw(gs::integers::<usize>().max_value(5));
+        let use_cases = (0..count)
+            .map(|index| format!("language.generated.{index}"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            assignment_count(&use_cases),
+            match count {
+                0 => "Unassigned".to_string(),
+                1 => "1 use-case".to_string(),
+                count => format!("{count} use-cases"),
+            }
+        );
+    }
+
+    #[hegel::test]
+    fn join_or_none_matches_generated_values(tc: TestCase) {
+        let values = tc.draw(
+            gs::vecs(gs::sampled_from(vec![
+                "language.summarize".to_string(),
+                "speech.transcribe".to_string(),
+                "vision.describe".to_string(),
+            ]))
+            .max_size(4),
+        );
+
+        assert_eq!(
+            join_or_none(&values),
+            if values.is_empty() {
+                "none".to_string()
+            } else {
+                values.join(", ")
+            }
+        );
+    }
+
+    #[hegel::test]
+    fn formats_generated_non_positive_profile_sizes_as_unknown(tc: TestCase) {
+        let bytes = tc.draw(gs::integers::<i64>().max_value(0));
+
+        assert_eq!(format_profile_size(bytes), "unknown size");
     }
 
     #[test]

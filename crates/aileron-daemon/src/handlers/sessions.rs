@@ -80,6 +80,8 @@ mod tests {
     use crate::permissions::PermissionStore;
     use crate::profiles::ProfileStore;
     use crate::state::{Inner, InstallRecord, Session};
+    use hegel::TestCase;
+    use hegel::generators as gs;
     use std::collections::{HashMap, VecDeque};
 
     fn test_inner() -> Inner {
@@ -134,6 +136,36 @@ mod tests {
         assert!(!sessions[0].started_at.is_empty());
     }
 
+    #[hegel::test]
+    fn active_sessions_reports_generated_session_ids(tc: TestCase) {
+        let ids = tc.draw(
+            gs::vecs(gs::sampled_from(vec![
+                "session-a".to_string(),
+                "session-b".to_string(),
+                "session-c".to_string(),
+                "session-d".to_string(),
+            ]))
+            .max_size(4),
+        );
+        let mut inner = test_inner();
+        for id in &ids {
+            inner
+                .sessions
+                .insert(id.clone(), session(id, &format!("profile-{id}")));
+        }
+        let mut expected = ids;
+        expected.sort();
+        expected.dedup();
+
+        let mut actual = active_sessions(&inner)
+            .into_iter()
+            .map(|session| session.session_id)
+            .collect::<Vec<_>>();
+        actual.sort();
+
+        assert_eq!(actual, expected);
+    }
+
     #[test]
     fn kill_session_removes_only_requested_session() {
         let mut inner = test_inner();
@@ -148,6 +180,26 @@ mod tests {
 
         assert!(!inner.sessions.contains_key("session-a"));
         assert!(inner.sessions.contains_key("session-b"));
+    }
+
+    #[hegel::test]
+    fn kill_session_removes_generated_target_only(tc: TestCase) {
+        let target = tc.draw(gs::sampled_from(vec![
+            "session-a".to_string(),
+            "session-b".to_string(),
+        ]));
+        let mut inner = test_inner();
+        inner
+            .sessions
+            .insert("session-a".to_string(), session("session-a", "profile-a"));
+        inner
+            .sessions
+            .insert("session-b".to_string(), session("session-b", "profile-a"));
+
+        assert!(kill_session(&mut inner, &target));
+
+        assert!(!inner.sessions.contains_key(&target));
+        assert_eq!(inner.sessions.len(), 1);
     }
 
     #[test]

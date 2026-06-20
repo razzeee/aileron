@@ -1369,6 +1369,8 @@ fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hegel::TestCase;
+    use hegel::generators as gs;
 
     fn generation_options() -> GenerationOptions {
         GenerationOptions {
@@ -1383,6 +1385,29 @@ mod tests {
     #[test]
     fn validate_options_accepts_normal_generation_options() {
         assert_eq!(validate_options(&generation_options()), Ok(128));
+    }
+
+    #[hegel::test]
+    fn validate_options_accepts_generated_valid_options(tc: TestCase) {
+        let maximum_response_tokens = tc.draw(gs::integers::<i64>().min_value(1).max_value(4096));
+        let temperature_tenths = tc.draw(gs::integers::<i64>().min_value(0).max_value(20));
+        let sampling_mode = tc.draw(gs::sampled_from(vec![
+            "default".to_string(),
+            "greedy".to_string(),
+            "creative".to_string(),
+        ]));
+        let options = GenerationOptions {
+            maximum_response_tokens,
+            temperature: temperature_tenths as f64 / 10.0,
+            sampling_mode,
+            source_language_hint: String::new(),
+            target_language_hint: String::new(),
+        };
+
+        assert_eq!(
+            validate_options(&options),
+            Ok(maximum_response_tokens as u32)
+        );
     }
 
     #[test]
@@ -1427,6 +1452,20 @@ mod tests {
         );
     }
 
+    #[hegel::test]
+    fn language_generation_accepts_generated_text_language_use_cases(tc: TestCase) {
+        let use_case = tc.draw(gs::sampled_from(vec![
+            "language.summarize".to_string(),
+            "language.translate".to_string(),
+            "language.rephrase".to_string(),
+            "language.classify".to_string(),
+            "language.extract".to_string(),
+            "language.analyze".to_string(),
+        ]));
+
+        assert!(ensure_language_generation_use_case(&use_case).is_ok());
+    }
+
     #[test]
     fn language_generation_excludes_embed_use_case() {
         assert_eq!(
@@ -1443,6 +1482,43 @@ mod tests {
         );
         assert_eq!(ensure_speech_use_case("speech.translate"), Ok("translate"));
         assert!(ensure_speech_use_case("language.extract").is_err());
+    }
+
+    #[hegel::test]
+    fn speech_use_case_maps_generated_supported_cases_to_tasks(tc: TestCase) {
+        let (use_case, task) = tc.draw(gs::sampled_from(vec![
+            ("speech.transcribe".to_string(), "transcribe"),
+            ("speech.translate".to_string(), "translate"),
+        ]));
+
+        assert_eq!(ensure_speech_use_case(&use_case), Ok(task));
+    }
+
+    #[hegel::test]
+    fn guided_fields_schema_accepts_generated_supported_kinds(tc: TestCase) {
+        let kind = tc.draw(gs::sampled_from(vec![
+            "string".to_string(),
+            "number".to_string(),
+            "integer".to_string(),
+            "boolean".to_string(),
+            "string_array".to_string(),
+        ]));
+        let required = tc.draw(gs::booleans());
+        let field = GuidedField {
+            name: "field".to_string(),
+            kind: kind.clone(),
+            description: "generated field".to_string(),
+            required,
+        };
+
+        let schema = guided_fields_schema(&[field]).expect("supported kind should build schema");
+
+        assert_eq!(schema["type"], "object");
+        assert!(schema["properties"].get("field").is_some());
+        assert_eq!(
+            schema["required"].as_array().unwrap().len(),
+            usize::from(required)
+        );
     }
 
     #[test]
@@ -1474,5 +1550,20 @@ mod tests {
             base64_decode("not base64!"),
             Err("invalid base64 char:  ".to_string())
         );
+    }
+
+    #[hegel::test]
+    fn base64_decode_accepts_generated_valid_alphabet(tc: TestCase) {
+        let chars = tc.draw(
+            gs::vecs(gs::sampled_from(
+                "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+                    .chars()
+                    .collect::<Vec<_>>(),
+            ))
+            .max_size(64),
+        );
+        let encoded = chars.into_iter().collect::<String>();
+
+        assert!(base64_decode(&encoded).is_ok());
     }
 }

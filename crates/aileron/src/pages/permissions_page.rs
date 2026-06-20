@@ -155,6 +155,8 @@ where
 mod tests {
     use super::*;
     use chrono::FixedOffset;
+    use hegel::TestCase;
+    use hegel::generators as gs;
 
     #[test]
     fn formats_rfc3339_timestamp_in_requested_timezone() {
@@ -166,8 +168,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn preserves_unparseable_timestamps() {
-        assert_eq!(format_local_time("not a timestamp"), "not a timestamp");
+    #[hegel::test]
+    fn preserves_generated_unparseable_timestamps(tc: TestCase) {
+        let timestamp = tc.draw(gs::sampled_from(vec![
+            "not a timestamp".to_string(),
+            "2026-99-99T99:99:99Z".to_string(),
+            "yesterday".to_string(),
+        ]));
+
+        assert_eq!(format_local_time(&timestamp), timestamp);
     }
 }

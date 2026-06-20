@@ -9,6 +9,8 @@ use libadwaita::prelude::*;
 use libadwaita::{ActionRow, AlertDialog, PreferencesGroup, PreferencesPage};
 use relm4::{ComponentParts, ComponentSender, SimpleComponent};
 
+use super::{format_duration, format_speed, install_is_terminal_status};
+
 pub struct DownloadsPage {
     poll_active: Rc<Cell<bool>>,
     start_poll: bool,
@@ -327,7 +329,7 @@ fn matching_runtime_installs<'a>(
 }
 
 fn install_is_terminal(install: &InstallStatus) -> bool {
-    install.status.starts_with("Failed:") || install.status == "Completed"
+    install_is_terminal_status(&install.status)
 }
 
 fn download_subtitle(
@@ -482,29 +484,6 @@ fn compact_image_ref(image_ref: &str) -> String {
     format!("{registry}/…/{image}")
 }
 
-fn format_speed(bytes_per_second: i64) -> String {
-    let bytes_per_second = bytes_per_second as f64;
-    if bytes_per_second >= 1_000_000_000.0 {
-        format!("{:.1} GB/s", bytes_per_second / 1_000_000_000.0)
-    } else if bytes_per_second >= 1_000_000.0 {
-        format!("{:.1} MB/s", bytes_per_second / 1_000_000.0)
-    } else if bytes_per_second >= 1_000.0 {
-        format!("{:.1} KB/s", bytes_per_second / 1_000.0)
-    } else {
-        format!("{} B/s", bytes_per_second as i64)
-    }
-}
-
-fn format_duration(seconds: i64) -> String {
-    if seconds < 60 {
-        format!("{seconds}s")
-    } else if seconds < 3600 {
-        format!("{}m {}s", seconds / 60, seconds % 60)
-    } else {
-        format!("{}h {}m", seconds / 3600, (seconds % 3600) / 60)
-    }
-}
-
 fn has_active_downloads() -> bool {
     use aileron_varlink::aileron_Models::VarlinkClientInterface;
 
@@ -576,6 +555,8 @@ fn clear_list(list: &ListBox) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hegel::TestCase;
+    use hegel::generators as gs;
 
     #[test]
     fn runtime_name_is_human_readable() {
@@ -666,6 +647,27 @@ mod tests {
         );
     }
 
+    #[hegel::test]
+    fn runtime_percent_is_clamped_to_display_range(tc: TestCase) {
+        let bytes_pulled = tc.draw(gs::integers::<i64>().min_value(-200).max_value(200));
+        let runtime_install = InstallStatus {
+            profile_id: "runtime:ghcr.io/razzeee/aileron-runtime-asr-whisper-cpp:vulkan"
+                .to_string(),
+            bytes_pulled,
+            total_bytes: 100,
+            bytes_per_second: 0,
+            eta_seconds: -1,
+            status: "Pulling runtime image...".to_string(),
+            cancel_requested: false,
+        };
+
+        let expected = (bytes_pulled as f64).clamp(0.0, 100.0);
+
+        assert!(
+            runtime_profile_subtitle(&runtime_install).ends_with(&format!(" · {expected:.0}%"))
+        );
+    }
+
     #[test]
     fn derives_runtime_id_from_runtime_download_ref() {
         assert_eq!(
@@ -674,6 +676,27 @@ mod tests {
             )
             .as_deref(),
             Some("vision-llama-cpp-gemma4")
+        );
+    }
+
+    #[hegel::test]
+    fn runtime_download_runtime_id_strips_runtime_prefix_and_tag(tc: TestCase) {
+        let runtime_id = tc.draw(gs::sampled_from(vec![
+            "llm-llama-cpp".to_string(),
+            "asr-whisper-cpp".to_string(),
+            "vision-llama-cpp-gemma4".to_string(),
+        ]));
+        let variant = tc.draw(gs::sampled_from(vec![
+            "cpu".to_string(),
+            "cuda".to_string(),
+            "rocm".to_string(),
+            "vulkan".to_string(),
+        ]));
+        let profile_id = format!("runtime:ghcr.io/example/aileron-runtime-{runtime_id}:{variant}");
+
+        assert_eq!(
+            runtime_download_runtime_id(&profile_id).as_deref(),
+            Some(runtime_id.as_str())
         );
     }
 

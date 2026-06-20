@@ -260,6 +260,8 @@ fn system_artifacts_match(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hegel::TestCase;
+    use hegel::generators as gs;
 
     fn profile_with_runtime_images(runtime_images: Vec<RuntimeImage>) -> Profile {
         Profile {
@@ -300,6 +302,107 @@ mod tests {
         );
     }
 
+    #[hegel::test]
+    fn runtime_image_for_uses_first_available_fallback_tag(tc: TestCase) {
+        let variant = tc.draw(gs::sampled_from(vec![
+            Variant::Cpu,
+            Variant::Cuda,
+            Variant::Rocm,
+            Variant::Vulkan,
+        ]));
+        let available = tc.draw(
+            gs::vecs(gs::sampled_from(vec![
+                "cpu".to_string(),
+                "cuda".to_string(),
+                "rocm".to_string(),
+                "vulkan".to_string(),
+            ]))
+            .max_size(4),
+        );
+        let profile = profile_with_runtime_images(
+            available
+                .iter()
+                .map(|tag| RuntimeImage {
+                    variant: tag.clone(),
+                    image_ref: format!("example/runtime:{tag}"),
+                })
+                .collect(),
+        );
+
+        let expected = variant
+            .fallback_tags()
+            .iter()
+            .find(|tag| available.iter().any(|available| available == *tag))
+            .map(|tag| format!("example/runtime:{tag}"));
+
+        assert_eq!(profile.runtime_image_for(variant), expected.as_deref());
+    }
+
+    #[test]
+    fn validate_profile_requires_existing_artifact_path() {
+        let mut profile = profile_with_runtime_images(Vec::new());
+        profile.artifact_path = test_dir("missing-artifact-path");
+
+        let err = validate_profile(&profile).expect_err("missing artifact path should fail");
+
+        assert!(err.to_string().contains("artifact path does not exist"));
+    }
+
+    #[test]
+    fn validate_profile_accepts_existing_artifact_path() {
+        let dir = test_dir("existing-artifact-path");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create artifact path");
+        let mut profile = profile_with_runtime_images(Vec::new());
+        profile.artifact_path = dir.clone();
+
+        validate_profile(&profile).expect("existing artifact path should be valid");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn system_artifacts_match_hashes_declared_artifacts() {
+        let dir = test_dir("system-artifacts-match");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create artifact dir");
+        std::fs::write(dir.join("model.gguf"), b"model").expect("write artifact");
+        let sha256 = Sha256::digest(b"model")
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let artifacts = vec![crate::manifests::ManifestArtifact {
+            role: "model".to_string(),
+            url: "https://example.invalid/model.gguf".to_string(),
+            filename: "model.gguf".to_string(),
+            sha256,
+            size_bytes: 5,
+        }];
+
+        assert!(system_artifacts_match(&dir, &artifacts).expect("hash artifacts"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn system_artifacts_reject_hash_mismatch() {
+        let dir = test_dir("system-artifacts-mismatch");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create artifact dir");
+        std::fs::write(dir.join("model.gguf"), b"model").expect("write artifact");
+        let artifacts = vec![crate::manifests::ManifestArtifact {
+            role: "model".to_string(),
+            url: "https://example.invalid/model.gguf".to_string(),
+            filename: "model.gguf".to_string(),
+            sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            size_bytes: 5,
+        }];
+
+        assert!(!system_artifacts_match(&dir, &artifacts).expect("hash artifacts"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn remove_rejects_system_backed_profile_without_user_shadow() {
         let mut store = ProfileStore {
@@ -318,5 +421,13 @@ mod tests {
             .expect_err("system profile deletion should fail");
 
         assert!(err.to_string().contains("system-backed profile"));
+    }
+
+    fn test_dir(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "aileron-{name}-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ))
     }
 }

@@ -1324,6 +1324,8 @@ struct ContainerResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hegel::TestCase;
+    use hegel::generators as gs;
 
     #[test]
     fn oci_config_preserves_core_sandbox_settings() {
@@ -1578,6 +1580,80 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[hegel::test]
+    fn store_key_outputs_safe_path_component_for_generated_refs(tc: TestCase) {
+        let chars = tc.draw(
+            gs::vecs(gs::sampled_from(vec![
+                'a', 'Z', '0', '.', '-', '_', '/', ':', '@', '+', '=', '#', ' ',
+            ]))
+            .max_size(64),
+        );
+        let image_ref = chars.into_iter().collect::<String>();
+        let key = store_key(&image_ref);
+
+        assert_eq!(key.len(), image_ref.len());
+        assert!(
+            key.chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '_')
+        );
+    }
+
+    #[hegel::test]
+    fn parse_memory_limit_accepts_generated_supported_units(tc: TestCase) {
+        let value = tc.draw(gs::integers::<i64>().min_value(0).max_value(1024));
+        let (suffix, multiplier) = tc.draw(gs::sampled_from(vec![
+            ("", 1_i64),
+            ("b", 1_i64),
+            ("k", 1024_i64),
+            ("kb", 1024_i64),
+            ("m", 1024_i64 * 1024),
+            ("mb", 1024_i64 * 1024),
+            ("g", 1024_i64 * 1024 * 1024),
+            ("gb", 1024_i64 * 1024 * 1024),
+        ]));
+        let limit = format!("{value}{suffix}");
+
+        assert_eq!(parse_memory_limit(&limit).unwrap(), value * multiplier);
+    }
+
+    #[hegel::test]
+    fn image_ref_uses_tag_matches_generated_last_path_tag(tc: TestCase) {
+        let tag = tc.draw(gs::sampled_from(vec![
+            "cpu".to_string(),
+            "cuda".to_string(),
+            "rocm".to_string(),
+            "vulkan".to_string(),
+        ]));
+        let other_tag = tc.draw(gs::sampled_from(vec![
+            "debug".to_string(),
+            "latest".to_string(),
+            "test".to_string(),
+        ]));
+        let image_ref = format!("registry.example:5000/ns/runtime:{tag}");
+
+        assert!(image_ref_uses_tag(&image_ref, &tag));
+        assert!(!image_ref_uses_tag(&image_ref, &other_tag));
+    }
+
+    #[hegel::test]
+    fn base64_encoding_uses_expected_length_alphabet_and_padding(tc: TestCase) {
+        let data = tc.draw(gs::binary().max_size(128));
+        let encoded = base64_encode(&data);
+
+        assert_eq!(encoded.len(), data.len().div_ceil(3) * 4);
+        assert!(
+            encoded
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '+' || ch == '/' || ch == '=')
+        );
+        match data.len() % 3 {
+            0 => assert!(!encoded.ends_with('=')),
+            1 => assert!(encoded.ends_with("==")),
+            2 => assert!(encoded.ends_with('=')),
+            _ => unreachable!(),
+        }
+    }
+
     fn env(config: &Value) -> Vec<&str> {
         config["process"]["env"]
             .as_array()
@@ -1727,6 +1803,106 @@ mod tests {
             .expect("valid structured response should succeed");
 
         assert_eq!(result.as_deref(), Some(r#"{"name":"Ada"}"#));
+    }
+
+    #[test]
+    fn schema_validation_rejects_missing_and_additional_object_fields() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "required": ["name"],
+            "properties": {
+                "name": { "type": "string" }
+            },
+            "additionalProperties": false
+        });
+
+        let missing =
+            validate_json_schema(r#"{}"#, &schema).expect_err("missing required field should fail");
+        let additional = validate_json_schema(r#"{"name":"Ada","extra":true}"#, &schema)
+            .expect_err("additional property should fail");
+
+        assert!(missing.to_string().contains("missing required field"));
+        assert!(
+            additional
+                .to_string()
+                .contains("unexpected additional property")
+        );
+    }
+
+    #[test]
+    fn schema_validation_checks_array_item_types_and_bounds() {
+        let schema = serde_json::json!({
+            "type": "array",
+            "items": { "type": "integer" },
+            "minItems": 1,
+            "maxItems": 2
+        });
+
+        validate_json_schema("[1, 2]", &schema).expect("valid bounded array");
+
+        assert!(
+            validate_json_schema("[]", &schema)
+                .expect_err("too few items should fail")
+                .to_string()
+                .contains("minItems")
+        );
+        assert!(
+            validate_json_schema("[1, 2, 3]", &schema)
+                .expect_err("too many items should fail")
+                .to_string()
+                .contains("maxItems")
+        );
+        assert!(
+            validate_json_schema("[1.5]", &schema)
+                .expect_err("non-integer item should fail")
+                .to_string()
+                .contains("expected integer")
+        );
+    }
+
+    #[hegel::test]
+    fn schema_validation_accepts_generated_values_inside_string_and_number_bounds(tc: TestCase) {
+        let count = tc.draw(gs::integers::<u64>().min_value(1).max_value(10));
+        let name = "x".repeat(count as usize);
+        let score = tc.draw(gs::integers::<i64>().min_value(0).max_value(100));
+        let data = serde_json::json!({ "name": name, "score": score }).to_string();
+        let schema = serde_json::json!({
+            "type": "object",
+            "required": ["name", "score"],
+            "properties": {
+                "name": { "type": "string", "minLength": 1, "maxLength": 10 },
+                "score": { "type": "integer", "minimum": 0, "maximum": 100 }
+            }
+        });
+
+        validate_json_schema(&data, &schema).expect("generated data should satisfy schema");
+    }
+
+    #[test]
+    fn schema_validation_checks_enum_and_unsupported_schema_keywords() {
+        let enum_schema = serde_json::json!({ "enum": ["red", "blue"] });
+        let ref_schema = serde_json::json!({ "$ref": "#/defs/name" });
+        let unsupported_schema = serde_json::json!({ "type": "date" });
+
+        validate_json_schema(r#""red""#, &enum_schema).expect("enum member should pass");
+        assert!(
+            validate_json_schema(r#""green""#, &enum_schema)
+                .expect_err("non-member should fail")
+                .to_string()
+                .contains("not in enum")
+        );
+        assert!(
+            validate_json_schema(r#""red""#, &ref_schema)
+                .expect_err("$ref should fail explicitly")
+                .to_string()
+                .contains("$ref is not supported")
+        );
+        assert!(
+            validate_json_schema(r#""2026-06-20""#, &unsupported_schema)
+                .expect_err("unsupported type should fail")
+                .to_string()
+                .contains("unsupported schema type")
+        );
     }
 
     #[test]
