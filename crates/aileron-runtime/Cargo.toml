@@ -1,0 +1,47 @@
+[package]
+name = "aileron-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+llama = ["dep:encoding_rs", "dep:llama-cpp-2"]
+llama-cuda = ["llama", "llama-cpp-2/cuda"]
+llama-rocm = ["llama", "llama-cpp-2/rocm"]
+llama-vulkan = ["llama", "llama-cpp-2/vulkan"]
+vision = ["llama", "dep:base64", "llama-cpp-2/mtmd"]
+vision-cuda = ["vision", "llama-cuda"]
+vision-rocm = ["vision", "llama-rocm"]
+vision-vulkan = ["vision", "llama-vulkan"]
+whisper = ["dep:base64", "dep:whisper-rs"]
+whisper-cuda = ["whisper", "whisper-rs/cuda"]
+whisper-vulkan = ["whisper", "whisper-rs/vulkan"]
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+base64 = { version = "0.22", optional = true }
+encoding_rs = { version = "0.8.35", optional = true }
+llama-cpp-2 = { version = "0.1.150", optional = true }
+whisper-rs = { version = "0.16.0", optional = true }
+
+[[bin]]
+name = "aileron-runtime-stub"
+path = "src/bin/stub.rs"
+
+[[bin]]
+name = "aileron-runtime-llm-llama-cpp"
+path = "src/bin/llm_llama_cpp.rs"
+required-features = ["llama"]
+
+[[bin]]
+name = "aileron-runtime-vision-llama-cpp"
+path = "src/bin/vision_llama_cpp.rs"
+required-features = ["vision"]
+
+[[bin]]
+name = "aileron-runtime-asr-whisper-cpp"
+path = "src/bin/asr_whisper_cpp.rs"
+required-features = ["whisper"]

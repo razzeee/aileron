@@ -1,0 +1,242 @@
+use std::io::{BufRead, Write};
+
+use anyhow::Result;
+use serde::Deserialize;
+use serde_json::{Value, json};
+
+#[cfg(feature = "llama")]
+pub mod llama_runtime;
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct Request {
+    #[serde(default = "unknown_id")]
+    pub id: String,
+    #[serde(default, rename = "type")]
+    pub request_type: String,
+    #[serde(default)]
+    pub system: Option<String>,
+    #[serde(default)]
+    pub prompt: Option<String>,
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+    #[serde(default)]
+    pub choices: Option<u32>,
+    #[serde(default)]
+    pub temperature: Option<f64>,
+    #[serde(default)]
+    pub audio: Option<String>,
+    #[serde(default)]
+    pub image: Option<Value>,
+    #[serde(default)]
+    pub language_hint: Option<String>,
+    #[serde(default)]
+    pub task: Option<String>,
+    #[serde(default)]
+    pub response_format: Option<ResponseFormat>,
+    #[serde(default)]
+    pub tools: Option<Vec<Value>>,
+    #[serde(default)]
+    pub tool_results: Option<Vec<Value>>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ResponseFormat {
+    #[serde(default, rename = "type")]
+    pub format_type: Option<String>,
+    #[serde(default)]
+    pub schema: Value,
+}
+
+fn unknown_id() -> String {
+    "unknown".to_string()
+}
+
+pub fn send(value: Value) -> Result<()> {
+    let mut stdout = std::io::stdout().lock();
+    serde_json::to_writer(&mut stdout, &value)?;
+    stdout.write_all(b"\n")?;
+    stdout.flush()?;
+    Ok(())
+}
+
+pub fn serve_requests(
+    log_prefix: &str,
+    mut handler: impl FnMut(Request) -> Result<()>,
+) -> Result<()> {
+    eprintln!("[{log_prefix}] ready");
+
+    for raw_line in std::io::stdin().lock().lines() {
+        let line = raw_line?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let req: Request = match serde_json::from_str(trimmed) {
+            Ok(req) => req,
+            Err(err) => {
+                eprintln!("[{log_prefix}] bad request JSON: {err}");
+                continue;
+            }
+        };
+
+        let req_id = req.id.clone();
+        let req_type = req.request_type.clone();
+        if let Err(err) = handler(req) {
+            eprintln!("[{log_prefix}] error handling {req_type}: {err:?}");
+            send(json!({
+                "id": req_id,
+                "error": "internal_error",
+                "reason": err.to_string(),
+                "done": true,
+            }))?;
+        }
+    }
+
+    Ok(())
+}
+
+pub fn send_unsupported(req: &Request, done: bool) -> Result<()> {
+    let mut response = json!({
+        "id": req.id,
+        "error": "unsupported_type",
+        "reason": req.request_type,
+    });
+    if done {
+        response["done"] = Value::Bool(true);
+    }
+    send(response)
+}
+
+pub fn clamp_choices(value: Option<u32>) -> usize {
+    value.unwrap_or(1).clamp(1, 3) as usize
+}
+
+pub fn stub_value_for_schema(schema: &Value) -> Value {
+    match schema_type(schema) {
+        Some("object") => {
+            let props = schema
+                .get("properties")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            let required = schema
+                .get("required")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_else(|| props.keys().cloned().collect());
+            let mut out = serde_json::Map::new();
+            for key in required {
+                let prop_schema = props.get(&key).unwrap_or(&Value::Null);
+                out.insert(key, stub_value_for_schema(prop_schema));
+            }
+            Value::Object(out)
+        }
+        Some("array") => json!([stub_value_for_schema(
+            schema.get("items").unwrap_or(&Value::Null)
+        )]),
+        Some("string") => schema
+            .get("enum")
+            .and_then(Value::as_array)
+            .and_then(|items| items.first())
+            .cloned()
+            .unwrap_or_else(|| json!("stub")),
+        Some("integer") => json!(schema.get("minimum").and_then(Value::as_i64).unwrap_or(0)),
+        Some("number") => json!(schema.get("minimum").and_then(Value::as_f64).unwrap_or(0.0)),
+        Some("boolean") => json!(true),
+        Some("null") => Value::Null,
+        _ => json!("stub"),
+    }
+}
+
+fn schema_type(schema: &Value) -> Option<&str> {
+    let type_value = schema.get("type")?;
+    if let Some(type_name) = type_value.as_str() {
+        return Some(type_name);
+    }
+    type_value
+        .as_array()
+        .and_then(|items| items.iter().find_map(Value::as_str))
+}
+
+pub fn first_tool_name(tools: Option<&[Value]>) -> String {
+    tools
+        .and_then(|items| items.first())
+        .and_then(|tool| tool.get("name"))
+        .and_then(Value::as_str)
+        .unwrap_or("stub_tool")
+        .to_string()
+}
+
+pub fn field_as_string(value: &Value, key: &str) -> Option<String> {
+    value.get(key).map(|item| {
+        item.as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| item.to_string())
+    })
+}
+
+pub fn first_json_value(raw: &str) -> std::result::Result<String, String> {
+    for (index, _) in raw.match_indices(['{', '[']) {
+        let candidate = &raw[index..];
+        let mut values = serde_json::Deserializer::from_str(candidate).into_iter::<Value>();
+        match values.next() {
+            Some(Ok(value)) => return serde_json::to_string(&value).map_err(|err| err.to_string()),
+            Some(Err(_)) | None => continue,
+        }
+    }
+
+    Err("model output did not contain a JSON object or array".to_string())
+}
+
+pub fn available_threads() -> i32 {
+    std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(4) as i32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stub_value_satisfies_required_object_shape() {
+        let schema = json!({
+            "type": "object",
+            "required": ["name", "count", "ok"],
+            "properties": {
+                "name": {"type": "string", "enum": ["demo"]},
+                "count": {"type": "integer", "minimum": 3},
+                "ok": {"type": "boolean"},
+                "ignored": {"type": "string"}
+            }
+        });
+
+        assert_eq!(
+            stub_value_for_schema(&schema),
+            json!({"name": "demo", "count": 3, "ok": true})
+        );
+    }
+
+    #[test]
+    fn clamp_choices_limits_runtime_choice_count() {
+        assert_eq!(clamp_choices(None), 1);
+        assert_eq!(clamp_choices(Some(0)), 1);
+        assert_eq!(clamp_choices(Some(2)), 2);
+        assert_eq!(clamp_choices(Some(99)), 3);
+    }
+
+    #[test]
+    fn first_json_value_ignores_surrounding_text() {
+        assert_eq!(
+            first_json_value("Sure: {\"ok\":true} trailing text").unwrap(),
+            "{\"ok\":true}"
+        );
+    }
+}

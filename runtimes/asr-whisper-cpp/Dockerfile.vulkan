@@ -1,31 +1,33 @@
-ARG PYTHON_IMAGE="python:3.13-slim"
-FROM ${PYTHON_IMAGE} AS builder
+ARG BUILDER_IMAGE="rust:1-bookworm"
+ARG FINAL_IMAGE="debian:bookworm-slim"
+FROM ${BUILDER_IMAGE} AS builder
 
-# Vulkan build of pywhispercpp — any GPU with Vulkan support.
+# Vulkan build of whisper.cpp via whisper-rs; any GPU with Vulkan support.
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential cmake \
+        ca-certificates build-essential cmake clang libclang-dev pkg-config git ninja-build \
         libvulkan-dev glslc glslang-tools spirv-headers \
     && rm -rf /var/lib/apt/lists/*
 
 ENV CMAKE_ARGS="-DGGML_VULKAN=on"
 
-RUN python -m pip install --root=/runtime --no-cache-dir --no-binary pywhispercpp "pywhispercpp>=1.2.0"
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+RUN cargo build --locked --release -p aileron-runtime --bin aileron-runtime-asr-whisper-cpp \
+        --no-default-features --features whisper-vulkan \
+    && cp target/release/aileron-runtime-asr-whisper-cpp /entrypoint
 
-FROM ${PYTHON_IMAGE}
+FROM ${FINAL_IMAGE}
 
 ENV XDG_CACHE_HOME=/tmp
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        libgomp1 libvulkan1 mesa-vulkan-drivers \
+        ca-certificates libgomp1 libstdc++6 libgcc-s1 libvulkan1 mesa-vulkan-drivers \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /runtime/usr /usr
-
-RUN find /usr -path '*/site-packages/lib*.so*' -exec cp -a {} /usr/local/lib/ \; \
-    && ldconfig
-
-COPY entrypoint.py /entrypoint.py
+COPY --from=builder /entrypoint /entrypoint
+RUN chmod 0755 /entrypoint
 
 LABEL org.aileron.runtime="true" \
       org.aileron.runtime_id="asr-whisper-cpp" \
@@ -33,4 +35,4 @@ LABEL org.aileron.runtime="true" \
       org.opencontainers.image.description="Aileron Whisper.cpp runtime for local speech transcription." \
       org.opencontainers.image.licenses="GPL-3.0-or-later"
 
-ENTRYPOINT ["python", "/entrypoint.py"]
+ENTRYPOINT ["/entrypoint"]

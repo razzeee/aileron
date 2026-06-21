@@ -17,7 +17,7 @@ Run all commands below from the repository root.
 ## Build
 
 ```sh
-podman build -t docker.io/example/aileron-runtime-stub:cpu runtimes/stub
+podman build -f runtimes/stub/Dockerfile -t docker.io/example/aileron-runtime-stub:cpu .
 ```
 
 The project also publishes this runtime to GHCR from the runtime image workflow:

@@ -2,35 +2,37 @@ ARG CUDA_DEVEL_IMAGE="nvidia/cuda:13.3.0-devel-ubuntu24.04"
 ARG CUDA_RUNTIME_IMAGE="nvidia/cuda:13.3.0-runtime-ubuntu24.04"
 FROM ${CUDA_DEVEL_IMAGE} AS builder
 
-# NVIDIA CUDA build of pywhispercpp.
+# NVIDIA CUDA build of whisper.cpp via whisper-rs.
 # Requires nvidia-container-toolkit on the host.
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        python3 python3-pip python3-dev \
-        build-essential cmake \
+        ca-certificates curl \
+        build-essential cmake clang libclang-dev pkg-config git ninja-build \
     && rm -rf /var/lib/apt/lists/* \
-    && ln -sf python3 /usr/bin/python
+    && if ! command -v cargo >/dev/null 2>&1; then \
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal; \
+    fi
 
 ENV CMAKE_ARGS="-DGGML_CUDA=on"
-ENV PIP_BREAK_SYSTEM_PACKAGES=1
+ENV PATH="/root/.cargo/bin:${PATH}"
 
-RUN python -m pip install --root=/runtime --no-cache-dir --no-binary pywhispercpp "pywhispercpp>=1.2.0"
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+RUN cargo build --locked --release -p aileron-runtime --bin aileron-runtime-asr-whisper-cpp \
+        --no-default-features --features whisper-cuda \
+    && cp target/release/aileron-runtime-asr-whisper-cpp /entrypoint
 
 FROM ${CUDA_RUNTIME_IMAGE}
 
 ENV XDG_CACHE_HOME=/tmp
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        python3 libgomp1 \
-    && rm -rf /var/lib/apt/lists/* \
-    && ln -sf python3 /usr/bin/python
+        ca-certificates libgomp1 libstdc++6 libgcc-s1 \
+    && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /runtime/usr /usr
-
-RUN find /usr -path '*/site-packages/lib*.so*' -exec cp -a {} /usr/local/lib/ \; \
-    && ldconfig
-
-COPY entrypoint.py /entrypoint.py
+COPY --from=builder /entrypoint /entrypoint
+RUN chmod 0755 /entrypoint
 
 LABEL org.aileron.runtime="true" \
       org.aileron.runtime_id="asr-whisper-cpp" \
@@ -38,4 +40,4 @@ LABEL org.aileron.runtime="true" \
       org.opencontainers.image.description="Aileron Whisper.cpp runtime for local speech transcription." \
       org.opencontainers.image.licenses="GPL-3.0-or-later"
 
-ENTRYPOINT ["python", "/entrypoint.py"]
+ENTRYPOINT ["/entrypoint"]

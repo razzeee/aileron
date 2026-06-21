@@ -1,6 +1,6 @@
 # LLM Runtime
 
-This runtime runs llama.cpp through `llama-cpp-python` and implements text generation plus structured output for GGUF models mounted at `/model/model.gguf`.
+This runtime runs llama.cpp through the Rust `llama-cpp-2` bindings and implements text generation plus structured output for GGUF models mounted at `/model/model.gguf`.
 
 Model weights are not baked into the image. A model manifest downloads and verifies the GGUF artifact, then references this runtime by `runtime_id`.
 
@@ -21,8 +21,8 @@ One shared llama.cpp Dockerfile builds all accelerator variants with build args:
 | Variant | Base/build args | Hardware | Notes |
 |---|---|---|---|
 | `cpu` | default | CPU | Default, works everywhere |
-| `cuda` | `BASE_IMAGE=nvidia/cuda:13.3.0-devel-ubuntu24.04`, `CMAKE_ARGS=-DGGML_CUDA=on` | NVIDIA GPU | Requires NVIDIA container support on host |
-| `rocm` | `BASE_IMAGE=rocm/dev-ubuntu-22.04:7.2.4-complete`, `CMAKE_ARGS=-DGGML_HIP=on ...` | AMD GPU | Requires ROCm devices on host |
+| `cuda` | `BUILDER_IMAGE=nvidia/cuda:13.3.0-devel-ubuntu24.04`, `CMAKE_ARGS=-DGGML_CUDA=on` | NVIDIA GPU | Requires NVIDIA container support on host |
+| `rocm` | `BUILDER_IMAGE=rocm/dev-ubuntu-22.04:7.2.4`, `CMAKE_ARGS=-DGGML_HIP=on ...` | AMD GPU | Requires ROCm devices on host |
 | `vulkan` | `CMAKE_ARGS=-DGGML_VULKAN=on` plus Vulkan packages | Vulkan GPU | NVIDIA / AMD / Intel Arc |
 
 Tag images by runtime and variant. The daemon does not infer image tags from model profiles; it resolves `runtime_id + detected variant` through runtime manifests.
@@ -34,47 +34,47 @@ Tag images by runtime and variant. The daemon does not infer image tags from mod
 podman build \
     -f runtimes/llama-cpp.Dockerfile \
     --build-arg RUNTIME_ID=llm-llama-cpp \
-    --build-arg ENTRYPOINT_PATH=runtimes/llm-llama-cpp/entrypoint.py \
-    --build-arg EXTRA_PIP_PACKAGES=jsonschema \
+    --build-arg RUNTIME_BIN=aileron-runtime-llm-llama-cpp \
     -t docker.io/example/aileron-runtime-llm-llama-cpp:cpu \
     .
 
 # NVIDIA CUDA
 podman build \
     -f runtimes/llama-cpp.Dockerfile \
-    --build-arg BASE_IMAGE=nvidia/cuda:13.3.0-devel-ubuntu24.04 \
-    --build-arg APT_PACKAGES="python3 python3-pip python3-dev build-essential cmake git ninja-build" \
+    --build-arg BUILDER_IMAGE=nvidia/cuda:13.3.0-devel-ubuntu24.04 \
+    --build-arg FINAL_IMAGE=nvidia/cuda:13.3.0-runtime-ubuntu24.04 \
     --build-arg CMAKE_ARGS="-DGGML_CUDA=on" \
     --build-arg CUDA_DOCKER_ARCH=all \
     --build-arg LDFLAGS="-L/usr/local/cuda/lib64/stubs -Wl,-rpath-link,/usr/local/cuda/lib64/stubs" \
     --build-arg RUNTIME_ID=llm-llama-cpp \
-    --build-arg ENTRYPOINT_PATH=runtimes/llm-llama-cpp/entrypoint.py \
-    --build-arg EXTRA_PIP_PACKAGES=jsonschema \
+    --build-arg RUNTIME_VARIANT=cuda \
+    --build-arg RUNTIME_BIN=aileron-runtime-llm-llama-cpp \
     -t docker.io/example/aileron-runtime-llm-llama-cpp:cuda \
     .
 
 # AMD ROCm
 podman build \
     -f runtimes/llama-cpp.Dockerfile \
-    --build-arg BASE_IMAGE=rocm/dev-ubuntu-22.04:7.2.4-complete \
-    --build-arg APT_PACKAGES="python3 python3-pip python3-dev build-essential cmake git ninja-build" \
+    --build-arg BUILDER_IMAGE=rocm/dev-ubuntu-22.04:7.2.4 \
+    --build-arg FINAL_IMAGE=rocm/dev-ubuntu-22.04:7.2.4 \
+    --build-arg APT_PACKAGES="hipblas-dev rocblas-dev" \
     --build-arg CMAKE_ARGS="-DGGML_HIP=on -DAMDGPU_TARGETS=gfx1030;gfx1031;gfx1032;gfx1100;gfx1101;gfx1102;gfx1103;gfx1150;gfx1151;gfx1152;gfx1153" \
     --build-arg FORCE_CMAKE=1 \
-    --build-arg PIP_INSTALL_ARGS="--no-binary llama-cpp-python" \
     --build-arg RUNTIME_ID=llm-llama-cpp \
-    --build-arg ENTRYPOINT_PATH=runtimes/llm-llama-cpp/entrypoint.py \
-    --build-arg EXTRA_PIP_PACKAGES=jsonschema \
+    --build-arg RUNTIME_VARIANT=rocm \
+    --build-arg RUNTIME_BIN=aileron-runtime-llm-llama-cpp \
     -t docker.io/example/aileron-runtime-llm-llama-cpp:rocm \
     .
 
 # Vulkan
 podman build \
     -f runtimes/llama-cpp.Dockerfile \
-    --build-arg APT_PACKAGES="build-essential cmake git ninja-build libvulkan-dev vulkan-tools libvulkan1 mesa-vulkan-drivers" \
+    --build-arg APT_PACKAGES="libvulkan-dev glslc glslang-tools spirv-headers" \
+    --build-arg RUNTIME_APT_PACKAGES="libgomp1 libstdc++6 libgcc-s1 ca-certificates libvulkan1 mesa-vulkan-drivers" \
     --build-arg CMAKE_ARGS="-DGGML_VULKAN=on" \
     --build-arg RUNTIME_ID=llm-llama-cpp \
-    --build-arg ENTRYPOINT_PATH=runtimes/llm-llama-cpp/entrypoint.py \
-    --build-arg EXTRA_PIP_PACKAGES=jsonschema \
+    --build-arg RUNTIME_VARIANT=vulkan \
+    --build-arg RUNTIME_BIN=aileron-runtime-llm-llama-cpp \
     -t docker.io/example/aileron-runtime-llm-llama-cpp:vulkan \
     .
 ```
@@ -136,5 +136,5 @@ Aileron derives the filename, model ID, and profile ID from the URL and checksum
 |---|---|---|
 | `MODEL_PATH` | `/model/model.gguf` | Path to the mounted GGUF model file |
 | `N_CTX` | `4096` | Context window size |
-| `N_GPU_LAYERS` | auto | Layers to offload; auto-detected if unset (`-1` = all) |
+| `N_GPU_LAYERS` | `0` | Layers to offload; daemon sets `-1` for GPU variants (`-1` = all) |
 | `N_THREADS` | all cores | CPU threads used when GPU is not available |

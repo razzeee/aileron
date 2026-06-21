@@ -2699,8 +2699,8 @@ Writing manifest to image destination\n";
         let rootfs_tmp = tmp_dir.join("new-rootfs");
         std::fs::create_dir_all(&rootfs_final).expect("create old rootfs");
         std::fs::create_dir_all(&rootfs_tmp).expect("create new rootfs");
-        std::fs::write(rootfs_final.join("entrypoint.py"), "old").expect("write old file");
-        std::fs::write(rootfs_tmp.join("entrypoint.py"), "new").expect("write new file");
+        std::fs::write(rootfs_final.join("entrypoint"), "old").expect("write old file");
+        std::fs::write(rootfs_tmp.join("entrypoint"), "new").expect("write new file");
 
         let error = replace_runtime_rootfs(&store, "runtime", &rootfs_tmp, || {
             anyhow::bail!("metadata failed")
@@ -2709,7 +2709,7 @@ Writing manifest to image destination\n";
 
         assert!(error.to_string().contains("metadata failed"));
         assert_eq!(
-            std::fs::read_to_string(rootfs_final.join("entrypoint.py")).unwrap(),
+            std::fs::read_to_string(rootfs_final.join("entrypoint")).unwrap(),
             "old"
         );
         assert!(!rootfs_tmp.exists());
