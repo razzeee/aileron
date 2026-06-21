@@ -655,7 +655,7 @@ async fn runtime_image_usage(state: &SharedState) -> RuntimeImageUsage {
     let guard = state.0.lock().await;
     let mut profiles_by_ref: HashMap<String, Vec<String>> = HashMap::new();
     for profile in guard.profiles.all() {
-        if let Some(image_ref) = resolve_runtime_image(&guard, profile) {
+        for image_ref in resolve_runtime_images(&guard, profile) {
             profiles_by_ref
                 .entry(image_ref.to_string())
                 .or_default()
@@ -964,14 +964,26 @@ async fn remove_oci_runtime_rootfs(store: &Path, image_id: &str) -> anyhow::Resu
     Ok(())
 }
 
-fn resolve_runtime_image<'a>(
+fn resolve_runtime_images<'a>(
     guard: &'a crate::state::Inner,
     profile: &'a Profile,
-) -> Option<&'a str> {
-    guard
+) -> Vec<&'a str> {
+    let manifest_images = guard
         .runtimes
-        .resolve(&profile.runtime_id, guard.variant)
-        .or_else(|| profile.runtime_image_for(guard.variant))
+        .resolve_candidates(&profile.runtime_id, guard.variant);
+    if !manifest_images.is_empty() {
+        return manifest_images;
+    }
+
+    profile.runtime_image_candidates(guard.variant)
+}
+
+fn runtime_support_error_string(guard: &crate::state::Inner, runtime_id: &str) -> String {
+    format!(
+        "runtime {} does not support {}",
+        runtime_id,
+        guard.variant.as_tag()
+    )
 }
 
 fn filename_from_url(url: &str) -> anyhow::Result<String> {
@@ -1049,21 +1061,20 @@ async fn install_manifest_data_inner(
     let artifact_dir = crate::profiles::model_dir(&manifest.model_id);
     let profile = manifest.clone().into_profile(artifact_dir.clone());
 
-    let runtime_image = {
+    let runtime_images = {
         let guard = state.0.lock().await;
-        resolve_runtime_image(&guard, &profile)
+        let runtime_images = resolve_runtime_images(&guard, &profile)
+            .into_iter()
             .map(str::to_string)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "runtime {} does not support {}",
-                    profile.runtime_id,
-                    guard.variant.as_tag()
-                )
-            })?
+            .collect::<Vec<_>>();
+        if runtime_images.is_empty() {
+            anyhow::bail!(runtime_support_error_string(&guard, &profile.runtime_id));
+        }
+        runtime_images
     };
 
     update_install_status(state, &profile.profile_id, "Preparing runtime image...").await;
-    pull_runtime_image(state, &runtime_image, Some(&profile.profile_id)).await?;
+    pull_runtime_image_candidates(state, &runtime_images, Some(&profile.profile_id)).await?;
 
     install_artifacts(
         state,
@@ -1338,6 +1349,25 @@ async fn pull_runtime_image(
     )
     .await;
     result
+}
+
+async fn pull_runtime_image_candidates(
+    state: &SharedState,
+    image_refs: &[String],
+    owner_profile_id: Option<&str>,
+) -> anyhow::Result<()> {
+    let mut errors = Vec::new();
+    for image_ref in image_refs {
+        match pull_runtime_image(state, image_ref, owner_profile_id).await {
+            Ok(()) => return Ok(()),
+            Err(error) => errors.push(format!("{image_ref}: {error:#}")),
+        }
+    }
+
+    anyhow::bail!(
+        "failed to prepare any runtime image: {}",
+        errors.join(" | ")
+    )
 }
 
 async fn pull_runtime_image_unconditional(
@@ -2106,7 +2136,7 @@ mod tests {
     }
 
     #[test]
-    fn usage_marks_only_resolved_runtime_image() {
+    fn usage_matches_declared_runtime_image_refs() {
         let usage = RuntimeImageUsage {
             profiles_by_ref: HashMap::from([(
                 "example/asr:vulkan".to_string(),

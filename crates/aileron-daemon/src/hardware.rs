@@ -34,9 +34,9 @@ impl Variant {
     pub fn fallback_tags(&self) -> &'static [&'static str] {
         match self {
             Variant::Cpu => &["cpu"],
-            Variant::Cuda => &["cuda", "vulkan"],
-            Variant::Rocm => &["rocm", "vulkan"],
-            Variant::Vulkan => &["vulkan"],
+            Variant::Cuda => &["cuda", "vulkan", "cpu"],
+            Variant::Rocm => &["rocm", "vulkan", "cpu"],
+            Variant::Vulkan => &["vulkan", "cpu"],
         }
     }
 }

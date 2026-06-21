@@ -623,7 +623,7 @@ The daemon probes the host once at startup and selects the best available runtim
 | `vulkaninfo` reports a device | `:vulkan` | Any Vulkan GPU |
 | Nothing found | `:cpu` | CPU-only runtime |
 
-Runtime manifests declare explicit runtime images per variant. If the detected CUDA or ROCm variant is unsupported, the daemon may fall back to a Vulkan image when present, but it does not fall back to CPU. If the selected accelerator image is missing locally, availability reports unavailable. Override detection with `AILERON_VARIANT=cpu|cuda|rocm|vulkan`.
+Runtime manifests declare explicit runtime images per variant. The daemon prefers the detected accelerator, falls back from CUDA or ROCm to Vulkan when present, and always treats CPU as the final fallback. If none of the candidate runtime rootfs trees are installed locally, availability reports unavailable. Override detection with `AILERON_VARIANT=cpu|cuda|rocm|vulkan`.
 
 ## Container security
 

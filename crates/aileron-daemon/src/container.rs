@@ -1201,6 +1201,78 @@ impl ContainerPool {
         Ok(self.containers.get_mut(profile_id).unwrap())
     }
 
+    /// Get or spawn a container using the first runtime image that starts.
+    /// Existing containers are reused when their image is still in the candidate
+    /// set, so a working fallback is not churned on every request.
+    pub fn get_or_spawn_any(
+        &mut self,
+        profile_id: &str,
+        image_refs: &[String],
+        artifact_path: &Path,
+        runtime_options: &HashMap<String, String>,
+        on_status: impl FnMut(String) + Send + 'static,
+    ) -> Result<&mut Container> {
+        if image_refs.is_empty() {
+            bail!("no runtime images resolved for profile {profile_id}");
+        }
+
+        let can_reuse = self.containers.get(profile_id).is_some_and(|container| {
+            image_refs
+                .iter()
+                .any(|image_ref| image_ref == &container.image_ref)
+                && container.artifact_path == artifact_path
+                && container.runtime_options == *runtime_options
+        });
+        if can_reuse {
+            return Ok(self.containers.get_mut(profile_id).unwrap());
+        }
+
+        if self.containers.contains_key(profile_id) {
+            info!(
+                "replacing container for profile {} with one of {} candidate runtime images",
+                profile_id,
+                image_refs.len()
+            );
+            self.containers.remove(profile_id);
+        }
+
+        let on_status = std::sync::Arc::new(std::sync::Mutex::new(on_status));
+        let mut errors = Vec::new();
+        for image_ref in image_refs {
+            let status_callback = on_status.clone();
+            match Container::spawn(
+                image_ref,
+                artifact_path,
+                runtime_options,
+                &self.memory_limit,
+                &self.oci_store,
+                &self.system_oci_store,
+                move |line| {
+                    if let Ok(mut callback) = status_callback.lock() {
+                        (*callback)(line);
+                    }
+                },
+            ) {
+                Ok(container) => {
+                    self.containers.insert(profile_id.to_string(), container);
+                    return Ok(self.containers.get_mut(profile_id).unwrap());
+                }
+                Err(error) => {
+                    warn!(
+                        "failed to start runtime image {} for profile {}: {:#}",
+                        image_ref, profile_id, error
+                    );
+                    errors.push(format!("{image_ref}: {error:#}"));
+                }
+            }
+        }
+
+        bail!(
+            "failed to start any runtime image for profile {profile_id}: {}",
+            errors.join(" | ")
+        )
+    }
+
     /// Kill and remove the container for a profile.
     pub fn kill(&mut self, profile_id: &str) {
         if self.containers.remove(profile_id).is_some() {

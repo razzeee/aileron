@@ -132,11 +132,24 @@ impl RuntimeManifestStore {
     }
 
     pub fn resolve(&self, runtime_id: &str, detected: Variant) -> Option<&str> {
-        let runtime = self.runtimes.get(runtime_id)?;
-        detected
-            .fallback_tags()
-            .iter()
-            .find_map(|variant| runtime.images.get(*variant).map(String::as_str))
+        self.resolve_candidates(runtime_id, detected)
+            .into_iter()
+            .next()
+    }
+
+    pub fn resolve_candidates(&self, runtime_id: &str, detected: Variant) -> Vec<&str> {
+        let Some(runtime) = self.runtimes.get(runtime_id) else {
+            return Vec::new();
+        };
+        let mut candidates = Vec::new();
+        for variant in detected.fallback_tags() {
+            if let Some(image_ref) = runtime.images.get(*variant).map(String::as_str)
+                && !candidates.contains(&image_ref)
+            {
+                candidates.push(image_ref);
+            }
+        }
+        candidates
     }
 
     pub fn images_for(&self, runtime_id: &str) -> Vec<RuntimeImage> {
@@ -416,7 +429,7 @@ mod tests {
     use hegel::generators as gs;
 
     #[test]
-    fn resolves_detected_variant_without_cpu_fallback() {
+    fn resolves_detected_variant_with_cpu_fallback() {
         let runtime = RuntimeManifest {
             runtime_id: "llm-llama-cpp".to_string(),
             images: HashMap::from([
@@ -432,7 +445,10 @@ mod tests {
             manifests.resolve("llm-llama-cpp", Variant::Cuda),
             Some("example/llm:cuda")
         );
-        assert_eq!(manifests.resolve("llm-llama-cpp", Variant::Vulkan), None);
+        assert_eq!(
+            manifests.resolve("llm-llama-cpp", Variant::Vulkan),
+            Some("example/llm:cpu")
+        );
     }
 
     #[test]
@@ -455,6 +471,26 @@ mod tests {
         assert_eq!(
             manifests.resolve("asr-whisper-cpp", Variant::Cuda),
             Some("example/asr:vulkan")
+        );
+    }
+
+    #[test]
+    fn resolves_accelerator_variant_with_cpu_fallback() {
+        let runtime = RuntimeManifest {
+            runtime_id: "asr-whisper-cpp".to_string(),
+            images: HashMap::from([("cpu".to_string(), "example/asr:cpu".to_string())]),
+        };
+        let manifests = RuntimeManifestStore {
+            runtimes: HashMap::from([("asr-whisper-cpp".to_string(), runtime)]),
+        };
+
+        assert_eq!(
+            manifests.resolve("asr-whisper-cpp", Variant::Rocm),
+            Some("example/asr:cpu")
+        );
+        assert_eq!(
+            manifests.resolve_candidates("asr-whisper-cpp", Variant::Rocm),
+            vec!["example/asr:cpu"]
         );
     }
 

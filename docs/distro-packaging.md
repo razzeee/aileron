@@ -172,7 +172,7 @@ The daemon renders OCI layouts to rootfs directories with the `ocirender` Rust c
 
 ## Hardware Access
 
-Runtime manifests map each runtime ID to image variants such as `cpu`, `cuda`, `rocm`, and `vulkan`. The daemon chooses the best variant detected on the host.
+Runtime manifests map each runtime ID to image variants such as `cpu`, `cuda`, `rocm`, and `vulkan`. The daemon chooses the best variant detected on the host, falls back from CUDA or ROCm to Vulkan when available, and uses CPU as the final fallback.
 
 The generated OCI bundle exposes only the hardware needed by the selected variant:
 

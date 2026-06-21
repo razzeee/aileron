@@ -124,12 +124,23 @@ impl ProfileStore {
 
 impl Profile {
     pub fn runtime_image_for(&self, detected: Variant) -> Option<&str> {
-        detected.fallback_tags().iter().find_map(|variant| {
-            self.runtime_images
+        self.runtime_image_candidates(detected).into_iter().next()
+    }
+
+    pub fn runtime_image_candidates(&self, detected: Variant) -> Vec<&str> {
+        let mut candidates = Vec::new();
+        for variant in detected.fallback_tags() {
+            if let Some(image_ref) = self
+                .runtime_images
                 .iter()
                 .find(|img| img.variant == *variant)
                 .map(|img| img.image_ref.as_str())
-        })
+                && !candidates.contains(&image_ref)
+            {
+                candidates.push(image_ref);
+            }
+        }
+        candidates
     }
 }
 
@@ -299,6 +310,23 @@ mod tests {
         assert_eq!(
             profile.runtime_image_for(Variant::Cuda),
             Some("example/asr:vulkan")
+        );
+    }
+
+    #[test]
+    fn runtime_image_for_uses_cpu_as_final_fallback() {
+        let profile = profile_with_runtime_images(vec![RuntimeImage {
+            variant: "cpu".to_string(),
+            image_ref: "example/asr:cpu".to_string(),
+        }]);
+
+        assert_eq!(
+            profile.runtime_image_for(Variant::Rocm),
+            Some("example/asr:cpu")
+        );
+        assert_eq!(
+            profile.runtime_image_candidates(Variant::Rocm),
+            vec!["example/asr:cpu"]
         );
     }
 
