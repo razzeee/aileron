@@ -5,12 +5,14 @@ on:
     branches: ["main"]
     paths:
       - ".github/workflows/runtime-images.yml"
-      - "runtimes/_llama_cpp_common/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
       - "runtimes/llama-cpp.Dockerfile"
       - "runtimes/llm-llama-cpp/**"
       - "runtimes/vision-llama-cpp-gemma4/**"
       - "runtimes/asr-whisper-cpp/**"
       - "runtimes/stub/**"
+      - "crates/aileron-runtime/**"
   workflow_dispatch:
 
 permissions:
@@ -34,8 +36,7 @@ jobs:
               RUNTIME_ID=llm-llama-cpp
               RUNTIME_VARIANT=cpu
               RUNTIME_DESCRIPTION=Aileron llama.cpp runtime for local text generation.
-              ENTRYPOINT_PATH=runtimes/llm-llama-cpp/entrypoint.py
-              EXTRA_PIP_PACKAGES=jsonschema
+              RUNTIME_BIN=aileron-runtime-llm-llama-cpp
           - runtime_id: llm-llama-cpp
             image_name: aileron-runtime-llm-llama-cpp
             description: Aileron llama.cpp runtime for local text generation.
@@ -44,16 +45,15 @@ jobs:
             build_args: |
               BUILDER_IMAGE=nvidia/cuda:13.3.0-devel-ubuntu24.04
               FINAL_IMAGE=nvidia/cuda:13.3.0-runtime-ubuntu24.04
-              RUNTIME_APT_PACKAGES=python3 libgomp1
-              APT_PACKAGES=python3 python3-pip python3-dev build-essential cmake git ninja-build
+              RUNTIME_APT_PACKAGES=libgomp1 libstdc++6 libgcc-s1 ca-certificates
+              APT_PACKAGES=build-essential cmake git ninja-build
               CMAKE_ARGS=-DGGML_CUDA=on
               CUDA_DOCKER_ARCH=all
               LDFLAGS=-L/usr/local/cuda/lib64/stubs -Wl,-rpath-link,/usr/local/cuda/lib64/stubs
               RUNTIME_ID=llm-llama-cpp
               RUNTIME_VARIANT=cuda
               RUNTIME_DESCRIPTION=Aileron llama.cpp runtime for local text generation.
-              ENTRYPOINT_PATH=runtimes/llm-llama-cpp/entrypoint.py
-              EXTRA_PIP_PACKAGES=jsonschema
+              RUNTIME_BIN=aileron-runtime-llm-llama-cpp
           - runtime_id: llm-llama-cpp
             image_name: aileron-runtime-llm-llama-cpp
             description: Aileron llama.cpp runtime for local text generation.
@@ -62,16 +62,14 @@ jobs:
             build_args: |
               BUILDER_IMAGE=rocm/dev-ubuntu-22.04:7.2.4
               FINAL_IMAGE=rocm/dev-ubuntu-22.04:7.2.4
-              RUNTIME_APT_PACKAGES=python3 libgomp1 hipblas-dev rocblas-dev
-              APT_PACKAGES=python3 python3-pip python3-dev build-essential cmake git ninja-build hipblas-dev rocblas-dev
+              RUNTIME_APT_PACKAGES=libgomp1 libstdc++6 libgcc-s1 ca-certificates hipblas-dev rocblas-dev
+              APT_PACKAGES=build-essential cmake git ninja-build hipblas-dev rocblas-dev
               CMAKE_ARGS=-DGGML_HIP=on -DAMDGPU_TARGETS=gfx1030;gfx1031;gfx1032;gfx1100;gfx1101;gfx1102;gfx1103;gfx1150;gfx1151;gfx1152;gfx1153
               FORCE_CMAKE=1
-              PIP_INSTALL_ARGS=--no-binary llama-cpp-python
               RUNTIME_ID=llm-llama-cpp
               RUNTIME_VARIANT=rocm
               RUNTIME_DESCRIPTION=Aileron llama.cpp runtime for local text generation.
-              ENTRYPOINT_PATH=runtimes/llm-llama-cpp/entrypoint.py
-              EXTRA_PIP_PACKAGES=jsonschema
+              RUNTIME_BIN=aileron-runtime-llm-llama-cpp
           - runtime_id: llm-llama-cpp
             image_name: aileron-runtime-llm-llama-cpp
             description: Aileron llama.cpp runtime for local text generation.
@@ -79,13 +77,12 @@ jobs:
             variant: vulkan
             build_args: |
               APT_PACKAGES=build-essential cmake git ninja-build libvulkan-dev glslc glslang-tools spirv-headers
-              RUNTIME_APT_PACKAGES=libgomp1 libvulkan1 mesa-vulkan-drivers
+              RUNTIME_APT_PACKAGES=libgomp1 libstdc++6 libgcc-s1 ca-certificates libvulkan1 mesa-vulkan-drivers
               CMAKE_ARGS=-DGGML_VULKAN=on
               RUNTIME_ID=llm-llama-cpp
               RUNTIME_VARIANT=vulkan
               RUNTIME_DESCRIPTION=Aileron llama.cpp runtime for local text generation.
-              ENTRYPOINT_PATH=runtimes/llm-llama-cpp/entrypoint.py
-              EXTRA_PIP_PACKAGES=jsonschema
+              RUNTIME_BIN=aileron-runtime-llm-llama-cpp
           - runtime_id: vision-llama-cpp-gemma4
             image_name: aileron-runtime-vision-llama-cpp-gemma4
             description: Aileron Gemma 4 vision runtime using llama.cpp.
@@ -95,9 +92,7 @@ jobs:
               RUNTIME_ID=vision-llama-cpp-gemma4
               RUNTIME_VARIANT=cpu
               RUNTIME_DESCRIPTION=Aileron Gemma 4 vision runtime using llama.cpp.
-              ENTRYPOINT_PATH=runtimes/vision-llama-cpp-gemma4/entrypoint.py
-              INSTALL_SOURCE=git
-              EXTRA_PIP_PACKAGES=jsonschema
+              RUNTIME_BIN=aileron-runtime-vision-llama-cpp
           - runtime_id: vision-llama-cpp-gemma4
             image_name: aileron-runtime-vision-llama-cpp-gemma4
             description: Aileron Gemma 4 vision runtime using llama.cpp.
@@ -106,17 +101,15 @@ jobs:
             build_args: |
               BUILDER_IMAGE=nvidia/cuda:13.3.0-devel-ubuntu24.04
               FINAL_IMAGE=nvidia/cuda:13.3.0-runtime-ubuntu24.04
-              RUNTIME_APT_PACKAGES=python3 libgomp1
-              APT_PACKAGES=python3 python3-pip python3-dev build-essential cmake git ninja-build
+              RUNTIME_APT_PACKAGES=libgomp1 libstdc++6 libgcc-s1 ca-certificates
+              APT_PACKAGES=build-essential cmake git ninja-build
               CMAKE_ARGS=-DGGML_CUDA=on
               CUDA_DOCKER_ARCH=all
               LDFLAGS=-L/usr/local/cuda/lib64/stubs -Wl,-rpath-link,/usr/local/cuda/lib64/stubs
               RUNTIME_ID=vision-llama-cpp-gemma4
               RUNTIME_VARIANT=cuda
               RUNTIME_DESCRIPTION=Aileron Gemma 4 vision runtime using llama.cpp.
-              ENTRYPOINT_PATH=runtimes/vision-llama-cpp-gemma4/entrypoint.py
-              INSTALL_SOURCE=git
-              EXTRA_PIP_PACKAGES=jsonschema
+              RUNTIME_BIN=aileron-runtime-vision-llama-cpp
           - runtime_id: vision-llama-cpp-gemma4
             image_name: aileron-runtime-vision-llama-cpp-gemma4
             description: Aileron Gemma 4 vision runtime using llama.cpp.
@@ -125,17 +118,14 @@ jobs:
             build_args: |
               BUILDER_IMAGE=rocm/dev-ubuntu-22.04:7.2.4
               FINAL_IMAGE=rocm/dev-ubuntu-22.04:7.2.4
-              RUNTIME_APT_PACKAGES=python3 libgomp1 hipblas-dev rocblas-dev
-              APT_PACKAGES=python3 python3-pip python3-dev build-essential cmake git ninja-build hipblas-dev rocblas-dev
+              RUNTIME_APT_PACKAGES=libgomp1 libstdc++6 libgcc-s1 ca-certificates hipblas-dev rocblas-dev
+              APT_PACKAGES=build-essential cmake git ninja-build hipblas-dev rocblas-dev
               CMAKE_ARGS=-DGGML_HIP=on -DAMDGPU_TARGETS=gfx1030;gfx1031;gfx1032;gfx1100;gfx1101;gfx1102;gfx1103;gfx1150;gfx1151;gfx1152;gfx1153
               FORCE_CMAKE=1
-              PIP_INSTALL_ARGS=--no-binary llama-cpp-python
               RUNTIME_ID=vision-llama-cpp-gemma4
               RUNTIME_VARIANT=rocm
               RUNTIME_DESCRIPTION=Aileron Gemma 4 vision runtime using llama.cpp.
-              ENTRYPOINT_PATH=runtimes/vision-llama-cpp-gemma4/entrypoint.py
-              INSTALL_SOURCE=git
-              EXTRA_PIP_PACKAGES=jsonschema
+              RUNTIME_BIN=aileron-runtime-vision-llama-cpp
           - runtime_id: vision-llama-cpp-gemma4
             image_name: aileron-runtime-vision-llama-cpp-gemma4
             description: Aileron Gemma 4 vision runtime using llama.cpp.
@@ -143,14 +133,12 @@ jobs:
             variant: vulkan
             build_args: |
               APT_PACKAGES=build-essential cmake git ninja-build libvulkan-dev glslc glslang-tools spirv-headers
-              RUNTIME_APT_PACKAGES=libgomp1 libvulkan1 mesa-vulkan-drivers
+              RUNTIME_APT_PACKAGES=libgomp1 libstdc++6 libgcc-s1 ca-certificates libvulkan1 mesa-vulkan-drivers
               CMAKE_ARGS=-DGGML_VULKAN=on
               RUNTIME_ID=vision-llama-cpp-gemma4
               RUNTIME_VARIANT=vulkan
               RUNTIME_DESCRIPTION=Aileron Gemma 4 vision runtime using llama.cpp.
-              ENTRYPOINT_PATH=runtimes/vision-llama-cpp-gemma4/entrypoint.py
-              INSTALL_SOURCE=git
-              EXTRA_PIP_PACKAGES=jsonschema
+              RUNTIME_BIN=aileron-runtime-vision-llama-cpp
 
     steps:
       - uses: actions/checkout@v6
@@ -205,28 +193,28 @@ jobs:
             description: Aileron Whisper.cpp runtime for local speech transcription.
             documentation_path: runtimes/asr-whisper-cpp/README.md
             variant: cpu
-            context: runtimes/asr-whisper-cpp
+            context: .
             file: runtimes/asr-whisper-cpp/Dockerfile
           - runtime_id: asr-whisper-cpp
             image_name: aileron-runtime-asr-whisper-cpp
             description: Aileron Whisper.cpp runtime for local speech transcription.
             documentation_path: runtimes/asr-whisper-cpp/README.md
             variant: cuda
-            context: runtimes/asr-whisper-cpp
+            context: .
             file: runtimes/asr-whisper-cpp/Dockerfile.cuda
           - runtime_id: asr-whisper-cpp
             image_name: aileron-runtime-asr-whisper-cpp
             description: Aileron Whisper.cpp runtime for local speech transcription.
             documentation_path: runtimes/asr-whisper-cpp/README.md
             variant: vulkan
-            context: runtimes/asr-whisper-cpp
+            context: .
             file: runtimes/asr-whisper-cpp/Dockerfile.vulkan
           - runtime_id: stub
             image_name: aileron-runtime-stub
             description: Aileron stub runtime for development and protocol testing.
             documentation_path: runtimes/stub/README.md
             variant: cpu
-            context: runtimes/stub
+            context: .
             file: runtimes/stub/Dockerfile
     steps:
       - uses: actions/checkout@v6

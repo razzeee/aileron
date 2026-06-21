@@ -753,10 +753,8 @@ fn runtime_config_json(
     runtime_options: &HashMap<String, String>,
     memory_limit: &str,
 ) -> Result<Value> {
-    let mut env = vec![
-        "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
-        "PYTHONUNBUFFERED=1".to_string(),
-    ];
+    let mut env =
+        vec!["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string()];
     let mut mounts = vec![
         serde_json::json!({
             "destination": "/proc",
@@ -813,7 +811,7 @@ fn runtime_config_json(
         "process": {
             "terminal": false,
             "user": { "uid": 0, "gid": 0 },
-            "args": ["python", "/entrypoint.py"],
+            "args": ["/entrypoint"],
             "env": env,
             "cwd": "/",
             "noNewPrivileges": true,
@@ -1341,6 +1339,10 @@ mod tests {
         assert_eq!(config["root"]["readonly"], true);
         assert_eq!(config["root"]["path"], "/store/rootfs/runtime");
         assert_eq!(config["process"]["noNewPrivileges"], true);
+        assert_eq!(
+            config["process"]["args"],
+            serde_json::json!(["/entrypoint"])
+        );
         assert_eq!(
             config["process"]["capabilities"]["bounding"]
                 .as_array()

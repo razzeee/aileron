@@ -59,9 +59,9 @@ Reusable runtime images live in `runtimes/`. Model artifacts are installed separ
 
 | Directory | Description |
 |---|---|
-| `runtimes/llm-llama-cpp/` | llama-cpp-python runtime for text generation and structured output |
-| `runtimes/asr-whisper-cpp/` | pywhispercpp runtime for audio transcription |
-| `runtimes/vision-llama-cpp-gemma4/` | llama-cpp-python Gemma 4 multimodal runtime for image description |
+| `runtimes/llm-llama-cpp/` | Rust llama.cpp runtime for text generation and structured output |
+| `runtimes/asr-whisper-cpp/` | Rust whisper.cpp runtime for audio transcription |
+| `runtimes/vision-llama-cpp-gemma4/` | Rust llama.cpp Gemma 4 runtime for text and structured vision-model operations |
 | `runtimes/stub/` | no-ML test runtime implementing the stdio protocol |
 
 ## Building

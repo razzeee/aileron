@@ -1,6 +1,6 @@
 # ASR Runtime
 
-This runtime runs whisper.cpp through `pywhispercpp` and implements `speech.transcribe` for Whisper artifacts mounted under `/model`.
+This runtime runs whisper.cpp through the Rust `whisper-rs` bindings and implements `speech.transcribe` for Whisper artifacts mounted under `/model`.
 
 Model weights are not baked into the image. A model manifest downloads and verifies the Whisper artifact, then references this runtime by `runtime_id`.
 
@@ -31,20 +31,21 @@ There is no ROCm-specific Dockerfile currently. If the host detects `rocm` and t
 ```sh
 # CPU
 podman build \
+    -f runtimes/asr-whisper-cpp/Dockerfile \
     -t docker.io/example/aileron-runtime-asr-whisper-cpp:cpu \
-    runtimes/asr-whisper-cpp
+    .
 
 # NVIDIA CUDA
 podman build \
     -f runtimes/asr-whisper-cpp/Dockerfile.cuda \
     -t docker.io/example/aileron-runtime-asr-whisper-cpp:cuda \
-    runtimes/asr-whisper-cpp
+    .
 
 # Vulkan
 podman build \
     -f runtimes/asr-whisper-cpp/Dockerfile.vulkan \
     -t docker.io/example/aileron-runtime-asr-whisper-cpp:vulkan \
-    runtimes/asr-whisper-cpp
+    .
 ```
 
 ## Runtime Manifest
@@ -102,5 +103,5 @@ Aileron derives the filename, model ID, and profile ID from the URL and checksum
 | Variable | Default | Description |
 |---|---|---|
 | `MODEL_PATH` | `/model/model.bin` | Path to the mounted Whisper artifact |
-| `AILERON_DEVICE` | auto | Override device detection inside the runtime (`cpu`, `cuda`, or `vulkan`) |
+| `AILERON_DEVICE` | `cpu` | Device selected by the daemon (`cpu`, `cuda`, or `vulkan`) |
 | `N_THREADS` | host CPU count | Number of CPU threads passed to whisper.cpp |
