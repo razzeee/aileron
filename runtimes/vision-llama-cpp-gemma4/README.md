@@ -23,7 +23,7 @@ One shared llama.cpp Dockerfile builds all accelerator variants with build args:
 | Variant | Base/build args | Hardware | Notes |
 |---|---|---|---|
 | `cpu` | default | CPU | Default, works everywhere |
-| `cuda` | `BUILDER_IMAGE=nvidia/cuda:13.3.0-devel-ubuntu24.04`, `CMAKE_ARGS=-DGGML_CUDA=on` | NVIDIA GPU | Requires NVIDIA container support on host |
+| `cuda` | `BUILDER_IMAGE=nvidia/cuda:13.3.0-devel-ubuntu24.04`, `CMAKE_ARGS=-DGGML_CUDA=on` | NVIDIA GPU | Requires NVIDIA driver devices and `libcuda.so.1` on host |
 | `rocm` | `BUILDER_IMAGE=rocm/dev-ubuntu-22.04:7.2.4`, `CMAKE_ARGS=-DGGML_HIP=on` | AMD GPU | Requires ROCm devices on host |
 | `vulkan` | `CMAKE_ARGS=-DGGML_VULKAN=on` plus Vulkan packages | Vulkan GPU | NVIDIA / AMD / Intel Arc |
 
@@ -143,5 +143,5 @@ This runtime needs both `model.gguf` and `mmproj.gguf`, so install it through a 
 | `VISION_OCR_PROMPT` | built-in OCR prompt | Prompt used for `ocr` requests when none is supplied |
 | `VISION_SEGMENT_PROMPT` | built-in object box prompt | Prompt used for `segment` requests when none is supplied |
 | `N_CTX` | `4096` | Context window size |
-| `N_GPU_LAYERS` | `0` | Layers to offload; daemon sets `-1` for GPU variants (`-1` = all) |
+| `N_GPU_LAYERS` | `0` | Layers to offload; daemon starts GPU variants at `-1` (`-1` = all), then retries lower values on cold-start failure unless explicitly set by the profile |
 | `N_THREADS` | all cores | CPU threads used when GPU is not available |

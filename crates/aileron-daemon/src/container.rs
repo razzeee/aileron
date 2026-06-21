@@ -65,6 +65,26 @@ use serde_json::Value;
 use tracing::{info, warn};
 use uuid::Uuid;
 
+const NVIDIA_LIBRARY_DIR: &str = "/usr/local/nvidia/lib64";
+const NVIDIA_DRIVER_LIBRARIES: &[&str] = &[
+    "libcuda.so.1",
+    "libcuda.so",
+    "libnvidia-ml.so.1",
+    "libnvidia-ml.so",
+    "libnvidia-ptxjitcompiler.so.1",
+    "libnvidia-ptxjitcompiler.so",
+    "libnvidia-nvvm.so.4",
+    "libnvidia-nvvm.so",
+];
+const COMMON_LIBRARY_DIRS: &[&str] = &[
+    "/usr/lib/x86_64-linux-gnu",
+    "/usr/lib64",
+    "/usr/lib",
+    "/lib/x86_64-linux-gnu",
+    "/lib64",
+    "/run/opengl-driver/lib",
+];
+
 /// A running container for a single use-case.
 pub struct Container {
     #[allow(dead_code)]
@@ -79,6 +99,12 @@ pub struct Container {
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     pub last_used: std::time::Instant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeSpawnAttempt {
+    image_ref: String,
+    runtime_options: HashMap<String, String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -755,6 +781,7 @@ fn runtime_config_json(
 ) -> Result<Value> {
     let mut env =
         vec!["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string()];
+    let mut env_options = runtime_options.clone();
     let mut mounts = vec![
         serde_json::json!({
             "destination": "/proc",
@@ -783,24 +810,24 @@ fn runtime_config_json(
     ];
 
     if image_ref_uses_tag(image_ref, "cuda") {
-        add_cuda_mounts(&mut mounts);
+        add_cuda_mounts(&mut mounts, &mut env_options);
         add_readonly_mount(&mut mounts, "/sys");
-        env.push("N_GPU_LAYERS=-1".to_string());
-        env.push("AILERON_DEVICE=cuda".to_string());
+        push_default_env(&mut env, &env_options, "N_GPU_LAYERS", "-1");
+        push_default_env(&mut env, &env_options, "AILERON_DEVICE", "cuda");
     } else if image_ref_uses_tag(image_ref, "rocm") {
         add_device_mount(&mut mounts, "/dev/kfd");
         add_device_mount(&mut mounts, "/dev/dri");
         add_readonly_mount(&mut mounts, "/sys");
-        env.push("N_GPU_LAYERS=-1".to_string());
-        env.push("AILERON_DEVICE=rocm".to_string());
+        push_default_env(&mut env, &env_options, "N_GPU_LAYERS", "-1");
+        push_default_env(&mut env, &env_options, "AILERON_DEVICE", "rocm");
     } else if image_ref_uses_tag(image_ref, "vulkan") {
         add_device_mount(&mut mounts, "/dev/dri");
         add_readonly_mount(&mut mounts, "/sys");
-        env.push("N_GPU_LAYERS=-1".to_string());
-        env.push("AILERON_DEVICE=vulkan".to_string());
+        push_default_env(&mut env, &env_options, "N_GPU_LAYERS", "-1");
+        push_default_env(&mut env, &env_options, "AILERON_DEVICE", "vulkan");
     }
 
-    let mut runtime_options: Vec<_> = runtime_options.iter().collect();
+    let mut runtime_options: Vec<_> = env_options.iter().collect();
     runtime_options.sort_by(|a, b| a.0.cmp(b.0));
     for (key, value) in runtime_options {
         env.push(format!("{key}={value}"));
@@ -865,6 +892,17 @@ fn runtime_config_json(
     }))
 }
 
+fn push_default_env(
+    env: &mut Vec<String>,
+    runtime_options: &HashMap<String, String>,
+    key: &str,
+    value: &str,
+) {
+    if !runtime_options.contains_key(key) {
+        env.push(format!("{key}={value}"));
+    }
+}
+
 fn add_device_mount(mounts: &mut Vec<Value>, path: &str) {
     mounts.push(serde_json::json!({
         "destination": path,
@@ -874,7 +912,7 @@ fn add_device_mount(mounts: &mut Vec<Value>, path: &str) {
     }));
 }
 
-fn add_cuda_mounts(mounts: &mut Vec<Value>) {
+fn add_cuda_mounts(mounts: &mut Vec<Value>, runtime_options: &mut HashMap<String, String>) {
     add_existing_device_mounts(
         mounts,
         [
@@ -890,6 +928,7 @@ fn add_cuda_mounts(mounts: &mut Vec<Value>) {
     if Path::new("/proc/driver/nvidia").exists() {
         add_readonly_mount(mounts, "/proc/driver/nvidia");
     }
+    add_nvidia_driver_library_mounts(mounts, runtime_options);
 }
 
 fn add_existing_device_mounts<const N: usize>(mounts: &mut Vec<Value>, paths: [&str; N]) {
@@ -907,6 +946,113 @@ fn add_readonly_mount(mounts: &mut Vec<Value>, path: &str) {
         "source": path,
         "options": ["rbind", "ro", "nosuid", "nodev", "noexec"]
     }));
+}
+
+fn add_nvidia_driver_library_mounts(
+    mounts: &mut Vec<Value>,
+    runtime_options: &mut HashMap<String, String>,
+) {
+    add_nvidia_driver_library_mounts_from(mounts, runtime_options, nvidia_driver_library_mounts());
+}
+
+fn add_nvidia_driver_library_mounts_from(
+    mounts: &mut Vec<Value>,
+    runtime_options: &mut HashMap<String, String>,
+    library_mounts: Vec<(PathBuf, String)>,
+) {
+    if library_mounts.is_empty() {
+        return;
+    }
+
+    for (source, library_name) in library_mounts {
+        add_readonly_file_mount(
+            mounts,
+            &source,
+            &Path::new(NVIDIA_LIBRARY_DIR).join(library_name),
+        );
+    }
+    prepend_ld_library_path(runtime_options, NVIDIA_LIBRARY_DIR);
+}
+
+fn prepend_ld_library_path(runtime_options: &mut HashMap<String, String>, path: &str) {
+    runtime_options
+        .entry("LD_LIBRARY_PATH".to_string())
+        .and_modify(|existing| {
+            if !existing.split(':').any(|part| part == path) {
+                *existing = if existing.is_empty() {
+                    path.to_string()
+                } else {
+                    format!("{path}:{existing}")
+                };
+            }
+        })
+        .or_insert_with(|| path.to_string());
+}
+
+fn add_readonly_file_mount(mounts: &mut Vec<Value>, source: &Path, destination: &Path) {
+    mounts.push(serde_json::json!({
+        "destination": destination.display().to_string(),
+        "type": "bind",
+        "source": source.display().to_string(),
+        "options": ["bind", "ro", "nosuid", "nodev"]
+    }));
+}
+
+fn nvidia_driver_library_mounts() -> Vec<(PathBuf, String)> {
+    let ldconfig = ldconfig_library_cache();
+    let mut mounts = Vec::new();
+    for library_name in NVIDIA_DRIVER_LIBRARIES {
+        let Some(path) = find_host_library(library_name, &ldconfig) else {
+            continue;
+        };
+        if mounts.iter().any(|(_, name)| name == library_name) {
+            continue;
+        }
+        mounts.push((path, (*library_name).to_string()));
+    }
+    mounts
+}
+
+fn find_host_library(library_name: &str, ldconfig: &HashMap<String, PathBuf>) -> Option<PathBuf> {
+    ldconfig
+        .get(library_name)
+        .filter(|path| path.exists())
+        .cloned()
+        .or_else(|| {
+            COMMON_LIBRARY_DIRS
+                .iter()
+                .map(|dir| Path::new(dir).join(library_name))
+                .find(|path| path.exists())
+        })
+}
+
+fn ldconfig_library_cache() -> HashMap<String, PathBuf> {
+    std::process::Command::new("ldconfig")
+        .arg("-p")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+        .map(|output| parse_ldconfig_cache(&output))
+        .unwrap_or_default()
+}
+
+fn parse_ldconfig_cache(output: &str) -> HashMap<String, PathBuf> {
+    let mut libraries = HashMap::new();
+    for line in output.lines() {
+        let Some((name_and_abi, path)) = line.split_once("=>") else {
+            continue;
+        };
+        let Some(name) = name_and_abi.split_whitespace().next() else {
+            continue;
+        };
+        if NVIDIA_DRIVER_LIBRARIES.contains(&name) {
+            libraries
+                .entry(name.to_string())
+                .or_insert_with(|| PathBuf::from(path.trim()));
+        }
+    }
+    libraries
 }
 
 fn parse_memory_limit(limit: &str) -> Result<i64> {
@@ -1207,6 +1353,7 @@ impl ContainerPool {
     pub fn get_or_spawn_any(
         &mut self,
         profile_id: &str,
+        runtime_id: &str,
         image_refs: &[String],
         artifact_path: &Path,
         runtime_options: &HashMap<String, String>,
@@ -1215,13 +1362,14 @@ impl ContainerPool {
         if image_refs.is_empty() {
             bail!("no runtime images resolved for profile {profile_id}");
         }
+        let attempts = runtime_spawn_attempts(runtime_id, image_refs, runtime_options);
 
         let can_reuse = self.containers.get(profile_id).is_some_and(|container| {
-            image_refs
-                .iter()
-                .any(|image_ref| image_ref == &container.image_ref)
-                && container.artifact_path == artifact_path
-                && container.runtime_options == *runtime_options
+            attempts.iter().any(|attempt| {
+                attempt.image_ref == container.image_ref
+                    && attempt.runtime_options == container.runtime_options
+                    && container.artifact_path == artifact_path
+            })
         });
         if can_reuse {
             return Ok(self.containers.get_mut(profile_id).unwrap());
@@ -1238,12 +1386,12 @@ impl ContainerPool {
 
         let on_status = std::sync::Arc::new(std::sync::Mutex::new(on_status));
         let mut errors = Vec::new();
-        for image_ref in image_refs {
+        for attempt in attempts {
             let status_callback = on_status.clone();
             match Container::spawn(
-                image_ref,
+                &attempt.image_ref,
                 artifact_path,
-                runtime_options,
+                &attempt.runtime_options,
                 &self.memory_limit,
                 &self.oci_store,
                 &self.system_oci_store,
@@ -1260,9 +1408,11 @@ impl ContainerPool {
                 Err(error) => {
                     warn!(
                         "failed to start runtime image {} for profile {}: {:#}",
-                        image_ref, profile_id, error
+                        describe_spawn_attempt(&attempt),
+                        profile_id,
+                        error
                     );
-                    errors.push(format!("{image_ref}: {error:#}"));
+                    errors.push(format!("{}: {error:#}", describe_spawn_attempt(&attempt)));
                 }
             }
         }
@@ -1303,6 +1453,56 @@ impl ContainerPool {
             warn!("evicting idle container for profile {}", k);
             self.containers.remove(&k);
         }
+    }
+}
+
+fn runtime_spawn_attempts(
+    runtime_id: &str,
+    image_refs: &[String],
+    runtime_options: &HashMap<String, String>,
+) -> Vec<RuntimeSpawnAttempt> {
+    let mut attempts = Vec::new();
+    for image_ref in image_refs {
+        attempts.push(RuntimeSpawnAttempt {
+            image_ref: image_ref.clone(),
+            runtime_options: runtime_options.clone(),
+        });
+
+        if !is_gpu_image_ref(image_ref)
+            || !runtime_supports_gpu_layer_offload(runtime_id)
+            || runtime_options.contains_key("N_GPU_LAYERS")
+        {
+            continue;
+        }
+
+        for layers in ["64", "32", "16", "8", "4", "0"] {
+            let mut fallback_options = runtime_options.clone();
+            fallback_options.insert("N_GPU_LAYERS".to_string(), layers.to_string());
+            attempts.push(RuntimeSpawnAttempt {
+                image_ref: image_ref.clone(),
+                runtime_options: fallback_options,
+            });
+        }
+    }
+    attempts
+}
+
+fn is_gpu_image_ref(image_ref: &str) -> bool {
+    image_ref_uses_tag(image_ref, "cuda")
+        || image_ref_uses_tag(image_ref, "rocm")
+        || image_ref_uses_tag(image_ref, "vulkan")
+}
+
+fn runtime_supports_gpu_layer_offload(runtime_id: &str) -> bool {
+    runtime_id.contains("llama-cpp")
+}
+
+fn describe_spawn_attempt(attempt: &RuntimeSpawnAttempt) -> String {
+    match attempt.runtime_options.get("N_GPU_LAYERS") {
+        Some(layers) if is_gpu_image_ref(&attempt.image_ref) => {
+            format!("{} (N_GPU_LAYERS={layers})", attempt.image_ref)
+        }
+        _ => attempt.image_ref.clone(),
     }
 }
 
@@ -1627,8 +1827,86 @@ mod tests {
             .filter(|arg| arg.starts_with("AILERON_DEVICE="))
             .collect();
 
-        assert_eq!(n_gpu_layers, ["N_GPU_LAYERS=-1", "N_GPU_LAYERS=16"]);
-        assert_eq!(devices, ["AILERON_DEVICE=cuda", "AILERON_DEVICE=cpu"]);
+        assert_eq!(n_gpu_layers, ["N_GPU_LAYERS=16"]);
+        assert_eq!(devices, ["AILERON_DEVICE=cpu"]);
+    }
+
+    #[test]
+    fn runtime_spawn_attempts_retry_gpu_images_with_reduced_offload() {
+        let image_refs = vec![
+            "registry.example/ai/summarizer:cuda".to_string(),
+            "registry.example/ai/summarizer:cpu".to_string(),
+        ];
+
+        let attempts = runtime_spawn_attempts("llm-llama-cpp", &image_refs, &HashMap::new());
+        let attempt_summary = attempts
+            .iter()
+            .map(|attempt| {
+                (
+                    attempt.image_ref.as_str(),
+                    attempt
+                        .runtime_options
+                        .get("N_GPU_LAYERS")
+                        .map(String::as_str),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            attempt_summary,
+            vec![
+                ("registry.example/ai/summarizer:cuda", None),
+                ("registry.example/ai/summarizer:cuda", Some("64")),
+                ("registry.example/ai/summarizer:cuda", Some("32")),
+                ("registry.example/ai/summarizer:cuda", Some("16")),
+                ("registry.example/ai/summarizer:cuda", Some("8")),
+                ("registry.example/ai/summarizer:cuda", Some("4")),
+                ("registry.example/ai/summarizer:cuda", Some("0")),
+                ("registry.example/ai/summarizer:cpu", None),
+            ]
+        );
+    }
+
+    #[test]
+    fn runtime_spawn_attempts_do_not_retry_non_layered_gpu_images() {
+        let image_refs = vec![
+            "localhost/aileron/aileron-runtime-asr-whisper-cpp:cuda".to_string(),
+            "localhost/aileron/aileron-runtime-asr-whisper-cpp:cpu".to_string(),
+        ];
+
+        let attempts = runtime_spawn_attempts("asr-whisper-cpp", &image_refs, &HashMap::new());
+
+        assert_eq!(
+            attempts
+                .iter()
+                .map(|attempt| attempt.image_ref.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "localhost/aileron/aileron-runtime-asr-whisper-cpp:cuda",
+                "localhost/aileron/aileron-runtime-asr-whisper-cpp:cpu",
+            ]
+        );
+    }
+
+    #[test]
+    fn runtime_spawn_attempts_preserve_explicit_gpu_layer_override() {
+        let image_refs = vec![
+            "localhost/aileron/aileron-runtime-llm-llama-cpp:cuda".to_string(),
+            "localhost/aileron/aileron-runtime-llm-llama-cpp:vulkan".to_string(),
+        ];
+        let mut runtime_options = HashMap::new();
+        runtime_options.insert("N_GPU_LAYERS".to_string(), "12".to_string());
+
+        let attempts = runtime_spawn_attempts("llm-llama-cpp", &image_refs, &runtime_options);
+
+        assert_eq!(attempts.len(), 2);
+        assert!(attempts.iter().all(|attempt| {
+            attempt
+                .runtime_options
+                .get("N_GPU_LAYERS")
+                .map(String::as_str)
+                == Some("12")
+        }));
     }
 
     #[test]
@@ -1652,6 +1930,92 @@ mod tests {
         assert_eq!(destinations, vec![present.to_str().unwrap()]);
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn parses_ldconfig_nvidia_driver_library_entries() {
+        let cache = parse_ldconfig_cache(
+            r#"
+            123 libs found in cache `/etc/ld.so.cache'
+            libcuda.so.1 (libc6,x86-64) => /usr/lib64/libcuda.so.550.54
+            libnvidia-ml.so.1 (libc6,x86-64) => /usr/lib64/libnvidia-ml.so.550.54
+            libc.so.6 (libc6,x86-64) => /usr/lib64/libc.so.6
+            "#,
+        );
+
+        assert_eq!(
+            cache.get("libcuda.so.1"),
+            Some(&PathBuf::from("/usr/lib64/libcuda.so.550.54"))
+        );
+        assert_eq!(
+            cache.get("libnvidia-ml.so.1"),
+            Some(&PathBuf::from("/usr/lib64/libnvidia-ml.so.550.54"))
+        );
+        assert!(!cache.contains_key("libc.so.6"));
+    }
+
+    #[test]
+    fn nvidia_driver_library_mounts_are_readonly_and_searchable() {
+        let root = std::env::temp_dir().join(format!("aileron-nvidia-lib-test-{}", Uuid::new_v4()));
+        let libcuda = root.join("libcuda.so.1");
+        let libnvml = root.join("libnvidia-ml.so.1");
+        std::fs::create_dir_all(&root).expect("create temp dir");
+        std::fs::write(&libcuda, "cuda driver placeholder").expect("write libcuda");
+        std::fs::write(&libnvml, "nvml placeholder").expect("write nvml");
+
+        let mut mounts = Vec::new();
+        let mut runtime_options = HashMap::new();
+        add_nvidia_driver_library_mounts_from(
+            &mut mounts,
+            &mut runtime_options,
+            vec![
+                (libcuda.clone(), "libcuda.so.1".to_string()),
+                (libnvml.clone(), "libnvidia-ml.so.1".to_string()),
+            ],
+        );
+
+        assert_eq!(
+            runtime_options.get("LD_LIBRARY_PATH").map(String::as_str),
+            Some("/usr/local/nvidia/lib64")
+        );
+        assert!(mounts.iter().any(|mount| {
+            mount["source"] == libcuda.display().to_string()
+                && mount["destination"] == "/usr/local/nvidia/lib64/libcuda.so.1"
+                && array_contains(&mount["options"], "ro")
+                && !array_contains(&mount["options"], "noexec")
+        }));
+        assert!(mounts.iter().any(|mount| {
+            mount["source"] == libnvml.display().to_string()
+                && mount["destination"] == "/usr/local/nvidia/lib64/libnvidia-ml.so.1"
+                && array_contains(&mount["options"], "ro")
+                && !array_contains(&mount["options"], "noexec")
+        }));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn nvidia_driver_library_path_merges_with_profile_library_path() {
+        let mut mounts = Vec::new();
+        let mut runtime_options = HashMap::new();
+        runtime_options.insert(
+            "LD_LIBRARY_PATH".to_string(),
+            "/runtime/lib:/usr/local/nvidia/lib64-extra".to_string(),
+        );
+
+        add_nvidia_driver_library_mounts_from(
+            &mut mounts,
+            &mut runtime_options,
+            vec![(
+                PathBuf::from("/host/libcuda.so.1"),
+                "libcuda.so.1".to_string(),
+            )],
+        );
+
+        assert_eq!(
+            runtime_options.get("LD_LIBRARY_PATH").map(String::as_str),
+            Some("/usr/local/nvidia/lib64:/runtime/lib:/usr/local/nvidia/lib64-extra")
+        );
     }
 
     #[hegel::test]

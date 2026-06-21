@@ -623,7 +623,7 @@ The daemon probes the host once at startup and selects the best available runtim
 | `vulkaninfo` reports a device | `:vulkan` | Any Vulkan GPU |
 | Nothing found | `:cpu` | CPU-only runtime |
 
-Runtime manifests declare explicit runtime images per variant. The daemon prefers the detected accelerator, falls back from CUDA or ROCm to Vulkan when present, and always treats CPU as the final fallback. If none of the candidate runtime rootfs trees are installed locally, availability reports unavailable. Override detection with `AILERON_VARIANT=cpu|cuda|rocm|vulkan`.
+Runtime manifests declare explicit runtime images per variant. The daemon prefers the detected accelerator, falls back from CUDA or ROCm to Vulkan when present, and always treats CPU as the final fallback. For llama.cpp GPU runtimes, cold start first tries full layer offload, then retries reduced `N_GPU_LAYERS` values before moving to the next runtime image candidate. If none of the candidate runtime rootfs trees are installed locally, availability reports unavailable. Override detection with `AILERON_VARIANT=cpu|cuda|rocm|vulkan`.
 
 ## Container security
 
@@ -641,7 +641,7 @@ memory limit 8g         # OOM protection, configurable
 read-only /model        # selected profile artifact directory
 ```
 
-Accelerator runtimes receive only the host device mounts they need: CUDA gets existing `/dev/nvidia*` devices and optional `/proc/driver/nvidia`, ROCm gets `/dev/kfd` and `/dev/dri`, and Vulkan gets `/dev/dri`. Accelerator variants also receive read-only `/sys` for driver and topology discovery.
+Accelerator runtimes receive only the host device mounts they need: CUDA gets existing `/dev/nvidia*` devices, optional `/proc/driver/nvidia`, and discovered NVIDIA driver libraries such as `libcuda.so.1`; ROCm gets `/dev/kfd` and `/dev/dri`; and Vulkan gets `/dev/dri`. Accelerator variants also receive read-only `/sys` for driver and topology discovery.
 
 Runtime `/tmp` is a container-local tmpfs, not a bind mount to host `/tmp`, so it is not shared between containers. A warm runtime container can handle multiple requests for the same profile, so runtime implementations must use per-request temporary paths and remove request-specific files before replying.
 

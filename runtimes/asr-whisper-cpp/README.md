@@ -21,7 +21,7 @@ Three Dockerfiles are provided:
 | Dockerfile | Variant | Hardware | Notes |
 |---|---|---|---|
 | `Dockerfile` | `cpu` | CPU | Default, works everywhere |
-| `Dockerfile.cuda` | `cuda` | NVIDIA GPU | Requires NVIDIA container support on host |
+| `Dockerfile.cuda` | `cuda` | NVIDIA GPU | Requires NVIDIA driver devices and `libcuda.so.1` on host |
 | `Dockerfile.vulkan` | `vulkan` | Vulkan GPU | NVIDIA / AMD / Intel Arc |
 
 There is no ROCm-specific Dockerfile currently. If the host detects `rocm` and the runtime manifest has no `rocm` image, the daemon falls back to the `vulkan` image when present, then to `cpu` as the final fallback.
