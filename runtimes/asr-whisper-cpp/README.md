@@ -16,15 +16,16 @@ Run all commands below from the repository root.
 
 ## Platforms
 
-Three Dockerfiles are provided:
+Four Dockerfiles are provided:
 
 | Dockerfile | Variant | Hardware | Notes |
 |---|---|---|---|
 | `Dockerfile` | `cpu` | CPU | Default, works everywhere |
 | `Dockerfile.cuda` | `cuda` | NVIDIA GPU | Requires NVIDIA driver devices and `libcuda.so.1` on host |
+| `Dockerfile.rocm` | `rocm` | AMD GPU | Requires ROCm devices on host |
 | `Dockerfile.vulkan` | `vulkan` | Vulkan GPU | NVIDIA / AMD / Intel Arc |
 
-There is no ROCm-specific Dockerfile currently. If the host detects `rocm` and the runtime manifest has no `rocm` image, the daemon falls back to the `vulkan` image when present, then to `cpu` as the final fallback.
+If the host detects an accelerator and the runtime manifest has no matching image, the daemon falls back through the compatible variants declared in the manifest, then to `cpu` as the final fallback.
 
 ## Build
 
@@ -39,6 +40,12 @@ podman build \
 podman build \
     -f runtimes/asr-whisper-cpp/Dockerfile.cuda \
     -t docker.io/example/aileron-runtime-asr-whisper-cpp:cuda \
+    .
+
+# AMD ROCm
+podman build \
+    -f runtimes/asr-whisper-cpp/Dockerfile.rocm \
+    -t docker.io/example/aileron-runtime-asr-whisper-cpp:rocm \
     .
 
 # Vulkan
@@ -58,6 +65,7 @@ Publish the image refs through a runtime manifest file such as `/usr/share/ailer
   "images": {
     "cpu": "docker.io/example/aileron-runtime-asr-whisper-cpp:cpu",
     "cuda": "docker.io/example/aileron-runtime-asr-whisper-cpp:cuda",
+    "rocm": "docker.io/example/aileron-runtime-asr-whisper-cpp:rocm",
     "vulkan": "docker.io/example/aileron-runtime-asr-whisper-cpp:vulkan"
   }
 }

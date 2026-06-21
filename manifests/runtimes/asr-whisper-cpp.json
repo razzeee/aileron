@@ -3,6 +3,7 @@
   "images": {
     "cpu": "ghcr.io/razzeee/aileron-runtime-asr-whisper-cpp:cpu",
     "cuda": "ghcr.io/razzeee/aileron-runtime-asr-whisper-cpp:cuda",
+    "rocm": "ghcr.io/razzeee/aileron-runtime-asr-whisper-cpp:rocm",
     "vulkan": "ghcr.io/razzeee/aileron-runtime-asr-whisper-cpp:vulkan"
   }
 }

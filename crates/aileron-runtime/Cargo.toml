@@ -16,6 +16,7 @@ vision-rocm = ["vision", "llama-rocm"]
 vision-vulkan = ["vision", "llama-vulkan"]
 whisper = ["dep:base64", "dep:whisper-rs"]
 whisper-cuda = ["whisper", "whisper-rs/cuda"]
+whisper-rocm = ["whisper", "whisper-rs/hipblas"]
 whisper-vulkan = ["whisper", "whisper-rs/vulkan"]
 
 [dependencies]
