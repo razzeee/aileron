@@ -2,15 +2,17 @@ ARG CUDA_DEVEL_IMAGE="nvidia/cuda:13.3.0-devel-ubuntu24.04"
 ARG CUDA_RUNTIME_IMAGE="nvidia/cuda:13.3.0-runtime-ubuntu24.04"
 FROM ${CUDA_DEVEL_IMAGE} AS builder
 
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
 # NVIDIA CUDA build of whisper.cpp via whisper-rs.
 # Requires nvidia-container-toolkit on the host.
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates curl \
-        build-essential cmake clang libclang-dev pkg-config git ninja-build \
+    ca-certificates curl \
+    build-essential cmake clang libclang-dev pkg-config git ninja-build \
     && rm -rf /var/lib/apt/lists/* \
     && if ! command -v cargo >/dev/null 2>&1; then \
-        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal; \
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal; \
     fi
 
 ENV CMAKE_ARGS="-DGGML_CUDA=on"
@@ -20,7 +22,7 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 RUN cargo build --locked --release -p aileron-runtime --bin aileron-runtime-asr-whisper-cpp \
-        --no-default-features --features whisper-cuda \
+    --no-default-features --features whisper-cuda \
     && cp target/release/aileron-runtime-asr-whisper-cpp /entrypoint
 
 FROM ${CUDA_RUNTIME_IMAGE}
@@ -28,16 +30,16 @@ FROM ${CUDA_RUNTIME_IMAGE}
 ENV XDG_CACHE_HOME=/tmp
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates libgomp1 libstdc++6 libgcc-s1 \
+    ca-certificates libgomp1 libstdc++6 libgcc-s1 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /entrypoint /entrypoint
 RUN chmod 0755 /entrypoint
 
 LABEL org.aileron.runtime="true" \
-      org.aileron.runtime_id="asr-whisper-cpp" \
-      org.aileron.variant="cuda" \
-      org.opencontainers.image.description="Aileron Whisper.cpp runtime for local speech transcription." \
-      org.opencontainers.image.licenses="GPL-3.0-or-later"
+    org.aileron.runtime_id="asr-whisper-cpp" \
+    org.aileron.variant="cuda" \
+    org.opencontainers.image.description="Aileron Whisper.cpp runtime for local speech transcription." \
+    org.opencontainers.image.licenses="GPL-3.0-or-later"
 
 ENTRYPOINT ["/entrypoint"]

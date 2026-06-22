@@ -7,15 +7,17 @@ FROM ${ROCM_DEVEL_IMAGE} AS builder
 ARG ROCM_PATH
 ARG AMDGPU_TARGETS
 
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
 # AMD ROCm build of whisper.cpp via whisper-rs.
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates curl \
-        build-essential cmake clang libclang-dev pkg-config git ninja-build \
-        hipblas-dev rocblas-dev \
+    ca-certificates curl \
+    build-essential cmake clang libclang-dev pkg-config git ninja-build \
+    hipblas-dev rocblas-dev \
     && rm -rf /var/lib/apt/lists/* \
     && if ! command -v cargo >/dev/null 2>&1; then \
-        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal; \
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal; \
     fi
 
 ENV ROCM_PATH=${ROCM_PATH}
@@ -29,7 +31,7 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 RUN cargo build --locked --release -p aileron-runtime --bin aileron-runtime-asr-whisper-cpp \
-        --no-default-features --features whisper-rocm \
+    --no-default-features --features whisper-rocm \
     && cp target/release/aileron-runtime-asr-whisper-cpp /entrypoint
 
 FROM ${ROCM_RUNTIME_IMAGE}
@@ -43,16 +45,16 @@ ENV LD_LIBRARY_PATH="${ROCM_PATH}/lib:${LD_LIBRARY_PATH}"
 ENV PATH="${ROCM_PATH}/bin:${PATH}"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates libgomp1 libstdc++6 libgcc-s1 \
+    ca-certificates libgomp1 libstdc++6 libgcc-s1 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /entrypoint /entrypoint
 RUN chmod 0755 /entrypoint
 
 LABEL org.aileron.runtime="true" \
-      org.aileron.runtime_id="asr-whisper-cpp" \
-      org.aileron.variant="rocm" \
-      org.opencontainers.image.description="Aileron Whisper.cpp runtime for local speech transcription." \
-      org.opencontainers.image.licenses="GPL-3.0-or-later"
+    org.aileron.runtime_id="asr-whisper-cpp" \
+    org.aileron.variant="rocm" \
+    org.opencontainers.image.description="Aileron Whisper.cpp runtime for local speech transcription." \
+    org.opencontainers.image.licenses="GPL-3.0-or-later"
 
 ENTRYPOINT ["/entrypoint"]
