@@ -24,7 +24,7 @@ One shared llama.cpp Dockerfile builds all accelerator variants with build args:
 |---|---|---|---|
 | `cpu` | default | CPU | Default, works everywhere |
 | `cuda` | `BUILDER_IMAGE=nvidia/cuda:13.3.0-devel-ubuntu24.04`, `CMAKE_ARGS=-DGGML_CUDA=on` | NVIDIA GPU | Requires NVIDIA driver devices and `libcuda.so.1` on host |
-| `rocm` | `BUILDER_IMAGE=rocm/dev-ubuntu-22.04:7.2.4`, `CMAKE_ARGS=-DGGML_HIP=on` | AMD GPU | Requires ROCm devices on host |
+| `rocm` | `BUILDER_IMAGE=rocm/dev-ubuntu-22.04:7.2.4`, `CMAKE_ARGS=-DGGML_HIP=on` | AMD GPU | Requires ROCm devices on host and a ROCm-supported GPU architecture |
 | `vulkan` | `CMAKE_ARGS=-DGGML_VULKAN=on` plus Vulkan packages | Vulkan GPU | NVIDIA / AMD / Intel Arc, Xe, and integrated graphics |
 
 Tag images by runtime and variant. The daemon does not infer image tags from model profiles; it resolves `runtime_id + detected variant` through runtime manifests.
@@ -60,7 +60,7 @@ podman build \
     --build-arg BUILDER_IMAGE=rocm/dev-ubuntu-22.04:7.2.4 \
     --build-arg FINAL_IMAGE=rocm/dev-ubuntu-22.04:7.2.4 \
     --build-arg APT_PACKAGES="hipblas-dev rocblas-dev" \
-    --build-arg CMAKE_ARGS="-DGGML_HIP=on -DAMDGPU_TARGETS=gfx1030;gfx1031;gfx1032;gfx1100;gfx1101;gfx1102;gfx1103;gfx1150;gfx1151;gfx1152;gfx1153" \
+    --build-arg CMAKE_ARGS="-DGGML_HIP=on -DAMDGPU_TARGETS=gfx900;gfx906;gfx908;gfx90a;gfx942;gfx950;gfx1010;gfx1011;gfx1012;gfx1030;gfx1031;gfx1032;gfx1035;gfx1036;gfx1100;gfx1101;gfx1102;gfx1103;gfx1150;gfx1151;gfx1152;gfx1153;gfx1200;gfx1201" \
     --build-arg RUNTIME_ID=vision-llama-cpp-gemma4 \
     --build-arg RUNTIME_VARIANT=rocm \
     --build-arg RUNTIME_BIN=aileron-runtime-vision-llama-cpp \
@@ -79,6 +79,8 @@ podman build \
     -t docker.io/example/aileron-runtime-vision-llama-cpp-gemma4:vulkan \
     .
 ```
+
+The ROCm image is built for a broad set of common ROCm targets across Vega/CDNA/RDNA generations, but ROCm itself does not support every AMD GPU. AMD cards outside ROCm support should use the `vulkan` image fallback.
 
 ## Runtime Manifest
 

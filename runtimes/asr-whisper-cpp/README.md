@@ -22,7 +22,7 @@ Four Dockerfiles are provided:
 |---|---|---|---|
 | `Dockerfile` | `cpu` | CPU | Default, works everywhere |
 | `Dockerfile.cuda` | `cuda` | NVIDIA GPU | Requires NVIDIA driver devices and `libcuda.so.1` on host |
-| `Dockerfile.rocm` | `rocm` | AMD GPU | Requires ROCm devices on host |
+| `Dockerfile.rocm` | `rocm` | AMD GPU | Requires ROCm devices on host and a ROCm-supported GPU architecture |
 | `Dockerfile.vulkan` | `vulkan` | Vulkan GPU | NVIDIA / AMD / Intel Arc, Xe, and integrated graphics |
 
 If the host detects an accelerator and the runtime manifest has no matching image, the daemon falls back through the compatible variants declared in the manifest, then to `cpu` as the final fallback.
@@ -54,6 +54,8 @@ podman build \
     -t docker.io/example/aileron-runtime-asr-whisper-cpp:vulkan \
     .
 ```
+
+The ROCm image is built for a broad set of common ROCm targets across Vega/CDNA/RDNA generations, but ROCm itself does not support every AMD GPU. AMD cards outside ROCm support should use the `vulkan` image fallback.
 
 ## Runtime Manifest
 
