@@ -20,6 +20,14 @@ pub struct InferenceHandler {
     rt: tokio::runtime::Handle,
 }
 
+type ProfileRuntime = (
+    String,
+    String,
+    Vec<String>,
+    PathBuf,
+    HashMap<String, String>,
+);
+
 impl InferenceHandler {
     pub fn new(state: SharedState, rt: tokio::runtime::Handle) -> Self {
         Self { state, rt }
@@ -1297,16 +1305,7 @@ fn apply_translation_hints(
 fn profile_runtime(
     guard: &crate::state::Inner,
     profile_id: &str,
-) -> Result<
-    (
-        String,
-        String,
-        Vec<String>,
-        PathBuf,
-        HashMap<String, String>,
-    ),
-    String,
-> {
+) -> Result<ProfileRuntime, String> {
     let profile = guard
         .profiles
         .get(profile_id)

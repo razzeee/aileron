@@ -1,13 +1,19 @@
 ARG BUILDER_IMAGE="rust:1-bookworm"
 ARG FINAL_IMAGE="debian:bookworm-slim"
+ARG VULKAN_HEADERS_TAG="v1.4.354"
 FROM ${BUILDER_IMAGE} AS builder
+
+ARG VULKAN_HEADERS_TAG
 
 # Vulkan build of whisper.cpp via whisper-rs; any GPU with Vulkan support.
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates build-essential cmake clang libclang-dev pkg-config git ninja-build \
         libvulkan-dev glslc glslang-tools spirv-headers \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && git clone --depth 1 --branch "${VULKAN_HEADERS_TAG}" https://github.com/KhronosGroup/Vulkan-Headers.git /tmp/vulkan-headers \
+    && cp -r /tmp/vulkan-headers/include/* /usr/include/ \
+    && rm -rf /tmp/vulkan-headers
 
 ENV CMAKE_ARGS="-DGGML_VULKAN=on"
 

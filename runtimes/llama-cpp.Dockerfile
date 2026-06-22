@@ -13,6 +13,7 @@ ARG CUDA_DOCKER_ARCH=""
 ARG FORCE_CMAKE=""
 ARG LDFLAGS=""
 ARG ROCM_PATH="/opt/rocm"
+ARG VULKAN_HEADERS_TAG="v1.4.354"
 
 ENV CMAKE_ARGS="${CMAKE_ARGS}"
 ENV CUDA_DOCKER_ARCH="${CUDA_DOCKER_ARCH}"
@@ -24,6 +25,13 @@ ENV PATH="${ROCM_PATH}/bin:${PATH}"
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl build-essential cmake clang libclang-dev pkg-config git ninja-build ${APT_PACKAGES} \
     && rm -rf /var/lib/apt/lists/* \
+    && case " ${APT_PACKAGES} ${CMAKE_ARGS} " in \
+        *[Vv][Uu][Ll][Kk][Aa][Nn]* ) \
+            git clone --depth 1 --branch "${VULKAN_HEADERS_TAG}" https://github.com/KhronosGroup/Vulkan-Headers.git /tmp/vulkan-headers \
+            && cp -r /tmp/vulkan-headers/include/* /usr/include/ \
+            && rm -rf /tmp/vulkan-headers ;; \
+        * ) ;; \
+    esac \
     && if ! command -v cargo >/dev/null 2>&1; then \
         curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal; \
     fi \
@@ -56,7 +64,12 @@ RUN set -eux; \
         *) echo "unsupported RUNTIME_VARIANT=$RUNTIME_VARIANT" >&2; exit 1 ;; \
     esac; \
     if [ -n "$RUNTIME_FEATURES" ]; then features="$RUNTIME_FEATURES"; fi; \
-    cargo build --locked --release -p aileron-runtime --bin "$bin" --no-default-features --features "$features"; \
+    if [ "$RUNTIME_VARIANT" = "rocm" ]; then \
+        cargo build --locked --release -p aileron-runtime --lib --no-default-features --features "$features"; \
+        cargo rustc --locked --release -p aileron-runtime --bin "$bin" --no-default-features --features "$features" -- -C link-arg=-no-pie; \
+    else \
+        cargo build --locked --release -p aileron-runtime --bin "$bin" --no-default-features --features "$features"; \
+    fi; \
     cp "target/release/$bin" /entrypoint
 
 FROM ${FINAL_IMAGE}
