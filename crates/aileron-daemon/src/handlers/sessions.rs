@@ -102,6 +102,7 @@ mod tests {
             installing_profiles: HashMap::<String, InstallRecord>::new(),
             runtime_downloads: HashMap::<String, InstallRecord>::new(),
             runtime_download_owners: HashMap::new(),
+            runtime_update_checks: HashMap::new(),
             recent_installs: VecDeque::new(),
             recent_runtime_downloads: VecDeque::new(),
             variant: Variant::Cpu,

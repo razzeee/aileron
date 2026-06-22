@@ -27,6 +27,15 @@ pub struct InstallSample {
 }
 
 #[derive(Debug, Clone)]
+pub struct RuntimeUpdateCheck {
+    pub local_digest: String,
+    pub available: bool,
+    pub status: String,
+    pub checking: bool,
+    pub checked_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone)]
 pub struct Session {
     pub session_id: String,
     pub app_id: String,
@@ -47,6 +56,7 @@ pub struct Inner {
     pub installing_profiles: HashMap<String, InstallRecord>,
     pub runtime_downloads: HashMap<String, InstallRecord>,
     pub runtime_download_owners: HashMap<String, String>,
+    pub runtime_update_checks: HashMap<String, RuntimeUpdateCheck>,
     pub recent_installs: VecDeque<(String, InstallRecord)>,
     pub recent_runtime_downloads: VecDeque<(String, InstallRecord)>,
     /// Best available hardware variant, detected once at startup.
@@ -81,6 +91,7 @@ impl SharedState {
             installing_profiles: HashMap::new(),
             runtime_downloads: HashMap::new(),
             runtime_download_owners: HashMap::new(),
+            runtime_update_checks: HashMap::new(),
             recent_installs: VecDeque::new(),
             recent_runtime_downloads: VecDeque::new(),
             variant,

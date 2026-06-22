@@ -145,6 +145,9 @@ fn render_runtime_images(
                 append_empty_state(list_box);
                 return;
             }
+            let has_pending_update_check = images
+                .iter()
+                .any(|image| image.update_status == "checking for updates");
             let active_runtime_downloads = installs
                 .into_iter()
                 .filter(is_active_runtime_download)
@@ -159,9 +162,27 @@ fn render_runtime_images(
                 let active_download = active_runtime_downloads.get(&image.image_ref);
                 append_runtime_image_row(list_box, image, active_download);
             }
+            if runtime_list_should_refresh(
+                has_pending_update_check,
+                !active_runtime_downloads.is_empty(),
+            ) {
+                refresh_runtime_images_after_pending_work(list_box);
+            }
         }
         Err(e) => append_message(list_box, &format!("Error: {e}")),
     }
+}
+
+fn refresh_runtime_images_after_pending_work(list_box: &ListBox) {
+    let list_box = list_box.clone();
+    glib::timeout_add_seconds_local(2, move || {
+        refresh_runtime_images(&list_box);
+        glib::ControlFlow::Break
+    });
+}
+
+fn runtime_list_should_refresh(has_pending_update_check: bool, has_active_download: bool) -> bool {
+    has_pending_update_check || has_active_download
 }
 
 fn append_runtime_image_row(
@@ -268,9 +289,7 @@ fn is_active_runtime_download(install: &InstallStatus) -> bool {
 }
 
 fn runtime_update_action_visible(image: &OciRuntimeImage, has_active_download: bool) -> bool {
-    image.source != "system"
-        && (has_active_download
-            || (image.update_available && image.update_status != "installed: update not checked"))
+    image.source != "system" && (has_active_download || image.update_available)
 }
 
 fn runtime_status_label(status: &str) -> &str {
@@ -516,13 +535,38 @@ mod tests {
             size_bytes: 1,
             in_use: true,
             used_by_profiles: vec!["profile".to_string()],
-            update_available: true,
+            update_available: false,
             update_status: "installed: update not checked".to_string(),
             source: "user".to_string(),
         };
 
         assert!(!runtime_update_action_visible(&image, false));
         assert!(runtime_update_action_visible(&image, true));
+    }
+
+    #[test]
+    fn shows_update_action_when_update_is_available() {
+        let image = OciRuntimeImage {
+            image_id: "runtime".to_string(),
+            image_ref: "ghcr.io/example/runtime:cpu".to_string(),
+            runtime_id: "llm-llama-cpp".to_string(),
+            variant: "cpu".to_string(),
+            size_bytes: 1,
+            in_use: true,
+            used_by_profiles: vec!["profile".to_string()],
+            update_available: true,
+            update_status: "update available".to_string(),
+            source: "user".to_string(),
+        };
+
+        assert!(runtime_update_action_visible(&image, false));
+    }
+
+    #[test]
+    fn refreshes_while_runtime_work_is_pending() {
+        assert!(runtime_list_should_refresh(true, false));
+        assert!(runtime_list_should_refresh(false, true));
+        assert!(!runtime_list_should_refresh(false, false));
     }
 
     #[test]

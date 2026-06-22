@@ -9,11 +9,13 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::manifests::{self, ManifestArtifact, ModelManifest};
 use crate::profiles::Profile;
-use crate::state::{InstallRecord, InstallSample, SharedState};
+use crate::state::{
+    InstallRecord, InstallSample, RuntimeUpdateCheck as CachedRuntimeUpdateCheck, SharedState,
+};
 #[allow(unused_imports)]
 use aileron_varlink::aileron_Models::{
     Call_AssignUseCase, Call_CancelInstall, Call_DeleteProfile, Call_InstallManifest,
@@ -139,11 +141,9 @@ impl VarlinkInterface for ModelsHandler {
     }
 
     fn list_runtime_images(&self, call: &mut dyn Call_ListRuntimeImages) -> varlink::Result<()> {
-        let images = self.rt.block_on(async {
-            let usage = runtime_image_usage(&self.state).await;
-            let store = oci_store_for_state(&self.state).await;
-            list_aileron_runtime_images(&store, &usage)
-        });
+        let images = self
+            .rt
+            .block_on(async { list_runtime_images_for_state(&self.state).await });
         match images {
             Ok(images) => call.reply(images),
             Err(e) => Err(io_err(e)),
@@ -187,7 +187,11 @@ impl VarlinkInterface for ModelsHandler {
         let result = self.rt.block_on(async {
             let usage = runtime_image_usage(&self.state).await;
             let store = oci_store_for_state(&self.state).await;
-            let images = list_aileron_runtime_images(&store, &usage)?;
+            let images = build_aileron_runtime_images(
+                stored_aileron_runtime_images(&store)?,
+                &usage,
+                &HashMap::new(),
+            );
             let mut removed = Vec::new();
             let mut errors = Vec::new();
             for image in images.into_iter().filter(|image| !image.in_use) {
@@ -651,6 +655,8 @@ struct RuntimeImageUpdateCheck {
     status: String,
 }
 
+const RUNTIME_UPDATE_CHECK_TTL: Duration = Duration::from_secs(300);
+
 async fn runtime_image_usage(state: &SharedState) -> RuntimeImageUsage {
     let guard = state.0.lock().await;
     let mut profiles_by_ref: HashMap<String, Vec<String>> = HashMap::new();
@@ -670,21 +676,40 @@ async fn oci_store_for_state(state: &SharedState) -> PathBuf {
     guard.containers.oci_store.clone()
 }
 
-fn list_aileron_runtime_images(
-    store: &Path,
-    usage: &RuntimeImageUsage,
+async fn list_runtime_images_for_state(
+    state: &SharedState,
 ) -> anyhow::Result<Vec<OciRuntimeImage>> {
+    let usage = runtime_image_usage(state).await;
+    let store = oci_store_for_state(state).await;
+    let update_checks = {
+        let guard = state.0.lock().await;
+        guard.runtime_update_checks.clone()
+    };
+    let stored = stored_aileron_runtime_images(&store)?;
+    schedule_runtime_update_checks(state, &stored, &update_checks).await;
+    Ok(build_aileron_runtime_images(stored, &usage, &update_checks))
+}
+
+fn stored_aileron_runtime_images(store: &Path) -> anyhow::Result<Vec<StoredRuntimeImage>> {
     let mut images = stored_runtime_images(store, "user")?;
     images.extend(stored_runtime_images(
         &crate::container::default_system_oci_store(),
         "system",
     )?);
     dedupe_runtime_images(&mut images);
+    Ok(images)
+}
+
+fn build_aileron_runtime_images(
+    images: Vec<StoredRuntimeImage>,
+    usage: &RuntimeImageUsage,
+    update_checks: &HashMap<String, CachedRuntimeUpdateCheck>,
+) -> Vec<OciRuntimeImage> {
     let mut images = images
         .into_iter()
         .map(|image| {
             let used_by_profiles = usage.used_by(&image);
-            let update = runtime_image_local_status(&image);
+            let update = runtime_image_local_status(&image, update_checks);
             OciRuntimeImage {
                 image_id: image.image_id,
                 image_ref: image.image_ref,
@@ -705,7 +730,7 @@ fn list_aileron_runtime_images(
             .then(a.variant.cmp(&b.variant))
             .then(a.image_ref.cmp(&b.image_ref))
     });
-    Ok(images)
+    images
 }
 
 fn dedupe_runtime_images(images: &mut Vec<StoredRuntimeImage>) {
@@ -726,7 +751,10 @@ fn dedupe_runtime_images(images: &mut Vec<StoredRuntimeImage>) {
     });
 }
 
-fn runtime_image_local_status(image: &StoredRuntimeImage) -> RuntimeImageUpdateCheck {
+fn runtime_image_local_status(
+    image: &StoredRuntimeImage,
+    update_checks: &HashMap<String, CachedRuntimeUpdateCheck>,
+) -> RuntimeImageUpdateCheck {
     if image.source == "system" {
         return RuntimeImageUpdateCheck {
             available: false,
@@ -735,20 +763,162 @@ fn runtime_image_local_status(image: &StoredRuntimeImage) -> RuntimeImageUpdateC
     }
 
     if remote_tag_is_checkable(&image.image_ref) {
-        // TODO: Compare the remote tag digest and report updates when it changes.
-        return RuntimeImageUpdateCheck {
-            available: false,
-            status: if image.digest.is_some() {
-                "installed: update not checked".to_string()
-            } else {
-                "installed: digest unavailable".to_string()
-            },
-        };
+        return runtime_image_cached_status(image, update_checks.get(&image.image_ref));
     }
 
     RuntimeImageUpdateCheck {
         available: false,
         status: "not checkable".to_string(),
+    }
+}
+
+fn runtime_image_cached_status(
+    image: &StoredRuntimeImage,
+    cached: Option<&CachedRuntimeUpdateCheck>,
+) -> RuntimeImageUpdateCheck {
+    let Some(local_digest) = image.digest.as_deref() else {
+        return RuntimeImageUpdateCheck {
+            available: false,
+            status: "installed: digest unavailable".to_string(),
+        };
+    };
+
+    let Some(cached) = cached.filter(|cached| cached.local_digest == local_digest) else {
+        return RuntimeImageUpdateCheck {
+            available: false,
+            status: "checking for updates".to_string(),
+        };
+    };
+
+    if !cached.checking && runtime_update_check_expired(cached) {
+        return RuntimeImageUpdateCheck {
+            available: false,
+            status: "checking for updates".to_string(),
+        };
+    }
+
+    RuntimeImageUpdateCheck {
+        available: cached.available && !cached.checking,
+        status: cached.status.clone(),
+    }
+}
+
+fn runtime_update_check_expired(cached: &CachedRuntimeUpdateCheck) -> bool {
+    let Ok(ttl) = chrono::Duration::from_std(RUNTIME_UPDATE_CHECK_TTL) else {
+        return false;
+    };
+    chrono::Utc::now().signed_duration_since(cached.checked_at) >= ttl
+}
+
+async fn schedule_runtime_update_checks(
+    state: &SharedState,
+    images: &[StoredRuntimeImage],
+    update_checks: &HashMap<String, CachedRuntimeUpdateCheck>,
+) {
+    for image in images {
+        if image.source == "system" || !remote_tag_is_checkable(&image.image_ref) {
+            continue;
+        }
+        let Some(local_digest) = image.digest.clone() else {
+            continue;
+        };
+        if let Some(check) = update_checks.get(&image.image_ref)
+            && check.local_digest == local_digest
+            && (check.checking || !runtime_update_check_expired(check))
+        {
+            continue;
+        }
+
+        mark_runtime_update_checking(state, &image.image_ref, &local_digest).await;
+        let state = state.clone();
+        let image_ref = image.image_ref.clone();
+        tokio::spawn(async move {
+            let result = tokio::task::spawn_blocking({
+                let image_ref = image_ref.clone();
+                move || remote_selected_manifest_digest(&image_ref)
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!("runtime update check task failed: {error}"))
+            .and_then(|result| result);
+            finish_runtime_update_check(&state, &image_ref, &local_digest, result).await;
+        });
+    }
+}
+
+async fn mark_runtime_update_checking(state: &SharedState, image_ref: &str, local_digest: &str) {
+    let mut guard = state.0.lock().await;
+    guard.runtime_update_checks.insert(
+        image_ref.to_string(),
+        CachedRuntimeUpdateCheck {
+            local_digest: local_digest.to_string(),
+            available: false,
+            status: "checking for updates".to_string(),
+            checking: true,
+            checked_at: chrono::Utc::now(),
+        },
+    );
+}
+
+async fn finish_runtime_update_check(
+    state: &SharedState,
+    image_ref: &str,
+    local_digest: &str,
+    result: anyhow::Result<String>,
+) {
+    let check = match result {
+        Ok(remote_digest) if remote_digest == local_digest => CachedRuntimeUpdateCheck {
+            local_digest: local_digest.to_string(),
+            available: false,
+            status: "up to date".to_string(),
+            checking: false,
+            checked_at: chrono::Utc::now(),
+        },
+        Ok(_) => CachedRuntimeUpdateCheck {
+            local_digest: local_digest.to_string(),
+            available: true,
+            status: "update available".to_string(),
+            checking: false,
+            checked_at: chrono::Utc::now(),
+        },
+        Err(_) => CachedRuntimeUpdateCheck {
+            local_digest: local_digest.to_string(),
+            available: false,
+            status: "update check failed".to_string(),
+            checking: false,
+            checked_at: chrono::Utc::now(),
+        },
+    };
+    let mut guard = state.0.lock().await;
+    guard
+        .runtime_update_checks
+        .insert(image_ref.to_string(), check);
+}
+
+#[cfg(test)]
+fn runtime_image_remote_status(
+    image: &StoredRuntimeImage,
+    remote_digest: impl FnOnce(&str) -> anyhow::Result<String>,
+) -> RuntimeImageUpdateCheck {
+    let Some(local_digest) = image.digest.as_deref() else {
+        return RuntimeImageUpdateCheck {
+            available: false,
+            status: "installed: digest unavailable".to_string(),
+        };
+    };
+
+    match remote_digest(&image.image_ref) {
+        Ok(remote_digest) if remote_digest == local_digest => RuntimeImageUpdateCheck {
+            available: false,
+            status: "up to date".to_string(),
+        },
+        Ok(_) => RuntimeImageUpdateCheck {
+            available: true,
+            status: "update available".to_string(),
+        },
+        Err(_) => RuntimeImageUpdateCheck {
+            available: false,
+            status: "update check failed".to_string(),
+        },
     }
 }
 
@@ -914,10 +1084,14 @@ async fn remove_aileron_runtime_image(
     image_id: &str,
     usage: &RuntimeImageUsage,
 ) -> anyhow::Result<()> {
-    let image = list_aileron_runtime_images(store, usage)?
-        .into_iter()
-        .find(|image| image.image_id == image_id || image.image_ref == image_id)
-        .ok_or_else(|| anyhow::anyhow!("Aileron runtime image not found: {image_id}"))?;
+    let image = build_aileron_runtime_images(
+        stored_aileron_runtime_images(store)?,
+        usage,
+        &HashMap::new(),
+    )
+    .into_iter()
+    .find(|image| image.image_id == image_id || image.image_ref == image_id)
+    .ok_or_else(|| anyhow::anyhow!("Aileron runtime image not found: {image_id}"))?;
     if image.source != "user" {
         anyhow::bail!(
             "system runtime image cannot be removed: {}",
@@ -939,9 +1113,13 @@ async fn start_runtime_image_update(state: &SharedState, image_ref: &str) -> any
     }
     let usage = RuntimeImageUsage::default();
     let store = oci_store_for_state(state).await;
-    let known = list_aileron_runtime_images(&store, &usage)?
-        .into_iter()
-        .any(|image| image.image_ref == image_ref || image.image_id == image_ref);
+    let known = build_aileron_runtime_images(
+        stored_aileron_runtime_images(&store)?,
+        &usage,
+        &HashMap::new(),
+    )
+    .into_iter()
+    .any(|image| image.image_ref == image_ref || image.image_id == image_ref);
     if !known {
         anyhow::bail!("Aileron runtime image not found: {image_ref}");
     }
@@ -1770,6 +1948,73 @@ fn skopeo_raw_manifest(image_ref: &str) -> anyhow::Result<Vec<u8>> {
     Ok(output.stdout)
 }
 
+fn remote_selected_manifest_digest(image_ref: &str) -> anyhow::Result<String> {
+    selected_manifest_digest_from_raw(&skopeo_raw_manifest_with_timeout(
+        image_ref,
+        Duration::from_secs(10),
+    )?)
+}
+
+fn skopeo_raw_manifest_with_timeout(image_ref: &str, timeout: Duration) -> anyhow::Result<Vec<u8>> {
+    let mut child = std::process::Command::new("skopeo")
+        .args(["inspect", "--raw", &transport_ref(image_ref)])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("failed to capture skopeo raw inspect output"))?;
+    let stdout_reader = thread::spawn(move || {
+        let mut stdout = stdout;
+        let mut buffer = Vec::new();
+        stdout.read_to_end(&mut buffer)?;
+        Ok::<_, std::io::Error>(buffer)
+    });
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            let stdout = stdout_reader
+                .join()
+                .map_err(|_| anyhow::anyhow!("skopeo raw inspect output reader panicked"))??;
+            if !status.success() {
+                anyhow::bail!("skopeo raw inspect failed for {image_ref}");
+            }
+            return Ok(stdout);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stdout_reader.join();
+            anyhow::bail!("skopeo raw inspect timed out for {image_ref}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn selected_manifest_digest_from_raw(raw: &[u8]) -> anyhow::Result<String> {
+    let value: serde_json::Value = serde_json::from_slice(raw)?;
+    if value.get("layers").is_some() {
+        use sha2::{Digest, Sha256};
+
+        let digest = Sha256::digest(raw);
+        return Ok(format!("sha256:{}", hex_digest(&digest)));
+    }
+
+    let index: OciIndex = serde_json::from_value(value)?;
+    let descriptor = index
+        .manifests
+        .iter()
+        .find(|descriptor| descriptor_matches_host(descriptor))
+        .or_else(|| index.manifests.first())
+        .ok_or_else(|| anyhow::anyhow!("OCI index has no manifests"))?;
+    Ok(descriptor.digest.clone())
+}
+
+fn hex_digest(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 fn image_ref_with_digest(image_ref: &str, digest: &str) -> Option<String> {
     if image_ref.contains('@') {
         return Some(image_ref.to_string());
@@ -2377,7 +2622,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_tag_runtime_status_does_not_report_update_without_remote_check() {
+    fn remote_tag_runtime_status_reports_up_to_date_when_digests_match() {
         let image = StoredRuntimeImage {
             image_id: "runtime".to_string(),
             image_ref: "ghcr.io/example/runtime:cpu".to_string(),
@@ -2389,10 +2634,192 @@ mod tests {
             source: "user".to_string(),
         };
 
-        let status = runtime_image_local_status(&image);
+        let status = runtime_image_remote_status(&image, |_| Ok("sha256:abc".to_string()));
 
         assert!(!status.available);
-        assert_eq!(status.status, "installed: update not checked");
+        assert_eq!(status.status, "up to date");
+    }
+
+    #[test]
+    fn remote_tag_runtime_status_reports_update_when_digests_differ() {
+        let image = StoredRuntimeImage {
+            image_id: "runtime".to_string(),
+            image_ref: "ghcr.io/example/runtime:cpu".to_string(),
+            names: vec!["ghcr.io/example/runtime:cpu".to_string()],
+            runtime_id: "llm-llama-cpp".to_string(),
+            variant: "cpu".to_string(),
+            digest: Some("sha256:abc".to_string()),
+            size_bytes: 1,
+            source: "user".to_string(),
+        };
+
+        let status = runtime_image_remote_status(&image, |_| Ok("sha256:def".to_string()));
+
+        assert!(status.available);
+        assert_eq!(status.status, "update available");
+    }
+
+    #[test]
+    fn remote_tag_runtime_status_does_not_report_update_when_check_fails() {
+        let image = StoredRuntimeImage {
+            image_id: "runtime".to_string(),
+            image_ref: "ghcr.io/example/runtime:cpu".to_string(),
+            names: vec!["ghcr.io/example/runtime:cpu".to_string()],
+            runtime_id: "llm-llama-cpp".to_string(),
+            variant: "cpu".to_string(),
+            digest: Some("sha256:abc".to_string()),
+            size_bytes: 1,
+            source: "user".to_string(),
+        };
+
+        let status = runtime_image_remote_status(&image, |_| anyhow::bail!("offline"));
+
+        assert!(!status.available);
+        assert_eq!(status.status, "update check failed");
+    }
+
+    #[test]
+    fn remote_tag_runtime_status_does_not_report_update_without_local_digest() {
+        let image = StoredRuntimeImage {
+            image_id: "runtime".to_string(),
+            image_ref: "ghcr.io/example/runtime:cpu".to_string(),
+            names: vec!["ghcr.io/example/runtime:cpu".to_string()],
+            runtime_id: "llm-llama-cpp".to_string(),
+            variant: "cpu".to_string(),
+            digest: None,
+            size_bytes: 1,
+            source: "user".to_string(),
+        };
+
+        let status = runtime_image_remote_status(&image, |_| Ok("sha256:def".to_string()));
+
+        assert!(!status.available);
+        assert_eq!(status.status, "installed: digest unavailable");
+    }
+
+    #[test]
+    fn remote_tag_cached_status_checks_when_no_cache_exists() {
+        let image = StoredRuntimeImage {
+            image_id: "runtime".to_string(),
+            image_ref: "ghcr.io/example/runtime:cpu".to_string(),
+            names: vec!["ghcr.io/example/runtime:cpu".to_string()],
+            runtime_id: "llm-llama-cpp".to_string(),
+            variant: "cpu".to_string(),
+            digest: Some("sha256:abc".to_string()),
+            size_bytes: 1,
+            source: "user".to_string(),
+        };
+
+        let status = runtime_image_cached_status(&image, None);
+
+        assert!(!status.available);
+        assert_eq!(status.status, "checking for updates");
+    }
+
+    #[test]
+    fn remote_tag_cached_status_uses_matching_cached_update() {
+        let image = StoredRuntimeImage {
+            image_id: "runtime".to_string(),
+            image_ref: "ghcr.io/example/runtime:cpu".to_string(),
+            names: vec!["ghcr.io/example/runtime:cpu".to_string()],
+            runtime_id: "llm-llama-cpp".to_string(),
+            variant: "cpu".to_string(),
+            digest: Some("sha256:abc".to_string()),
+            size_bytes: 1,
+            source: "user".to_string(),
+        };
+        let cached = CachedRuntimeUpdateCheck {
+            local_digest: "sha256:abc".to_string(),
+            available: true,
+            status: "update available".to_string(),
+            checking: false,
+            checked_at: chrono::Utc::now(),
+        };
+
+        let status = runtime_image_cached_status(&image, Some(&cached));
+
+        assert!(status.available);
+        assert_eq!(status.status, "update available");
+    }
+
+    #[test]
+    fn remote_tag_cached_status_ignores_stale_cached_update() {
+        let image = StoredRuntimeImage {
+            image_id: "runtime".to_string(),
+            image_ref: "ghcr.io/example/runtime:cpu".to_string(),
+            names: vec!["ghcr.io/example/runtime:cpu".to_string()],
+            runtime_id: "llm-llama-cpp".to_string(),
+            variant: "cpu".to_string(),
+            digest: Some("sha256:new".to_string()),
+            size_bytes: 1,
+            source: "user".to_string(),
+        };
+        let cached = CachedRuntimeUpdateCheck {
+            local_digest: "sha256:old".to_string(),
+            available: true,
+            status: "update available".to_string(),
+            checking: false,
+            checked_at: chrono::Utc::now(),
+        };
+
+        let status = runtime_image_cached_status(&image, Some(&cached));
+
+        assert!(!status.available);
+        assert_eq!(status.status, "checking for updates");
+    }
+
+    #[test]
+    fn remote_tag_cached_status_rechecks_expired_cached_result() {
+        let image = StoredRuntimeImage {
+            image_id: "runtime".to_string(),
+            image_ref: "ghcr.io/example/runtime:cpu".to_string(),
+            names: vec!["ghcr.io/example/runtime:cpu".to_string()],
+            runtime_id: "llm-llama-cpp".to_string(),
+            variant: "cpu".to_string(),
+            digest: Some("sha256:abc".to_string()),
+            size_bytes: 1,
+            source: "user".to_string(),
+        };
+        let cached = CachedRuntimeUpdateCheck {
+            local_digest: "sha256:abc".to_string(),
+            available: false,
+            status: "up to date".to_string(),
+            checking: false,
+            checked_at: chrono::Utc::now()
+                - chrono::Duration::from_std(RUNTIME_UPDATE_CHECK_TTL).unwrap()
+                - chrono::Duration::seconds(1),
+        };
+
+        let status = runtime_image_cached_status(&image, Some(&cached));
+
+        assert!(!status.available);
+        assert_eq!(status.status, "checking for updates");
+    }
+
+    #[test]
+    fn selected_manifest_digest_hashes_single_manifest_raw_bytes() {
+        let raw = br#"{"schemaVersion":2,"layers":[],"config":{"digest":"sha256:config"}}"#;
+        let expected = {
+            use sha2::{Digest, Sha256};
+
+            format!("sha256:{}", hex_digest(&Sha256::digest(raw)))
+        };
+
+        let digest = selected_manifest_digest_from_raw(raw).unwrap();
+
+        assert_eq!(digest, expected);
+    }
+
+    #[test]
+    fn selected_manifest_digest_uses_host_manifest_from_index() {
+        let raw = format!(
+            r#"{{"manifests":[{{"digest":"sha256:other","platform":{{"os":"linux","architecture":"other"}}}},{{"digest":"sha256:host","platform":{{"os":"linux","architecture":"{}"}}}}]}}"#,
+            oci_arch(std::env::consts::ARCH)
+        );
+
+        let digest = selected_manifest_digest_from_raw(raw.as_bytes()).unwrap();
+
+        assert_eq!(digest, "sha256:host");
     }
 
     #[test]
@@ -2408,7 +2835,7 @@ mod tests {
             source: "user".to_string(),
         };
 
-        let status = runtime_image_local_status(&image);
+        let status = runtime_image_local_status(&image, &HashMap::new());
 
         assert!(!status.available);
         assert_eq!(status.status, "not checkable");
