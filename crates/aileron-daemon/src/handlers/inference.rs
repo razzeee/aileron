@@ -53,7 +53,7 @@ impl VarlinkInterface for InferenceHandler {
                         reason: format!("{app_id} is denied permission for {use_case}"),
                     });
                 }
-                let profile_id = match guard.assignments.get(&use_case) {
+                let profile_id = match assigned_profile_id_for_use_case(&guard, &use_case) {
                     Some(profile_id) => profile_id,
                     None => {
                         return call.reply(ModelAvailability {
@@ -63,7 +63,7 @@ impl VarlinkInterface for InferenceHandler {
                         });
                     }
                 };
-                let profile = match guard.profiles.get(profile_id) {
+                let profile = match guard.profiles.get(&profile_id) {
                     Some(profile) => profile,
                     None => {
                         return call.reply(ModelAvailability {
@@ -788,13 +788,9 @@ async fn create_session_record(
         }
     }
 
-    let profile_id = guard
-        .assignments
-        .get(&use_case)
-        .ok_or_else(|| {
-            CreateSessionError::ModelUnavailable(format!("no profile assigned for {use_case}"))
-        })?
-        .to_string();
+    let profile_id = assigned_profile_id_for_use_case(&guard, &use_case).ok_or_else(|| {
+        CreateSessionError::ModelUnavailable(format!("no profile assigned for {use_case}"))
+    })?;
     if guard.profiles.get(&profile_id).is_none() {
         return Err(CreateSessionError::ModelUnavailable(format!(
             "assigned profile {profile_id} is not installed"
@@ -812,6 +808,22 @@ async fn create_session_record(
     };
     guard.sessions.insert(session_id.clone(), session);
     Ok(session_id)
+}
+
+fn assigned_profile_id_for_use_case(guard: &crate::state::Inner, use_case: &str) -> Option<String> {
+    if let Some(profile_id) = guard.assignments.get(use_case) {
+        return Some(profile_id.to_string());
+    }
+
+    if use_case == "speech.translate" {
+        let profile_id = guard.assignments.get("speech.transcribe")?;
+        let profile = guard.profiles.get(profile_id)?;
+        if profile.supports_use_case("speech.translate") {
+            return Some(profile_id.to_string());
+        }
+    }
+
+    None
 }
 
 async fn stream_tokens(

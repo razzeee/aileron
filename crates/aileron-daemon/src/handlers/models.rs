@@ -51,13 +51,23 @@ impl VarlinkInterface for ModelsHandler {
                 .profiles
                 .all()
                 .map(|profile| {
-                    let assigned_use_cases = guard
+                    let mut assigned_use_cases: Vec<String> = guard
                         .assignments
                         .all()
                         .iter()
                         .filter(|(_, assigned)| assigned.as_str() == profile.profile_id)
                         .map(|(use_case, _)| use_case.clone())
                         .collect();
+                    if assigned_use_cases
+                        .iter()
+                        .any(|use_case| use_case == "speech.transcribe")
+                        && guard.assignments.get("speech.translate").is_none()
+                        && profile.supports_use_case("speech.translate")
+                    {
+                        assigned_use_cases.push("speech.translate".to_string());
+                    }
+                    assigned_use_cases.sort();
+                    assigned_use_cases.dedup();
                     let runtime_images = if profile.runtime_images.is_empty() {
                         guard.runtimes.images_for(&profile.runtime_id)
                     } else {
@@ -75,7 +85,7 @@ impl VarlinkInterface for ModelsHandler {
                                 image_ref: image.image_ref.clone(),
                             })
                             .collect(),
-                        use_cases: profile.use_cases.clone(),
+                        use_cases: profile.effective_use_cases(),
                         specializations: Some(profile.specializations.clone()),
                         assigned_use_cases,
                         size_bytes: profile_artifact_size_bytes(&profile.artifact_path),
@@ -519,10 +529,7 @@ fn fit_level(
 }
 
 fn profile_supports_use_case(profile: &Profile, use_case: &str) -> bool {
-    profile
-        .use_cases
-        .iter()
-        .any(|supported| supported == use_case)
+    profile.supports_use_case(use_case)
 }
 
 struct CatalogFit<'a> {
@@ -2158,7 +2165,7 @@ async fn register_profile(
 ) -> anyhow::Result<(Vec<String>, Vec<UseCaseConflict>)> {
     let mut guard = state.0.lock().await;
     let profile_id = profile.profile_id.clone();
-    let suggested = profile.use_cases.clone();
+    let suggested = profile.effective_use_cases();
     guard.profiles.insert(profile)?;
 
     let mut auto_assigned = Vec::new();
@@ -2315,10 +2322,14 @@ mod tests {
     use std::os::unix::fs::symlink;
 
     fn profile_with_use_cases(use_cases: &[&str]) -> Profile {
+        profile_with_runtime_and_use_cases("runtime", use_cases)
+    }
+
+    fn profile_with_runtime_and_use_cases(runtime_id: &str, use_cases: &[&str]) -> Profile {
         Profile {
             profile_id: "profile".to_string(),
             model_id: "model".to_string(),
-            runtime_id: "runtime".to_string(),
+            runtime_id: runtime_id.to_string(),
             runtime_options: HashMap::new(),
             artifact_path: PathBuf::from("/tmp/model"),
             runtime_images: Vec::new(),
@@ -2337,6 +2348,13 @@ mod tests {
         assert!(profile_supports_use_case(&profile, "language.summarize"));
         assert!(profile_supports_use_case(&profile, "language.embed"));
         assert!(!profile_supports_use_case(&profile, "vision.describe"));
+    }
+
+    #[test]
+    fn whisper_transcribe_profile_supports_speech_translate() {
+        let profile = profile_with_runtime_and_use_cases("asr-whisper-cpp", &["speech.transcribe"]);
+
+        assert!(profile_supports_use_case(&profile, "speech.translate"));
     }
 
     #[hegel::test]

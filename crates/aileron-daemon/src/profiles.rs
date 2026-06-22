@@ -123,6 +123,23 @@ impl ProfileStore {
 }
 
 impl Profile {
+    pub fn effective_use_cases(&self) -> Vec<String> {
+        let mut use_cases = self.use_cases.clone();
+        if self.implies_use_case("speech.translate")
+            && !use_cases
+                .iter()
+                .any(|use_case| use_case == "speech.translate")
+        {
+            use_cases.push("speech.translate".to_string());
+        }
+        use_cases
+    }
+
+    pub fn supports_use_case(&self, use_case: &str) -> bool {
+        self.use_cases.iter().any(|supported| supported == use_case)
+            || self.implies_use_case(use_case)
+    }
+
     pub fn runtime_image_for(&self, detected: Variant) -> Option<&str> {
         self.runtime_image_candidates(detected).into_iter().next()
     }
@@ -141,6 +158,15 @@ impl Profile {
             }
         }
         candidates
+    }
+
+    fn implies_use_case(&self, use_case: &str) -> bool {
+        use_case == "speech.translate"
+            && self.runtime_id == "asr-whisper-cpp"
+            && self
+                .use_cases
+                .iter()
+                .any(|supported| supported == "speech.transcribe")
     }
 }
 
