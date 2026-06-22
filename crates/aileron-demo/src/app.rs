@@ -719,11 +719,23 @@ fn build_prediction_page() -> gtk4::Widget {
                             set_prediction_choices(&choices_label, &suggestions);
                         }
                     }
-                    Ok(PredictionEvent::Error { seq, message }) => {
+                    Ok(PredictionEvent::Error {
+                        seq,
+                        message,
+                        attempted_session,
+                    }) => {
                         if seq == active_seq.get() {
                             status_spinner.stop();
                             status_title.set_text("Prediction failed");
                             status_detail.set_text(&message);
+                            if let Some(id) = clear_failed_prediction_session(
+                                &mut session_id.borrow_mut(),
+                                attempted_session.as_deref(),
+                            ) {
+                                std::thread::spawn(move || {
+                                    let _ = end_prediction_session(&id);
+                                });
+                            }
                         }
                     }
                     Err(std::sync::mpsc::TryRecvError::Empty) => break,
@@ -777,6 +789,7 @@ fn build_prediction_page() -> gtk4::Widget {
                 let tx_for_error = tx.clone();
                 let _ = tx.send(PredictionEvent::Busy(seq));
                 let existing_session = session_id.borrow().clone();
+                let attempted_session = existing_session.clone();
                 std::thread::spawn(move || {
                     match predict_inline_completion(existing_session, &input_text) {
                         Ok((session, suggestions)) => {
@@ -793,6 +806,7 @@ fn build_prediction_page() -> gtk4::Widget {
                             let _ = tx_for_error.send(PredictionEvent::Error {
                                 seq,
                                 message: friendly_error(&e),
+                                attempted_session,
                             });
                         }
                     }
@@ -2500,6 +2514,7 @@ enum PredictionEvent {
     Error {
         seq: u64,
         message: String,
+        attempted_session: Option<String>,
     },
 }
 
@@ -3170,20 +3185,22 @@ fn predict_inline_completion(
 
     let conn = Connection::session()?;
     let proxy = zbus::blocking::Proxy::new(&conn, BUS, PATH, IFACE)?;
-    let session_id = match existing_session {
+    let used_existing_session = existing_session.is_some();
+    let create_session = || -> anyhow::Result<String> {
+        let id: String = proxy.call(
+            "CreateSession",
+            &(
+                "org.aileron.Demo",
+                "language.rephrase",
+                "Inline typing prediction session.",
+            ),
+        )?;
+        let _: () = proxy.call("Prewarm", &(&id, ""))?;
+        Ok(id)
+    };
+    let mut session_id = match existing_session {
         Some(id) => id,
-        None => {
-            let id: String = proxy.call(
-                "CreateSession",
-                &(
-                    "org.aileron.Demo",
-                    "language.rephrase",
-                    "Inline typing prediction session.",
-                ),
-            )?;
-            let _: () = proxy.call("Prewarm", &(&id, ""))?;
-            id
-        }
+        None => create_session()?,
     };
 
     let prompt_input = if input.chars().count() > 2048 {
@@ -3199,8 +3216,22 @@ fn predict_inline_completion(
         input.to_string()
     };
     let options = (4_i64, 0.0_f64, "greedy", "", "");
-    let completions: Vec<String> =
-        proxy.call("PredictNext", &(&session_id, &prompt_input, 3_i64, options))?;
+    let completions_result: zbus::Result<Vec<String>> =
+        proxy.call("PredictNext", &(&session_id, &prompt_input, 3_i64, options));
+    let completions = match completions_result {
+        Ok(completions) => completions,
+        Err(e) if used_existing_session && is_session_not_found_message(&e.to_string()) => {
+            session_id = create_session()?;
+            match proxy.call("PredictNext", &(&session_id, &prompt_input, 3_i64, options)) {
+                Ok(completions) => completions,
+                Err(e) => {
+                    let _: zbus::Result<()> = proxy.call("EndSession", &(&session_id,));
+                    return Err(e.into());
+                }
+            }
+        }
+        Err(e) => return Err(e.into()),
+    };
     let mut cleaned = Vec::new();
     for completion in completions {
         let completion = clean_prediction(input, &completion);
@@ -3212,6 +3243,24 @@ fn predict_inline_completion(
         }
     }
     Ok((session_id, cleaned))
+}
+
+fn clear_failed_prediction_session(
+    current: &mut Option<String>,
+    attempted_session: Option<&str>,
+) -> Option<String> {
+    let attempted_session = attempted_session?;
+    if current.as_deref() == Some(attempted_session) {
+        current.take()
+    } else {
+        None
+    }
+}
+
+fn is_session_not_found_message(message: &str) -> bool {
+    message.contains("aileron.Inference.SessionNotFound")
+        || message.contains("aileron.Inference.SessionNotFound_Args")
+        || message.contains("SessionNotFound_Args")
 }
 
 fn end_prediction_session(session_id: &str) -> anyhow::Result<()> {
@@ -4008,8 +4057,9 @@ fn base64_encode(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        DemoMode, base64_encode, concise_error, execute_count_tool, guided_tool_loop_fields,
-        initial_final_answer, parse_guided_tool_loop_response,
+        DemoMode, base64_encode, clear_failed_prediction_session, concise_error,
+        execute_count_tool, guided_tool_loop_fields, initial_final_answer,
+        is_session_not_found_message, parse_guided_tool_loop_response,
     };
     use hegel::TestCase;
     use hegel::generators as gs;
@@ -4032,6 +4082,36 @@ mod tests {
             concise_error(error),
             "The running Aileron portal is older than this demo and does not expose the Language interface. Restart the updated portal with `systemctl --user restart aileron-portal`, or rebuild/reinstall the portal service if it was installed from an older binary."
         );
+    }
+
+    #[test]
+    fn failed_prediction_clears_matching_cached_session() {
+        let mut current = Some("session-a".to_string());
+
+        let cleared = clear_failed_prediction_session(&mut current, Some("session-a"));
+
+        assert_eq!(cleared.as_deref(), Some("session-a"));
+        assert_eq!(current, None);
+    }
+
+    #[test]
+    fn failed_prediction_keeps_unrelated_cached_session() {
+        let mut current = Some("session-b".to_string());
+
+        let cleared = clear_failed_prediction_session(&mut current, Some("session-a"));
+
+        assert_eq!(cleared, None);
+        assert_eq!(current.as_deref(), Some("session-b"));
+    }
+
+    #[test]
+    fn stale_prediction_session_errors_are_detected() {
+        let error = "org.freedesktop.DBus.Error.Failed: aileron.Inference.SessionNotFound: Some(SessionNotFound_Args { session_id: \"missing\" })";
+
+        assert!(is_session_not_found_message(error));
+        assert!(!is_session_not_found_message(
+            "aileron.Inference.GenerationFailed"
+        ));
     }
 
     #[test]
