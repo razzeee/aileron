@@ -2,6 +2,7 @@
   "runtime_id": "vision-llama-cpp-gemma4",
   "capabilities": [
     "generate",
+    "predict_next",
     "generate_structured",
     "describe",
     "ocr",

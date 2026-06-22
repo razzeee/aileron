@@ -2,7 +2,7 @@
 
 This runtime runs llama.cpp through the Rust `llama-cpp-2` bindings for a Gemma GGUF model mounted at `/model/model.gguf` plus a matching projection file mounted at `/model/mmproj.gguf`.
 
-The Rust entrypoint supports text generation, structured generation, structured streaming, embeddings, and image-specific `describe`, `ocr`, and `segment` requests through llama.cpp's MTMD multimodal path.
+The Rust entrypoint supports text generation, inline `predict_next` completions, structured generation, structured streaming, embeddings, and image-specific `describe`, `ocr`, and `segment` requests through llama.cpp's MTMD multimodal path.
 
 Model weights are not baked into the image. A model manifest downloads and verifies both artifacts, then references this runtime by `runtime_id`.
 
