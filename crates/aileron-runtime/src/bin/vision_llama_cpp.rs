@@ -1,8 +1,9 @@
 use aileron_runtime::llama_runtime::{
-    DEFAULT_SYSTEM, LlamaRuntimeConfig, embedding, generate_chat, generate_from_evaluated_prompt,
-    initialize_llama, load_model, new_context, render_chat_prompt,
+    DEFAULT_SYSTEM, LlamaRuntimeConfig, clean_inline_completion, embedding, generate_chat,
+    generate_completion, generate_from_evaluated_prompt, initialize_llama, load_model, new_context,
+    render_chat_prompt,
 };
-use aileron_runtime::{Request, first_json_value, send, send_unsupported};
+use aileron_runtime::{Request, clamp_choices, first_json_value, send, send_unsupported};
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use llama_cpp_2::context::LlamaContext;
@@ -68,6 +69,7 @@ fn handle_request(
 ) -> Result<()> {
     match req.request_type.as_str() {
         "generate" => handle_generate(model, ctx, &req),
+        "predict_next" => handle_predict_next(model, ctx, &req),
         "generate_structured" => handle_generate_structured(model, ctx, &req),
         "generate_structured_stream" => handle_generate_structured_stream(model, ctx, &req),
         "embed" => handle_embed(model, ctx, &req),
@@ -95,6 +97,45 @@ fn handle_generate(model: &LlamaModel, ctx: &mut LlamaContext<'_>, req: &Request
         |token| send(json!({"id": req.id, "token": token})),
     )?;
     send(json!({"id": req.id, "done": true}))
+}
+
+fn handle_predict_next(
+    model: &LlamaModel,
+    ctx: &mut LlamaContext<'_>,
+    req: &Request,
+) -> Result<()> {
+    let prefix = req.prompt.as_deref().unwrap_or_default();
+    let max_tokens = req.max_tokens.unwrap_or(4);
+    let choices = clamp_choices(req.choices);
+    let base_temperature = req.temperature.unwrap_or(0.0);
+    let temperatures = [
+        base_temperature,
+        base_temperature.max(0.4),
+        base_temperature.max(0.8),
+    ];
+    let mut completions = Vec::new();
+
+    for temperature in temperatures {
+        let raw =
+            generate_completion(
+                model,
+                ctx,
+                prefix,
+                max_tokens,
+                temperature,
+                None,
+                |_| Ok(()),
+            )?;
+        let completion = clean_inline_completion(prefix, &raw);
+        if !completion.is_empty() && !completions.contains(&completion) {
+            completions.push(completion);
+        }
+        if completions.len() >= choices {
+            break;
+        }
+    }
+
+    send(json!({"id": req.id, "completions": completions, "done": true}))
 }
 
 fn handle_generate_structured(
