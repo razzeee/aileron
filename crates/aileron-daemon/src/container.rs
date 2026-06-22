@@ -65,6 +65,9 @@ use serde_json::Value;
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use crate::hardware::Variant;
+use crate::profiles::RuntimeCandidate;
+
 const NVIDIA_LIBRARY_DIR: &str = "/usr/local/nvidia/lib64";
 const VULKAN_ICD_DIR: &str = "/usr/share/vulkan/icd.d";
 const NVIDIA_DRIVER_LIBRARIES: &[&str] = &[
@@ -95,6 +98,8 @@ const VULKAN_ICD_DIRS: &[&str] = &[
 /// A running container for a single use-case.
 pub struct Container {
     #[allow(dead_code)]
+    pub variant: Variant,
+    #[allow(dead_code)]
     pub image_ref: String,
     #[allow(dead_code)]
     pub artifact_path: PathBuf,
@@ -110,6 +115,7 @@ pub struct Container {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RuntimeSpawnAttempt {
+    variant: Variant,
     image_ref: String,
     runtime_options: HashMap<String, String>,
 }
@@ -163,7 +169,7 @@ impl Container {
     /// namespace, read-only rootfs, tmpfs `/tmp`, no capabilities, no new
     /// privileges, PID limit, memory limit, and `/model` mounted read-only.
     pub fn spawn(
-        image_ref: &str,
+        candidate: &RuntimeCandidate,
         artifact_path: &Path,
         runtime_options: &HashMap<String, String>,
         memory_limit: &str,
@@ -171,8 +177,10 @@ impl Container {
         system_oci_store: &Path,
         mut on_status: impl FnMut(String) + Send + 'static,
     ) -> Result<Self> {
+        let image_ref = candidate.image_ref.as_str();
         info!("spawning OCI runtime for {}", image_ref);
         let bundle = OciRuntimeManager::new(oci_store, system_oci_store).prepare_bundle(
+            candidate.variant,
             image_ref,
             artifact_path,
             runtime_options,
@@ -244,6 +252,7 @@ impl Container {
         }
 
         Ok(Self {
+            variant: candidate.variant,
             image_ref: image_ref.to_string(),
             artifact_path: artifact_path.to_path_buf(),
             runtime_options: runtime_options.clone(),
@@ -709,6 +718,7 @@ impl OciRuntimeManager {
 
     fn prepare_bundle(
         &self,
+        variant: Variant,
         image_ref: &str,
         artifact_path: &Path,
         runtime_options: &HashMap<String, String>,
@@ -734,6 +744,7 @@ impl OciRuntimeManager {
         fs::create_dir_all(&bundle_dir)
             .with_context(|| format!("failed to create OCI bundle at {}", bundle_dir.display()))?;
         let config = runtime_config_json(
+            variant,
             image_ref,
             &rootfs,
             artifact_path,
@@ -764,7 +775,15 @@ pub fn default_system_oci_store() -> PathBuf {
 }
 
 pub fn runtime_rootfs_path(user_store: &Path, image_ref: &str) -> Option<PathBuf> {
-    runtime_rootfs_path_from_stores(user_store, &default_system_oci_store(), image_ref)
+    runtime_rootfs_path_in_stores(user_store, &default_system_oci_store(), image_ref)
+}
+
+pub fn runtime_rootfs_path_in_stores(
+    user_store: &Path,
+    system_store: &Path,
+    image_ref: &str,
+) -> Option<PathBuf> {
+    runtime_rootfs_path_from_stores(user_store, system_store, image_ref)
 }
 
 fn runtime_rootfs_path_from_stores(
@@ -780,7 +799,8 @@ fn runtime_rootfs_path_from_stores(
 }
 
 fn runtime_config_json(
-    image_ref: &str,
+    variant: Variant,
+    _image_ref: &str,
     rootfs: &Path,
     artifact_path: &Path,
     runtime_options: &HashMap<String, String>,
@@ -816,18 +836,18 @@ fn runtime_config_json(
         }),
     ];
 
-    if image_ref_uses_tag(image_ref, "cuda") {
+    if variant == Variant::Cuda {
         add_cuda_mounts(&mut mounts, &mut env_options);
         add_readonly_mount(&mut mounts, "/sys");
         push_default_env(&mut env, &env_options, "N_GPU_LAYERS", "-1");
         push_default_env(&mut env, &env_options, "AILERON_DEVICE", "cuda");
-    } else if image_ref_uses_tag(image_ref, "rocm") {
+    } else if variant == Variant::Rocm {
         add_device_mount(&mut mounts, "/dev/kfd");
         add_device_mount(&mut mounts, "/dev/dri");
         add_readonly_mount(&mut mounts, "/sys");
         push_default_env(&mut env, &env_options, "N_GPU_LAYERS", "-1");
         push_default_env(&mut env, &env_options, "AILERON_DEVICE", "rocm");
-    } else if image_ref_uses_tag(image_ref, "vulkan") {
+    } else if variant == Variant::Vulkan {
         add_device_mount(&mut mounts, "/dev/dri");
         add_nvidia_vulkan_mounts(&mut mounts, &mut env_options);
         add_readonly_mount(&mut mounts, "/sys");
@@ -1243,6 +1263,7 @@ pub(crate) fn store_key(image_ref: &str) -> String {
         .collect()
 }
 
+#[cfg(test)]
 fn image_ref_uses_tag(image_ref: &str, tag: &str) -> bool {
     let tagged_ref = image_ref
         .split_once('@')
@@ -1472,13 +1493,15 @@ impl ContainerPool {
     pub fn get_or_spawn(
         &mut self,
         profile_id: &str,
+        variant: Variant,
         image_ref: &str,
         artifact_path: &Path,
         runtime_options: &HashMap<String, String>,
         on_status: impl FnMut(String) + Send + 'static,
     ) -> Result<&mut Container> {
         if self.containers.get(profile_id).is_some_and(|container| {
-            container.image_ref != image_ref
+            container.variant != variant
+                || container.image_ref != image_ref
                 || container.artifact_path != artifact_path
                 || container.runtime_options != *runtime_options
         }) {
@@ -1490,8 +1513,12 @@ impl ContainerPool {
         }
 
         if !self.containers.contains_key(profile_id) {
+            let candidate = RuntimeCandidate {
+                variant,
+                image_ref: image_ref.to_string(),
+            };
             let c = Container::spawn(
-                image_ref,
+                &candidate,
                 artifact_path,
                 runtime_options,
                 &self.memory_limit,
@@ -1511,19 +1538,20 @@ impl ContainerPool {
         &mut self,
         profile_id: &str,
         runtime_id: &str,
-        image_refs: &[String],
+        candidates: &[RuntimeCandidate],
         artifact_path: &Path,
         runtime_options: &HashMap<String, String>,
         on_status: impl FnMut(String) + Send + 'static,
     ) -> Result<&mut Container> {
-        if image_refs.is_empty() {
+        if candidates.is_empty() {
             bail!("no runtime images resolved for profile {profile_id}");
         }
-        let attempts = runtime_spawn_attempts(runtime_id, image_refs, runtime_options);
+        let attempts = runtime_spawn_attempts(runtime_id, candidates, runtime_options);
 
         let can_reuse = self.containers.get(profile_id).is_some_and(|container| {
             attempts.iter().any(|attempt| {
                 attempt.image_ref == container.image_ref
+                    && attempt.variant == container.variant
                     && attempt.runtime_options == container.runtime_options
                     && container.artifact_path == artifact_path
             })
@@ -1536,17 +1564,47 @@ impl ContainerPool {
             info!(
                 "replacing container for profile {} with one of {} candidate runtime images",
                 profile_id,
-                image_refs.len()
+                candidates.len()
             );
             self.containers.remove(profile_id);
         }
 
         let on_status = std::sync::Arc::new(std::sync::Mutex::new(on_status));
         let mut errors = Vec::new();
+        let mut missing = Vec::new();
+        let mut attempted = false;
         for attempt in attempts {
-            let status_callback = on_status.clone();
-            match Container::spawn(
+            if runtime_rootfs_path_in_stores(
+                &self.oci_store,
+                &self.system_oci_store,
                 &attempt.image_ref,
+            )
+            .is_none()
+            {
+                if missing.contains(&attempt.image_ref) {
+                    continue;
+                }
+                missing.push(attempt.image_ref.clone());
+                let role = if attempt.image_ref == candidates[0].image_ref {
+                    "preferred"
+                } else {
+                    "fallback"
+                };
+                errors.push(format!(
+                    "{role} runtime image {} ({}) is not installed in the user or system OCI store",
+                    attempt.image_ref,
+                    attempt.variant.as_tag()
+                ));
+                continue;
+            }
+            attempted = true;
+            let status_callback = on_status.clone();
+            let candidate = RuntimeCandidate {
+                variant: attempt.variant,
+                image_ref: attempt.image_ref.clone(),
+            };
+            match Container::spawn(
+                &candidate,
                 artifact_path,
                 &attempt.runtime_options,
                 &self.memory_limit,
@@ -1569,15 +1627,30 @@ impl ContainerPool {
                         profile_id,
                         error
                     );
-                    errors.push(format!("{}: {error:#}", describe_spawn_attempt(&attempt)));
+                    let role = if attempt.image_ref == candidates[0].image_ref {
+                        "preferred"
+                    } else {
+                        "fallback"
+                    };
+                    errors.push(format!(
+                        "{role} runtime image {} failed to start: {error:#}",
+                        describe_spawn_attempt(&attempt)
+                    ));
                 }
             }
         }
 
-        bail!(
-            "failed to start any runtime image for profile {profile_id}: {}",
-            errors.join(" | ")
-        )
+        if attempted {
+            bail!(
+                "failed to start any installed runtime image for profile {profile_id}: {}",
+                errors.join(" | ")
+            )
+        } else {
+            bail!(
+                "no installed runtime fallback was available for profile {profile_id}: {}",
+                errors.join(" | ")
+            )
+        }
     }
 
     /// Kill and remove the container for a profile.
@@ -1615,17 +1688,18 @@ impl ContainerPool {
 
 fn runtime_spawn_attempts(
     runtime_id: &str,
-    image_refs: &[String],
+    candidates: &[RuntimeCandidate],
     runtime_options: &HashMap<String, String>,
 ) -> Vec<RuntimeSpawnAttempt> {
     let mut attempts = Vec::new();
-    for image_ref in image_refs {
+    for candidate in candidates {
         attempts.push(RuntimeSpawnAttempt {
-            image_ref: image_ref.clone(),
+            variant: candidate.variant,
+            image_ref: candidate.image_ref.clone(),
             runtime_options: runtime_options.clone(),
         });
 
-        if !is_gpu_image_ref(image_ref)
+        if !is_gpu_variant(candidate.variant)
             || !runtime_supports_gpu_layer_offload(runtime_id)
             || runtime_options.contains_key("N_GPU_LAYERS")
         {
@@ -1636,7 +1710,8 @@ fn runtime_spawn_attempts(
             let mut fallback_options = runtime_options.clone();
             fallback_options.insert("N_GPU_LAYERS".to_string(), layers.to_string());
             attempts.push(RuntimeSpawnAttempt {
-                image_ref: image_ref.clone(),
+                variant: candidate.variant,
+                image_ref: candidate.image_ref.clone(),
                 runtime_options: fallback_options,
             });
         }
@@ -1644,10 +1719,8 @@ fn runtime_spawn_attempts(
     attempts
 }
 
-fn is_gpu_image_ref(image_ref: &str) -> bool {
-    image_ref_uses_tag(image_ref, "cuda")
-        || image_ref_uses_tag(image_ref, "rocm")
-        || image_ref_uses_tag(image_ref, "vulkan")
+fn is_gpu_variant(variant: Variant) -> bool {
+    matches!(variant, Variant::Cuda | Variant::Rocm | Variant::Vulkan)
 }
 
 fn runtime_supports_gpu_layer_offload(runtime_id: &str) -> bool {
@@ -1656,7 +1729,7 @@ fn runtime_supports_gpu_layer_offload(runtime_id: &str) -> bool {
 
 fn describe_spawn_attempt(attempt: &RuntimeSpawnAttempt) -> String {
     match attempt.runtime_options.get("N_GPU_LAYERS") {
-        Some(layers) if is_gpu_image_ref(&attempt.image_ref) => {
+        Some(layers) if is_gpu_variant(attempt.variant) => {
             format!("{} (N_GPU_LAYERS={layers})", attempt.image_ref)
         }
         _ => attempt.image_ref.clone(),
@@ -1757,6 +1830,7 @@ mod tests {
     #[test]
     fn oci_config_preserves_core_sandbox_settings() {
         let config = runtime_config_json(
+            Variant::Cpu,
             "localhost/aileron/summarize:cpu",
             Path::new("/store/rootfs/runtime"),
             Path::new("/models/foo"),
@@ -1807,6 +1881,7 @@ mod tests {
     #[test]
     fn oci_config_exposes_rocm_devices_for_rocm_tag() {
         let config = runtime_config_json(
+            Variant::Rocm,
             "localhost/aileron/summarize:rocm",
             Path::new("/store/rootfs/runtime"),
             Path::new("/models/foo"),
@@ -1832,6 +1907,7 @@ mod tests {
     #[test]
     fn oci_config_exposes_cuda_env_for_cuda_tag() {
         let config = runtime_config_json(
+            Variant::Cuda,
             "localhost/aileron/summarize:cuda",
             Path::new("/store/rootfs/runtime"),
             Path::new("/models/foo"),
@@ -1851,6 +1927,7 @@ mod tests {
     #[test]
     fn oci_config_exposes_vulkan_device_for_vulkan_tag() {
         let config = runtime_config_json(
+            Variant::Vulkan,
             "localhost/aileron/summarize:vulkan",
             Path::new("/store/rootfs/runtime"),
             Path::new("/models/foo"),
@@ -1870,6 +1947,7 @@ mod tests {
     #[test]
     fn oci_config_does_not_expose_gpu_devices_for_cpu_tag() {
         let config = runtime_config_json(
+            Variant::Cpu,
             "localhost/aileron/summarize:cpu",
             Path::new("/store/rootfs/runtime"),
             Path::new("/models/foo"),
@@ -1882,6 +1960,44 @@ mod tests {
         assert!(!device_mounts(&config).contains(&"/dev/dri"));
         assert!(!mount_destinations(&config).contains(&"/sys"));
         assert!(!env(&config).contains(&"N_GPU_LAYERS=-1"));
+        assert!(
+            !env(&config)
+                .iter()
+                .any(|entry| entry.starts_with("AILERON_DEVICE="))
+        );
+    }
+
+    #[test]
+    fn explicit_variant_controls_accelerator_mounts_for_untagged_digest_ref() {
+        let config = runtime_config_json(
+            Variant::Vulkan,
+            "ghcr.io/example/aileron-runtime@sha256:abcdef",
+            Path::new("/store/rootfs/runtime"),
+            Path::new("/models/foo"),
+            &HashMap::new(),
+            "8g",
+        )
+        .expect("build OCI config");
+
+        assert!(device_mounts(&config).contains(&"/dev/dri"));
+        assert!(env(&config).contains(&"AILERON_DEVICE=vulkan"));
+        assert!(env(&config).contains(&"N_GPU_LAYERS=-1"));
+    }
+
+    #[test]
+    fn explicit_cpu_variant_does_not_expose_gpu_for_gpu_tagged_ref() {
+        let config = runtime_config_json(
+            Variant::Cpu,
+            "ghcr.io/example/aileron-runtime:vulkan",
+            Path::new("/store/rootfs/runtime"),
+            Path::new("/models/foo"),
+            &HashMap::new(),
+            "8g",
+        )
+        .expect("build OCI config");
+
+        assert!(!device_mounts(&config).contains(&"/dev/dri"));
+        assert!(!mount_destinations(&config).contains(&"/sys"));
         assert!(
             !env(&config)
                 .iter()
@@ -1907,6 +2023,16 @@ mod tests {
 
         for image_ref in refs {
             let config = runtime_config_json(
+                Variant::from_tag(if image_ref_uses_tag(image_ref, "cuda") {
+                    "cuda"
+                } else if image_ref_uses_tag(image_ref, "rocm") {
+                    "rocm"
+                } else if image_ref_uses_tag(image_ref, "vulkan") {
+                    "vulkan"
+                } else {
+                    "cpu"
+                })
+                .expect("declared variant tag"),
                 image_ref,
                 Path::new("/store/rootfs/runtime"),
                 Path::new("/models/foo"),
@@ -1946,6 +2072,7 @@ mod tests {
         runtime_options.insert("VISION_HANDLER".to_string(), "gemma4".to_string());
 
         let config = runtime_config_json(
+            Variant::Cpu,
             "localhost/aileron/vision:cpu",
             Path::new("/store/rootfs/runtime"),
             Path::new("/models/foo"),
@@ -1964,6 +2091,7 @@ mod tests {
         runtime_options.insert("AILERON_DEVICE".to_string(), "cpu".to_string());
 
         let config = runtime_config_json(
+            Variant::Cuda,
             "localhost/aileron/llm:cuda",
             Path::new("/store/rootfs/runtime"),
             Path::new("/models/foo"),
@@ -1990,12 +2118,18 @@ mod tests {
 
     #[test]
     fn runtime_spawn_attempts_retry_gpu_images_with_reduced_offload() {
-        let image_refs = vec![
-            "registry.example/ai/summarizer:cuda".to_string(),
-            "registry.example/ai/summarizer:cpu".to_string(),
+        let candidates = vec![
+            RuntimeCandidate {
+                variant: Variant::Cuda,
+                image_ref: "registry.example/ai/summarizer:cuda".to_string(),
+            },
+            RuntimeCandidate {
+                variant: Variant::Cpu,
+                image_ref: "registry.example/ai/summarizer:cpu".to_string(),
+            },
         ];
 
-        let attempts = runtime_spawn_attempts("llm-llama-cpp", &image_refs, &HashMap::new());
+        let attempts = runtime_spawn_attempts("llm-llama-cpp", &candidates, &HashMap::new());
         let attempt_summary = attempts
             .iter()
             .map(|attempt| {
@@ -2026,12 +2160,18 @@ mod tests {
 
     #[test]
     fn runtime_spawn_attempts_do_not_retry_non_layered_gpu_images() {
-        let image_refs = vec![
-            "localhost/aileron/aileron-runtime-asr-whisper-cpp:cuda".to_string(),
-            "localhost/aileron/aileron-runtime-asr-whisper-cpp:cpu".to_string(),
+        let candidates = vec![
+            RuntimeCandidate {
+                variant: Variant::Cuda,
+                image_ref: "localhost/aileron/aileron-runtime-asr-whisper-cpp:cuda".to_string(),
+            },
+            RuntimeCandidate {
+                variant: Variant::Cpu,
+                image_ref: "localhost/aileron/aileron-runtime-asr-whisper-cpp:cpu".to_string(),
+            },
         ];
 
-        let attempts = runtime_spawn_attempts("asr-whisper-cpp", &image_refs, &HashMap::new());
+        let attempts = runtime_spawn_attempts("asr-whisper-cpp", &candidates, &HashMap::new());
 
         assert_eq!(
             attempts
@@ -2047,14 +2187,20 @@ mod tests {
 
     #[test]
     fn runtime_spawn_attempts_preserve_explicit_gpu_layer_override() {
-        let image_refs = vec![
-            "localhost/aileron/aileron-runtime-llm-llama-cpp:cuda".to_string(),
-            "localhost/aileron/aileron-runtime-llm-llama-cpp:vulkan".to_string(),
+        let candidates = vec![
+            RuntimeCandidate {
+                variant: Variant::Cuda,
+                image_ref: "localhost/aileron/aileron-runtime-llm-llama-cpp:cuda".to_string(),
+            },
+            RuntimeCandidate {
+                variant: Variant::Vulkan,
+                image_ref: "localhost/aileron/aileron-runtime-llm-llama-cpp:vulkan".to_string(),
+            },
         ];
         let mut runtime_options = HashMap::new();
         runtime_options.insert("N_GPU_LAYERS".to_string(), "12".to_string());
 
-        let attempts = runtime_spawn_attempts("llm-llama-cpp", &image_refs, &runtime_options);
+        let attempts = runtime_spawn_attempts("llm-llama-cpp", &candidates, &runtime_options);
 
         assert_eq!(attempts.len(), 2);
         assert!(attempts.iter().all(|attempt| {
@@ -2064,6 +2210,119 @@ mod tests {
                 .map(String::as_str)
                 == Some("12")
         }));
+    }
+
+    #[test]
+    fn runtime_spawn_attempts_use_variant_for_untagged_gpu_ref() {
+        let candidates = vec![RuntimeCandidate {
+            variant: Variant::Vulkan,
+            image_ref: "registry.example/ai/summarizer@sha256:abcdef".to_string(),
+        }];
+
+        let attempts = runtime_spawn_attempts("llm-llama-cpp", &candidates, &HashMap::new());
+
+        assert_eq!(attempts.len(), 7);
+        assert_eq!(attempts[0].runtime_options.get("N_GPU_LAYERS"), None);
+        assert_eq!(
+            attempts[1]
+                .runtime_options
+                .get("N_GPU_LAYERS")
+                .map(String::as_str),
+            Some("64")
+        );
+    }
+
+    #[test]
+    fn container_reuse_requires_matching_variant() {
+        let artifact_path = test_dir("variant-reuse-artifacts");
+        let _ = std::fs::remove_dir_all(&artifact_path);
+        std::fs::create_dir_all(&artifact_path).expect("create artifact path");
+        let mut pool = ContainerPool {
+            containers: HashMap::from([(
+                "profile".to_string(),
+                test_container(
+                    Variant::Cpu,
+                    "registry.example/runtime@sha256:abcdef",
+                    &artifact_path,
+                ),
+            )]),
+            idle_timeout_secs: 300,
+            memory_limit: "512m".to_string(),
+            oci_store: test_dir("variant-reuse-user-store"),
+            system_oci_store: test_dir("variant-reuse-system-store"),
+        };
+        let candidates = vec![RuntimeCandidate {
+            variant: Variant::Vulkan,
+            image_ref: "registry.example/runtime@sha256:abcdef".to_string(),
+        }];
+
+        let err = match pool.get_or_spawn_any(
+            "profile",
+            "llm-llama-cpp",
+            &candidates,
+            &artifact_path,
+            &HashMap::new(),
+            |_| {},
+        ) {
+            Ok(_) => panic!("different variant must not reuse existing container"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("no installed runtime fallback"));
+        assert!(!pool.containers.contains_key("profile"));
+
+        let _ = std::fs::remove_dir_all(artifact_path);
+        let _ = std::fs::remove_dir_all(pool.oci_store);
+        let _ = std::fs::remove_dir_all(pool.system_oci_store);
+    }
+
+    #[test]
+    fn get_or_spawn_any_reports_when_no_candidate_rootfs_is_installed() {
+        let user_store = test_dir("missing-user-rootfs");
+        let system_store = test_dir("missing-system-rootfs");
+        let artifact_path = test_dir("missing-rootfs-artifacts");
+        let _ = std::fs::remove_dir_all(&user_store);
+        let _ = std::fs::remove_dir_all(&system_store);
+        let _ = std::fs::remove_dir_all(&artifact_path);
+        std::fs::create_dir_all(&artifact_path).expect("create artifact path");
+        let mut pool = ContainerPool {
+            containers: HashMap::new(),
+            idle_timeout_secs: 300,
+            memory_limit: "512m".to_string(),
+            oci_store: user_store.clone(),
+            system_oci_store: system_store.clone(),
+        };
+        let candidates = vec![
+            RuntimeCandidate {
+                variant: Variant::Cuda,
+                image_ref: "localhost/aileron/runtime:cuda".to_string(),
+            },
+            RuntimeCandidate {
+                variant: Variant::Cpu,
+                image_ref: "localhost/aileron/runtime:cpu".to_string(),
+            },
+        ];
+
+        let err = match pool.get_or_spawn_any(
+            "profile",
+            "llm-llama-cpp",
+            &candidates,
+            &artifact_path,
+            &HashMap::new(),
+            |_| {},
+        ) {
+            Ok(_) => panic!("missing rootfs candidates should fail before spawn"),
+            Err(err) => err,
+        };
+
+        let reason = err.to_string();
+        assert!(reason.contains("no installed runtime fallback was available"));
+        assert!(reason.contains("preferred runtime image"));
+        assert!(reason.contains("fallback runtime image"));
+
+        let _ = std::fs::remove_dir_all(user_store);
+        let _ = std::fs::remove_dir_all(system_store);
+        let _ = std::fs::remove_dir_all(artifact_path);
     }
 
     #[test]
@@ -2422,6 +2681,35 @@ mod tests {
             .any(|value| value.as_str() == Some(expected))
     }
 
+    fn test_dir(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "aileron-{name}-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ))
+    }
+
+    fn test_container(variant: Variant, image_ref: &str, artifact_path: &Path) -> Container {
+        let child = std::process::Command::new("true")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn inert test process");
+        let mut child = child;
+        let stdin = child.stdin.take().expect("piped stdin");
+        let stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
+        Container {
+            variant,
+            image_ref: image_ref.to_string(),
+            artifact_path: artifact_path.to_path_buf(),
+            runtime_options: HashMap::new(),
+            child,
+            stdin,
+            stdout,
+            last_used: std::time::Instant::now(),
+        }
+    }
+
     #[test]
     fn structured_response_error_returns_immediately() {
         let resp = ContainerResponse {
@@ -2596,9 +2884,13 @@ mod tests {
         let artifact_path =
             std::env::temp_dir().join(format!("aileron-stub-artifacts-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&artifact_path).expect("create temporary artifact directory");
+        let candidate = RuntimeCandidate {
+            variant: Variant::Cpu,
+            image_ref: image_ref.clone(),
+        };
 
         let mut container = Container::spawn(
-            &image_ref,
+            &candidate,
             &artifact_path,
             &HashMap::new(),
             "512m",

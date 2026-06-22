@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use crate::hardware::Variant;
-use crate::profiles::RuntimeImage;
+use crate::profiles::{RuntimeCandidate, RuntimeImage};
 
 #[derive(Debug, Clone, Default)]
 pub struct RuntimeManifestStore {
@@ -141,12 +141,37 @@ impl RuntimeManifestStore {
         let Some(runtime) = self.runtimes.get(runtime_id) else {
             return Vec::new();
         };
+        self.resolve_runtime_candidates(runtime_id, detected)
+            .into_iter()
+            .map(|candidate| {
+                runtime
+                    .images
+                    .get(candidate.variant.as_tag())
+                    .map(String::as_str)
+                    .expect("runtime candidate came from manifest image")
+            })
+            .collect()
+    }
+
+    pub fn resolve_runtime_candidates(
+        &self,
+        runtime_id: &str,
+        detected: Variant,
+    ) -> Vec<RuntimeCandidate> {
+        let Some(runtime) = self.runtimes.get(runtime_id) else {
+            return Vec::new();
+        };
         let mut candidates = Vec::new();
-        for variant in detected.fallback_tags() {
-            if let Some(image_ref) = runtime.images.get(*variant).map(String::as_str)
-                && !candidates.contains(&image_ref)
+        for variant_tag in detected.fallback_tags() {
+            let Some(variant) = Variant::from_tag(variant_tag) else {
+                continue;
+            };
+            if let Some(image_ref) = runtime.images.get(*variant_tag).cloned()
+                && !candidates.iter().any(|candidate: &RuntimeCandidate| {
+                    candidate.variant == variant && candidate.image_ref == image_ref
+                })
             {
-                candidates.push(image_ref);
+                candidates.push(RuntimeCandidate { variant, image_ref });
             }
         }
         candidates
@@ -491,6 +516,37 @@ mod tests {
         assert_eq!(
             manifests.resolve_candidates("asr-whisper-cpp", Variant::Rocm),
             vec!["example/asr:cpu"]
+        );
+    }
+
+    #[test]
+    fn runtime_candidates_keep_same_ref_for_distinct_variants() {
+        let shared_ref = "example/runtime@sha256:abcdef";
+        let runtime = RuntimeManifest {
+            runtime_id: "runtime".to_string(),
+            images: HashMap::from([
+                ("cpu".to_string(), shared_ref.to_string()),
+                ("vulkan".to_string(), shared_ref.to_string()),
+            ]),
+        };
+        let manifests = RuntimeManifestStore {
+            runtimes: HashMap::from([("runtime".to_string(), runtime)]),
+        };
+
+        let candidates = manifests.resolve_runtime_candidates("runtime", Variant::Vulkan);
+
+        assert_eq!(
+            candidates,
+            vec![
+                RuntimeCandidate {
+                    variant: Variant::Vulkan,
+                    image_ref: shared_ref.to_string(),
+                },
+                RuntimeCandidate {
+                    variant: Variant::Cpu,
+                    image_ref: shared_ref.to_string(),
+                },
+            ]
         );
     }
 

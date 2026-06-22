@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use uuid::Uuid;
 
+use crate::profiles::RuntimeCandidate;
 use crate::state::SharedState;
 #[allow(unused_imports)]
 // VarlinkCallError is a supertrait; its methods reach us via Call_* dyn objects.
@@ -23,7 +24,7 @@ pub struct InferenceHandler {
 type ProfileRuntime = (
     String,
     String,
-    Vec<String>,
+    Vec<RuntimeCandidate>,
     PathBuf,
     HashMap<String, String>,
 );
@@ -42,7 +43,7 @@ impl VarlinkInterface for InferenceHandler {
         use_case: String,
     ) -> varlink::Result<()> {
         self.rt.block_on(async {
-            let (image_refs, artifact_path, oci_store) = {
+            let (candidates, artifact_path, oci_store, system_oci_store) = {
                 let guard = self.state.0.lock().await;
                 if !guard.config.allow_all
                     && matches!(guard.permissions.check(&app_id, &use_case), Some(false))
@@ -73,11 +74,8 @@ impl VarlinkInterface for InferenceHandler {
                         });
                     }
                 };
-                let image_refs = resolve_runtime_images(&guard, profile)
-                    .into_iter()
-                    .map(str::to_string)
-                    .collect::<Vec<_>>();
-                if image_refs.is_empty() {
+                let candidates = resolve_runtime_candidates(&guard, profile);
+                if candidates.is_empty() {
                     return call.reply(ModelAvailability {
                         is_available: false,
                         code: "runtime_unsupported".to_string(),
@@ -89,9 +87,10 @@ impl VarlinkInterface for InferenceHandler {
                     });
                 }
                 (
-                    image_refs,
+                    candidates,
                     profile.artifact_path.clone(),
                     guard.containers.oci_store.clone(),
+                    guard.containers.system_oci_store.clone(),
                 )
             };
 
@@ -103,8 +102,13 @@ impl VarlinkInterface for InferenceHandler {
                 });
             }
 
-            let runtime_exists = image_refs.iter().any(|image_ref| {
-                crate::container::runtime_rootfs_path(&oci_store, image_ref).is_some()
+            let runtime_exists = candidates.iter().any(|candidate| {
+                crate::container::runtime_rootfs_path_in_stores(
+                    &oci_store,
+                    &system_oci_store,
+                    &candidate.image_ref,
+                )
+                .is_some()
             });
 
             call.reply(ModelAvailability {
@@ -117,7 +121,7 @@ impl VarlinkInterface for InferenceHandler {
                 reason: if runtime_exists {
                     "available".to_string()
                 } else {
-                    runtime_missing_reason(&image_refs)
+                    runtime_missing_reason(&candidates)
                 },
             })
         })
@@ -1322,11 +1326,8 @@ fn profile_runtime(
         .profiles
         .get(profile_id)
         .ok_or_else(|| format!("assigned profile {profile_id} is not installed"))?;
-    let image_refs = resolve_runtime_images(guard, profile)
-        .into_iter()
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    if image_refs.is_empty() {
+    let candidates = resolve_runtime_candidates(guard, profile);
+    if candidates.is_empty() {
         return Err(format!(
             "runtime {} does not support {}",
             profile.runtime_id,
@@ -1342,35 +1343,47 @@ fn profile_runtime(
     Ok((
         profile.profile_id.clone(),
         profile.runtime_id.clone(),
-        image_refs,
+        candidates,
         profile.artifact_path.clone(),
         profile.runtime_options.clone(),
     ))
 }
 
-fn resolve_runtime_images<'a>(
-    guard: &'a crate::state::Inner,
-    profile: &'a crate::profiles::Profile,
-) -> Vec<&'a str> {
-    let manifest_images = guard
+fn resolve_runtime_candidates(
+    guard: &crate::state::Inner,
+    profile: &crate::profiles::Profile,
+) -> Vec<RuntimeCandidate> {
+    let manifest_candidates = guard
         .runtimes
-        .resolve_candidates(&profile.runtime_id, guard.variant);
-    if !manifest_images.is_empty() {
-        return manifest_images;
+        .resolve_runtime_candidates(&profile.runtime_id, guard.variant);
+    if !manifest_candidates.is_empty() {
+        return manifest_candidates;
     }
 
-    profile.runtime_image_candidates(guard.variant)
+    profile.runtime_candidates(guard.variant)
 }
 
-fn runtime_missing_reason(image_refs: &[String]) -> String {
-    match image_refs {
+fn runtime_missing_reason(candidates: &[RuntimeCandidate]) -> String {
+    match candidates {
         [] => "no runtime image candidates resolved".to_string(),
-        [image_ref] => {
-            format!("runtime rootfs for {image_ref} is not present in the user or system OCI store")
+        [candidate] => {
+            format!(
+                "runtime rootfs for {} ({}) is not present in the user or system OCI store",
+                candidate.image_ref,
+                candidate.variant.as_tag()
+            )
         }
         _ => format!(
             "none of the runtime rootfs candidates are present in the user or system OCI store: {}",
-            image_refs.join(", ")
+            candidates
+                .iter()
+                .map(|candidate| format!(
+                    "{} ({})",
+                    candidate.image_ref,
+                    candidate.variant.as_tag()
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
         ),
     }
 }

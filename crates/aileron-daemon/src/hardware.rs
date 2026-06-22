@@ -22,6 +22,16 @@ pub enum Variant {
 }
 
 impl Variant {
+    pub fn from_tag(tag: &str) -> Option<Self> {
+        match tag {
+            "cpu" => Some(Variant::Cpu),
+            "cuda" => Some(Variant::Cuda),
+            "rocm" => Some(Variant::Rocm),
+            "vulkan" => Some(Variant::Vulkan),
+            _ => None,
+        }
+    }
+
     pub fn as_tag(&self) -> &'static str {
         match self {
             Variant::Cpu => "cpu",

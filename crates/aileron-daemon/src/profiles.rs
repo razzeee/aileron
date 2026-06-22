@@ -15,6 +15,12 @@ pub struct RuntimeImage {
     pub image_ref: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeCandidate {
+    pub variant: Variant,
+    pub image_ref: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArtifactHash {
     #[serde(default)]
@@ -145,16 +151,34 @@ impl Profile {
     }
 
     pub fn runtime_image_candidates(&self, detected: Variant) -> Vec<&str> {
+        self.runtime_candidates(detected)
+            .into_iter()
+            .map(|candidate| {
+                self.runtime_images
+                    .iter()
+                    .find(|image| image.image_ref == candidate.image_ref)
+                    .map(|image| image.image_ref.as_str())
+                    .expect("runtime candidate came from profile image")
+            })
+            .collect()
+    }
+
+    pub fn runtime_candidates(&self, detected: Variant) -> Vec<RuntimeCandidate> {
         let mut candidates = Vec::new();
-        for variant in detected.fallback_tags() {
+        for variant_tag in detected.fallback_tags() {
+            let Some(variant) = Variant::from_tag(variant_tag) else {
+                continue;
+            };
             if let Some(image_ref) = self
                 .runtime_images
                 .iter()
-                .find(|img| img.variant == *variant)
-                .map(|img| img.image_ref.as_str())
-                && !candidates.contains(&image_ref)
+                .find(|img| img.variant == *variant_tag)
+                .map(|img| img.image_ref.clone())
+                && !candidates.iter().any(|candidate: &RuntimeCandidate| {
+                    candidate.variant == variant && candidate.image_ref == image_ref
+                })
             {
-                candidates.push(image_ref);
+                candidates.push(RuntimeCandidate { variant, image_ref });
             }
         }
         candidates
@@ -353,6 +377,37 @@ mod tests {
         assert_eq!(
             profile.runtime_image_candidates(Variant::Rocm),
             vec!["example/asr:cpu"]
+        );
+    }
+
+    #[test]
+    fn runtime_candidates_keep_same_ref_for_distinct_variants() {
+        let shared_ref = "example/runtime@sha256:abcdef";
+        let profile = profile_with_runtime_images(vec![
+            RuntimeImage {
+                variant: "cpu".to_string(),
+                image_ref: shared_ref.to_string(),
+            },
+            RuntimeImage {
+                variant: "vulkan".to_string(),
+                image_ref: shared_ref.to_string(),
+            },
+        ]);
+
+        let candidates = profile.runtime_candidates(Variant::Vulkan);
+
+        assert_eq!(
+            candidates,
+            vec![
+                RuntimeCandidate {
+                    variant: Variant::Vulkan,
+                    image_ref: shared_ref.to_string(),
+                },
+                RuntimeCandidate {
+                    variant: Variant::Cpu,
+                    image_ref: shared_ref.to_string(),
+                },
+            ]
         );
     }
 
