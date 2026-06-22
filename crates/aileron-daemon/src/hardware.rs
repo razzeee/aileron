@@ -9,7 +9,7 @@
 ///   1. `AILERON_VARIANT` env var — explicit override
 ///   2. CUDA  — `nvidia-smi` reports a GPU
 ///   3. ROCm  — ROCm userspace reports a GPU
-///   4. Vulkan — `vulkaninfo` reports a device
+///   4. Vulkan — `/dev/dri/renderD*` or `vulkaninfo` reports a device
 ///   5. CPU   — no accelerator detected
 use tracing::info;
 
@@ -69,7 +69,7 @@ pub fn detect() -> Variant {
         return Variant::Rocm;
     }
     if has_vulkan() {
-        info!("hardware variant: vulkan (vulkaninfo detected device)");
+        info!("hardware variant: vulkan (/dev/dri or vulkaninfo detected device)");
         return Variant::Vulkan;
     }
 
@@ -138,8 +138,12 @@ fn has_rocm() -> bool {
 fn has_vulkan() -> bool {
     has_dri_render_node()
         || run("vulkaninfo", &["--summary"])
-            .map(|out| out.contains("deviceName") || out.contains("deviceType"))
+            .map(|out| vulkaninfo_reports_device(&out))
             .unwrap_or(false)
+}
+
+fn vulkaninfo_reports_device(output: &str) -> bool {
+    output.contains("deviceName") || output.contains("deviceType")
 }
 
 #[cfg(target_os = "linux")]
@@ -195,6 +199,24 @@ mod tests {
         assert!(has_dri_render_node_in(&temp));
 
         std::fs::remove_dir_all(temp).expect("cleanup");
+    }
+
+    #[test]
+    fn detects_intel_vulkaninfo_device_summary() {
+        let output = r#"
+Devices:
+========
+GPU0:
+    deviceName        = Intel(R) Arc(tm) Graphics
+    deviceType        = PHYSICAL_DEVICE_TYPE_DISCRETE_GPU
+"#;
+
+        assert!(vulkaninfo_reports_device(output));
+    }
+
+    #[test]
+    fn ignores_empty_vulkaninfo_summary() {
+        assert!(!vulkaninfo_reports_device("========\nVULKANINFO\n========"));
     }
 
     #[cfg(target_os = "linux")]

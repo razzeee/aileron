@@ -23,7 +23,7 @@ Four Dockerfiles are provided:
 | `Dockerfile` | `cpu` | CPU | Default, works everywhere |
 | `Dockerfile.cuda` | `cuda` | NVIDIA GPU | Requires NVIDIA driver devices and `libcuda.so.1` on host |
 | `Dockerfile.rocm` | `rocm` | AMD GPU | Requires ROCm devices on host |
-| `Dockerfile.vulkan` | `vulkan` | Vulkan GPU | NVIDIA / AMD / Intel Arc |
+| `Dockerfile.vulkan` | `vulkan` | Vulkan GPU | NVIDIA / AMD / Intel Arc, Xe, and integrated graphics |
 
 If the host detects an accelerator and the runtime manifest has no matching image, the daemon falls back through the compatible variants declared in the manifest, then to `cpu` as the final fallback.
 

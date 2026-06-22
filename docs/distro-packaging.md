@@ -172,7 +172,7 @@ The daemon renders OCI layouts to rootfs directories with the `ocirender` Rust c
 
 ## Hardware Access
 
-Runtime manifests map each runtime ID to image variants such as `cpu`, `cuda`, `rocm`, and `vulkan`. The daemon chooses the best variant detected on the host, falls back from CUDA or ROCm to Vulkan when available, and uses CPU as the final fallback. llama.cpp GPU runtimes also retry cold start with reduced `N_GPU_LAYERS` values before moving to the next image candidate, unless the profile explicitly sets `N_GPU_LAYERS`.
+Runtime manifests map each runtime ID to image variants such as `cpu`, `cuda`, `rocm`, and `vulkan`. The daemon chooses the best variant detected on the host, falls back from CUDA or ROCm to Vulkan when available, and uses CPU as the final fallback. Intel GPUs use the existing `vulkan` variant rather than a separate `intel` variant. llama.cpp GPU runtimes also retry cold start with reduced `N_GPU_LAYERS` values before moving to the next image candidate, unless the profile explicitly sets `N_GPU_LAYERS`.
 
 The generated OCI bundle exposes only the hardware needed by the selected variant:
 
@@ -186,6 +186,8 @@ The generated OCI bundle exposes only the hardware needed by the selected varian
 Actual device bind mounts must not use `nodev`; GPU runtimes need functional device nodes, not only visible paths. Non-device mounts such as `/tmp`, `/dev/shm`, and `/sys` keep restrictive flags where possible.
 
 Distro packages should not add broad device permissions themselves. Device access should follow the distro's normal GPU stack policy, udev rules, and user group configuration.
+
+Intel Vulkan acceleration requires render nodes such as `/dev/dri/renderD*` and an Intel Vulkan ICD. Common distro packages include Mesa's Intel Vulkan driver, often named `mesa-vulkan-drivers`, `mesa-vulkan-intel`, or `vulkan-intel`, plus `vulkan-tools` if administrators want to validate with `vulkaninfo`.
 
 CUDA runtimes require a working host NVIDIA kernel driver and driver userspace libraries such as `libcuda.so.1`. Aileron discovers these libraries through `ldconfig -p` and common system library paths, then mounts them read-only into CUDA bundles under `/usr/local/nvidia/lib64`.
 
