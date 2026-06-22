@@ -2745,6 +2745,7 @@ struct GuidedToolLoopResponse {
     tool_name: String,
     word: String,
     character: String,
+    #[serde(default)]
     answer: String,
 }
 
@@ -3448,7 +3449,17 @@ fn run_character_tool_demo(
             options,
         ),
     )?;
-    let mut response = parse_guided_tool_loop_response(&content, prompt, false)?;
+    let mut response = if content.trim().is_empty() && !tool_calls.is_empty() {
+        GuidedToolLoopResponse {
+            action: "call_tool".to_string(),
+            tool_name: "count_character_occurrences".to_string(),
+            word: String::new(),
+            character: String::new(),
+            answer: String::new(),
+        }
+    } else {
+        parse_guided_tool_loop_response(&content, prompt, false)?
+    };
     tx.send(ToolEvent::Trace(format!(
         "after_llm_call: action={}, native_tool_calls={}, tool_name={}, word={}, character={}, answer={:?}",
         response.action,
@@ -3464,7 +3475,14 @@ fn run_character_tool_demo(
             "after_agent_loop: guided response selected final answer without tool execution"
                 .to_string(),
         ))?;
-        tx.send(ToolEvent::Final(response.answer))?;
+        let answer = match initial_final_answer(response) {
+            Ok(answer) => answer,
+            Err(e) => {
+                let _: () = proxy.call("EndSession", &(&session_id,))?;
+                return Err(e);
+            }
+        };
+        tx.send(ToolEvent::Final(answer))?;
         let _: () = proxy.call("EndSession", &(&session_id,))?;
         tx.send(ToolEvent::Done)?;
         return Ok(());
@@ -3600,7 +3618,7 @@ fn guided_tool_loop_fields() -> Vec<(String, String, String, bool)> {
             "answer".to_string(),
             "string".to_string(),
             "Final user-facing answer when action is final, otherwise empty".to_string(),
-            true,
+            false,
         ),
     ]
 }
@@ -3661,13 +3679,66 @@ fn format_tool_result_answer(result: &serde_json::Value) -> String {
     format!("The character '{character}' occurs {count} times in {word}.")
 }
 
+fn initial_final_answer(response: GuidedToolLoopResponse) -> anyhow::Result<String> {
+    let answer = response.answer.trim().to_string();
+    if answer.is_empty() || answer == "stub" {
+        anyhow::bail!("guided response selected final without an answer");
+    }
+    Ok(answer)
+}
+
 fn infer_word_from_prompt(prompt: &str) -> Option<String> {
-    prompt
+    let parts = prompt
         .split(|ch: char| !ch.is_ascii_alphanumeric())
         .filter(|part| part.len() > 1)
+        .collect::<Vec<_>>();
+
+    parts
+        .iter()
+        .enumerate()
         .rev()
-        .find(|part| part.chars().any(|ch| ch.eq_ignore_ascii_case(&'r')))
-        .map(str::to_string)
+        .find(|(_, part)| part.eq_ignore_ascii_case("in") || part.eq_ignore_ascii_case("within"))
+        .and_then(|(index, _)| {
+            parts[index + 1..]
+                .iter()
+                .rev()
+                .find(|part| is_count_target_candidate(part))
+        })
+        .or_else(|| {
+            parts
+                .iter()
+                .rev()
+                .find(|part| is_count_target_candidate(part))
+        })
+        .map(|part| (*part).to_string())
+}
+
+fn is_count_target_candidate(part: &str) -> bool {
+    let lower = part.to_ascii_lowercase();
+    !matches!(
+        lower.as_str(),
+        "a" | "an"
+            | "are"
+            | "character"
+            | "count"
+            | "does"
+            | "how"
+            | "in"
+            | "input"
+            | "is"
+            | "letter"
+            | "many"
+            | "occur"
+            | "occurs"
+            | "of"
+            | "string"
+            | "text"
+            | "the"
+            | "times"
+            | "to"
+            | "within"
+            | "word"
+    )
 }
 
 fn infer_character_from_prompt(prompt: &str) -> Option<char> {
@@ -3681,6 +3752,15 @@ fn infer_character_from_prompt(prompt: &str) -> Option<char> {
                 .split("character")
                 .nth(1)
                 .and_then(|rest| rest.chars().find(|ch| ch.is_ascii_alphabetic()))
+        })
+        .or_else(|| {
+            lower
+                .split(|ch: char| !ch.is_ascii_alphanumeric())
+                .find_map(|part| {
+                    let mut chars = part.chars();
+                    let ch = chars.next()?;
+                    (chars.next().is_none() && ch.is_ascii_alphabetic()).then_some(ch)
+                })
         })
 }
 
@@ -3928,7 +4008,8 @@ fn base64_encode(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        DemoMode, base64_encode, concise_error, execute_count_tool, parse_guided_tool_loop_response,
+        DemoMode, base64_encode, concise_error, execute_count_tool, guided_tool_loop_fields,
+        initial_final_answer, parse_guided_tool_loop_response,
     };
     use hegel::TestCase;
     use hegel::generators as gs;
@@ -4001,6 +4082,19 @@ mod tests {
         assert_eq!(result["count"], 5);
     }
 
+    #[test]
+    fn count_tool_infers_non_r_prompt_arguments() {
+        let result = execute_count_tool(
+            "How many times does the letter s occur in Mississippi?",
+            "{}",
+        )
+        .expect("count tool should infer non-r demo args");
+
+        assert_eq!(result["word"], "Mississippi");
+        assert_eq!(result["character"], "s");
+        assert_eq!(result["count"], 4);
+    }
+
     #[hegel::test]
     fn guided_tool_loop_stub_fields_are_inferred_from_prompt(tc: TestCase) {
         let word = tc.draw(gs::sampled_from(vec![
@@ -4021,6 +4115,45 @@ mod tests {
         assert_eq!(response.tool_name, "count_character_occurrences");
         assert_eq!(response.word, word);
         assert_eq!(response.character, character.to_string());
+    }
+
+    #[test]
+    fn guided_tool_loop_rejects_missing_text_tool_arguments() {
+        let error = parse_guided_tool_loop_response(
+            r#"{"action":"call_tool","tool_name":"count_character_occurrences","answer":""}"#,
+            "How many times does the letter s occur in Mississippi?",
+            false,
+        )
+        .expect_err("text tool calls should include structured arguments");
+
+        assert!(error.to_string().contains("missing field"));
+    }
+
+    #[test]
+    fn guided_tool_loop_schema_requires_tool_args_but_not_answer() {
+        let required_fields = guided_tool_loop_fields()
+            .into_iter()
+            .filter_map(|(name, _, _, required)| required.then_some(name))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            required_fields,
+            vec!["action", "tool_name", "word", "character"]
+        );
+    }
+
+    #[test]
+    fn initial_final_answer_rejects_empty_answer() {
+        let response = parse_guided_tool_loop_response(
+            r#"{"action":"final","tool_name":"","word":"","character":""}"#,
+            "What time is it?",
+            false,
+        )
+        .expect("answer is optional in the schema");
+
+        let error = initial_final_answer(response).expect_err("empty final answer should fail");
+
+        assert!(error.to_string().contains("without an answer"));
     }
 
     #[hegel::test]
