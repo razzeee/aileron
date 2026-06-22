@@ -86,6 +86,10 @@ ENV ROCM_PATH="${ROCM_PATH}"
 ENV PATH="${ROCM_PATH}/bin:${PATH}"
 
 RUN apt-get update && apt-get install -y --no-install-recommends ${RUNTIME_APT_PACKAGES} \
+    && if [ "$RUNTIME_VARIANT" = "vulkan" ]; then \
+    rm -f /usr/share/vulkan/icd.d/lvp_icd*.json /usr/share/vulkan/icd.d/lavapipe*.json; \
+    fi \
+    && mkdir -p /usr/local/nvidia/lib64 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /entrypoint /entrypoint

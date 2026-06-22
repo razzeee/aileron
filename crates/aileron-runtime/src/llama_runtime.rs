@@ -228,6 +228,7 @@ pub fn generate_from_evaluated_prompt(
     let mut sampler = sampler_for(model, temperature, schema);
     let mut decoder = UTF_8.new_decoder();
     let mut output = String::new();
+    let mut batch = LlamaBatch::new(1, 1);
 
     for _ in 0..max_tokens {
         let token = sampler.sample(ctx, -1);
@@ -242,7 +243,7 @@ pub fn generate_from_evaluated_prompt(
             output.push_str(&piece);
         }
 
-        let mut batch = LlamaBatch::new(1, 1);
+        batch.clear();
         batch.add(token, n_past, &[0], true)?;
         n_past += 1;
         ctx.decode(&mut batch).context("decode generated token")?;

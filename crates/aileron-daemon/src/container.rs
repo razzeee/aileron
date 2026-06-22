@@ -66,6 +66,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 const NVIDIA_LIBRARY_DIR: &str = "/usr/local/nvidia/lib64";
+const VULKAN_ICD_DIR: &str = "/usr/share/vulkan/icd.d";
 const NVIDIA_DRIVER_LIBRARIES: &[&str] = &[
     "libcuda.so.1",
     "libcuda.so",
@@ -83,6 +84,12 @@ const COMMON_LIBRARY_DIRS: &[&str] = &[
     "/lib/x86_64-linux-gnu",
     "/lib64",
     "/run/opengl-driver/lib",
+];
+const VULKAN_ICD_DIRS: &[&str] = &[
+    "/run/opengl-driver/share/vulkan/icd.d",
+    "/etc/vulkan/icd.d",
+    "/usr/local/share/vulkan/icd.d",
+    "/usr/share/vulkan/icd.d",
 ];
 
 /// A running container for a single use-case.
@@ -822,6 +829,7 @@ fn runtime_config_json(
         push_default_env(&mut env, &env_options, "AILERON_DEVICE", "rocm");
     } else if image_ref_uses_tag(image_ref, "vulkan") {
         add_device_mount(&mut mounts, "/dev/dri");
+        add_nvidia_vulkan_mounts(&mut mounts, &mut env_options);
         add_readonly_mount(&mut mounts, "/sys");
         push_default_env(&mut env, &env_options, "N_GPU_LAYERS", "-1");
         push_default_env(&mut env, &env_options, "AILERON_DEVICE", "vulkan");
@@ -913,6 +921,20 @@ fn add_device_mount(mounts: &mut Vec<Value>, path: &str) {
 }
 
 fn add_cuda_mounts(mounts: &mut Vec<Value>, runtime_options: &mut HashMap<String, String>) {
+    add_nvidia_device_mounts(mounts);
+    add_nvidia_driver_library_mounts(mounts, runtime_options);
+}
+
+fn add_nvidia_vulkan_mounts(
+    mounts: &mut Vec<Value>,
+    runtime_options: &mut HashMap<String, String>,
+) {
+    add_nvidia_device_mounts(mounts);
+    add_nvidia_driver_library_mounts(mounts, runtime_options);
+    add_nvidia_vulkan_icd_mounts(mounts, runtime_options);
+}
+
+fn add_nvidia_device_mounts(mounts: &mut Vec<Value>) {
     add_existing_device_mounts(
         mounts,
         [
@@ -928,7 +950,6 @@ fn add_cuda_mounts(mounts: &mut Vec<Value>, runtime_options: &mut HashMap<String
     if Path::new("/proc/driver/nvidia").exists() {
         add_readonly_mount(mounts, "/proc/driver/nvidia");
     }
-    add_nvidia_driver_library_mounts(mounts, runtime_options);
 }
 
 fn add_existing_device_mounts<const N: usize>(mounts: &mut Vec<Value>, paths: [&str; N]) {
@@ -974,6 +995,49 @@ fn add_nvidia_driver_library_mounts_from(
     prepend_ld_library_path(runtime_options, NVIDIA_LIBRARY_DIR);
 }
 
+fn add_nvidia_vulkan_icd_mounts(
+    mounts: &mut Vec<Value>,
+    runtime_options: &mut HashMap<String, String>,
+) {
+    add_nvidia_vulkan_icd_mounts_from(mounts, runtime_options, nvidia_vulkan_icd_files());
+}
+
+fn add_nvidia_vulkan_icd_mounts_from(
+    mounts: &mut Vec<Value>,
+    runtime_options: &mut HashMap<String, String>,
+    icd_files: Vec<PathBuf>,
+) {
+    let mut driver_files = Vec::new();
+    for source in icd_files {
+        let Some(file_name) = source.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !is_nvidia_vulkan_icd_file_name(file_name) {
+            continue;
+        }
+
+        let destination = Path::new(VULKAN_ICD_DIR).join(file_name);
+        let destination_string = destination.display().to_string();
+        if driver_files.contains(&destination_string) {
+            continue;
+        }
+
+        add_readonly_file_mount(mounts, &source, &destination);
+        driver_files.push(destination_string);
+    }
+
+    if driver_files.is_empty()
+        || runtime_options.contains_key("VK_DRIVER_FILES")
+        || runtime_options.contains_key("VK_ICD_FILENAMES")
+    {
+        return;
+    }
+
+    let driver_files = driver_files.join(":");
+    runtime_options.insert("VK_DRIVER_FILES".to_string(), driver_files.clone());
+    runtime_options.insert("VK_ICD_FILENAMES".to_string(), driver_files);
+}
+
 fn prepend_ld_library_path(runtime_options: &mut HashMap<String, String>, path: &str) {
     runtime_options
         .entry("LD_LIBRARY_PATH".to_string())
@@ -1005,12 +1069,102 @@ fn nvidia_driver_library_mounts() -> Vec<(PathBuf, String)> {
         let Some(path) = find_host_library(library_name, &ldconfig) else {
             continue;
         };
-        if mounts.iter().any(|(_, name)| name == library_name) {
-            continue;
+        push_unique_library_mount(&mut mounts, path, library_name);
+    }
+
+    let mut ldconfig_entries = ldconfig.iter().collect::<Vec<_>>();
+    ldconfig_entries.sort_by(|a, b| a.0.cmp(b.0));
+    for (library_name, path) in ldconfig_entries {
+        push_unique_library_mount(&mut mounts, path.clone(), library_name);
+    }
+
+    for dir in COMMON_LIBRARY_DIRS {
+        for (path, library_name) in nvidia_driver_library_files_in_dir(Path::new(dir)) {
+            push_unique_library_mount(&mut mounts, path, &library_name);
         }
-        mounts.push((path, (*library_name).to_string()));
     }
     mounts
+}
+
+fn push_unique_library_mount(
+    mounts: &mut Vec<(PathBuf, String)>,
+    path: PathBuf,
+    library_name: &str,
+) {
+    if path.exists() && !mounts.iter().any(|(_, name)| name == library_name) {
+        mounts.push((path, library_name.to_string()));
+    }
+}
+
+fn nvidia_driver_library_files_in_dir(dir: &Path) -> Vec<(PathBuf, String)> {
+    let mut files = fs::read_dir(dir)
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.filter_map(|entry| entry.ok()))
+        .filter_map(|entry| {
+            let file_type = entry.file_type().ok()?;
+            if !file_type.is_file() && !file_type.is_symlink() {
+                return None;
+            }
+            let library_name = entry.file_name().to_str()?.to_string();
+            if is_nvidia_driver_library_name(&library_name) {
+                Some((entry.path(), library_name))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    files.sort_by(|a, b| a.1.cmp(&b.1));
+    files
+}
+
+fn nvidia_vulkan_icd_files() -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    for dir in VULKAN_ICD_DIRS {
+        let mut dir_files = fs::read_dir(dir)
+            .ok()
+            .into_iter()
+            .flat_map(|entries| entries.filter_map(|entry| entry.ok()))
+            .filter_map(|entry| {
+                let file_type = entry.file_type().ok()?;
+                if !file_type.is_file() && !file_type.is_symlink() {
+                    return None;
+                }
+                let file_name = entry.file_name().to_str()?.to_string();
+                if is_nvidia_vulkan_icd_file_name(&file_name) {
+                    Some(entry.path())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        dir_files.sort();
+        for file in dir_files {
+            let Some(file_name) = file.file_name() else {
+                continue;
+            };
+            if !files.iter().any(|existing: &PathBuf| {
+                existing
+                    .file_name()
+                    .is_some_and(|existing| existing == file_name)
+            }) {
+                files.push(file);
+            }
+        }
+    }
+    files
+}
+
+fn is_nvidia_driver_library_name(name: &str) -> bool {
+    NVIDIA_DRIVER_LIBRARIES.contains(&name)
+        || (name.starts_with("libnvidia-") && name.contains(".so"))
+        || name.starts_with("libGLX_nvidia.so")
+        || name.starts_with("libEGL_nvidia.so")
+}
+
+fn is_nvidia_vulkan_icd_file_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.ends_with(".json") && lower.contains("nvidia")
 }
 
 fn find_host_library(library_name: &str, ldconfig: &HashMap<String, PathBuf>) -> Option<PathBuf> {
@@ -1046,7 +1200,7 @@ fn parse_ldconfig_cache(output: &str) -> HashMap<String, PathBuf> {
         let Some(name) = name_and_abi.split_whitespace().next() else {
             continue;
         };
-        if NVIDIA_DRIVER_LIBRARIES.contains(&name) {
+        if is_nvidia_driver_library_name(name) {
             libraries
                 .entry(name.to_string())
                 .or_insert_with(|| PathBuf::from(path.trim()));
@@ -1090,9 +1244,12 @@ pub(crate) fn store_key(image_ref: &str) -> String {
 }
 
 fn image_ref_uses_tag(image_ref: &str, tag: &str) -> bool {
-    image_ref
+    let tagged_ref = image_ref
+        .split_once('@')
+        .map_or(image_ref, |(tagged_ref, _)| tagged_ref);
+    tagged_ref
         .rsplit_once('/')
-        .map_or(image_ref, |(_, after_slash)| after_slash)
+        .map_or(tagged_ref, |(_, after_slash)| after_slash)
         .rsplit_once(':')
         .is_some_and(|(_, image_tag)| image_tag == tag)
 }
@@ -1939,6 +2096,8 @@ mod tests {
             123 libs found in cache `/etc/ld.so.cache'
             libcuda.so.1 (libc6,x86-64) => /usr/lib64/libcuda.so.550.54
             libnvidia-ml.so.1 (libc6,x86-64) => /usr/lib64/libnvidia-ml.so.550.54
+            libGLX_nvidia.so.0 (libc6,x86-64) => /usr/lib64/libGLX_nvidia.so.550.54
+            libnvidia-glcore.so.550.54 (libc6,x86-64) => /usr/lib64/libnvidia-glcore.so.550.54
             libc.so.6 (libc6,x86-64) => /usr/lib64/libc.so.6
             "#,
         );
@@ -1950,6 +2109,14 @@ mod tests {
         assert_eq!(
             cache.get("libnvidia-ml.so.1"),
             Some(&PathBuf::from("/usr/lib64/libnvidia-ml.so.550.54"))
+        );
+        assert_eq!(
+            cache.get("libGLX_nvidia.so.0"),
+            Some(&PathBuf::from("/usr/lib64/libGLX_nvidia.so.550.54"))
+        );
+        assert_eq!(
+            cache.get("libnvidia-glcore.so.550.54"),
+            Some(&PathBuf::from("/usr/lib64/libnvidia-glcore.so.550.54"))
         );
         assert!(!cache.contains_key("libc.so.6"));
     }
@@ -1992,6 +2159,57 @@ mod tests {
         }));
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn nvidia_vulkan_icd_mounts_force_host_nvidia_driver_files() {
+        let root = std::env::temp_dir().join(format!("aileron-vulkan-icd-test-{}", Uuid::new_v4()));
+        let icd = root.join("nvidia_icd.json");
+        std::fs::create_dir_all(&root).expect("create temp dir");
+        std::fs::write(&icd, "{}").expect("write icd");
+
+        let mut mounts = Vec::new();
+        let mut runtime_options = HashMap::new();
+        add_nvidia_vulkan_icd_mounts_from(&mut mounts, &mut runtime_options, vec![icd.clone()]);
+
+        let driver_files = "/usr/share/vulkan/icd.d/nvidia_icd.json";
+        assert_eq!(
+            runtime_options.get("VK_DRIVER_FILES").map(String::as_str),
+            Some(driver_files)
+        );
+        assert_eq!(
+            runtime_options.get("VK_ICD_FILENAMES").map(String::as_str),
+            Some(driver_files)
+        );
+        assert!(mounts.iter().any(|mount| {
+            mount["source"] == icd.display().to_string()
+                && mount["destination"] == driver_files
+                && array_contains(&mount["options"], "ro")
+        }));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn nvidia_vulkan_icd_mounts_preserve_explicit_driver_files() {
+        let mut mounts = Vec::new();
+        let mut runtime_options = HashMap::new();
+        runtime_options.insert(
+            "VK_DRIVER_FILES".to_string(),
+            "/custom/nvidia_icd.json".to_string(),
+        );
+
+        add_nvidia_vulkan_icd_mounts_from(
+            &mut mounts,
+            &mut runtime_options,
+            vec![PathBuf::from("/host/nvidia_icd.json")],
+        );
+
+        assert_eq!(
+            runtime_options.get("VK_DRIVER_FILES").map(String::as_str),
+            Some("/custom/nvidia_icd.json")
+        );
+        assert!(!runtime_options.contains_key("VK_ICD_FILENAMES"));
     }
 
     #[test]
@@ -2071,6 +2289,18 @@ mod tests {
 
         assert!(image_ref_uses_tag(&image_ref, &tag));
         assert!(!image_ref_uses_tag(&image_ref, &other_tag));
+    }
+
+    #[test]
+    fn image_ref_uses_tag_accepts_tagged_digest_refs() {
+        assert!(image_ref_uses_tag(
+            "ghcr.io/example/aileron-runtime:vulkan@sha256:abcdef",
+            "vulkan"
+        ));
+        assert!(!image_ref_uses_tag(
+            "ghcr.io/example/aileron-runtime:cpu@sha256:abcdef",
+            "vulkan"
+        ));
     }
 
     #[hegel::test]

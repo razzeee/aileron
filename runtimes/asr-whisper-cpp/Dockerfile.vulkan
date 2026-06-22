@@ -30,6 +30,8 @@ ENV XDG_CACHE_HOME=/tmp
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates libgomp1 libstdc++6 libgcc-s1 libvulkan1 mesa-vulkan-drivers \
+    && rm -f /usr/share/vulkan/icd.d/lvp_icd*.json /usr/share/vulkan/icd.d/lavapipe*.json \
+    && mkdir -p /usr/local/nvidia/lib64 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /entrypoint /entrypoint
