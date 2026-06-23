@@ -9,6 +9,8 @@ use sha2::{Digest, Sha256};
 
 use crate::hardware::Variant;
 
+const ML_RUNTIME_ID: &str = "llm-vision-whisper";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeImage {
     pub variant: String,
@@ -186,7 +188,7 @@ impl Profile {
 
     fn implies_use_case(&self, use_case: &str) -> bool {
         use_case == "speech.translate"
-            && self.runtime_id == "asr-whisper-cpp"
+            && self.runtime_id == ML_RUNTIME_ID
             && self
                 .use_cases
                 .iter()

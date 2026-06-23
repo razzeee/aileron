@@ -108,7 +108,7 @@ $XDG_DATA_HOME/aileron/models/<model-id>/
 /usr/lib/aileron/models/<model-id>/
 ```
 
-`<store-key>` is derived from the image reference by keeping ASCII letters, digits, `.`, `-`, and `_`, and replacing every other character with `_`. For example, `ghcr.io/razzeee/aileron-runtime-llm-llama-cpp:cpu` becomes `ghcr.io_razzeee_aileron-runtime-llm-llama-cpp_cpu`.
+`<store-key>` is derived from the image reference by keeping ASCII letters, digits, `.`, `-`, and `_`, and replacing every other character with `_`. For example, `ghcr.io/razzeee/aileron-runtime-llm-vision-whisper:cpu` becomes `ghcr.io_razzeee_aileron-runtime-llm-vision-whisper_cpu`.
 
 Runtime packages for offline use should install pre-rendered rootfs trees and optional metadata:
 
@@ -172,7 +172,7 @@ The daemon renders OCI layouts to rootfs directories with the `ocirender` Rust c
 
 ## Hardware Access
 
-Runtime manifests map each runtime ID to image variants such as `cpu`, `cuda`, `rocm`, and `vulkan`. The daemon chooses the best variant detected on the host, falls back from CUDA or ROCm to Vulkan when available, and uses CPU as the final fallback. Intel GPUs use the existing `vulkan` variant rather than a separate `intel` variant. llama.cpp GPU runtimes also retry cold start with reduced `N_GPU_LAYERS` values before moving to the next image candidate, unless the profile explicitly sets `N_GPU_LAYERS`.
+Runtime manifests map each runtime ID to image variants such as `cpu`, `cuda`, `rocm`, and `vulkan`. The daemon chooses the best variant detected on the host, falls back from CUDA or ROCm to Vulkan when available, and uses CPU as the final fallback. Intel GPUs use the existing `vulkan` variant rather than a separate `intel` variant. The combined ML runtime also retries cold start with reduced `N_GPU_LAYERS` values before moving to the next image candidate, unless the profile explicitly sets `N_GPU_LAYERS`.
 
 The generated OCI bundle exposes only the hardware needed by the selected variant:
 

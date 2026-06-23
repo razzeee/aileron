@@ -530,7 +530,7 @@ mod tests {
         let image = OciRuntimeImage {
             image_id: "runtime".to_string(),
             image_ref: "ghcr.io/example/runtime:cpu".to_string(),
-            runtime_id: "llm-llama-cpp".to_string(),
+            runtime_id: "llm-vision-whisper".to_string(),
             variant: "cpu".to_string(),
             size_bytes: 1,
             in_use: true,
@@ -549,7 +549,7 @@ mod tests {
         let image = OciRuntimeImage {
             image_id: "runtime".to_string(),
             image_ref: "ghcr.io/example/runtime:cpu".to_string(),
-            runtime_id: "llm-llama-cpp".to_string(),
+            runtime_id: "llm-vision-whisper".to_string(),
             variant: "cpu".to_string(),
             size_bytes: 1,
             in_use: true,

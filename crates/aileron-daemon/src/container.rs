@@ -69,6 +69,7 @@ use crate::hardware::Variant;
 use crate::profiles::RuntimeCandidate;
 
 const NVIDIA_LIBRARY_DIR: &str = "/usr/local/nvidia/lib64";
+const ML_RUNTIME_ID: &str = "llm-vision-whisper";
 const VULKAN_ICD_DIR: &str = "/usr/share/vulkan/icd.d";
 const NVIDIA_DRIVER_LIBRARIES: &[&str] = &[
     "libcuda.so.1",
@@ -1858,7 +1859,7 @@ fn is_gpu_variant(variant: Variant) -> bool {
 }
 
 fn runtime_supports_gpu_layer_offload(runtime_id: &str) -> bool {
-    runtime_id.contains("llama-cpp")
+    runtime_id == ML_RUNTIME_ID
 }
 
 fn describe_spawn_attempt(attempt: &RuntimeSpawnAttempt) -> String {
@@ -2142,17 +2143,10 @@ mod tests {
     #[test]
     fn all_declared_runtime_refs_get_expected_accelerator_mounts() {
         let refs = [
-            "ghcr.io/razzeee/aileron-runtime-asr-whisper-cpp:cpu",
-            "ghcr.io/razzeee/aileron-runtime-asr-whisper-cpp:cuda",
-            "ghcr.io/razzeee/aileron-runtime-asr-whisper-cpp:vulkan",
-            "ghcr.io/razzeee/aileron-runtime-llm-llama-cpp:cpu",
-            "ghcr.io/razzeee/aileron-runtime-llm-llama-cpp:cuda",
-            "ghcr.io/razzeee/aileron-runtime-llm-llama-cpp:rocm",
-            "ghcr.io/razzeee/aileron-runtime-llm-llama-cpp:vulkan",
-            "ghcr.io/razzeee/aileron-runtime-vision-llama-cpp-gemma4:cpu",
-            "ghcr.io/razzeee/aileron-runtime-vision-llama-cpp-gemma4:cuda",
-            "ghcr.io/razzeee/aileron-runtime-vision-llama-cpp-gemma4:rocm",
-            "ghcr.io/razzeee/aileron-runtime-vision-llama-cpp-gemma4:vulkan",
+            "ghcr.io/razzeee/aileron-runtime-llm-vision-whisper:cpu",
+            "ghcr.io/razzeee/aileron-runtime-llm-vision-whisper:cuda",
+            "ghcr.io/razzeee/aileron-runtime-llm-vision-whisper:rocm",
+            "ghcr.io/razzeee/aileron-runtime-llm-vision-whisper:vulkan",
         ];
 
         for image_ref in refs {
@@ -2263,7 +2257,7 @@ mod tests {
             },
         ];
 
-        let attempts = runtime_spawn_attempts("llm-llama-cpp", &candidates, &HashMap::new());
+        let attempts = runtime_spawn_attempts(ML_RUNTIME_ID, &candidates, &HashMap::new());
         let attempt_summary = attempts
             .iter()
             .map(|attempt| {
@@ -2297,15 +2291,15 @@ mod tests {
         let candidates = vec![
             RuntimeCandidate {
                 variant: Variant::Cuda,
-                image_ref: "localhost/aileron/aileron-runtime-asr-whisper-cpp:cuda".to_string(),
+                image_ref: "localhost/aileron/aileron-runtime-stub:cuda".to_string(),
             },
             RuntimeCandidate {
                 variant: Variant::Cpu,
-                image_ref: "localhost/aileron/aileron-runtime-asr-whisper-cpp:cpu".to_string(),
+                image_ref: "localhost/aileron/aileron-runtime-stub:cpu".to_string(),
             },
         ];
 
-        let attempts = runtime_spawn_attempts("asr-whisper-cpp", &candidates, &HashMap::new());
+        let attempts = runtime_spawn_attempts("stub", &candidates, &HashMap::new());
 
         assert_eq!(
             attempts
@@ -2313,8 +2307,8 @@ mod tests {
                 .map(|attempt| attempt.image_ref.as_str())
                 .collect::<Vec<_>>(),
             vec![
-                "localhost/aileron/aileron-runtime-asr-whisper-cpp:cuda",
-                "localhost/aileron/aileron-runtime-asr-whisper-cpp:cpu",
+                "localhost/aileron/aileron-runtime-stub:cuda",
+                "localhost/aileron/aileron-runtime-stub:cpu",
             ]
         );
     }
@@ -2324,17 +2318,18 @@ mod tests {
         let candidates = vec![
             RuntimeCandidate {
                 variant: Variant::Cuda,
-                image_ref: "localhost/aileron/aileron-runtime-llm-llama-cpp:cuda".to_string(),
+                image_ref: "localhost/aileron/aileron-runtime-llm-vision-whisper:cuda".to_string(),
             },
             RuntimeCandidate {
                 variant: Variant::Vulkan,
-                image_ref: "localhost/aileron/aileron-runtime-llm-llama-cpp:vulkan".to_string(),
+                image_ref: "localhost/aileron/aileron-runtime-llm-vision-whisper:vulkan"
+                    .to_string(),
             },
         ];
         let mut runtime_options = HashMap::new();
         runtime_options.insert("N_GPU_LAYERS".to_string(), "12".to_string());
 
-        let attempts = runtime_spawn_attempts("llm-llama-cpp", &candidates, &runtime_options);
+        let attempts = runtime_spawn_attempts(ML_RUNTIME_ID, &candidates, &runtime_options);
 
         assert_eq!(attempts.len(), 2);
         assert!(attempts.iter().all(|attempt| {
@@ -2353,7 +2348,7 @@ mod tests {
             image_ref: "registry.example/ai/summarizer@sha256:abcdef".to_string(),
         }];
 
-        let attempts = runtime_spawn_attempts("llm-llama-cpp", &candidates, &HashMap::new());
+        let attempts = runtime_spawn_attempts(ML_RUNTIME_ID, &candidates, &HashMap::new());
 
         assert_eq!(attempts.len(), 7);
         assert_eq!(attempts[0].runtime_options.get("N_GPU_LAYERS"), None);
@@ -2392,7 +2387,7 @@ mod tests {
 
         let err = match pool.get_or_spawn_any(
             "profile",
-            "llm-llama-cpp",
+            ML_RUNTIME_ID,
             &candidates,
             &artifact_path,
             &HashMap::new(),
@@ -2439,7 +2434,7 @@ mod tests {
 
         let err = match pool.get_or_spawn_any(
             "profile",
-            "llm-llama-cpp",
+            ML_RUNTIME_ID,
             &candidates,
             &artifact_path,
             &HashMap::new(),

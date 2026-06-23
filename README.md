@@ -59,9 +59,7 @@ Reusable runtime images live in `runtimes/`. Model artifacts are installed separ
 
 | Directory | Description |
 |---|---|
-| `runtimes/llm-llama-cpp/` | Rust llama.cpp runtime for text generation and structured output |
-| `runtimes/asr-whisper-cpp/` | Rust whisper.cpp runtime for audio transcription |
-| `runtimes/vision-llama-cpp-gemma4/` | Rust llama.cpp Gemma 4 runtime for text and structured vision-model operations |
+| `runtimes/llm-vision-whisper/` | combined Rust llama.cpp and whisper.cpp runtime for text, vision, and speech |
 | `runtimes/stub/` | no-ML test runtime implementing the stdio protocol |
 
 ## Building
@@ -163,9 +161,7 @@ Runtime images can be built with any OCI/Docker-compatible builder. The daemon p
 
 | Runtime | Details |
 |---|---|
-| `runtimes/llm-llama-cpp/` | [LLM runtime README](runtimes/llm-llama-cpp/README.md) |
-| `runtimes/asr-whisper-cpp/` | [ASR runtime README](runtimes/asr-whisper-cpp/README.md) |
-| `runtimes/vision-llama-cpp-gemma4/` | [Vision runtime README](runtimes/vision-llama-cpp-gemma4/README.md) |
+| `runtimes/llm-vision-whisper/` | [LLM, vision, and Whisper runtime README](runtimes/llm-vision-whisper/README.md) |
 | `runtimes/stub/` | [Stub runtime README](runtimes/stub/README.md) |
 
 Runtime manifests provide explicit runtime image refs per variant such as `cpu`, `cuda`, `rocm`, or `vulkan`; see [Hardware variant selection](#hardware-variant-selection). Model manifests only need to reference the `runtime_id`.
@@ -186,7 +182,7 @@ Model manifests live under `models/`. A compact single-artifact text GGUF manife
 }
 ```
 
-For manifests loaded from disk, Aileron derives `profile_id` and `model_id` from the JSON filename when those fields are omitted. For example, `models/llama3.2-3b-instruct-q4-k-m.json` becomes `llama3.2-3b-instruct-q4-k-m`. For ad-hoc JSON without a filename, Aileron falls back to `llmfit_model_id` by lowercasing it and replacing every character outside `[a-z0-9._-]` with `_`, without collapsing repeated underscores. Single GGUF artifacts default to `role: "model"`, `filename: "model.gguf"`, `runtime_id: "llm-llama-cpp"`, and conservative language use-cases derived from llmfit metadata when available.
+For manifests loaded from disk, Aileron derives `profile_id` and `model_id` from the JSON filename when those fields are omitted. For example, `models/llama3.2-3b-instruct-q4-k-m.json` becomes `llama3.2-3b-instruct-q4-k-m`. For ad-hoc JSON without a filename, Aileron falls back to `llmfit_model_id` by lowercasing it and replacing every character outside `[a-z0-9._-]` with `_`, without collapsing repeated underscores. Single GGUF artifacts default to `role: "model"`, `filename: "model.gguf"`, `runtime_id: "llm-vision-whisper"`, and conservative language use-cases derived from llmfit metadata when available.
 
 Fully explicit manifests are still supported and are required when a runtime, filename, or use-case choice cannot be inferred safely:
 
@@ -195,7 +191,7 @@ Fully explicit manifests are still supported and are required when a runtime, fi
   "profile_id": "llama3.2-3b-instruct-q4",
   "model_id": "llama3.2-3b-instruct-q4",
   "llmfit_model_id": "meta-llama/Llama-3.2-3B-Instruct",
-  "runtime_id": "llm-llama-cpp",
+  "runtime_id": "llm-vision-whisper",
   "tier": "balanced",
   "use_cases": ["language.summarize", "language.translate", "language.analyze"],
   "artifacts": [
@@ -220,12 +216,12 @@ Runtime manifests live under `runtimes/` and map the runtime ID to OCI images fo
 
 ```json
 {
-  "runtime_id": "llm-llama-cpp",
+  "runtime_id": "llm-vision-whisper",
   "images": {
-    "cpu": "docker.io/example/aileron-runtime-llm-llama-cpp:cpu",
-    "cuda": "docker.io/example/aileron-runtime-llm-llama-cpp:cuda",
-    "rocm": "docker.io/example/aileron-runtime-llm-llama-cpp:rocm",
-    "vulkan": "docker.io/example/aileron-runtime-llm-llama-cpp:vulkan"
+    "cpu": "docker.io/example/aileron-runtime-llm-vision-whisper:cpu",
+    "cuda": "docker.io/example/aileron-runtime-llm-vision-whisper:cuda",
+    "rocm": "docker.io/example/aileron-runtime-llm-vision-whisper:rocm",
+    "vulkan": "docker.io/example/aileron-runtime-llm-vision-whisper:vulkan"
   }
 }
 ```

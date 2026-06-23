@@ -7,10 +7,7 @@ on:
       - ".github/workflows/runtime-images.yml"
       - "Cargo.toml"
       - "Cargo.lock"
-      - "runtimes/llama-cpp.Dockerfile"
-      - "runtimes/llm-llama-cpp/**"
-      - "runtimes/vision-llama-cpp-gemma4/**"
-      - "runtimes/asr-whisper-cpp/**"
+      - "runtimes/llm-vision-whisper/**"
       - "runtimes/stub/**"
       - "crates/aileron-runtime/**"
   workflow_dispatch:
@@ -20,28 +17,19 @@ permissions:
   packages: write
 
 jobs:
-  llama-cpp:
-    name: ${{ matrix.runtime_id }} ${{ matrix.variant }}
+  ml-runtime:
+    name: llm-vision-whisper ${{ matrix.variant }}
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
         include:
-          - runtime_id: llm-llama-cpp
-            image_name: aileron-runtime-llm-llama-cpp
-            description: Aileron llama.cpp runtime for local text generation.
-            documentation_path: runtimes/llm-llama-cpp/README.md
-            variant: cpu
+          - variant: cpu
             build_args: |
-              RUNTIME_ID=llm-llama-cpp
+              RUNTIME_ID=llm-vision-whisper
               RUNTIME_VARIANT=cpu
-              RUNTIME_DESCRIPTION=Aileron llama.cpp runtime for local text generation.
-              RUNTIME_BIN=aileron-runtime-llm-llama-cpp
-          - runtime_id: llm-llama-cpp
-            image_name: aileron-runtime-llm-llama-cpp
-            description: Aileron llama.cpp runtime for local text generation.
-            documentation_path: runtimes/llm-llama-cpp/README.md
-            variant: cuda
+              RUNTIME_DESCRIPTION=Aileron combined LLM, vision, and Whisper runtime.
+          - variant: cuda
             build_args: |
               BUILDER_IMAGE=nvidia/cuda:13.3.0-devel-ubuntu24.04
               FINAL_IMAGE=nvidia/cuda:13.3.0-runtime-ubuntu24.04
@@ -50,15 +38,10 @@ jobs:
               CMAKE_ARGS=-DGGML_CUDA=on
               CUDA_DOCKER_ARCH=all
               LDFLAGS=-L/usr/local/cuda/lib64/stubs -Wl,-rpath-link,/usr/local/cuda/lib64/stubs
-              RUNTIME_ID=llm-llama-cpp
+              RUNTIME_ID=llm-vision-whisper
               RUNTIME_VARIANT=cuda
-              RUNTIME_DESCRIPTION=Aileron llama.cpp runtime for local text generation.
-              RUNTIME_BIN=aileron-runtime-llm-llama-cpp
-          - runtime_id: llm-llama-cpp
-            image_name: aileron-runtime-llm-llama-cpp
-            description: Aileron llama.cpp runtime for local text generation.
-            documentation_path: runtimes/llm-llama-cpp/README.md
-            variant: rocm
+              RUNTIME_DESCRIPTION=Aileron combined LLM, vision, and Whisper runtime.
+          - variant: rocm
             build_args: |
               BUILDER_IMAGE=rocm/dev-ubuntu-22.04:7.2.4
               FINAL_IMAGE=rocm/dev-ubuntu-22.04:7.2.4
@@ -66,79 +49,17 @@ jobs:
               APT_PACKAGES=build-essential cmake git ninja-build hipblas-dev rocblas-dev
               CMAKE_ARGS=-DGGML_HIP=on -DAMDGPU_TARGETS=gfx900;gfx906;gfx908;gfx90a;gfx942;gfx950;gfx1010;gfx1011;gfx1012;gfx1030;gfx1031;gfx1032;gfx1035;gfx1036;gfx1100;gfx1101;gfx1102;gfx1103;gfx1150;gfx1151;gfx1152;gfx1153;gfx1200;gfx1201
               FORCE_CMAKE=1
-              RUNTIME_ID=llm-llama-cpp
+              RUNTIME_ID=llm-vision-whisper
               RUNTIME_VARIANT=rocm
-              RUNTIME_DESCRIPTION=Aileron llama.cpp runtime for local text generation.
-              RUNTIME_BIN=aileron-runtime-llm-llama-cpp
-          - runtime_id: llm-llama-cpp
-            image_name: aileron-runtime-llm-llama-cpp
-            description: Aileron llama.cpp runtime for local text generation.
-            documentation_path: runtimes/llm-llama-cpp/README.md
-            variant: vulkan
+              RUNTIME_DESCRIPTION=Aileron combined LLM, vision, and Whisper runtime.
+          - variant: vulkan
             build_args: |
               APT_PACKAGES=build-essential cmake git ninja-build libvulkan-dev glslc glslang-tools spirv-headers
               RUNTIME_APT_PACKAGES=libgomp1 libstdc++6 libgcc-s1 ca-certificates libvulkan1 mesa-vulkan-drivers
               CMAKE_ARGS=-DGGML_VULKAN=on
-              RUNTIME_ID=llm-llama-cpp
+              RUNTIME_ID=llm-vision-whisper
               RUNTIME_VARIANT=vulkan
-              RUNTIME_DESCRIPTION=Aileron llama.cpp runtime for local text generation.
-              RUNTIME_BIN=aileron-runtime-llm-llama-cpp
-          - runtime_id: vision-llama-cpp-gemma4
-            image_name: aileron-runtime-vision-llama-cpp-gemma4
-            description: Aileron Gemma 4 vision runtime using llama.cpp.
-            documentation_path: runtimes/vision-llama-cpp-gemma4/README.md
-            variant: cpu
-            build_args: |
-              RUNTIME_ID=vision-llama-cpp-gemma4
-              RUNTIME_VARIANT=cpu
-              RUNTIME_DESCRIPTION=Aileron Gemma 4 vision runtime using llama.cpp.
-              RUNTIME_BIN=aileron-runtime-vision-llama-cpp
-          - runtime_id: vision-llama-cpp-gemma4
-            image_name: aileron-runtime-vision-llama-cpp-gemma4
-            description: Aileron Gemma 4 vision runtime using llama.cpp.
-            documentation_path: runtimes/vision-llama-cpp-gemma4/README.md
-            variant: cuda
-            build_args: |
-              BUILDER_IMAGE=nvidia/cuda:13.3.0-devel-ubuntu24.04
-              FINAL_IMAGE=nvidia/cuda:13.3.0-runtime-ubuntu24.04
-              RUNTIME_APT_PACKAGES=libgomp1 libstdc++6 libgcc-s1 ca-certificates
-              APT_PACKAGES=build-essential cmake git ninja-build
-              CMAKE_ARGS=-DGGML_CUDA=on
-              CUDA_DOCKER_ARCH=all
-              LDFLAGS=-L/usr/local/cuda/lib64/stubs -Wl,-rpath-link,/usr/local/cuda/lib64/stubs
-              RUNTIME_ID=vision-llama-cpp-gemma4
-              RUNTIME_VARIANT=cuda
-              RUNTIME_DESCRIPTION=Aileron Gemma 4 vision runtime using llama.cpp.
-              RUNTIME_BIN=aileron-runtime-vision-llama-cpp
-          - runtime_id: vision-llama-cpp-gemma4
-            image_name: aileron-runtime-vision-llama-cpp-gemma4
-            description: Aileron Gemma 4 vision runtime using llama.cpp.
-            documentation_path: runtimes/vision-llama-cpp-gemma4/README.md
-            variant: rocm
-            build_args: |
-              BUILDER_IMAGE=rocm/dev-ubuntu-22.04:7.2.4
-              FINAL_IMAGE=rocm/dev-ubuntu-22.04:7.2.4
-              RUNTIME_APT_PACKAGES=libgomp1 libstdc++6 libgcc-s1 ca-certificates hipblas-dev rocblas-dev
-              APT_PACKAGES=build-essential cmake git ninja-build hipblas-dev rocblas-dev
-              CMAKE_ARGS=-DGGML_HIP=on -DAMDGPU_TARGETS=gfx900;gfx906;gfx908;gfx90a;gfx942;gfx950;gfx1010;gfx1011;gfx1012;gfx1030;gfx1031;gfx1032;gfx1035;gfx1036;gfx1100;gfx1101;gfx1102;gfx1103;gfx1150;gfx1151;gfx1152;gfx1153;gfx1200;gfx1201
-              FORCE_CMAKE=1
-              RUNTIME_ID=vision-llama-cpp-gemma4
-              RUNTIME_VARIANT=rocm
-              RUNTIME_DESCRIPTION=Aileron Gemma 4 vision runtime using llama.cpp.
-              RUNTIME_BIN=aileron-runtime-vision-llama-cpp
-          - runtime_id: vision-llama-cpp-gemma4
-            image_name: aileron-runtime-vision-llama-cpp-gemma4
-            description: Aileron Gemma 4 vision runtime using llama.cpp.
-            documentation_path: runtimes/vision-llama-cpp-gemma4/README.md
-            variant: vulkan
-            build_args: |
-              APT_PACKAGES=build-essential cmake git ninja-build libvulkan-dev glslc glslang-tools spirv-headers
-              RUNTIME_APT_PACKAGES=libgomp1 libstdc++6 libgcc-s1 ca-certificates libvulkan1 mesa-vulkan-drivers
-              CMAKE_ARGS=-DGGML_VULKAN=on
-              RUNTIME_ID=vision-llama-cpp-gemma4
-              RUNTIME_VARIANT=vulkan
-              RUNTIME_DESCRIPTION=Aileron Gemma 4 vision runtime using llama.cpp.
-              RUNTIME_BIN=aileron-runtime-vision-llama-cpp
+              RUNTIME_DESCRIPTION=Aileron combined LLM, vision, and Whisper runtime.
 
     steps:
       - uses: actions/checkout@v7
@@ -160,62 +81,30 @@ jobs:
         uses: docker/build-push-action@v7.2.0
         with:
           context: .
-          file: runtimes/llama-cpp.Dockerfile
+          file: runtimes/llm-vision-whisper/Dockerfile
           push: true
           build-args: ${{ matrix.build_args }}
           tags: |
-            ghcr.io/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image_name }}:${{ matrix.variant }}
-            ghcr.io/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image_name }}:${{ github.sha }}-${{ matrix.variant }}
+            ghcr.io/${{ env.IMAGE_NAMESPACE }}/aileron-runtime-llm-vision-whisper:${{ matrix.variant }}
+            ghcr.io/${{ env.IMAGE_NAMESPACE }}/aileron-runtime-llm-vision-whisper:${{ github.sha }}-${{ matrix.variant }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.title=${{ matrix.image_name }}
+            org.opencontainers.image.title=aileron-runtime-llm-vision-whisper
             org.opencontainers.image.version=${{ matrix.variant }}
-            org.opencontainers.image.description=${{ matrix.description }}
+            org.opencontainers.image.description=Aileron combined LLM, vision, and Whisper runtime.
             org.opencontainers.image.licenses=GPL-3.0-or-later
-            org.opencontainers.image.documentation=${{ github.server_url }}/${{ github.repository }}/blob/${{ github.ref_name }}/${{ matrix.documentation_path }}
+            org.opencontainers.image.documentation=${{ github.server_url }}/${{ github.repository }}/blob/${{ github.ref_name }}/runtimes/llm-vision-whisper/README.md
           annotations: |
-            index,manifest:org.opencontainers.image.description=${{ matrix.description }}
+            index,manifest:org.opencontainers.image.description=Aileron combined LLM, vision, and Whisper runtime.
             index,manifest:org.opencontainers.image.licenses=GPL-3.0-or-later
-            index,manifest:org.opencontainers.image.documentation=${{ github.server_url }}/${{ github.repository }}/blob/${{ github.ref_name }}/${{ matrix.documentation_path }}
-          cache-from: type=gha,scope=${{ matrix.image_name }}-${{ matrix.variant }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.image_name }}-${{ matrix.variant }}
+            index,manifest:org.opencontainers.image.documentation=${{ github.server_url }}/${{ github.repository }}/blob/${{ github.ref_name }}/runtimes/llm-vision-whisper/README.md
+          cache-from: type=gha,scope=aileron-runtime-llm-vision-whisper-${{ matrix.variant }}
+          cache-to: type=gha,mode=max,scope=aileron-runtime-llm-vision-whisper-${{ matrix.variant }}
 
-  other-runtimes:
-    name: ${{ matrix.runtime_id }} ${{ matrix.variant }}
+  stub:
+    name: stub cpu
     runs-on: ubuntu-24.04
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runtime_id: asr-whisper-cpp
-            image_name: aileron-runtime-asr-whisper-cpp
-            description: Aileron Whisper.cpp runtime for local speech transcription.
-            documentation_path: runtimes/asr-whisper-cpp/README.md
-            variant: cpu
-            context: .
-            file: runtimes/asr-whisper-cpp/Dockerfile
-          - runtime_id: asr-whisper-cpp
-            image_name: aileron-runtime-asr-whisper-cpp
-            description: Aileron Whisper.cpp runtime for local speech transcription.
-            documentation_path: runtimes/asr-whisper-cpp/README.md
-            variant: cuda
-            context: .
-            file: runtimes/asr-whisper-cpp/Dockerfile.cuda
-          - runtime_id: asr-whisper-cpp
-            image_name: aileron-runtime-asr-whisper-cpp
-            description: Aileron Whisper.cpp runtime for local speech transcription.
-            documentation_path: runtimes/asr-whisper-cpp/README.md
-            variant: vulkan
-            context: .
-            file: runtimes/asr-whisper-cpp/Dockerfile.vulkan
-          - runtime_id: stub
-            image_name: aileron-runtime-stub
-            description: Aileron stub runtime for development and protocol testing.
-            documentation_path: runtimes/stub/README.md
-            variant: cpu
-            context: .
-            file: runtimes/stub/Dockerfile
     steps:
       - uses: actions/checkout@v7
 
@@ -235,23 +124,23 @@ jobs:
       - name: Build and push image
         uses: docker/build-push-action@v7.2.0
         with:
-          context: ${{ matrix.context }}
-          file: ${{ matrix.file }}
+          context: .
+          file: runtimes/stub/Dockerfile
           push: true
           tags: |
-            ghcr.io/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image_name }}:${{ matrix.variant }}
-            ghcr.io/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image_name }}:${{ github.sha }}-${{ matrix.variant }}
+            ghcr.io/${{ env.IMAGE_NAMESPACE }}/aileron-runtime-stub:cpu
+            ghcr.io/${{ env.IMAGE_NAMESPACE }}/aileron-runtime-stub:${{ github.sha }}-cpu
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.title=${{ matrix.image_name }}
-            org.opencontainers.image.version=${{ matrix.variant }}
-            org.opencontainers.image.description=${{ matrix.description }}
+            org.opencontainers.image.title=aileron-runtime-stub
+            org.opencontainers.image.version=cpu
+            org.opencontainers.image.description=Aileron stub runtime for development and protocol testing.
             org.opencontainers.image.licenses=GPL-3.0-or-later
-            org.opencontainers.image.documentation=${{ github.server_url }}/${{ github.repository }}/blob/${{ github.ref_name }}/${{ matrix.documentation_path }}
+            org.opencontainers.image.documentation=${{ github.server_url }}/${{ github.repository }}/blob/${{ github.ref_name }}/runtimes/stub/README.md
           annotations: |
-            index,manifest:org.opencontainers.image.description=${{ matrix.description }}
+            index,manifest:org.opencontainers.image.description=Aileron stub runtime for development and protocol testing.
             index,manifest:org.opencontainers.image.licenses=GPL-3.0-or-later
-            index,manifest:org.opencontainers.image.documentation=${{ github.server_url }}/${{ github.repository }}/blob/${{ github.ref_name }}/${{ matrix.documentation_path }}
-          cache-from: type=gha,scope=${{ matrix.image_name }}-${{ matrix.variant }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.image_name }}-${{ matrix.variant }}
+            index,manifest:org.opencontainers.image.documentation=${{ github.server_url }}/${{ github.repository }}/blob/${{ github.ref_name }}/runtimes/stub/README.md
+          cache-from: type=gha,scope=aileron-runtime-stub-cpu
+          cache-to: type=gha,mode=max,scope=aileron-runtime-stub-cpu

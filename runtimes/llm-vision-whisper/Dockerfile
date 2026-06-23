@@ -4,10 +4,7 @@ FROM ${BUILDER_IMAGE} AS builder
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
-ARG RUNTIME_ID
 ARG RUNTIME_VARIANT="cpu"
-ARG RUNTIME_DESCRIPTION="Aileron llama.cpp runtime for local inference."
-ARG RUNTIME_BIN=""
 ARG RUNTIME_FEATURES=""
 ARG APT_PACKAGES=""
 ARG CMAKE_ARGS=""
@@ -15,6 +12,7 @@ ARG CUDA_DOCKER_ARCH=""
 ARG FORCE_CMAKE=""
 ARG LDFLAGS=""
 ARG ROCM_PATH="/opt/rocm"
+ARG AMDGPU_TARGETS="gfx900;gfx906;gfx908;gfx90a;gfx942;gfx950;gfx1010;gfx1011;gfx1012;gfx1030;gfx1031;gfx1032;gfx1035;gfx1036;gfx1100;gfx1101;gfx1102;gfx1103;gfx1150;gfx1151;gfx1152;gfx1153;gfx1200;gfx1201"
 ARG VULKAN_HEADERS_TAG="v1.4.354"
 
 ENV CMAKE_ARGS="${CMAKE_ARGS}"
@@ -22,6 +20,10 @@ ENV CUDA_DOCKER_ARCH="${CUDA_DOCKER_ARCH}"
 ENV FORCE_CMAKE="${FORCE_CMAKE}"
 ENV LDFLAGS="${LDFLAGS}"
 ENV ROCM_PATH="${ROCM_PATH}"
+ENV HIP_PATH="${ROCM_PATH}"
+ENV CMAKE_PREFIX_PATH="${ROCM_PATH}"
+ENV LD_LIBRARY_PATH="${ROCM_PATH}/lib"
+ENV AMDGPU_TARGETS="${AMDGPU_TARGETS}"
 ENV PATH="${ROCM_PATH}/bin:${PATH}"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -48,41 +50,39 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 
 RUN set -eux; \
-    case "$RUNTIME_ID" in \
-    llm-llama-cpp) bin="aileron-runtime-llm-llama-cpp" ;; \
-    vision-llama-cpp-gemma4) bin="aileron-runtime-vision-llama-cpp" ;; \
-    *) echo "unsupported RUNTIME_ID=$RUNTIME_ID" >&2; exit 1 ;; \
-    esac; \
-    if [ -n "$RUNTIME_BIN" ]; then bin="$RUNTIME_BIN"; fi; \
-    case "$RUNTIME_ID:$RUNTIME_VARIANT" in \
-    llm-llama-cpp:cpu) features="llama" ;; \
-    llm-llama-cpp:cuda) features="llama-cuda" ;; \
-    llm-llama-cpp:rocm) features="llama-rocm" ;; \
-    llm-llama-cpp:vulkan) features="llama-vulkan" ;; \
-    vision-llama-cpp-gemma4:cpu) features="vision" ;; \
-    vision-llama-cpp-gemma4:cuda) features="vision-cuda" ;; \
-    vision-llama-cpp-gemma4:rocm) features="vision-rocm" ;; \
-    vision-llama-cpp-gemma4:vulkan) features="vision-vulkan" ;; \
+    case "$RUNTIME_VARIANT" in \
+    cpu) features="vision whisper" ;; \
+    cuda) features="vision-cuda whisper-cuda" ;; \
+    rocm) features="vision-rocm whisper-rocm" ;; \
+    vulkan) features="vision-vulkan whisper-vulkan" ;; \
     *) echo "unsupported RUNTIME_VARIANT=$RUNTIME_VARIANT" >&2; exit 1 ;; \
     esac; \
     if [ -n "$RUNTIME_FEATURES" ]; then features="$RUNTIME_FEATURES"; fi; \
+    mkdir -p /runtime-bins; \
     if [ "$RUNTIME_VARIANT" = "rocm" ]; then \
     cargo build --locked --release -p aileron-runtime --lib --no-default-features --features "$features"; \
+    fi; \
+    for bin in aileron-runtime-llm-llama-cpp aileron-runtime-vision-llama-cpp aileron-runtime-asr-whisper-cpp; do \
+    if [ "$RUNTIME_VARIANT" = "rocm" ]; then \
     cargo rustc --locked --release -p aileron-runtime --bin "$bin" --no-default-features --features "$features" -- -C link-arg=-no-pie; \
     else \
     cargo build --locked --release -p aileron-runtime --bin "$bin" --no-default-features --features "$features"; \
     fi; \
-    cp "target/release/$bin" /entrypoint
+    cp "target/release/$bin" "/runtime-bins/$bin"; \
+    done
 
 FROM ${FINAL_IMAGE}
 
-ARG RUNTIME_ID
+ARG RUNTIME_ID="llm-vision-whisper"
 ARG RUNTIME_VARIANT="cpu"
-ARG RUNTIME_DESCRIPTION="Aileron llama.cpp runtime for local inference."
+ARG RUNTIME_DESCRIPTION="Aileron combined LLM, vision, and Whisper runtime."
 ARG RUNTIME_APT_PACKAGES="libgomp1 libstdc++6 libgcc-s1 ca-certificates"
 ARG ROCM_PATH="/opt/rocm"
 
+ENV XDG_CACHE_HOME=/tmp
 ENV ROCM_PATH="${ROCM_PATH}"
+ENV HIP_PATH="${ROCM_PATH}"
+ENV LD_LIBRARY_PATH="${ROCM_PATH}/lib"
 ENV PATH="${ROCM_PATH}/bin:${PATH}"
 
 RUN apt-get update && apt-get install -y --no-install-recommends ${RUNTIME_APT_PACKAGES} \
@@ -92,8 +92,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends ${RUNTIME_APT_P
     && mkdir -p /usr/local/nvidia/lib64 \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /entrypoint /entrypoint
-RUN chmod 0755 /entrypoint
+COPY --from=builder /runtime-bins/* /usr/local/bin/
+COPY runtimes/llm-vision-whisper/entrypoint.sh /entrypoint
+RUN chmod 0755 /entrypoint /usr/local/bin/aileron-runtime-*
 
 LABEL org.aileron.runtime="true" \
     org.aileron.runtime_id="${RUNTIME_ID}" \

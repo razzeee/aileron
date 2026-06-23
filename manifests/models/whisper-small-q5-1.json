@@ -1,5 +1,5 @@
 {
-  "runtime_id": "asr-whisper-cpp",
+  "runtime_id": "llm-vision-whisper",
   "tier": "small",
   "min_ram_gb": 1.0,
   "artifact": {

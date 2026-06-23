@@ -450,7 +450,7 @@ fn render_library_list(
             recommended,
             fit,
             profile.tier,
-            model_kind(&profile.runtime_id),
+            model_kind(&profile.runtime_id, &profile.use_cases),
             format_size(profile.disk_size_gb),
             memory
         ));
@@ -607,13 +607,23 @@ fn add_detail_row(list: &ListBox, title: &str, value: &str) {
     list.append(&row);
 }
 
-fn model_kind(runtime_id: &str) -> &'static str {
-    if runtime_id.starts_with("llm-") {
-        "Text"
-    } else if runtime_id.starts_with("asr-") {
-        "Speech"
-    } else if runtime_id.starts_with("vision-") {
+fn model_kind(runtime_id: &str, use_cases: &[String]) -> &'static str {
+    if use_cases
+        .iter()
+        .any(|use_case| use_case.starts_with("vision."))
+    {
         "Vision"
+    } else if use_cases
+        .iter()
+        .any(|use_case| use_case.starts_with("speech."))
+    {
+        "Speech"
+    } else if runtime_id.starts_with("llm-")
+        || use_cases
+            .iter()
+            .any(|use_case| use_case.starts_with("language."))
+    {
+        "Text"
     } else {
         "Runtime"
     }
@@ -1687,7 +1697,7 @@ fn refresh_model_list(lists: &ModelLists) {
                 row.set_subtitle(&format!(
                     "{} · {} · {} · {} · {}",
                     availability,
-                    model_kind(&model.runtime_id),
+                    model_kind(&model.runtime_id, &model.use_cases),
                     source_label(&model.source),
                     assignment_count(&model.assigned_use_cases),
                     format_profile_size(model.size_bytes)
@@ -1998,6 +2008,28 @@ mod tests {
         assert_eq!(format_profile_size(2 * 1024 * 1024 * 1024), "2.0 GB");
     }
 
+    #[test]
+    fn model_kind_uses_declared_use_cases_for_combined_runtime() {
+        assert_eq!(
+            model_kind("llm-vision-whisper", &["language.summarize".to_string()]),
+            "Text"
+        );
+        assert_eq!(
+            model_kind("llm-vision-whisper", &["speech.transcribe".to_string()]),
+            "Speech"
+        );
+        assert_eq!(
+            model_kind(
+                "llm-vision-whisper",
+                &[
+                    "language.summarize".to_string(),
+                    "vision.describe".to_string(),
+                ],
+            ),
+            "Vision"
+        );
+    }
+
     #[hegel::test]
     fn assignment_count_matches_generated_count(tc: TestCase) {
         let count = tc.draw(gs::integers::<usize>().max_value(5));
@@ -2176,7 +2208,7 @@ mod tests {
             model_id: profile_id.to_string(),
             llmfit_model_id: String::new(),
             spdx_license: Some(String::new()),
-            runtime_id: "asr-whisper-cpp".to_string(),
+            runtime_id: "llm-vision-whisper".to_string(),
             tier: tier.to_string(),
             disk_size_gb,
             min_ram_gb: 1.0,
