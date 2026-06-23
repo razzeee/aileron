@@ -1,12 +1,14 @@
 use aileron_runtime::llama_runtime::{
     DEFAULT_SYSTEM, LlamaRuntimeConfig, clean_inline_completion, embedding, generate_chat,
-    generate_completion, initialize_llama, load_model, new_context, render_tool_results,
+    generate_completion, initialize_llama, load_model, new_context, new_embedding_context,
+    render_tool_results,
 };
 use aileron_runtime::{
     Request, clamp_choices, first_json_value, first_tool_name, send, send_unsupported,
 };
 use anyhow::Result;
 use llama_cpp_2::context::LlamaContext;
+use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::model::LlamaModel;
 use serde_json::{Value, json};
 
@@ -15,17 +17,27 @@ fn main() -> Result<()> {
     let backend = initialize_llama("aileron-llm")?;
     let model = load_model("aileron-llm", &backend, &config, "")?;
     let mut ctx = new_context(&backend, &model, &config)?;
+    let mut embed_ctx: Option<LlamaContext<'_>> = None;
 
-    aileron_runtime::serve_requests("aileron-llm", |req| handle_request(&model, &mut ctx, req))
+    aileron_runtime::serve_requests("aileron-llm", |req| {
+        handle_request(&backend, &model, &mut ctx, &mut embed_ctx, &config, req)
+    })
 }
 
-fn handle_request(model: &LlamaModel, ctx: &mut LlamaContext<'_>, req: Request) -> Result<()> {
+fn handle_request<'model>(
+    backend: &LlamaBackend,
+    model: &'model LlamaModel,
+    ctx: &mut LlamaContext<'_>,
+    embed_ctx: &mut Option<LlamaContext<'model>>,
+    config: &LlamaRuntimeConfig,
+    req: Request,
+) -> Result<()> {
     match req.request_type.as_str() {
         "generate" => handle_generate(model, ctx, &req),
         "predict_next" => handle_predict_next(model, ctx, &req),
         "generate_structured" => handle_generate_structured(model, ctx, &req),
         "generate_structured_stream" => handle_generate_structured_stream(model, ctx, &req),
-        "embed" => handle_embed(model, ctx, &req),
+        "embed" => handle_embed(backend, model, embed_ctx, config, &req),
         _ => send_unsupported(&req, false),
     }
 }
@@ -174,7 +186,17 @@ fn structured_result(
     first_json_value(&result)
 }
 
-fn handle_embed(model: &LlamaModel, ctx: &mut LlamaContext<'_>, req: &Request) -> Result<()> {
+fn handle_embed<'model>(
+    backend: &LlamaBackend,
+    model: &'model LlamaModel,
+    embed_ctx: &mut Option<LlamaContext<'model>>,
+    config: &LlamaRuntimeConfig,
+    req: &Request,
+) -> Result<()> {
+    let ctx = match embed_ctx {
+        Some(ctx) => ctx,
+        None => embed_ctx.insert(new_embedding_context(backend, model, config)?),
+    };
     let values = embedding(model, ctx, req.prompt.as_deref().unwrap_or_default())?;
     send(json!({"id": req.id, "embedding": values, "done": true}))
 }

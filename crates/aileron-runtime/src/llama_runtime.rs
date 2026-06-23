@@ -88,22 +88,45 @@ pub fn load_model(
         .with_context(|| format!("load llama model from {}", config.model_path))
 }
 
+/// Build a context for autoregressive text generation.
+///
+/// Embeddings and pooling are left disabled here on purpose: enabling them
+/// forces llama.cpp to produce pooled outputs instead of per-token logits,
+/// which the sampler depends on. Use [`new_embedding_context`] for `embed`.
 pub fn new_context<'model>(
     backend: &LlamaBackend,
     model: &'model LlamaModel,
     config: &LlamaRuntimeConfig,
 ) -> Result<LlamaContext<'model>> {
-    let n_ctx = NonZeroU32::new(config.n_ctx);
-    let params = LlamaContextParams::default()
-        .with_n_ctx(n_ctx)
-        .with_n_threads(config.n_threads)
-        .with_n_threads_batch(config.n_threads)
+    let params = base_context_params(config)
+        .with_embeddings(false)
+        .with_pooling_type(LlamaPoolingType::None);
+
+    model
+        .new_context(backend, params)
+        .context("create llama generation context")
+}
+
+pub fn new_embedding_context<'model>(
+    backend: &LlamaBackend,
+    model: &'model LlamaModel,
+    config: &LlamaRuntimeConfig,
+) -> Result<LlamaContext<'model>> {
+    let params = base_context_params(config)
         .with_embeddings(true)
         .with_pooling_type(LlamaPoolingType::Mean);
 
     model
         .new_context(backend, params)
-        .context("create llama context")
+        .context("create llama embedding context")
+}
+
+fn base_context_params(config: &LlamaRuntimeConfig) -> LlamaContextParams {
+    let n_ctx = NonZeroU32::new(config.n_ctx);
+    LlamaContextParams::default()
+        .with_n_ctx(n_ctx)
+        .with_n_threads(config.n_threads)
+        .with_n_threads_batch(config.n_threads)
 }
 
 pub fn render_chat_prompt(model: &LlamaModel, system: &str, prompt: &str) -> Result<String> {
@@ -306,10 +329,12 @@ pub fn embedding(model: &LlamaModel, ctx: &mut LlamaContext<'_>, text: &str) -> 
     }
     ctx.decode(&mut batch).context("decode embedding input")?;
 
-    match ctx.embeddings_seq_ith(0) {
-        Ok(values) => Ok(values.to_vec()),
-        Err(_) => Ok(ctx.embeddings_ith(last_index as i32)?.to_vec()),
-    }
+    // `ctx` must be an embedding context (see `new_embedding_context`): with
+    // mean pooling the sentence embedding is read per-sequence, not per-token.
+    Ok(ctx
+        .embeddings_seq_ith(0)
+        .context("read pooled sequence embedding")?
+        .to_vec())
 }
 
 pub fn clean_inline_completion(prefix: &str, raw: &str) -> String {

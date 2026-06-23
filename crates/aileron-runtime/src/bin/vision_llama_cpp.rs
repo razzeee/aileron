@@ -1,12 +1,13 @@
 use aileron_runtime::llama_runtime::{
     DEFAULT_SYSTEM, LlamaRuntimeConfig, clean_inline_completion, embedding, generate_chat,
     generate_completion, generate_from_evaluated_prompt, initialize_llama, load_model, new_context,
-    render_chat_prompt,
+    new_embedding_context, render_chat_prompt,
 };
 use aileron_runtime::{Request, clamp_choices, first_json_value, send, send_unsupported};
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use llama_cpp_2::context::LlamaContext;
+use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::model::LlamaModel;
 use llama_cpp_2::mtmd::{
     MtmdBitmap, MtmdContext, MtmdContextParams, MtmdInputText, mtmd_default_marker,
@@ -30,9 +31,18 @@ fn main() -> Result<()> {
     )?;
     let mtmd = init_mtmd(&model, &config, &mmproj_path)?;
     let mut ctx = new_context(&backend, &model, &config)?;
+    let mut embed_ctx: Option<LlamaContext<'_>> = None;
 
     aileron_runtime::serve_requests("aileron-vision", |req| {
-        handle_request(&model, &mtmd, &mut ctx, req)
+        handle_request(
+            &backend,
+            &model,
+            &mtmd,
+            &mut ctx,
+            &mut embed_ctx,
+            &config,
+            req,
+        )
     })
 }
 
@@ -61,10 +71,13 @@ fn init_mtmd(
     Ok(mtmd)
 }
 
-fn handle_request(
-    model: &LlamaModel,
+fn handle_request<'model>(
+    backend: &LlamaBackend,
+    model: &'model LlamaModel,
     mtmd: &MtmdContext,
     ctx: &mut LlamaContext<'_>,
+    embed_ctx: &mut Option<LlamaContext<'model>>,
+    config: &LlamaRuntimeConfig,
     req: Request,
 ) -> Result<()> {
     match req.request_type.as_str() {
@@ -72,7 +85,7 @@ fn handle_request(
         "predict_next" => handle_predict_next(model, ctx, &req),
         "generate_structured" => handle_generate_structured(model, ctx, &req),
         "generate_structured_stream" => handle_generate_structured_stream(model, ctx, &req),
-        "embed" => handle_embed(model, ctx, &req),
+        "embed" => handle_embed(backend, model, embed_ctx, config, &req),
         "describe" => handle_describe(model, mtmd, ctx, &req),
         "ocr" => handle_ocr(model, mtmd, ctx, &req),
         "segment" => handle_segment(model, mtmd, ctx, &req),
@@ -203,7 +216,17 @@ fn structured_result(
     first_json_value(&result)
 }
 
-fn handle_embed(model: &LlamaModel, ctx: &mut LlamaContext<'_>, req: &Request) -> Result<()> {
+fn handle_embed<'model>(
+    backend: &LlamaBackend,
+    model: &'model LlamaModel,
+    embed_ctx: &mut Option<LlamaContext<'model>>,
+    config: &LlamaRuntimeConfig,
+    req: &Request,
+) -> Result<()> {
+    let ctx = match embed_ctx {
+        Some(ctx) => ctx,
+        None => embed_ctx.insert(new_embedding_context(backend, model, config)?),
+    };
     let values = embedding(model, ctx, req.prompt.as_deref().unwrap_or_default())?;
     send(json!({"id": req.id, "embedding": values, "done": true}))
 }
