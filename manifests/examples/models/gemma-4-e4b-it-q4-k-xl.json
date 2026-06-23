@@ -1,6 +1,4 @@
 {
-  "profile_id": "gemma-4-e4b-it-q4-k-xl",
-  "model_id": "gemma-4-e4b-it-q4-k-xl",
   "llmfit_model_id": "google/gemma-4-E4B-it",
   "runtime_id": "vision-llama-cpp-gemma4",
   "tier": "large",
@@ -12,14 +10,12 @@
     {
       "role": "model",
       "url": "https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-Q4_K_M.gguf",
-      "filename": "model.gguf",
       "sha256": "519b9793ed6ce0ff530f1b7c96e848e08e49e7af4d57bb97f76215963a54146d",
       "size_bytes": 4977169568
     },
     {
       "role": "mmproj",
       "url": "https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF/resolve/main/mmproj-F16.gguf",
-      "filename": "mmproj.gguf",
       "sha256": "ddf46c21d7078e95338cfc22306b19b276a29a5ad089023449dd54d4b6170a51",
       "size_bytes": 990372672
     }

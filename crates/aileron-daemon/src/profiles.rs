@@ -264,10 +264,7 @@ fn load_system_profiles() -> Result<HashMap<String, Profile>> {
             if path.extension().and_then(|s| s.to_str()) != Some("json") {
                 continue;
             }
-            let data = std::fs::read_to_string(&path)
-                .with_context(|| format!("read model manifest {}", path.display()))?;
-            let manifest = crate::manifests::parse_model_manifest_json(&data)
-                .with_context(|| format!("parse model manifest {}", path.display()))?;
+            let manifest = crate::manifests::read_model_manifest_path(&path)?;
             let artifact_dir = system_model_dir(&manifest.model_id);
             if !artifact_dir.is_dir()
                 || !system_artifacts_match(&artifact_dir, &manifest.artifacts)?

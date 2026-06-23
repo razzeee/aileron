@@ -1206,8 +1206,7 @@ async fn install_manifest_path(
     path: PathBuf,
     requested_profile_id: Option<String>,
 ) -> anyhow::Result<(Vec<String>, Vec<UseCaseConflict>)> {
-    let data = std::fs::read_to_string(&path)?;
-    let manifest = manifests::parse_model_manifest_json(&data)?;
+    let manifest = manifests::read_model_manifest_path(&path)?;
     if let Some(requested) = requested_profile_id
         && manifest.profile_id != requested
     {

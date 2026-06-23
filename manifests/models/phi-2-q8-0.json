@@ -1,17 +1,9 @@
 {
-  "profile_id": "phi-2-q8-0",
-  "model_id": "phi-2-q8-0",
-  "runtime_id": "llm-llama-cpp",
   "tier": "balanced",
   "min_ram_gb": 6.0,
-  "use_cases": ["language.summarize", "language.rephrase", "language.classify", "language.extract", "language.analyze"],
-  "artifacts": [
-    {
-      "role": "model",
-      "url": "https://huggingface.co/ggml-org/models-moved/resolve/main/phi-2/ggml-model-q8_0.gguf",
-      "filename": "model.gguf",
-      "sha256": "26a44c5a2bc22f33a1271cdf1accb689028141a6cb12e97671740a9803d23c63",
-      "size_bytes": 2958032736
-    }
-  ]
+  "artifact": {
+    "url": "https://huggingface.co/ggml-org/models-moved/resolve/main/phi-2/ggml-model-q8_0.gguf",
+    "sha256": "26a44c5a2bc22f33a1271cdf1accb689028141a6cb12e97671740a9803d23c63",
+    "size_bytes": 2958032736
+  }
 }

@@ -1,17 +1,10 @@
 {
-  "profile_id": "stories15m-f16",
-  "model_id": "stories15m-f16",
-  "runtime_id": "llm-llama-cpp",
   "tier": "small",
   "min_ram_gb": 1.0,
   "use_cases": ["language.summarize", "language.rephrase", "language.classify", "language.extract"],
-  "artifacts": [
-    {
-      "role": "model",
-      "url": "https://huggingface.co/ggml-org/models-moved/resolve/main/tinyllamas/stories15M.gguf",
-      "filename": "model.gguf",
-      "sha256": "61b50d457809a5194818fd22e6724b456cd7bb9a6264c52c8110684c53f3704a",
-      "size_bytes": 98357920
-    }
-  ]
+  "artifact": {
+    "url": "https://huggingface.co/ggml-org/models-moved/resolve/main/tinyllamas/stories15M.gguf",
+    "sha256": "61b50d457809a5194818fd22e6724b456cd7bb9a6264c52c8110684c53f3704a",
+    "size_bytes": 98357920
+  }
 }

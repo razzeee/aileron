@@ -174,7 +174,21 @@ Runtime manifests provide explicit runtime image refs per variant such as `cpu`,
 
 Manifests are discovered from `$XDG_DATA_HOME/aileron/manifests`, `/etc/aileron/manifests`, `/usr/share/aileron/manifests`, and `manifests` in the current working directory. Override the search path with `AILERON_MANIFEST_DIRS`.
 
-Model manifests live under `models/` and reference a reusable runtime by ID:
+Model manifests live under `models/`. A compact single-artifact text GGUF manifest only needs the metadata key plus an artifact URL and SHA-256:
+
+```json
+{
+  "llmfit_model_id": "meta-llama/Llama-3.2-3B-Instruct",
+  "artifact": {
+    "url": "https://example.org/models/Llama-3.2-3B-Instruct-Q4_K_M.gguf",
+    "sha256": "42e64ea673cdfe2512e48df7e7e616ff61a52164dc41e18a9945ca200825a83c"
+  }
+}
+```
+
+For manifests loaded from disk, Aileron derives `profile_id` and `model_id` from the JSON filename when those fields are omitted. For example, `models/llama3.2-3b-instruct-q4-k-m.json` becomes `llama3.2-3b-instruct-q4-k-m`. For ad-hoc JSON without a filename, Aileron falls back to `llmfit_model_id` by lowercasing it and replacing every character outside `[a-z0-9._-]` with `_`, without collapsing repeated underscores. Single GGUF artifacts default to `role: "model"`, `filename: "model.gguf"`, `runtime_id: "llm-llama-cpp"`, and conservative language use-cases derived from llmfit metadata when available.
+
+Fully explicit manifests are still supported and are required when a runtime, filename, or use-case choice cannot be inferred safely:
 
 ```json
 {
@@ -196,9 +210,9 @@ Model manifests live under `models/` and reference a reusable runtime by ID:
 }
 ```
 
-The optional `artifacts[].role` field identifies what a file is for runtimes that need more than one artifact. Single-file profiles usually use `model`; llama.cpp vision profiles commonly use both `model` and `mmproj`. Artifact roles must be unique within a manifest when present.
+Use `artifact` for a compact single-file manifest and `artifacts` for explicit or multi-file manifests. The optional artifact `role` field identifies what a file is for runtimes that need more than one artifact. Single-file profiles default to `model`; llama.cpp vision profiles commonly use both `model` and `mmproj`. Artifact roles must be unique within a manifest when present, and multi-artifact manifests must provide roles explicitly.
 
-The `artifacts[].size_bytes` field is the preferred source for the user-facing install/download size, because it lives next to the exact URL and SHA-256 it describes. `disk_size_gb` is still accepted as fallback catalog metadata when exact artifact byte sizes are unavailable. The optional `llmfit_model_id` field should be the Hugging Face model name used by `llmfit-core`; when present, Aileron uses llmfit metadata to show a simple fit label and RAM/VRAM requirements for the current PC. If it is absent or unknown, Aileron falls back to the manifest's `min_ram_gb` metadata. These fields do not trigger automatic downloads or automatic reassignment.
+The `artifacts[].size_bytes` field is the preferred source for the user-facing install/download size, because it lives next to the exact URL and SHA-256 it describes. It is optional; install progress works without it but cannot show a precise total before download. `disk_size_gb` is still accepted as fallback catalog metadata when exact artifact byte sizes are unavailable. The optional `llmfit_model_id` field should be the model name used by `llmfit-core`; when present, Aileron uses llmfit metadata to show a simple fit label and RAM/VRAM requirements for the current PC and derive safe default use-cases. If it is absent or unknown, Aileron falls back to the manifest's explicit metadata or conservative runtime defaults. These fields do not trigger automatic downloads or automatic reassignment.
 
 Distributions should package Aileron, runtime manifests, and model catalog manifests. They do not need to ship model weights in the distro package. The user explicitly chooses a catalog profile to install, sees its size and recommendation metadata, then Aileron downloads and verifies the declared artifacts.
 

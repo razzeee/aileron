@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
+use llmfit_core::{Capability, ModelFormat, UseCase};
 use serde::Deserialize;
 
 use crate::hardware::Variant;
@@ -48,10 +49,41 @@ pub struct ManifestArtifact {
     #[serde(default)]
     pub role: String,
     pub url: String,
+    #[serde(default)]
     pub filename: String,
     pub sha256: String,
     #[serde(default)]
     pub size_bytes: u64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct RawModelManifest {
+    #[serde(default)]
+    profile_id: String,
+    #[serde(default)]
+    model_id: String,
+    #[serde(default)]
+    llmfit_model_id: String,
+    #[serde(default)]
+    runtime_id: String,
+    #[serde(default)]
+    runtime_options: HashMap<String, String>,
+    #[serde(default)]
+    tier: String,
+    #[serde(default)]
+    disk_size_gb: f64,
+    #[serde(default)]
+    min_ram_gb: f64,
+    #[serde(default)]
+    runtime_images: Vec<RuntimeImage>,
+    #[serde(default)]
+    use_cases: Vec<String>,
+    #[serde(default)]
+    specializations: Vec<String>,
+    #[serde(default)]
+    artifact: Option<ManifestArtifact>,
+    #[serde(default)]
+    artifacts: Vec<ManifestArtifact>,
 }
 
 impl ModelManifest {
@@ -239,14 +271,48 @@ pub fn manifest_dirs() -> Vec<PathBuf> {
 }
 
 pub fn find_model_manifest(profile_id: &str) -> Result<Option<PathBuf>> {
+    find_model_manifest_in_dirs(profile_id, manifest_dirs())
+}
+
+fn find_model_manifest_in_dirs(profile_id: &str, dirs: Vec<PathBuf>) -> Result<Option<PathBuf>> {
     let filename = format!("{profile_id}.json");
-    for dir in manifest_dirs() {
+    for dir in &dirs {
         let path = dir.join("models").join(&filename);
         if path.exists() {
-            return Ok(Some(path));
+            let manifest = read_model_manifest_path(&path)?;
+            if manifest.profile_id == profile_id {
+                return Ok(Some(path));
+            }
+        }
+    }
+    for dir in dirs {
+        let models_dir = dir.join("models");
+        if !models_dir.exists() {
+            continue;
+        }
+        for entry in std::fs::read_dir(&models_dir)
+            .with_context(|| format!("read {}", models_dir.display()))?
+        {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            let manifest = read_model_manifest_path(&path)?;
+            if manifest.profile_id == profile_id {
+                return Ok(Some(path));
+            }
         }
     }
     Ok(None)
+}
+
+pub(crate) fn read_model_manifest_path(path: &std::path::Path) -> Result<ModelManifest> {
+    let data = std::fs::read_to_string(path)
+        .with_context(|| format!("read model manifest {}", path.display()))?;
+    let profile_id_hint = path.file_stem().and_then(|stem| stem.to_str());
+    parse_model_manifest_json_with_profile_id_hint(&data, profile_id_hint)
+        .with_context(|| format!("parse model manifest {}", path.display()))
 }
 
 pub fn list_catalog_profiles() -> Result<Vec<CatalogProfileInfo>> {
@@ -264,10 +330,7 @@ pub fn list_catalog_profiles() -> Result<Vec<CatalogProfileInfo>> {
             if path.extension().and_then(|s| s.to_str()) != Some("json") {
                 continue;
             }
-            let data = std::fs::read_to_string(&path)
-                .with_context(|| format!("read model manifest {}", path.display()))?;
-            let manifest = parse_model_manifest_json(&data)
-                .with_context(|| format!("parse model manifest {}", path.display()))?;
+            let manifest = read_model_manifest_path(&path)?;
             let disk_size_gb = manifest_disk_size_gb(&manifest);
             profiles.push(CatalogProfileInfo {
                 profile_id: manifest.profile_id,
@@ -301,7 +364,15 @@ fn manifest_disk_size_gb(manifest: &ModelManifest) -> f64 {
 }
 
 pub fn parse_model_manifest_json(data: &str) -> Result<ModelManifest> {
-    let manifest: ModelManifest = serde_json::from_str(data)?;
+    parse_model_manifest_json_with_profile_id_hint(data, None)
+}
+
+fn parse_model_manifest_json_with_profile_id_hint(
+    data: &str,
+    profile_id_hint: Option<&str>,
+) -> Result<ModelManifest> {
+    let raw: RawModelManifest = serde_json::from_str(data)?;
+    let manifest = normalize_model_manifest(raw, profile_id_hint)?;
     validate_non_empty("profile_id", &manifest.profile_id)?;
     validate_non_empty("model_id", &manifest.model_id)?;
     if !manifest.llmfit_model_id.is_empty() {
@@ -333,6 +404,287 @@ pub fn parse_model_manifest_json(data: &str) -> Result<ModelManifest> {
         }
     }
     Ok(manifest)
+}
+
+fn normalize_model_manifest(
+    raw: RawModelManifest,
+    profile_id_hint: Option<&str>,
+) -> Result<ModelManifest> {
+    if raw.artifact.is_some() && !raw.artifacts.is_empty() {
+        bail!("model manifest must use either artifact or artifacts, not both");
+    }
+    let mut artifacts = raw.artifacts.clone();
+    if let Some(artifact) = raw.artifact.clone() {
+        artifacts.push(artifact);
+    }
+    normalize_artifacts(&mut artifacts)?;
+
+    let metadata = (!raw.llmfit_model_id.is_empty())
+        .then(|| crate::llmfit_metadata::find(&raw.llmfit_model_id))
+        .flatten();
+    let profile_id = derive_profile_id(&raw, profile_id_hint, &artifacts)?;
+    let model_id = if raw.model_id.trim().is_empty() {
+        profile_id.clone()
+    } else {
+        raw.model_id
+    };
+    let runtime_id = derive_runtime_id(&raw.runtime_id, &artifacts, &raw.use_cases, metadata)?;
+    let use_cases = if raw.use_cases.is_empty() {
+        derive_use_cases(&runtime_id, metadata)?
+    } else {
+        raw.use_cases
+    };
+
+    Ok(ModelManifest {
+        profile_id,
+        model_id,
+        llmfit_model_id: raw.llmfit_model_id,
+        runtime_id,
+        runtime_options: raw.runtime_options,
+        tier: raw.tier,
+        disk_size_gb: raw.disk_size_gb,
+        min_ram_gb: raw.min_ram_gb,
+        runtime_images: raw.runtime_images,
+        use_cases,
+        specializations: raw.specializations,
+        artifacts,
+    })
+}
+
+fn derive_profile_id(
+    raw: &RawModelManifest,
+    profile_id_hint: Option<&str>,
+    artifacts: &[ManifestArtifact],
+) -> Result<String> {
+    if !raw.profile_id.trim().is_empty() {
+        return Ok(raw.profile_id.clone());
+    }
+    if !raw.model_id.trim().is_empty() {
+        return Ok(raw.model_id.clone());
+    }
+    if let Some(profile_id_hint) = profile_id_hint.filter(|hint| !hint.trim().is_empty()) {
+        return normalize_manifest_id(profile_id_hint);
+    }
+    if !raw.llmfit_model_id.trim().is_empty() {
+        return normalize_manifest_id(&raw.llmfit_model_id);
+    }
+    derive_profile_id_from_artifact(artifacts)
+}
+
+fn derive_profile_id_from_artifact(artifacts: &[ManifestArtifact]) -> Result<String> {
+    let artifact = artifacts
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("profile_id or llmfit_model_id is required"))?;
+    let filename = artifact_url_filename(&artifact.url)
+        .or_else(|| (!artifact.filename.trim().is_empty()).then(|| artifact.filename.clone()))
+        .ok_or_else(|| anyhow::anyhow!("profile_id or llmfit_model_id is required"))?;
+    let stem = filename_stem(&filename);
+    let id = normalize_manifest_id(stem)?;
+    let sha_prefix: String = artifact.sha256.chars().take(12).collect();
+    if sha_prefix.is_empty() {
+        Ok(id)
+    } else {
+        Ok(format!("{id}_{sha_prefix}"))
+    }
+}
+
+fn normalize_manifest_id(value: &str) -> Result<String> {
+    let normalized = value
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let normalized = normalized.trim_matches('_').to_string();
+    if normalized.is_empty() {
+        bail!("derived profile_id must not be empty");
+    }
+    Ok(normalized)
+}
+
+fn derive_runtime_id(
+    runtime_id: &str,
+    artifacts: &[ManifestArtifact],
+    use_cases: &[String],
+    metadata: Option<&llmfit_core::LlmModel>,
+) -> Result<String> {
+    if !runtime_id.trim().is_empty() {
+        return Ok(runtime_id.to_string());
+    }
+    if use_cases
+        .iter()
+        .all(|use_case| use_case.starts_with("speech."))
+        && !use_cases.is_empty()
+    {
+        return Ok("asr-whisper-cpp".to_string());
+    }
+    if let Some(model) = metadata {
+        match model.format {
+            ModelFormat::Gguf if model_capabilities(model).contains(&Capability::Vision) => {
+                bail!("runtime_id is required for vision GGUF models");
+            }
+            ModelFormat::Gguf => return Ok("llm-llama-cpp".to_string()),
+            _ => bail!(
+                "runtime_id is required for {} model format",
+                model_format_label(model.format)
+            ),
+        }
+    }
+    if artifacts.len() > 1 || artifacts.iter().any(|artifact| artifact.role == "mmproj") {
+        bail!("runtime_id is required for multi-artifact manifests");
+    }
+    if artifacts
+        .iter()
+        .any(|artifact| artifact_filename_extension(artifact).as_deref() == Some("gguf"))
+    {
+        return Ok("llm-llama-cpp".to_string());
+    }
+    bail!("runtime_id is required when it cannot be inferred")
+}
+
+fn derive_use_cases(
+    runtime_id: &str,
+    metadata: Option<&llmfit_core::LlmModel>,
+) -> Result<Vec<String>> {
+    if runtime_id == "asr-whisper-cpp" {
+        return Ok(vec![
+            "speech.transcribe".to_string(),
+            "speech.translate".to_string(),
+        ]);
+    }
+    if let Some(model) = metadata {
+        let use_case = UseCase::from_model(model);
+        let mut use_cases = match use_case {
+            UseCase::Embedding => vec!["language.embed"],
+            UseCase::Coding => vec!["language.extract", "language.analyze"],
+            UseCase::General | UseCase::Reasoning | UseCase::Chat | UseCase::Multimodal => {
+                default_language_use_cases()
+            }
+        };
+        if use_case == UseCase::Multimodal
+            || runtime_id.starts_with("vision-")
+            || model_capabilities(model).contains(&Capability::Vision)
+        {
+            use_cases.extend(["vision.describe", "vision.ocr"]);
+        }
+        return Ok(dedup_use_cases(use_cases));
+    }
+    if runtime_id.starts_with("vision-") {
+        let mut use_cases = default_language_use_cases();
+        use_cases.extend(["vision.describe", "vision.ocr"]);
+        return Ok(dedup_use_cases(use_cases));
+    }
+    if runtime_id.starts_with("llm-") {
+        return Ok(default_language_use_cases()
+            .into_iter()
+            .map(str::to_string)
+            .collect());
+    }
+    bail!("use_cases are required when they cannot be inferred")
+}
+
+fn model_format_label(format: ModelFormat) -> &'static str {
+    match format {
+        ModelFormat::Gguf => "gguf",
+        ModelFormat::Awq => "awq",
+        ModelFormat::Gptq => "gptq",
+        ModelFormat::Autoround => "autoround",
+        ModelFormat::Mlx => "mlx",
+        ModelFormat::Safetensors => "safetensors",
+    }
+}
+
+fn default_language_use_cases() -> Vec<&'static str> {
+    vec![
+        "language.summarize",
+        "language.rephrase",
+        "language.classify",
+        "language.extract",
+        "language.analyze",
+    ]
+}
+
+fn dedup_use_cases(use_cases: Vec<&'static str>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    use_cases
+        .into_iter()
+        .filter(|use_case| seen.insert(*use_case))
+        .map(str::to_string)
+        .collect()
+}
+
+fn model_capabilities(model: &llmfit_core::LlmModel) -> Vec<Capability> {
+    Capability::infer(model)
+}
+
+fn normalize_artifacts(artifacts: &mut [ManifestArtifact]) -> Result<()> {
+    let artifact_count = artifacts.len();
+    for artifact in artifacts {
+        if artifact.role.trim().is_empty() {
+            if artifact_count <= 1 {
+                artifact.role = "model".to_string();
+            } else {
+                bail!("multi-artifact manifests must define artifact roles");
+            }
+        }
+        if artifact.filename.trim().is_empty() {
+            artifact.filename = default_artifact_filename(artifact, artifact_count)?;
+        }
+    }
+    Ok(())
+}
+
+fn default_artifact_filename(artifact: &ManifestArtifact, artifact_count: usize) -> Result<String> {
+    match artifact.role.as_str() {
+        "model" => match artifact_filename_extension(artifact).as_deref() {
+            Some("bin") => Ok("model.bin".to_string()),
+            Some("gguf") => Ok("model.gguf".to_string()),
+            _ if artifact_count == 1 => artifact_url_filename(&artifact.url)
+                .ok_or_else(|| anyhow::anyhow!("artifacts[].filename is required")),
+            _ => bail!("artifacts[].filename is required for model artifact"),
+        },
+        "mmproj" => Ok("mmproj.gguf".to_string()),
+        _ => artifact_url_filename(&artifact.url)
+            .ok_or_else(|| anyhow::anyhow!("artifacts[].filename is required")),
+    }
+}
+
+fn artifact_filename_extension(artifact: &ManifestArtifact) -> Option<String> {
+    let filename = if artifact.filename.trim().is_empty() {
+        artifact_url_filename(&artifact.url)?
+    } else {
+        artifact.filename.clone()
+    };
+    filename
+        .rsplit_once('.')
+        .map(|(_, extension)| extension.to_ascii_lowercase())
+}
+
+fn artifact_url_filename(url: &str) -> Option<String> {
+    let without_fragment = url.split('#').next().unwrap_or(url);
+    let without_query = without_fragment
+        .split('?')
+        .next()
+        .unwrap_or(without_fragment);
+    let filename = without_query.rsplit('/').next()?.trim();
+    if filename.is_empty() || filename == "." || filename == ".." {
+        None
+    } else {
+        Some(filename.to_string())
+    }
+}
+
+fn filename_stem(filename: &str) -> &str {
+    filename
+        .rsplit_once('.')
+        .map(|(stem, _)| stem)
+        .unwrap_or(filename)
 }
 
 fn parse_runtime_manifest_json(data: &str) -> Result<RuntimeManifest> {
@@ -590,6 +942,54 @@ mod tests {
     }
 
     #[test]
+    fn find_model_manifest_skips_filename_match_with_different_profile_id() {
+        let dir = test_dir("model-manifest-profile-id-lookup");
+        let models_dir = dir.join("models");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&models_dir).expect("create models dir");
+        std::fs::write(
+            models_dir.join("foo.json"),
+            r#"{"profile_id":"bar","runtime_id":"stub","use_cases":["language.summarize"],"artifacts":[]}"#,
+        )
+        .expect("write mismatched manifest");
+        let expected = models_dir.join("actual.json");
+        std::fs::write(
+            &expected,
+            r#"{"profile_id":"foo","runtime_id":"stub","use_cases":["language.summarize"],"artifacts":[]}"#,
+        )
+        .expect("write matching manifest");
+
+        let found = find_model_manifest_in_dirs("foo", vec![dir.clone()])
+            .expect("find manifest")
+            .expect("matching manifest should exist");
+
+        assert_eq!(found, expected);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn read_model_manifest_path_uses_filename_as_profile_id_hint() {
+        let dir = test_dir("model-manifest-profile-id-hint");
+        let models_dir = dir.join("models");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&models_dir).expect("create models dir");
+        let path = models_dir.join("file-stem-profile.json");
+        std::fs::write(
+            &path,
+            r#"{"artifact":{"url":"https://example.invalid/model.gguf","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}"#,
+        )
+        .expect("write compact manifest");
+
+        let manifest = read_model_manifest_path(&path).expect("read compact manifest");
+
+        assert_eq!(manifest.profile_id, "file-stem-profile");
+        assert_eq!(manifest.model_id, "file-stem-profile");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn model_manifest_into_profile_preserves_install_fields() {
         let manifest = ModelManifest {
             profile_id: "profile".to_string(),
@@ -711,6 +1111,115 @@ mod tests {
     }
 
     #[test]
+    fn derives_compact_llm_manifest_fields_from_llmfit_id() {
+        let data = r#"
+        {
+            "llmfit_model_id": "meta-llama/Llama-3.2-3B-Instruct",
+            "artifact": {
+                "url": "https://example.invalid/Llama-3.2-3B-Instruct-Q4_K_M.gguf?download=1",
+                "sha256": "42e64ea673cdfe2512e48df7e7e616ff61a52164dc41e18a9945ca200825a83c"
+            }
+        }
+        "#;
+
+        let manifest = parse_model_manifest_json(data).expect("compact manifest should parse");
+
+        assert_eq!(manifest.profile_id, "meta-llama_llama-3.2-3b-instruct");
+        assert_eq!(manifest.model_id, manifest.profile_id);
+        assert_eq!(manifest.runtime_id, "llm-llama-cpp");
+        assert_eq!(manifest.artifacts.len(), 1);
+        assert_eq!(manifest.artifacts[0].role, "model");
+        assert_eq!(manifest.artifacts[0].filename, "model.gguf");
+        assert!(
+            manifest
+                .use_cases
+                .contains(&"language.summarize".to_string())
+        );
+        assert!(manifest.use_cases.contains(&"language.analyze".to_string()));
+        assert!(
+            !manifest
+                .use_cases
+                .contains(&"language.translate".to_string())
+        );
+    }
+
+    #[test]
+    fn compact_manifest_normalization_does_not_collapse_underscores() {
+        assert_eq!(
+            normalize_manifest_id("Org/Foo::Bar").expect("normalize id"),
+            "org_foo__bar"
+        );
+    }
+
+    #[test]
+    fn derives_fallback_profile_id_from_artifact_when_no_llmfit_id_exists() {
+        let data = r#"
+        {
+            "artifact": {
+                "url": "https://example.invalid/models/stories260K.gguf",
+                "sha256": "270cba1bd5109f42d03350f60406024560464db173c0e387d91f0426d3bd256d"
+            }
+        }
+        "#;
+
+        let manifest = parse_model_manifest_json(data).expect("compact manifest should parse");
+
+        assert_eq!(manifest.profile_id, "stories260k_270cba1bd510");
+        assert_eq!(manifest.model_id, manifest.profile_id);
+        assert_eq!(manifest.runtime_id, "llm-llama-cpp");
+        assert_eq!(manifest.artifacts[0].filename, "model.gguf");
+    }
+
+    #[test]
+    fn compact_multi_artifact_manifest_requires_roles() {
+        let data = r#"
+        {
+            "runtime_id": "vision-llama-cpp-gemma4",
+            "use_cases": ["vision.describe"],
+            "artifacts": [
+                {
+                    "url": "https://example.invalid/model.gguf",
+                    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                },
+                {
+                    "url": "https://example.invalid/mmproj.gguf",
+                    "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                }
+            ]
+        }
+        "#;
+
+        let err = parse_model_manifest_json(data).expect_err("roles should be required");
+
+        assert!(err.to_string().contains("artifact roles"));
+    }
+
+    #[test]
+    fn compact_multi_artifact_manifest_requires_runtime_id() {
+        let data = r#"
+        {
+            "use_cases": ["vision.describe"],
+            "artifacts": [
+                {
+                    "role": "model",
+                    "url": "https://example.invalid/model.gguf",
+                    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                },
+                {
+                    "role": "mmproj",
+                    "url": "https://example.invalid/mmproj.gguf",
+                    "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                }
+            ]
+        }
+        "#;
+
+        let err = parse_model_manifest_json(data).expect_err("runtime_id should be required");
+
+        assert!(err.to_string().contains("multi-artifact"));
+    }
+
+    #[test]
     fn accepts_runtime_options() {
         let data = r#"
         {
@@ -779,12 +1288,15 @@ mod tests {
 
     #[test]
     fn validates_example_model_manifests() {
-        for data in [
-            include_str!("../../../manifests/examples/models/llama3.2-3b-instruct-q4-k-m.json"),
-            include_str!("../../../manifests/examples/models/whisper-large-v3-turbo-q5-0.json"),
-            include_str!("../../../manifests/examples/models/gemma-4-e4b-it-q4-k-xl.json"),
+        for path in [
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../manifests/examples/models/llama3.2-3b-instruct-q4-k-m.json"),
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../manifests/examples/models/whisper-large-v3-turbo-q5-0.json"),
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../manifests/examples/models/gemma-4-e4b-it-q4-k-xl.json"),
         ] {
-            parse_model_manifest_json(data).expect("example model manifest should be valid");
+            read_model_manifest_path(&path).expect("example model manifest should be valid");
         }
     }
 
@@ -797,8 +1309,7 @@ mod tests {
             if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
                 continue;
             }
-            let data = std::fs::read_to_string(&path).expect("read profile library model manifest");
-            parse_model_manifest_json(&data)
+            read_model_manifest_path(&path)
                 .expect("profile library model manifest should be valid");
             count += 1;
         }
@@ -817,8 +1328,7 @@ mod tests {
             if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
                 continue;
             }
-            let data = std::fs::read_to_string(&path).expect("read profile library model manifest");
-            let manifest = parse_model_manifest_json(&data)
+            let manifest = read_model_manifest_path(&path)
                 .expect("profile library model manifest should be valid");
             let mut artifacts = manifest
                 .artifacts
