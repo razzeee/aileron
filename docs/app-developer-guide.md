@@ -29,6 +29,7 @@ Current tokens:
 - `language.summarize`
 - `language.translate`
 - `language.rephrase`
+- `language.complete`
 - `language.classify`
 - `language.extract`
 - `language.analyze`
@@ -53,7 +54,7 @@ For conversational features, keep stable instructions in the session and send th
 
 ## Text Generation
 
-Use `language.*` use cases with `Respond` for full responses or `StreamResponse` for token streaming.
+Use task-specific language generation use cases with `Respond` for full responses or `StreamResponse` for token streaming. `language.complete` is reserved for inline completion through `PredictNext`; do not use `language.rephrase` for ghost text or next-word suggestions.
 
 Good prompt shape:
 
@@ -66,6 +67,10 @@ Summarize the article below in three bullet points. Preserve important names and
 Prefer explicit output constraints over relying on a specific model's behavior.
 
 For `language.translate`, `GenerationOptions` includes optional `source_language_hint` and `target_language_hint` strings. Pass empty strings when the app does not know one side. These are hints, not strict locale settings; apps should still make the requested translation clear in the prompt.
+
+## Inline Completion
+
+Use `language.complete` with `PredictNext` for ghost text, current-word endings, or next-word suggestions. Send the raw text prefix the user typed, not an instruction prompt. The daemon caps results at three short completions.
 
 ## Guided Output
 

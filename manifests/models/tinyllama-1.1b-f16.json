@@ -4,6 +4,7 @@
   "use_cases": [
     "language.summarize",
     "language.rephrase",
+    "language.complete",
     "language.classify",
     "language.extract"
   ],

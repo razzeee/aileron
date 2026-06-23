@@ -1053,7 +1053,7 @@ async fn predict_next_completions(
     let (app_id, use_case, profile_id, runtime_id, image_refs, artifact_path, runtime_options) =
         match guard.sessions.get(&session_id) {
             Some(s) => {
-                ensure_language_generation_use_case(&s.use_case)
+                ensure_exact_use_case(&s.use_case, "language.complete", "PredictNext")
                     .map_err(GenerationError::ModelUnavailable)?;
                 let (profile_id, runtime_id, image_refs, artifact_path, runtime_options) =
                     profile_runtime(&guard, &s.profile_id)
@@ -1405,14 +1405,12 @@ fn validate_options(options: &GenerationOptions) -> Result<u32, String> {
 }
 
 fn ensure_language_generation_use_case(use_case: &str) -> Result<(), String> {
-    // `language.embed` is a language.* token but produces vectors, not text, so it is
-    // not a valid use-case for the text-generation methods.
-    if use_case.starts_with("language.") && use_case != "language.embed" {
-        Ok(())
-    } else {
-        Err(format!(
-            "text generation requires a language.* use-case, got {use_case}"
-        ))
+    match use_case {
+        "language.summarize" | "language.translate" | "language.rephrase" | "language.classify"
+        | "language.extract" | "language.analyze" => Ok(()),
+        _ => Err(format!(
+            "full text generation requires a language generation use-case, got {use_case}"
+        )),
     }
 }
 
@@ -1595,7 +1593,10 @@ mod tests {
         assert!(ensure_language_generation_use_case("language.extract").is_ok());
         assert_eq!(
             ensure_language_generation_use_case("vision.describe"),
-            Err("text generation requires a language.* use-case, got vision.describe".to_string())
+            Err(
+                "full text generation requires a language generation use-case, got vision.describe"
+                    .to_string()
+            )
         );
     }
 
@@ -1617,7 +1618,35 @@ mod tests {
     fn language_generation_excludes_embed_use_case() {
         assert_eq!(
             ensure_language_generation_use_case("language.embed"),
-            Err("text generation requires a language.* use-case, got language.embed".to_string())
+            Err(
+                "full text generation requires a language generation use-case, got language.embed"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn language_generation_excludes_completion_use_case() {
+        assert_eq!(
+            ensure_language_generation_use_case("language.complete"),
+            Err(
+                "full text generation requires a language generation use-case, got language.complete"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn predict_next_requires_completion_use_case() {
+        assert!(
+            ensure_exact_use_case("language.complete", "language.complete", "PredictNext").is_ok()
+        );
+        assert_eq!(
+            ensure_exact_use_case("language.rephrase", "language.complete", "PredictNext"),
+            Err(
+                "PredictNext requires use-case language.complete, got language.rephrase"
+                    .to_string()
+            )
         );
     }
 

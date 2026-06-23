@@ -322,13 +322,14 @@ Paste or fetch an article URL, then click **Summarize**. Tokens stream into the 
 
 Use-case tokens are the daemon's routing and policy keys. A token maps to one assigned profile, permissions are granted per app and token, and warm containers are pooled per profile. Assigning the same profile to multiple declared tokens is valid.
 
-Use-cases describe the task intent and modality; methods describe the operation shape. `Respond` and `RespondGuided` are text-generation operations for `language.*` sessions (except `language.embed`). `Embed` is for `language.embed`. `Transcribe` serves both `speech.transcribe` and `speech.translate` (the daemon runs the whisper transcribe or translate-to-English task based on the session use-case). `Describe` is for `vision.describe`, `Ocr` is for `vision.ocr`, and `Segment` is for `vision.segment`. There is intentionally no separate `language.guided` token: guided generation is an output constraint for a real language task use-case, not a task intent of its own. Use `language.analyze` when one guided response combines multiple analytical intents, such as summary, extraction, and classification fields.
+Use-cases describe the task intent and modality; methods describe the operation shape. Full-response methods (`Respond`, `StreamResponse`, `RespondGuided`, `StreamGuidedResponse`, and `SubmitToolResultsGuided`) are for language generation use-cases other than `language.embed` and `language.complete`. `PredictNext` is for `language.complete`. `Embed` is for `language.embed`. `Transcribe` serves both `speech.transcribe` and `speech.translate` (the daemon runs the whisper transcribe or translate-to-English task based on the session use-case). `Describe` is for `vision.describe`, `Ocr` is for `vision.ocr`, and `Segment` is for `vision.segment`. There is intentionally no separate `language.guided` token: guided generation is an output constraint for a real language task use-case, not a task intent of its own. Use `language.analyze` when one guided response combines multiple analytical intents, such as summary, extraction, and classification fields.
 
 | Token | Task | Backend |
 |---|---|---|
 | `language.summarize` | Summarize text | llama.cpp |
 | `language.translate` | Translate text | llama.cpp |
 | `language.rephrase` | Rewrite / simplify text | llama.cpp |
+| `language.complete` | Complete typed text with short inline continuations | llama.cpp |
 | `language.classify` | Classify / tag text | llama.cpp |
 | `language.extract` | Extract structured data | llama.cpp |
 | `language.analyze` | Derive mixed structured insights from text | llama.cpp |
@@ -373,7 +374,7 @@ method Segment(session_id: string, image: string) -> (segments: []VisionSegment)
 method EndSession(session_id: string) -> ()
 ```
 
-`instructions` are stored on the session and forwarded to text containers as the container `system` prompt. `PredictNext` is for inline typing assistance: the daemon forwards the raw prefix to the runtime and returns up to three short completions, typically word suffixes or next words. `audio` is raw 16 kHz mono f32le PCM bytes encoded as base64; `Transcribe` returns a verbatim transcript for `speech.transcribe` sessions and an English translation for `speech.translate` sessions. `image` is PNG or JPEG bytes encoded as base64. `Embed` returns the embedding vector for `text`. `VisionSegment` coordinates are normalized `0.0..1.0` rectangles relative to image dimensions.
+`instructions` are stored on the session and forwarded to text containers as the container `system` prompt. `PredictNext` is for inline typing assistance on `language.complete` sessions: the daemon forwards the raw prefix to the runtime and returns up to three short completions, typically word suffixes or next words. `audio` is raw 16 kHz mono f32le PCM bytes encoded as base64; `Transcribe` returns a verbatim transcript for `speech.transcribe` sessions and an English translation for `speech.translate` sessions. `image` is PNG or JPEG bytes encoded as base64. `Embed` returns the embedding vector for `text`. `VisionSegment` coordinates are normalized `0.0..1.0` rectangles relative to image dimensions.
 
 `GenerationOptions.maximum_response_tokens` must be greater than zero and fit in `u32`. `temperature` must be finite and non-negative. `sampling_mode` must be non-empty. `source_language_hint` and `target_language_hint` are optional strings for `language.translate`; pass empty strings when unspecified. Today the daemon validates sampling fields, forwards `maximum_response_tokens` to containers as `max_tokens`, and folds translation hints into the session instructions for `language.translate`.
 
@@ -455,14 +456,16 @@ The portal does not talk to containers directly. It translates D-Bus calls into 
 
 ### Language Methods
 
+Full-response methods reject `language.embed` and `language.complete`; use `Embed` and `PredictNext` for those dedicated use-cases.
+
 | Method | Parameters | Returns | Notes |
 |---|---|---|---|
-| `Respond` | `session_id: s, prompt: s, options: (xdsss)` | `content: s` | Returns full generated text |
-| `PredictNext` | `session_id: s, prefix: s, count: x, options: (xdsss)` | `completions: as` | Returns up to three short inline typing completions from the raw prefix |
-| `StreamResponse` | `session_id: s, prompt: s, options: (xdsss)` | `()` | Emits `TokenReceived` signals; final token has `done=true` |
-| `RespondGuided` | `session_id: s, prompt: s, fields: a(sssb), tools: a(sss), options: (xdsss)` | `(content: s, tool_calls: a(sss))` | Language sessions only; returns JSON matching guided output fields or requested tool calls |
-| `StreamGuidedResponse` | `session_id: s, prompt: s, fields: a(sssb), options: (xdsss)` | `()` | Emits `GuidedSnapshotReceived` signals; final snapshot has `done=true` |
-| `SubmitToolResultsGuided` | `session_id: s, prompt: s, results: a(sss), fields: a(sssb), tools: a(sss), options: (xdsss)` | `(content: s, tool_calls: a(sss))` | Continues guided generation after the app executes or rejects tool calls; prompt carries app-owned context |
+| `Respond` | `session_id: s, prompt: s, options: (xdsss)` | `content: s` | Full language generation sessions only; returns full generated text |
+| `PredictNext` | `session_id: s, prefix: s, count: x, options: (xdsss)` | `completions: as` | `language.complete` sessions only; returns up to three short inline typing completions from the raw prefix |
+| `StreamResponse` | `session_id: s, prompt: s, options: (xdsss)` | `()` | Full language generation sessions only; emits `TokenReceived` signals; final token has `done=true` |
+| `RespondGuided` | `session_id: s, prompt: s, fields: a(sssb), tools: a(sss), options: (xdsss)` | `(content: s, tool_calls: a(sss))` | Full language generation sessions only; returns JSON matching guided output fields or requested tool calls |
+| `StreamGuidedResponse` | `session_id: s, prompt: s, fields: a(sssb), options: (xdsss)` | `()` | Full language generation sessions only; emits `GuidedSnapshotReceived` signals; final snapshot has `done=true` |
+| `SubmitToolResultsGuided` | `session_id: s, prompt: s, results: a(sss), fields: a(sssb), tools: a(sss), options: (xdsss)` | `(content: s, tool_calls: a(sss))` | Full language generation sessions only; continues after the app executes or rejects tool calls |
 | `Embed` | `session_id: s, text: s` | `embedding: ad` | `language.embed` sessions only; returns an embedding vector |
 
 ### Speech Methods

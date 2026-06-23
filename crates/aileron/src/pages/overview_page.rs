@@ -11,6 +11,7 @@ const USE_CASES: &[&str] = &[
     "language.summarize",
     "language.translate",
     "language.rephrase",
+    "language.complete",
     "language.classify",
     "language.extract",
     "language.analyze",
@@ -139,7 +140,8 @@ fn build_page(page: &PreferencesPage, sender: ComponentSender<OverviewPage>) -> 
 
     let metrics = Box::new(Orientation::Horizontal, 12);
     metrics.set_homogeneous(true);
-    let (readiness_card, readiness_value) = metric_card("Task readiness", "0 / 12");
+    let (readiness_card, readiness_value) =
+        metric_card("Task readiness", &format!("0 / {}", USE_CASES.len()));
     let (downloads_card, downloads_value) = metric_card("Downloads", "0");
     let (runtimes_card, runtimes_value) = metric_card("Runtime images", "0");
     let (sessions_card, sessions_value) = metric_card("Active sessions", "0");

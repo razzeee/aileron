@@ -108,7 +108,7 @@ A model manifest points at this runtime and provides the model file URL/checksum
   "profile_id": "llama3.2-3b-instruct-q4",
   "model_id": "llama3.2-3b-instruct-q4",
   "runtime_id": "llm-llama-cpp",
-  "use_cases": ["language.summarize", "language.translate", "language.extract", "language.analyze"],
+  "use_cases": ["language.summarize", "language.translate", "language.complete", "language.extract", "language.analyze"],
   "artifacts": [
     {
       "url": "https://huggingface.co/.../resolve/main/model.gguf",

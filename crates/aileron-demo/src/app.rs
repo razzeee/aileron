@@ -1066,7 +1066,7 @@ fn predict_inline_completion(
             "CreateSession",
             &(
                 "org.aileron.Demo",
-                "language.rephrase",
+                "language.complete",
                 "Inline typing prediction session.",
             ),
         )?;

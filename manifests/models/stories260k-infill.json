@@ -1,7 +1,7 @@
 {
   "tier": "small",
   "min_ram_gb": 1.0,
-  "use_cases": ["language.rephrase", "language.extract", "language.classify"],
+  "use_cases": ["language.rephrase", "language.complete", "language.extract", "language.classify"],
   "artifact": {
     "url": "https://huggingface.co/ggml-org/models-moved/resolve/main/tinyllamas/stories260K-infill.gguf",
     "sha256": "102f2a00a5bfc56d0706467830bda9e39fa5d7df1cd55e47291dd25b4b509140",
