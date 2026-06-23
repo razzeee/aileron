@@ -1,6 +1,6 @@
 {
   "runtime_id": "asr-whisper-cpp",
-  "capabilities": ["transcribe"],
+  "capabilities": ["transcribe", "translate"],
   "variants": ["cpu", "cuda", "rocm", "vulkan"],
   "artifact_layout": {
     "model": "/model/model.bin"
