@@ -88,6 +88,11 @@ method Embed(session_id: string, text: string) -> (embedding: []float)
 # language_hint: optional language hint; empty string means auto-detect/no hint
 method Transcribe(session_id: string, audio: string, language_hint: string) -> (text: string)
 
+# Stream transcript or translation segments. Session must have been created with
+# use_case: speech.transcribe (verbatim, source language) or speech.translate (translated to English).
+# The final reply has continues=false.
+method StreamTranscribe(session_id: string, audio: string, language_hint: string) -> (token: string)
+
 # Describe an image. Session must have been created with vision.describe
 # image: PNG or JPEG bytes encoded as base64
 method Describe(session_id: string, image: string) -> (text: string)

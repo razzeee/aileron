@@ -492,6 +492,68 @@ impl SpeechPortalBackend {
         Ok(reply.text)
     }
 
+    async fn stream_transcribe(
+        &self,
+        session_id: &str,
+        audio_b64: &str,
+        language_hint: &str,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> zbus::fdo::Result<()> {
+        use aileron_varlink::aileron_Inference::VarlinkClientInterface;
+
+        self.emit_loading_if_cold(session_id, &emitter).await?;
+        let session_id = session_id.to_string();
+        let conn =
+            aileron_ipc::client::connect().map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn);
+        let mut call = client.stream_transcribe(
+            session_id.clone(),
+            audio_b64.to_string(),
+            language_hint.to_string(),
+        );
+        let iter = call
+            .more()
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+
+        let mut pending_text: Option<String> = None;
+        for reply in iter {
+            let text = reply
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?
+                .token;
+
+            if let Some(previous) = pending_text.replace(text) {
+                SpeechPortalBackend::transcription_received(
+                    &emitter,
+                    &session_id,
+                    &previous,
+                    false,
+                )
+                .await
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            }
+        }
+
+        SpeechPortalBackend::transcription_received(
+            &emitter,
+            &session_id,
+            pending_text.as_deref().unwrap_or_default(),
+            true,
+        )
+        .await
+        .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+
+        self.mark_warm(&session_id);
+        Ok(())
+    }
+
+    #[zbus(signal)]
+    async fn transcription_received(
+        emitter: &SignalEmitter<'_>,
+        session_id: &str,
+        text: &str,
+        done: bool,
+    ) -> zbus::Result<()>;
+
     async fn end_session(&self, session_id: &str) -> zbus::fdo::Result<()> {
         end_session_impl(&self.state, session_id)
     }
@@ -778,6 +840,44 @@ impl LanguagePortalBackend {
             .is_some_and(|u| self.state.warm.lock().unwrap().contains(u));
         if !is_warm {
             LanguagePortalBackend::model_loading(emitter, "starting model")
+                .await
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn mark_warm(&self, session_id: &str) {
+        if let Some(use_case) = self
+            .state
+            .session_use_cases
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .cloned()
+        {
+            self.state.warm.lock().unwrap().insert(use_case);
+        }
+    }
+}
+
+impl SpeechPortalBackend {
+    async fn emit_loading_if_cold(
+        &self,
+        session_id: &str,
+        emitter: &SignalEmitter<'_>,
+    ) -> zbus::fdo::Result<()> {
+        let use_case = self
+            .state
+            .session_use_cases
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .cloned();
+        let is_warm = use_case
+            .as_ref()
+            .is_some_and(|u| self.state.warm.lock().unwrap().contains(u));
+        if !is_warm {
+            SpeechPortalBackend::model_loading(emitter, "starting model")
                 .await
                 .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         }

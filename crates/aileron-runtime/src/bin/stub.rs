@@ -140,7 +140,11 @@ fn handle_transcribe(req: &Request) -> Result<()> {
 
     send(json!({
         "id": req.id,
-        "token": format!("Stub {verb}: audio received.{suffix}"),
+        "token": format!("Stub {verb}: "),
+    }))?;
+    send(json!({
+        "id": req.id,
+        "token": format!("audio received.{suffix}"),
         "done": true,
     }))
 }

@@ -11,9 +11,10 @@ use crate::state::SharedState;
 use aileron_varlink::aileron_Inference::{
     Call_CreateSession, Call_Describe, Call_Embed, Call_EndSession, Call_GetUseCaseAvailability,
     Call_Ocr, Call_PredictNext, Call_Prewarm, Call_Respond, Call_RespondGuided, Call_Segment,
-    Call_StreamGuidedResponse, Call_StreamResponse, Call_SubmitToolResultsGuided, Call_Transcribe,
-    GenerationOptions, GuidedField, ModelAvailability, ToolCall, ToolDefinition, ToolResult,
-    VarlinkCallError, VarlinkInterface, VisionSegment,
+    Call_StreamGuidedResponse, Call_StreamResponse, Call_StreamTranscribe,
+    Call_SubmitToolResultsGuided, Call_Transcribe, GenerationOptions, GuidedField,
+    ModelAvailability, ToolCall, ToolDefinition, ToolResult, VarlinkCallError, VarlinkInterface,
+    VisionSegment,
 };
 
 pub struct InferenceHandler {
@@ -403,6 +404,25 @@ impl VarlinkInterface for InferenceHandler {
             match container.transcribe(audio_bytes, Some(&language_hint), task) {
                 Ok(text) => call.reply(text),
                 Err(e) => call.reply_generation_failed(e.to_string()),
+            }
+        })
+    }
+
+    fn stream_transcribe(
+        &self,
+        call: &mut dyn Call_StreamTranscribe,
+        session_id: String,
+        audio: String,
+        language_hint: String,
+    ) -> varlink::Result<()> {
+        self.rt.block_on(async {
+            match stream_transcription(&self.state, call, session_id, audio, language_hint).await {
+                Ok(()) => Ok(()),
+                Err(SpeechError::SessionNotFound(id)) => call.reply_session_not_found(id),
+                Err(SpeechError::ModelUnavailable(reason)) => call.reply_model_unavailable(reason),
+                Err(SpeechError::InvalidInput(reason)) => call.reply_invalid_input(reason),
+                Err(SpeechError::Failed(reason)) => call.reply_generation_failed(reason),
+                Err(SpeechError::Reply(e)) => Err(e),
             }
         })
     }
@@ -830,6 +850,98 @@ fn assigned_profile_id_for_use_case(guard: &crate::state::Inner, use_case: &str)
     None
 }
 
+async fn stream_transcription(
+    state: &SharedState,
+    call: &mut dyn Call_StreamTranscribe,
+    session_id: String,
+    audio: String,
+    language_hint: String,
+) -> Result<(), SpeechError> {
+    let mut guard = state.0.lock().await;
+
+    let (
+        app_id,
+        use_case,
+        task,
+        profile_id,
+        runtime_id,
+        image_refs,
+        artifact_path,
+        runtime_options,
+    ) = match guard.sessions.get(&session_id) {
+        Some(s) => {
+            let task =
+                ensure_speech_use_case(&s.use_case).map_err(SpeechError::ModelUnavailable)?;
+            let (profile_id, runtime_id, image_refs, artifact_path, runtime_options) =
+                profile_runtime(&guard, &s.profile_id).map_err(SpeechError::ModelUnavailable)?;
+            (
+                s.app_id.clone(),
+                s.use_case.clone(),
+                task,
+                profile_id,
+                runtime_id,
+                image_refs,
+                artifact_path,
+                runtime_options,
+            )
+        }
+        None => return Err(SpeechError::SessionNotFound(session_id)),
+    };
+
+    let _ = guard.permissions.touch(&app_id, &use_case);
+    let audio_bytes = base64_decode(&audio).map_err(SpeechError::InvalidInput)?;
+    let container = guard
+        .containers
+        .get_or_spawn_any(
+            &profile_id,
+            &runtime_id,
+            &image_refs,
+            &artifact_path,
+            &runtime_options,
+            |_| {},
+        )
+        .map_err(|e| SpeechError::Failed(e.to_string()))?;
+
+    let wants_more = call.wants_more();
+    let mut pending_token: Option<String> = None;
+    let mut reply_error: Option<varlink::Error> = None;
+
+    let result = container.stream_transcribe(audio_bytes, Some(&language_hint), task, |token| {
+        if !wants_more {
+            pending_token = Some(token);
+            return;
+        }
+
+        if reply_error.is_some() {
+            return;
+        }
+
+        if let Some(previous) = pending_token.replace(token) {
+            call.set_continues(true);
+            if let Err(e) = call.reply(previous) {
+                reply_error = Some(e);
+            }
+        }
+    });
+
+    if let Some(e) = reply_error {
+        return Err(SpeechError::Reply(e));
+    }
+
+    if let Err(e) = result {
+        if wants_more {
+            call.set_continues(false);
+        }
+        return Err(SpeechError::Failed(e.to_string()));
+    }
+
+    if wants_more {
+        call.set_continues(false);
+    }
+    call.reply(pending_token.unwrap_or_default())
+        .map_err(SpeechError::Reply)
+}
+
 async fn stream_tokens(
     state: &SharedState,
     call: &mut dyn Call_StreamResponse,
@@ -937,6 +1049,14 @@ enum GenerationError {
     SessionNotFound(String),
     ModelUnavailable(String),
     InvalidOptions(String),
+    Failed(String),
+    Reply(varlink::Error),
+}
+
+enum SpeechError {
+    SessionNotFound(String),
+    ModelUnavailable(String),
+    InvalidInput(String),
     Failed(String),
     Reply(varlink::Error),
 }

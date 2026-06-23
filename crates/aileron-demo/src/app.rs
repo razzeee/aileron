@@ -10,7 +10,9 @@ use libadwaita::{
 };
 use relm4::{ComponentParts, ComponentSender, RelmApp, SimpleComponent};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use zbus::zvariant::Type;
 
@@ -597,9 +599,13 @@ impl DemoPhase {
 enum SpeechEvent {
     Phase(SpeechPhase),
     Transcript(String),
+    AppendTranscript(String),
     Error(String),
     Done,
 }
+
+const LIVE_SPEECH_MIN_CHUNK_BYTES: u64 = 4 * 16_000 * 4;
+const LIVE_SPEECH_POLL_MS: u64 = 500;
 
 enum ToolEvent {
     Trace(String),
@@ -643,6 +649,9 @@ enum SpeechPhase {
     CreatingSession,
     LoadingModel,
     Transcribing,
+    LiveRecording,
+    LiveChunk,
+    Finalizing,
 }
 
 impl SpeechPhase {
@@ -651,6 +660,9 @@ impl SpeechPhase {
             SpeechPhase::CreatingSession => "Creating Speech session",
             SpeechPhase::LoadingModel => "Loading Speech model",
             SpeechPhase::Transcribing => "Processing audio",
+            SpeechPhase::LiveRecording => "Live transcription running",
+            SpeechPhase::LiveChunk => "Processing live audio",
+            SpeechPhase::Finalizing => "Finalizing transcript",
         }
     }
 
@@ -659,6 +671,13 @@ impl SpeechPhase {
             SpeechPhase::CreatingSession => "Opening a Speech session through the portal...",
             SpeechPhase::LoadingModel => "Starting the local Speech container if it is cold...",
             SpeechPhase::Transcribing => "Sending recorded microphone audio to the Speech model...",
+            SpeechPhase::LiveRecording => {
+                "Recording microphone audio. Interim text may change after the final pass."
+            }
+            SpeechPhase::LiveChunk => "Sending the newest audio chunk for provisional text...",
+            SpeechPhase::Finalizing => {
+                "Replacing provisional chunks with one full-recording pass..."
+            }
         }
     }
 }
@@ -1688,6 +1707,20 @@ fn infer_character_from_prompt(prompt: &str) -> Option<char> {
         })
 }
 
+#[derive(Clone, Copy)]
+enum SpeechTranscriptMode {
+    Replace,
+    Append,
+}
+
+fn speech_instructions(use_case: &str) -> &'static str {
+    if use_case == "speech.translate" {
+        "Translate the provided audio into English accurately."
+    } else {
+        "Transcribe the provided audio accurately."
+    }
+}
+
 fn transcribe_recording(
     path: &PathBuf,
     use_case: &str,
@@ -1704,32 +1737,164 @@ fn transcribe_recording(
         anyhow::bail!("recording is empty");
     }
 
-    let instructions = if use_case == "speech.translate" {
-        "Translate the provided audio into English accurately."
-    } else {
-        "Transcribe the provided audio accurately."
-    };
-
-    let conn = Connection::session()?;
-    let proxy = zbus::blocking::Proxy::new(&conn, BUS, PATH, IFACE)?;
+    let call_conn = Connection::session()?;
+    let signal_conn = Connection::session()?;
+    let proxy = zbus::blocking::Proxy::new(&call_conn, BUS, PATH, IFACE)?;
+    let sig_proxy = zbus::blocking::Proxy::new(&signal_conn, BUS, PATH, IFACE)?;
 
     tx.send(SpeechEvent::Phase(SpeechPhase::CreatingSession))?;
     let session_id: String = proxy.call(
         "CreateSession",
-        &("org.aileron.Demo", use_case, instructions),
+        &("org.aileron.Demo", use_case, speech_instructions(use_case)),
     )?;
 
-    tx.send(SpeechEvent::Phase(SpeechPhase::LoadingModel))?;
-    tx.send(SpeechEvent::Phase(SpeechPhase::Transcribing))?;
-    let audio_b64 = base64_encode(&audio);
-    // speech.translate reuses the Transcribe method; the daemon selects the
-    // whisper transcribe-vs-translate task from the session use_case.
-    let transcript: String = proxy.call("Transcribe", &(&session_id, &audio_b64, ""))?;
-    tx.send(SpeechEvent::Transcript(transcript))?;
+    let result: anyhow::Result<()> = (|| {
+        tx.send(SpeechEvent::Phase(SpeechPhase::LoadingModel))?;
+        tx.send(SpeechEvent::Phase(SpeechPhase::Transcribing))?;
+        stream_speech_audio(
+            &proxy,
+            &sig_proxy,
+            &session_id,
+            &audio,
+            &tx,
+            SpeechTranscriptMode::Replace,
+        )?;
+        Ok(())
+    })();
 
-    let _: () = proxy.call("EndSession", &(&session_id,))?;
+    end_speech_session(&proxy, &session_id);
+    result?;
     tx.send(SpeechEvent::Done)?;
     Ok(())
+}
+
+fn live_transcribe_recording(
+    path: PathBuf,
+    use_case: &str,
+    stop: Arc<AtomicBool>,
+    tx: std::sync::mpsc::Sender<SpeechEvent>,
+) -> anyhow::Result<()> {
+    use zbus::blocking::Connection;
+
+    const BUS: &str = "org.freedesktop.impl.portal.desktop.aileron";
+    const PATH: &str = "/org/freedesktop/portal/desktop";
+    const IFACE: &str = "org.freedesktop.impl.portal.Speech";
+
+    let call_conn = Connection::session()?;
+    let signal_conn = Connection::session()?;
+    let proxy = zbus::blocking::Proxy::new(&call_conn, BUS, PATH, IFACE)?;
+    let sig_proxy = zbus::blocking::Proxy::new(&signal_conn, BUS, PATH, IFACE)?;
+
+    tx.send(SpeechEvent::Phase(SpeechPhase::CreatingSession))?;
+    let session_id: String = proxy.call(
+        "CreateSession",
+        &("org.aileron.Demo", use_case, speech_instructions(use_case)),
+    )?;
+
+    let result: anyhow::Result<()> = (|| {
+        tx.send(SpeechEvent::Phase(SpeechPhase::LiveRecording))?;
+        let mut offset = 0_u64;
+        while !stop.load(Ordering::Acquire) {
+            let len = match std::fs::metadata(&path) {
+                Ok(metadata) => metadata.len(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    std::thread::sleep(std::time::Duration::from_millis(LIVE_SPEECH_POLL_MS));
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let aligned_len = len - (len % 4);
+            if aligned_len.saturating_sub(offset) >= LIVE_SPEECH_MIN_CHUNK_BYTES {
+                let chunk = read_audio_range(&path, offset, aligned_len)?;
+                offset = aligned_len;
+                if !chunk.is_empty() {
+                    tx.send(SpeechEvent::Phase(SpeechPhase::LiveChunk))?;
+                    stream_speech_audio(
+                        &proxy,
+                        &sig_proxy,
+                        &session_id,
+                        &chunk,
+                        &tx,
+                        SpeechTranscriptMode::Append,
+                    )?;
+                    tx.send(SpeechEvent::Phase(SpeechPhase::LiveRecording))?;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(LIVE_SPEECH_POLL_MS));
+        }
+
+        tx.send(SpeechEvent::Phase(SpeechPhase::Finalizing))?;
+        let audio = std::fs::read(&path)?;
+        if audio.is_empty() {
+            anyhow::bail!("recording is empty");
+        }
+        tx.send(SpeechEvent::Transcript(String::new()))?;
+        stream_speech_audio(
+            &proxy,
+            &sig_proxy,
+            &session_id,
+            &audio,
+            &tx,
+            SpeechTranscriptMode::Replace,
+        )?;
+        Ok(())
+    })();
+
+    end_speech_session(&proxy, &session_id);
+    result?;
+    tx.send(SpeechEvent::Done)?;
+    Ok(())
+}
+
+fn stream_speech_audio(
+    proxy: &zbus::blocking::Proxy<'_>,
+    sig_proxy: &zbus::blocking::Proxy<'_>,
+    session_id: &str,
+    audio: &[u8],
+    tx: &std::sync::mpsc::Sender<SpeechEvent>,
+    mode: SpeechTranscriptMode,
+) -> anyhow::Result<String> {
+    let audio_b64 = base64_encode(audio);
+    let mut transcription_iter = sig_proxy.receive_signal("TranscriptionReceived")?;
+    let _: () = proxy.call("StreamTranscribe", &(session_id, &audio_b64, ""))?;
+
+    let mut transcript = String::new();
+    for msg in &mut transcription_iter {
+        let (sig_session, text, done): (String, String, bool) = msg.body().deserialize()?;
+        if sig_session != session_id {
+            continue;
+        }
+        transcript.push_str(&text);
+        match mode {
+            SpeechTranscriptMode::Replace => {
+                tx.send(SpeechEvent::Transcript(transcript.clone()))?;
+            }
+            SpeechTranscriptMode::Append => {
+                if !text.is_empty() {
+                    tx.send(SpeechEvent::AppendTranscript(text))?;
+                }
+            }
+        }
+        if done {
+            break;
+        }
+    }
+    Ok(transcript)
+}
+
+fn read_audio_range(path: &Path, start: u64, end: u64) -> anyhow::Result<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let len = end.saturating_sub(start);
+    let mut file = std::fs::File::open(path)?;
+    file.seek(SeekFrom::Start(start))?;
+    let mut bytes = vec![0_u8; len as usize];
+    file.read_exact(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn end_speech_session(proxy: &zbus::blocking::Proxy<'_>, session_id: &str) {
+    let _: zbus::Result<()> = proxy.call("EndSession", &(session_id,));
 }
 
 fn describe_image(image_b64: &str, tx: std::sync::mpsc::Sender<VisionEvent>) -> anyhow::Result<()> {

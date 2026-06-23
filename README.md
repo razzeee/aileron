@@ -322,7 +322,7 @@ Paste or fetch an article URL, then click **Summarize**. Tokens stream into the 
 
 Use-case tokens are the daemon's routing and policy keys. A token maps to one assigned profile, permissions are granted per app and token, and warm containers are pooled per profile. Assigning the same profile to multiple declared tokens is valid.
 
-Use-cases describe the task intent and modality; methods describe the operation shape. Full-response methods (`Respond`, `StreamResponse`, `RespondGuided`, `StreamGuidedResponse`, and `SubmitToolResultsGuided`) are for language generation use-cases other than `language.embed` and `language.complete`. `PredictNext` is for `language.complete`. `Embed` is for `language.embed`. `Transcribe` serves both `speech.transcribe` and `speech.translate` (the daemon runs the whisper transcribe or translate-to-English task based on the session use-case). `Describe` is for `vision.describe`, `Ocr` is for `vision.ocr`, and `Segment` is for `vision.segment`. There is intentionally no separate `language.guided` token: guided generation is an output constraint for a real language task use-case, not a task intent of its own. Use `language.analyze` when one guided response combines multiple analytical intents, such as summary, extraction, and classification fields.
+Use-cases describe the task intent and modality; methods describe the operation shape. Full-response methods (`Respond`, `StreamResponse`, `RespondGuided`, `StreamGuidedResponse`, and `SubmitToolResultsGuided`) are for language generation use-cases other than `language.embed` and `language.complete`. `PredictNext` is for `language.complete`. `Embed` is for `language.embed`. `Transcribe` serves both `speech.transcribe` and `speech.translate` (the daemon runs the whisper transcribe or translate-to-English task based on the session use-case), while `StreamTranscribe` returns the same speech result as segment tokens. `Describe` is for `vision.describe`, `Ocr` is for `vision.ocr`, and `Segment` is for `vision.segment`. There is intentionally no separate `language.guided` token: guided generation is an output constraint for a real language task use-case, not a task intent of its own. Use `language.analyze` when one guided response combines multiple analytical intents, such as summary, extraction, and classification fields.
 
 | Token | Task | Backend |
 |---|---|---|
@@ -368,13 +368,14 @@ method StreamGuidedResponse(session_id: string, prompt: string, fields: []Guided
 method SubmitToolResultsGuided(session_id: string, prompt: string, results: []ToolResult, fields: []GuidedField, tools: []ToolDefinition, options: GenerationOptions) -> (content: string, tool_calls: []ToolCall)
 method Embed(session_id: string, text: string) -> (embedding: []float)
 method Transcribe(session_id: string, audio: string, language_hint: string) -> (text: string)
+method StreamTranscribe(session_id: string, audio: string, language_hint: string) -> (token: string)
 method Describe(session_id: string, image: string) -> (text: string)
 method Ocr(session_id: string, image: string) -> (text: string)
 method Segment(session_id: string, image: string) -> (segments: []VisionSegment)
 method EndSession(session_id: string) -> ()
 ```
 
-`instructions` are stored on the session and forwarded to text containers as the container `system` prompt. `PredictNext` is for inline typing assistance on `language.complete` sessions: the daemon forwards the raw prefix to the runtime and returns up to three short completions, typically word suffixes or next words. `audio` is raw 16 kHz mono f32le PCM bytes encoded as base64; `Transcribe` returns a verbatim transcript for `speech.transcribe` sessions and an English translation for `speech.translate` sessions. `image` is PNG or JPEG bytes encoded as base64. `Embed` returns the embedding vector for `text`. `VisionSegment` coordinates are normalized `0.0..1.0` rectangles relative to image dimensions.
+`instructions` are stored on the session and forwarded to text containers as the container `system` prompt. `PredictNext` is for inline typing assistance on `language.complete` sessions: the daemon forwards the raw prefix to the runtime and returns up to three short completions, typically word suffixes or next words. `audio` is raw 16 kHz mono f32le PCM bytes encoded as base64; `Transcribe` returns a full verbatim transcript for `speech.transcribe` sessions and a full English translation for `speech.translate` sessions, while `StreamTranscribe` streams segment tokens for progressive speech UI. `image` is PNG or JPEG bytes encoded as base64. `Embed` returns the embedding vector for `text`. `VisionSegment` coordinates are normalized `0.0..1.0` rectangles relative to image dimensions.
 
 `GenerationOptions.maximum_response_tokens` must be greater than zero and fit in `u32`. `temperature` must be finite and non-negative. `sampling_mode` must be non-empty. `source_language_hint` and `target_language_hint` are optional strings for `language.translate`; pass empty strings when unspecified. Today the daemon validates sampling fields, forwards `maximum_response_tokens` to containers as `max_tokens`, and folds translation hints into the session instructions for `language.translate`.
 
@@ -440,7 +441,7 @@ The portal does not talk to containers directly. It translates D-Bus calls into 
 | Interface | Use-case prefix | Methods |
 |---|---|---|
 | `org.freedesktop.impl.portal.Language` | `language.*` | `GetUseCaseAvailability`, `CreateSession`, `Prewarm`, `Respond`, `StreamResponse`, `RespondGuided`, `StreamGuidedResponse`, `SubmitToolResultsGuided`, `Embed`, `EndSession` |
-| `org.freedesktop.impl.portal.Speech` | `speech.*` | `GetUseCaseAvailability`, `CreateSession`, `Prewarm`, `Transcribe`, `EndSession` |
+| `org.freedesktop.impl.portal.Speech` | `speech.*` | `GetUseCaseAvailability`, `CreateSession`, `Prewarm`, `Transcribe`, `StreamTranscribe`, `EndSession` |
 | `org.freedesktop.impl.portal.Vision` | `vision.*` | `GetUseCaseAvailability`, `CreateSession`, `Prewarm`, `Describe`, `Ocr`, `Segment`, `EndSession` |
 
 `GetUseCaseAvailability`, `CreateSession`, and `EndSession` have the same signatures on each interface. Each interface validates that the requested use-case token matches its prefix.
@@ -473,6 +474,7 @@ Full-response methods reject `language.embed` and `language.complete`; use `Embe
 | Method | Parameters | Returns | Notes |
 |---|---|---|---|
 | `Transcribe` | `session_id: s, audio_b64: s, language_hint: s` | `text: s` | 16 kHz mono f32le PCM, base64; empty hint means auto-detect/no hint; transcribes or translates per use-case |
+| `StreamTranscribe` | `session_id: s, audio_b64: s, language_hint: s` | `()` | Same input and use-cases as `Transcribe`; emits `TranscriptionReceived` signals; final segment has `done=true` |
 
 ### Vision Methods
 
@@ -491,6 +493,7 @@ These are D-Bus signatures: parentheses define a struct, and `a(...)` means an a
 | `ModelLoading` | `message: s` | The portal is about to start a cold backing container; available on each interface |
 | `TokenReceived` | `session_id: s, token: s, done: b` | Each token during `StreamResponse` on `Language` |
 | `GuidedSnapshotReceived` | `session_id: s, snapshot_json: s, done: b` | Each validated JSON snapshot during `StreamGuidedResponse` on `Language` |
+| `TranscriptionReceived` | `session_id: s, text: s, done: b` | Each segment during `StreamTranscribe` on `Speech` |
 
 D-Bus callers see underlying Varlink failures as `org.freedesktop.DBus.Error.Failed` with the Varlink error text.
 

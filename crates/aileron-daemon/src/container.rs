@@ -530,18 +530,23 @@ impl Container {
         language_hint: Option<&str>,
         task: &str,
     ) -> Result<String> {
+        let mut result = String::new();
+        self.stream_transcribe(audio, language_hint, task, |token| result.push_str(&token))?;
+        Ok(result)
+    }
+
+    /// Send a transcribe request and call `on_token` for each returned segment.
+    pub fn stream_transcribe(
+        &mut self,
+        audio: Vec<u8>,
+        language_hint: Option<&str>,
+        task: &str,
+        on_token: impl FnMut(String),
+    ) -> Result<()> {
         let id = Uuid::new_v4().to_string();
-        let mut req = ContainerRequest::new(id.clone(), "transcribe");
-        req.audio = Some(base64_encode(&audio));
-        req.task = Some(task.to_string());
-        req.language_hint = language_hint
-            .filter(|hint| !hint.is_empty())
-            .map(str::to_string);
-        let line = serde_json::to_string(&req)? + "\n";
-        self.stdin.write_all(line.as_bytes())?;
-        self.stdin.flush()?;
+        write_transcribe_request(&mut self.stdin, &id, &audio, language_hint, task)?;
         self.last_used = std::time::Instant::now();
-        self.read_text_response(&id)
+        read_text_stream_response(&mut self.stdout, &id, on_token)
     }
 
     /// Send a vision describe request and return the full description.
@@ -631,29 +636,59 @@ impl Container {
 
     fn read_text_response(&mut self, id: &str) -> Result<String> {
         let mut result = String::new();
-        loop {
-            let mut buf = String::new();
-            let n = self.stdout.read_line(&mut buf)?;
-            if n == 0 {
-                bail!("container stdout closed unexpectedly");
-            }
-            let resp: ContainerResponse = serde_json::from_str(buf.trim())?;
-            if resp.id != id {
-                continue;
-            }
-            if let Some(error) = resp.error {
-                let reason = resp.reason.unwrap_or_else(|| error.clone());
-                bail!("container returned error {error}: {reason}");
-            }
-            if let Some(token) = resp.token {
-                result.push_str(&token);
-            }
-            if resp.done.unwrap_or(false) {
-                break;
-            }
-        }
+        read_text_stream_response(&mut self.stdout, id, |token| result.push_str(&token))?;
         Ok(result)
     }
+}
+
+fn write_transcribe_request(
+    writer: &mut impl Write,
+    id: &str,
+    audio: &[u8],
+    language_hint: Option<&str>,
+    task: &str,
+) -> Result<()> {
+    let mut req = ContainerRequest::new(id.to_string(), "transcribe");
+    req.audio = Some(base64_encode(audio));
+    req.task = Some(task.to_string());
+    req.language_hint = language_hint
+        .filter(|hint| !hint.is_empty())
+        .map(str::to_string);
+    let line = serde_json::to_string(&req)? + "\n";
+    writer.write_all(line.as_bytes())?;
+    writer.flush()?;
+    Ok(())
+}
+
+fn read_text_stream_response(
+    reader: &mut impl BufRead,
+    id: &str,
+    mut on_token: impl FnMut(String),
+) -> Result<()> {
+    loop {
+        let mut buf = String::new();
+        let n = reader.read_line(&mut buf)?;
+        if n == 0 {
+            bail!("container stdout closed unexpectedly");
+        }
+        let resp: ContainerResponse = serde_json::from_str(buf.trim())?;
+        if resp.id != id {
+            continue;
+        }
+        if let Some(error) = resp.error {
+            let reason = resp.reason.unwrap_or_else(|| error.clone());
+            bail!("container returned error {error}: {reason}");
+        }
+        if let Some(token) = resp.token
+            && !token.is_empty()
+        {
+            on_token(token);
+        }
+        if resp.done.unwrap_or(false) {
+            break;
+        }
+    }
+    Ok(())
 }
 
 fn structured_response_result(resp: ContainerResponse, schema: &Value) -> Result<Option<String>> {
@@ -2989,6 +3024,59 @@ mod tests {
     }
 
     #[test]
+    fn text_stream_response_forwards_multiple_transcription_tokens() {
+        let input = concat!(
+            r#"{"id":"other","token":"skip","done":true}"#,
+            "\n",
+            r#"{"id":"request-1","token":"Hello "}"#,
+            "\n",
+            r#"{"id":"request-1","token":"world","done":true}"#,
+            "\n"
+        );
+        let mut reader = BufReader::new(std::io::Cursor::new(input.as_bytes()));
+        let mut tokens = Vec::new();
+
+        read_text_stream_response(&mut reader, "request-1", |token| tokens.push(token))
+            .expect("streamed tokens should be read");
+
+        assert_eq!(tokens, vec!["Hello ".to_string(), "world".to_string()]);
+    }
+
+    #[test]
+    fn text_stream_response_preserves_transcribe_aggregate_result() {
+        let input = concat!(
+            r#"{"id":"request-1","token":"Segment one. "}"#,
+            "\n",
+            r#"{"id":"request-1","token":"Segment two.","done":true}"#,
+            "\n"
+        );
+        let mut reader = BufReader::new(std::io::Cursor::new(input.as_bytes()));
+        let mut transcript = String::new();
+
+        read_text_stream_response(&mut reader, "request-1", |token| {
+            transcript.push_str(&token)
+        })
+        .expect("streamed tokens should aggregate");
+
+        assert_eq!(transcript, "Segment one. Segment two.");
+    }
+
+    #[test]
+    fn transcribe_request_matches_existing_container_shape() {
+        let mut output = Vec::new();
+
+        write_transcribe_request(&mut output, "request-1", b"pcm", Some("en"), "translate")
+            .expect("request should serialize");
+        let value: Value = serde_json::from_slice(&output).expect("request should be JSON");
+
+        assert_eq!(value["id"], "request-1");
+        assert_eq!(value["type"], "transcribe");
+        assert_eq!(value["audio"], "cGNt");
+        assert_eq!(value["task"], "translate");
+        assert_eq!(value["language_hint"], "en");
+    }
+
+    #[test]
     fn schema_validation_rejects_missing_and_additional_object_fields() {
         let schema = serde_json::json!({
             "type": "object",
@@ -3151,6 +3239,14 @@ mod tests {
             .transcribe(Vec::new(), None, "transcribe")
             .expect("transcribe through container wrapper");
         assert!(!transcript.is_empty());
+
+        let mut streamed_transcript = String::new();
+        container
+            .stream_transcribe(Vec::new(), None, "transcribe", |token| {
+                streamed_transcript.push_str(&token)
+            })
+            .expect("stream transcribe through container wrapper");
+        assert!(!streamed_transcript.is_empty());
 
         let translation = container
             .transcribe(Vec::new(), None, "translate")

@@ -244,10 +244,11 @@ Request:
 
 Audio is raw PCM bytes encoded as base64. The current portal-facing API documents 16 kHz mono `f32le` input. `language_hint` is optional and omitted when the caller leaves the hint unspecified. `task` is `transcribe` for a verbatim transcript in the source language (the default when omitted) or `translate` to translate the speech to English.
 
-Response uses the same token stream shape as text generation:
+Response uses the same token stream shape as text generation. ASR runtimes may emit one `token` per recognized segment; the daemon can either aggregate those tokens for `Transcribe` or forward them progressively through `StreamTranscribe` without changing this container protocol.
 
 ```json
-{"id":"request-id","token":"Hello world","done":true}
+{"id":"request-id","token":"Hello "}
+{"id":"request-id","token":"world","done":true}
 ```
 
 ## Image Description

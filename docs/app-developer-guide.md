@@ -96,7 +96,9 @@ Use `language.embed` with `Embed` to turn text into a fixed-length vector for se
 
 ## Speech And Vision
 
-Use `speech.transcribe` for verbatim speech-to-text and `speech.translate` to translate spoken audio into English text. Both use the `Transcribe` method; the daemon selects the whisper transcribe or translate task from the session use case. Audio is passed as base64-encoded raw PCM bytes through the portal-facing API. `Transcribe` also accepts an optional `language_hint` string; pass an empty string to let the runtime auto-detect or use its default behavior.
+Use `speech.transcribe` for verbatim speech-to-text and `speech.translate` to translate spoken audio into English text. Both use `Transcribe` for a single final result or `StreamTranscribe` for progressive segment updates; the daemon selects the whisper transcribe or translate task from the session use case. Audio is passed as base64-encoded raw PCM bytes through the portal-facing API. Both speech methods accept an optional `language_hint` string; pass an empty string to let the runtime auto-detect or use its default behavior.
+
+Live microphone chunking is app behavior in the current API. Apps that want interim text can keep recording locally, periodically send sufficiently large aligned PCM chunks through `StreamTranscribe`, and run one final `StreamTranscribe` pass over the complete recording when capture stops.
 
 Use `vision.describe` for image description and `vision.ocr` to extract text from an image with the `Ocr` method. Use `vision.segment` to identify visible objects with normalized rectangular boxes. Images are passed as base64-encoded PNG or JPEG bytes.
 

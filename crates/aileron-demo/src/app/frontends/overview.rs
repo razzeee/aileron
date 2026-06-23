@@ -58,9 +58,9 @@ pub(crate) fn build_page(stack: &ViewStack) -> gtk4::Widget {
     ));
     cards.append(&lab_card(
         "Speech Lab",
-        "Record microphone audio and transcribe it through the Speech portal path.",
-        "Transcribe",
-        "Try: record 5-10 seconds of speech, then transcribe locally.",
+        "Record microphone audio and stream transcription or translation through the Speech portal path.",
+        "Transcribe, StreamTranscribe",
+        "Try: start Live Transcribe, speak for 5-10 seconds, then stop for the final pass.",
         "Open Speech Lab",
         "speech",
         stack,
