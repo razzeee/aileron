@@ -51,25 +51,48 @@ COPY crates ./crates
 
 RUN set -eux; \
     case "$RUNTIME_VARIANT" in \
-    cpu) features="vision whisper" ;; \
-    cuda) features="vision-cuda whisper-cuda" ;; \
-    rocm) features="vision-rocm whisper-rocm" ;; \
-    vulkan) features="vision-vulkan whisper-vulkan" ;; \
+    cpu) \
+      features_llm="llama" \
+      features_vision="vision" \
+      features_asr="whisper" \
+      ;;\
+    cuda) \
+      features_llm="llama-cuda" \
+      features_vision="vision-cuda" \
+      features_asr="whisper-cuda" \
+      ;;\
+    rocm) \
+      features_llm="llama-rocm" \
+      features_vision="vision-rocm" \
+      features_asr="whisper-rocm" \
+      ;;\
+    vulkan) \
+      features_llm="llama-vulkan" \
+      features_vision="vision-vulkan" \
+      features_asr="whisper-vulkan" \
+      ;;\
     *) echo "unsupported RUNTIME_VARIANT=$RUNTIME_VARIANT" >&2; exit 1 ;; \
     esac; \
-    if [ -n "$RUNTIME_FEATURES" ]; then features="$RUNTIME_FEATURES"; fi; \
+    if [ -n "$RUNTIME_FEATURES" ]; then \
+      features_llm="$RUNTIME_FEATURES"; \
+      features_vision="$RUNTIME_FEATURES"; \
+      features_asr="$RUNTIME_FEATURES"; \
+    fi; \
     mkdir -p /runtime-bins; \
-    if [ "$RUNTIME_VARIANT" = "rocm" ]; then \
-    cargo build --locked --release -p aileron-runtime --lib --no-default-features --features "$features"; \
-    fi; \
-    for bin in aileron-runtime-llm-llama-cpp aileron-runtime-vision-llama-cpp aileron-runtime-asr-whisper-cpp; do \
-    if [ "$RUNTIME_VARIANT" = "rocm" ]; then \
-    cargo rustc --locked --release -p aileron-runtime --bin "$bin" --no-default-features --features "$features" -- -C link-arg=-no-pie; \
-    else \
-    cargo build --locked --release -p aileron-runtime --bin "$bin" --no-default-features --features "$features"; \
-    fi; \
-    cp "target/release/$bin" "/runtime-bins/$bin"; \
-    done
+    build_runtime_bin() { \
+      local bin="$1"; \
+      local features="$2"; \
+      if [ "$RUNTIME_VARIANT" = "rocm" ]; then \
+        cargo build --locked --release -p aileron-runtime --lib --no-default-features --features "$features"; \
+        cargo rustc --locked --release -p aileron-runtime --bin "$bin" --no-default-features --features "$features" -- -C link-arg=-no-pie; \
+      else \
+        cargo build --locked --release -p aileron-runtime --bin "$bin" --no-default-features --features "$features"; \
+      fi; \
+      cp "target/release/$bin" "/runtime-bins/$bin"; \
+    }; \
+    build_runtime_bin aileron-runtime-llm-llama-cpp "$features_llm"; \
+    build_runtime_bin aileron-runtime-vision-llama-cpp "$features_vision"; \
+    build_runtime_bin aileron-runtime-asr-whisper-cpp "$features_asr"
 
 FROM ${FINAL_IMAGE}
 
