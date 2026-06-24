@@ -1,6 +1,6 @@
 {
   "llmfit_model_id": "google/gemma-4-E4B-it",
-  "runtime_id": "vision-llama-cpp-gemma4",
+  "runtime_id": "llm-vision-whisper",
   "tier": "large",
   "use_cases": [
     "language.extract",

@@ -9,6 +9,8 @@ use serde::Deserialize;
 use crate::hardware::Variant;
 use crate::profiles::{RuntimeCandidate, RuntimeImage};
 
+const ML_RUNTIME_ID: &str = "llm-vision-whisper";
+
 #[derive(Debug, Clone, Default)]
 pub struct RuntimeManifestStore {
     runtimes: HashMap<String, RuntimeManifest>,
@@ -430,7 +432,7 @@ fn normalize_model_manifest(
     };
     let runtime_id = derive_runtime_id(&raw.runtime_id, &artifacts, &raw.use_cases, metadata)?;
     let use_cases = if raw.use_cases.is_empty() {
-        derive_use_cases(&runtime_id, metadata)?
+        derive_use_cases(&runtime_id, &artifacts, metadata)?
     } else {
         raw.use_cases
     };
@@ -522,37 +524,42 @@ fn derive_runtime_id(
         .all(|use_case| use_case.starts_with("speech."))
         && !use_cases.is_empty()
     {
-        return Ok("asr-whisper-cpp".to_string());
+        return Ok(ML_RUNTIME_ID.to_string());
     }
     if let Some(model) = metadata {
         match model.format {
-            ModelFormat::Gguf if model_capabilities(model).contains(&Capability::Vision) => {
-                bail!("runtime_id is required for vision GGUF models");
-            }
-            ModelFormat::Gguf => return Ok("llm-llama-cpp".to_string()),
+            ModelFormat::Gguf => return Ok(ML_RUNTIME_ID.to_string()),
             _ => bail!(
                 "runtime_id is required for {} model format",
                 model_format_label(model.format)
             ),
         }
     }
-    if artifacts.len() > 1 || artifacts.iter().any(|artifact| artifact.role == "mmproj") {
+    if artifacts.iter().any(|artifact| artifact.role == "mmproj") {
+        return Ok(ML_RUNTIME_ID.to_string());
+    }
+    if artifacts.len() > 1 {
         bail!("runtime_id is required for multi-artifact manifests");
     }
     if artifacts
         .iter()
         .any(|artifact| artifact_filename_extension(artifact).as_deref() == Some("gguf"))
     {
-        return Ok("llm-llama-cpp".to_string());
+        return Ok(ML_RUNTIME_ID.to_string());
     }
     bail!("runtime_id is required when it cannot be inferred")
 }
 
 fn derive_use_cases(
     runtime_id: &str,
+    artifacts: &[ManifestArtifact],
     metadata: Option<&llmfit_core::LlmModel>,
 ) -> Result<Vec<String>> {
-    if runtime_id == "asr-whisper-cpp" {
+    if runtime_id == ML_RUNTIME_ID
+        && artifacts
+            .iter()
+            .any(|artifact| artifact_filename_extension(artifact).as_deref() == Some("bin"))
+    {
         return Ok(vec![
             "speech.transcribe".to_string(),
             "speech.translate".to_string(),
@@ -568,23 +575,19 @@ fn derive_use_cases(
             }
         };
         if use_case == UseCase::Multimodal
-            || runtime_id.starts_with("vision-")
+            || artifacts.iter().any(|artifact| artifact.role == "mmproj")
             || model_capabilities(model).contains(&Capability::Vision)
         {
             use_cases.extend(["vision.describe", "vision.ocr"]);
         }
         return Ok(dedup_use_cases(use_cases));
     }
-    if runtime_id.starts_with("vision-") {
+    if runtime_id == ML_RUNTIME_ID {
         let mut use_cases = default_language_use_cases();
-        use_cases.extend(["vision.describe", "vision.ocr"]);
+        if artifacts.iter().any(|artifact| artifact.role == "mmproj") {
+            use_cases.extend(["vision.describe", "vision.ocr"]);
+        }
         return Ok(dedup_use_cases(use_cases));
-    }
-    if runtime_id.starts_with("llm-") {
-        return Ok(default_language_use_cases()
-            .into_iter()
-            .map(str::to_string)
-            .collect());
     }
     bail!("use_cases are required when they cannot be inferred")
 }
@@ -810,22 +813,22 @@ mod tests {
     #[test]
     fn resolves_detected_variant_with_cpu_fallback() {
         let runtime = RuntimeManifest {
-            runtime_id: "llm-llama-cpp".to_string(),
+            runtime_id: ML_RUNTIME_ID.to_string(),
             images: HashMap::from([
                 ("cpu".to_string(), "example/llm:cpu".to_string()),
                 ("cuda".to_string(), "example/llm:cuda".to_string()),
             ]),
         };
         let manifests = RuntimeManifestStore {
-            runtimes: HashMap::from([("llm-llama-cpp".to_string(), runtime)]),
+            runtimes: HashMap::from([(ML_RUNTIME_ID.to_string(), runtime)]),
         };
 
         assert_eq!(
-            manifests.resolve("llm-llama-cpp", Variant::Cuda),
+            manifests.resolve(ML_RUNTIME_ID, Variant::Cuda),
             Some("example/llm:cuda")
         );
         assert_eq!(
-            manifests.resolve("llm-llama-cpp", Variant::Vulkan),
+            manifests.resolve(ML_RUNTIME_ID, Variant::Vulkan),
             Some("example/llm:cpu")
         );
     }
@@ -833,22 +836,22 @@ mod tests {
     #[test]
     fn resolves_accelerator_variant_with_vulkan_fallback() {
         let runtime = RuntimeManifest {
-            runtime_id: "asr-whisper-cpp".to_string(),
+            runtime_id: ML_RUNTIME_ID.to_string(),
             images: HashMap::from([
                 ("cpu".to_string(), "example/asr:cpu".to_string()),
                 ("vulkan".to_string(), "example/asr:vulkan".to_string()),
             ]),
         };
         let manifests = RuntimeManifestStore {
-            runtimes: HashMap::from([("asr-whisper-cpp".to_string(), runtime)]),
+            runtimes: HashMap::from([(ML_RUNTIME_ID.to_string(), runtime)]),
         };
 
         assert_eq!(
-            manifests.resolve("asr-whisper-cpp", Variant::Rocm),
+            manifests.resolve(ML_RUNTIME_ID, Variant::Rocm),
             Some("example/asr:vulkan")
         );
         assert_eq!(
-            manifests.resolve("asr-whisper-cpp", Variant::Cuda),
+            manifests.resolve(ML_RUNTIME_ID, Variant::Cuda),
             Some("example/asr:vulkan")
         );
     }
@@ -856,19 +859,19 @@ mod tests {
     #[test]
     fn resolves_accelerator_variant_with_cpu_fallback() {
         let runtime = RuntimeManifest {
-            runtime_id: "asr-whisper-cpp".to_string(),
+            runtime_id: ML_RUNTIME_ID.to_string(),
             images: HashMap::from([("cpu".to_string(), "example/asr:cpu".to_string())]),
         };
         let manifests = RuntimeManifestStore {
-            runtimes: HashMap::from([("asr-whisper-cpp".to_string(), runtime)]),
+            runtimes: HashMap::from([(ML_RUNTIME_ID.to_string(), runtime)]),
         };
 
         assert_eq!(
-            manifests.resolve("asr-whisper-cpp", Variant::Rocm),
+            manifests.resolve(ML_RUNTIME_ID, Variant::Rocm),
             Some("example/asr:cpu")
         );
         assert_eq!(
-            manifests.resolve_candidates("asr-whisper-cpp", Variant::Rocm),
+            manifests.resolve_candidates(ML_RUNTIME_ID, Variant::Rocm),
             vec!["example/asr:cpu"]
         );
     }
@@ -1084,14 +1087,14 @@ mod tests {
     #[test]
     fn does_not_fallback_from_cpu() {
         let runtime = RuntimeManifest {
-            runtime_id: "llm-llama-cpp".to_string(),
+            runtime_id: ML_RUNTIME_ID.to_string(),
             images: HashMap::from([("cuda".to_string(), "example/llm:cuda".to_string())]),
         };
         let manifests = RuntimeManifestStore {
-            runtimes: HashMap::from([("llm-llama-cpp".to_string(), runtime)]),
+            runtimes: HashMap::from([(ML_RUNTIME_ID.to_string(), runtime)]),
         };
 
-        assert_eq!(manifests.resolve("llm-llama-cpp", Variant::Cpu), None);
+        assert_eq!(manifests.resolve(ML_RUNTIME_ID, Variant::Cpu), None);
     }
 
     #[test]
@@ -1128,7 +1131,7 @@ mod tests {
 
         assert_eq!(manifest.profile_id, "meta-llama_llama-3.2-3b-instruct");
         assert_eq!(manifest.model_id, manifest.profile_id);
-        assert_eq!(manifest.runtime_id, "llm-llama-cpp");
+        assert_eq!(manifest.runtime_id, ML_RUNTIME_ID);
         assert_eq!(manifest.artifacts.len(), 1);
         assert_eq!(manifest.artifacts[0].role, "model");
         assert_eq!(manifest.artifacts[0].filename, "model.gguf");
@@ -1173,7 +1176,7 @@ mod tests {
 
         assert_eq!(manifest.profile_id, "stories260k_270cba1bd510");
         assert_eq!(manifest.model_id, manifest.profile_id);
-        assert_eq!(manifest.runtime_id, "llm-llama-cpp");
+        assert_eq!(manifest.runtime_id, ML_RUNTIME_ID);
         assert_eq!(manifest.artifacts[0].filename, "model.gguf");
     }
 
@@ -1181,7 +1184,7 @@ mod tests {
     fn compact_multi_artifact_manifest_requires_roles() {
         let data = r#"
         {
-            "runtime_id": "vision-llama-cpp-gemma4",
+            "runtime_id": "llm-vision-whisper",
             "use_cases": ["vision.describe"],
             "artifacts": [
                 {
@@ -1202,7 +1205,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_multi_artifact_manifest_requires_runtime_id() {
+    fn compact_multi_artifact_manifest_infers_runtime_from_mmproj() {
         let data = r#"
         {
             "use_cases": ["vision.describe"],
@@ -1221,9 +1224,36 @@ mod tests {
         }
         "#;
 
-        let err = parse_model_manifest_json(data).expect_err("runtime_id should be required");
+        let manifest = parse_model_manifest_json(data).expect("mmproj should select ML runtime");
 
-        assert!(err.to_string().contains("multi-artifact"));
+        assert_eq!(manifest.runtime_id, ML_RUNTIME_ID);
+        assert_eq!(manifest.artifacts[0].filename, "model.gguf");
+        assert_eq!(manifest.artifacts[1].filename, "mmproj.gguf");
+    }
+
+    #[test]
+    fn derives_whisper_use_cases_from_bin_artifact() {
+        let data = r#"
+        {
+            "runtime_id": "llm-vision-whisper",
+            "artifact": {
+                "url": "https://example.invalid/ggml-small.bin",
+                "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }
+        }
+        "#;
+
+        let manifest = parse_model_manifest_json(data).expect("whisper manifest should parse");
+
+        assert_eq!(manifest.runtime_id, ML_RUNTIME_ID);
+        assert_eq!(manifest.artifacts[0].filename, "model.bin");
+        assert_eq!(
+            manifest.use_cases,
+            vec![
+                "speech.transcribe".to_string(),
+                "speech.translate".to_string()
+            ]
+        );
     }
 
     #[test]
@@ -1232,7 +1262,7 @@ mod tests {
         {
             "profile_id": "vision-profile",
             "model_id": "vision-model",
-            "runtime_id": "vision-llama-cpp",
+            "runtime_id": "llm-vision-whisper",
             "runtime_options": { "VISION_HANDLER": "gemma4" },
             "use_cases": ["vision.describe"],
             "artifacts": []
@@ -1255,7 +1285,7 @@ mod tests {
         {
             "profile_id": "vision-profile",
             "model_id": "vision-model",
-            "runtime_id": "vision-llama-cpp",
+            "runtime_id": "llm-vision-whisper",
             "runtime_options": { "vision_handler": "gemma4" },
             "use_cases": ["vision.describe"],
             "artifacts": []
@@ -1377,8 +1407,8 @@ mod tests {
             count += 1;
         }
         assert!(
-            count >= 3,
-            "expected at least 3 profile library runtime manifests"
+            count >= 1,
+            "expected at least 1 profile library runtime manifest"
         );
     }
 

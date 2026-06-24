@@ -1,0 +1,21 @@
+{
+  "runtime_id": "llm-vision-whisper",
+  "capabilities": [
+    "generate",
+    "predict_next",
+    "generate_structured",
+    "generate_structured_stream",
+    "embed",
+    "transcribe",
+    "translate",
+    "describe",
+    "ocr",
+    "segment"
+  ],
+  "variants": ["cpu", "cuda", "rocm", "vulkan"],
+  "artifact_layout": {
+    "model": "/model/model.gguf",
+    "whisper_model": "/model/model.bin",
+    "mmproj": "/model/mmproj.gguf"
+  }
+}

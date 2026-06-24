@@ -1,0 +1,9 @@
+{
+  "runtime_id": "llm-vision-whisper",
+  "images": {
+    "cpu": "ghcr.io/razzeee/aileron-runtime-llm-vision-whisper:cpu",
+    "cuda": "ghcr.io/razzeee/aileron-runtime-llm-vision-whisper:cuda",
+    "rocm": "ghcr.io/razzeee/aileron-runtime-llm-vision-whisper:rocm",
+    "vulkan": "ghcr.io/razzeee/aileron-runtime-llm-vision-whisper:vulkan"
+  }
+}

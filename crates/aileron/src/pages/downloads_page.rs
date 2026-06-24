@@ -561,23 +561,23 @@ mod tests {
     #[test]
     fn runtime_name_is_human_readable() {
         assert_eq!(
-            runtime_name("ghcr.io/razzeee/aileron-runtime-vision-llama-cpp-gemma4:rocm"),
-            "vision llama cpp gemma4 runtime (rocm)"
+            runtime_name("ghcr.io/razzeee/aileron-runtime-llm-vision-whisper:rocm"),
+            "llm vision whisper runtime (rocm)"
         );
     }
 
     #[test]
     fn compact_image_ref_keeps_registry_and_image() {
         assert_eq!(
-            compact_image_ref("ghcr.io/razzeee/aileron-runtime-vision-llama-cpp-gemma4:rocm"),
-            "ghcr.io/…/aileron-runtime-vision-llama-cpp-gemma4:rocm"
+            compact_image_ref("ghcr.io/razzeee/aileron-runtime-llm-vision-whisper:rocm"),
+            "ghcr.io/…/aileron-runtime-llm-vision-whisper:rocm"
         );
     }
 
     #[test]
     fn runtime_setup_text_hides_unknown_size_and_speed() {
         let install = InstallStatus {
-            profile_id: "runtime:ghcr.io/razzeee/aileron-runtime-vision-llama-cpp-gemma4:rocm"
+            profile_id: "runtime:ghcr.io/razzeee/aileron-runtime-llm-vision-whisper:rocm"
                 .to_string(),
             bytes_pulled: 0,
             total_bytes: 0,
@@ -590,11 +590,8 @@ mod tests {
         let title = runtime_setup_title(&install);
         let detail = runtime_detail_line(&install);
 
-        assert_eq!(title, "Pulling vision llama cpp gemma4 runtime (rocm)");
-        assert_eq!(
-            detail,
-            "ghcr.io/…/aileron-runtime-vision-llama-cpp-gemma4:rocm"
-        );
+        assert_eq!(title, "Pulling llm vision whisper runtime (rocm)");
+        assert_eq!(detail, "ghcr.io/…/aileron-runtime-llm-vision-whisper:rocm");
         assert!(!title.contains("size unknown"));
         assert!(!title.contains("speed calculating"));
         assert!(!detail.contains("size unknown"));
@@ -604,7 +601,7 @@ mod tests {
     #[test]
     fn profile_subtitle_hides_model_progress_during_runtime_setup() {
         let runtime_install = InstallStatus {
-            profile_id: "runtime:ghcr.io/razzeee/aileron-runtime-asr-whisper-cpp:vulkan"
+            profile_id: "runtime:ghcr.io/razzeee/aileron-runtime-llm-vision-whisper:vulkan"
                 .to_string(),
             bytes_pulled: 0,
             total_bytes: 0,
@@ -623,7 +620,7 @@ mod tests {
             Some(&runtime_install),
         );
 
-        assert_eq!(subtitle, "Preparing asr whisper cpp runtime (vulkan)");
+        assert_eq!(subtitle, "Preparing llm vision whisper runtime (vulkan)");
         assert!(!subtitle.contains("0.0 / 0.6 GB"));
         assert!(!subtitle.contains("speed calculating"));
     }
@@ -631,7 +628,7 @@ mod tests {
     #[test]
     fn profile_subtitle_shows_runtime_percent() {
         let runtime_install = InstallStatus {
-            profile_id: "runtime:ghcr.io/razzeee/aileron-runtime-asr-whisper-cpp:vulkan"
+            profile_id: "runtime:ghcr.io/razzeee/aileron-runtime-llm-vision-whisper:vulkan"
                 .to_string(),
             bytes_pulled: 42,
             total_bytes: 100,
@@ -643,7 +640,7 @@ mod tests {
 
         assert_eq!(
             runtime_profile_subtitle(&runtime_install),
-            "Pulling asr whisper cpp runtime (vulkan) · 42%"
+            "Pulling llm vision whisper runtime (vulkan) · 42%"
         );
     }
 
@@ -651,7 +648,7 @@ mod tests {
     fn runtime_percent_is_clamped_to_display_range(tc: TestCase) {
         let bytes_pulled = tc.draw(gs::integers::<i64>().min_value(-200).max_value(200));
         let runtime_install = InstallStatus {
-            profile_id: "runtime:ghcr.io/razzeee/aileron-runtime-asr-whisper-cpp:vulkan"
+            profile_id: "runtime:ghcr.io/razzeee/aileron-runtime-llm-vision-whisper:vulkan"
                 .to_string(),
             bytes_pulled,
             total_bytes: 100,
@@ -672,19 +669,18 @@ mod tests {
     fn derives_runtime_id_from_runtime_download_ref() {
         assert_eq!(
             runtime_download_runtime_id(
-                "runtime:ghcr.io/razzeee/aileron-runtime-vision-llama-cpp-gemma4:rocm"
+                "runtime:ghcr.io/razzeee/aileron-runtime-llm-vision-whisper:rocm"
             )
             .as_deref(),
-            Some("vision-llama-cpp-gemma4")
+            Some("llm-vision-whisper")
         );
     }
 
     #[hegel::test]
     fn runtime_download_runtime_id_strips_runtime_prefix_and_tag(tc: TestCase) {
         let runtime_id = tc.draw(gs::sampled_from(vec![
-            "llm-llama-cpp".to_string(),
-            "asr-whisper-cpp".to_string(),
-            "vision-llama-cpp-gemma4".to_string(),
+            "llm-vision-whisper".to_string(),
+            "stub".to_string(),
         ]));
         let variant = tc.draw(gs::sampled_from(vec![
             "cpu".to_string(),

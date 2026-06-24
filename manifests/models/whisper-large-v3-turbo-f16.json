@@ -1,6 +1,6 @@
 {
   "llmfit_model_id": "openai/whisper-large-v3-turbo",
-  "runtime_id": "asr-whisper-cpp",
+  "runtime_id": "llm-vision-whisper",
   "tier": "large",
   "min_ram_gb": 3.0,
   "artifact": {
