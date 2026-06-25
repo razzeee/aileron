@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use aileron_varlink::aileron_Models::InstallStatus;
+use gtk4::pango;
 use gtk4::prelude::*;
 use gtk4::{Box, Button, Label, ListBox, Orientation, ProgressBar, ScrolledWindow, Spinner};
 use libadwaita::prelude::*;
@@ -191,9 +192,10 @@ fn profile_download_row(
 
     let details = Box::new(Orientation::Vertical, 6);
     details.set_hexpand(true);
+    details.set_halign(gtk4::Align::Fill);
 
     let title = Label::new(Some(&download_title(&install.profile_id)));
-    title.set_xalign(0.0);
+    configure_download_label(&title, 48);
     title.add_css_class("heading");
 
     let subtitle = Label::new(Some(&download_subtitle(
@@ -205,7 +207,7 @@ fn profile_download_row(
         install.cancel_requested,
         runtime_install,
     )));
-    subtitle.set_xalign(0.0);
+    configure_download_label(&subtitle, 64);
     subtitle.add_css_class("dim-label");
 
     details.append(&title);
@@ -214,6 +216,7 @@ fn profile_download_row(
         && runtime_install.total_bytes > 0
     {
         let progress = ProgressBar::new();
+        progress.set_hexpand(true);
         progress.set_fraction(
             (runtime_install.bytes_pulled as f64 / runtime_install.total_bytes as f64)
                 .clamp(0.0, 1.0),
@@ -221,6 +224,7 @@ fn profile_download_row(
         details.append(&progress);
     } else if install.total_bytes > 0 && !is_runtime_setup_status(&install.status) {
         let progress = ProgressBar::new();
+        progress.set_hexpand(true);
         progress.set_fraction(
             (install.bytes_pulled as f64 / install.total_bytes as f64).clamp(0.0, 1.0),
         );
@@ -275,23 +279,31 @@ fn runtime_setup_row(install: &InstallStatus, grouped: bool) -> Box {
 
     let details = Box::new(Orientation::Vertical, 5);
     details.set_hexpand(true);
+    details.set_halign(gtk4::Align::Fill);
 
     let title = Label::new(Some(&runtime_setup_title(install)));
-    title.set_xalign(0.0);
+    configure_download_label(&title, 48);
     if !grouped {
         title.add_css_class("heading");
     }
 
     let subtitle = Label::new(Some(&runtime_detail_line(install)));
-    subtitle.set_xalign(0.0);
+    configure_download_label(&subtitle, 64);
     subtitle.add_css_class("dim-label");
-    subtitle.set_wrap(true);
 
     details.append(&title);
     details.append(&subtitle);
 
     row.append(&details);
     row
+}
+
+fn configure_download_label(label: &Label, max_width_chars: i32) {
+    label.set_xalign(0.0);
+    label.set_hexpand(true);
+    label.set_halign(gtk4::Align::Fill);
+    label.set_ellipsize(pango::EllipsizeMode::End);
+    label.set_max_width_chars(max_width_chars);
 }
 
 fn download_title(id: &str) -> String {

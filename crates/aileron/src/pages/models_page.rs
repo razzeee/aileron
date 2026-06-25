@@ -4,6 +4,7 @@ use std::collections::HashSet;
 use std::rc::Rc;
 
 use aileron_varlink::aileron_Models::InstallStatus;
+use gtk4::pango;
 use gtk4::prelude::*;
 use gtk4::{Box, Button, CheckButton, Label, ListBox, Orientation, ProgressBar, ScrolledWindow};
 use libadwaita::prelude::*;
@@ -1451,8 +1452,9 @@ fn download_row(install: &InstallStatus, lists: &ModelLists, window: Option<gtk4
 
     let details = Box::new(Orientation::Vertical, 6);
     details.set_hexpand(true);
+    details.set_halign(gtk4::Align::Fill);
     let title = Label::new(Some(&install.profile_id));
-    title.set_xalign(0.0);
+    configure_download_label(&title, 48);
     title.add_css_class("heading");
     let subtitle = Label::new(Some(&download_subtitle(
         install.bytes_pulled,
@@ -1462,9 +1464,10 @@ fn download_row(install: &InstallStatus, lists: &ModelLists, window: Option<gtk4
         &install.status,
         install.cancel_requested,
     )));
-    subtitle.set_xalign(0.0);
+    configure_download_label(&subtitle, 64);
     subtitle.add_css_class("dim-label");
     let progress = ProgressBar::new();
+    progress.set_hexpand(true);
     if install.total_bytes > 0 {
         progress.set_fraction(
             (install.bytes_pulled as f64 / install.total_bytes as f64).clamp(0.0, 1.0),
@@ -1493,6 +1496,14 @@ fn download_row(install: &InstallStatus, lists: &ModelLists, window: Option<gtk4
     });
     row.append(&cancel);
     row
+}
+
+fn configure_download_label(label: &Label, max_width_chars: i32) {
+    label.set_xalign(0.0);
+    label.set_hexpand(true);
+    label.set_halign(gtk4::Align::Fill);
+    label.set_ellipsize(pango::EllipsizeMode::End);
+    label.set_max_width_chars(max_width_chars);
 }
 
 fn install_is_terminal(install: &InstallStatus) -> bool {
