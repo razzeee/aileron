@@ -1,0 +1,3 @@
+[submodule "xdg-desktop-portal"]
+	path = xdg-desktop-portal
+	url = https://github.com/razzeee/xdg-desktop-portal.git

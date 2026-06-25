@@ -11,7 +11,7 @@ use crate::state::SharedState;
 use aileron_varlink::aileron_Inference::{
     Call_CreateSession, Call_Describe, Call_Embed, Call_EndSession, Call_GetUseCaseAvailability,
     Call_Ocr, Call_PredictNext, Call_Prewarm, Call_Respond, Call_RespondGuided, Call_Segment,
-    Call_StreamGuidedResponse, Call_StreamResponse, Call_StreamTranscribe,
+    Call_StreamRespondGuided, Call_StreamResponse, Call_StreamTranscribe,
     Call_SubmitToolResultsGuided, Call_Transcribe, GenerationOptions, GuidedField,
     ModelAvailability, ToolCall, ToolDefinition, ToolResult, VarlinkCallError, VarlinkInterface,
     VisionSegment,
@@ -148,12 +148,7 @@ impl VarlinkInterface for InferenceHandler {
         })
     }
 
-    fn prewarm(
-        &self,
-        call: &mut dyn Call_Prewarm,
-        session_id: String,
-        _prompt_prefix: String,
-    ) -> varlink::Result<()> {
+    fn prewarm(&self, call: &mut dyn Call_Prewarm, session_id: String) -> varlink::Result<()> {
         self.rt.block_on(async {
             let mut guard = self.state.0.lock().await;
             let (profile_id, runtime_id, image_refs, artifact_path, runtime_options) =
@@ -344,7 +339,7 @@ impl VarlinkInterface for InferenceHandler {
         call: &mut dyn Call_Transcribe,
         session_id: String,
         audio: String,
-        language_hint: String,
+        source_language_hint: String,
     ) -> varlink::Result<()> {
         self.rt.block_on(async {
             let mut guard = self.state.0.lock().await;
@@ -400,7 +395,7 @@ impl VarlinkInterface for InferenceHandler {
                 Err(e) => return call.reply_generation_failed(e.to_string()),
             };
 
-            match container.transcribe(audio_bytes, Some(&language_hint), task) {
+            match container.transcribe(audio_bytes, Some(&source_language_hint), task) {
                 Ok(text) => call.reply(text),
                 Err(e) => call.reply_generation_failed(e.to_string()),
             }
@@ -412,10 +407,12 @@ impl VarlinkInterface for InferenceHandler {
         call: &mut dyn Call_StreamTranscribe,
         session_id: String,
         audio: String,
-        language_hint: String,
+        source_language_hint: String,
     ) -> varlink::Result<()> {
         self.rt.block_on(async {
-            match stream_transcription(&self.state, call, session_id, audio, language_hint).await {
+            match stream_transcription(&self.state, call, session_id, audio, source_language_hint)
+                .await
+            {
                 Ok(()) => Ok(()),
                 Err(SpeechError::SessionNotFound(id)) => call.reply_session_not_found(id),
                 Err(SpeechError::ModelUnavailable(reason)) => call.reply_model_unavailable(reason),
@@ -696,17 +693,26 @@ impl VarlinkInterface for InferenceHandler {
         })
     }
 
-    fn stream_guided_response(
+    fn stream_respond_guided(
         &self,
-        call: &mut dyn Call_StreamGuidedResponse,
+        call: &mut dyn Call_StreamRespondGuided,
         session_id: String,
         prompt: String,
         fields: Vec<GuidedField>,
+        tools: Vec<ToolDefinition>,
         options: GenerationOptions,
     ) -> varlink::Result<()> {
         self.rt.block_on(async {
-            match stream_guided_snapshots(&self.state, call, session_id, prompt, fields, options)
-                .await
+            match stream_guided_snapshots(
+                &self.state,
+                call,
+                session_id,
+                prompt,
+                fields,
+                tools,
+                options,
+            )
+            .await
             {
                 Ok(()) => Ok(()),
                 Err(GenerationError::SessionNotFound(id)) => call.reply_session_not_found(id),
@@ -854,7 +860,7 @@ async fn stream_transcription(
     call: &mut dyn Call_StreamTranscribe,
     session_id: String,
     audio: String,
-    language_hint: String,
+    source_language_hint: String,
 ) -> Result<(), SpeechError> {
     let mut guard = state.0.lock().await;
 
@@ -905,23 +911,24 @@ async fn stream_transcription(
     let mut pending_token: Option<String> = None;
     let mut reply_error: Option<varlink::Error> = None;
 
-    let result = container.stream_transcribe(audio_bytes, Some(&language_hint), task, |token| {
-        if !wants_more {
-            pending_token = Some(token);
-            return;
-        }
-
-        if reply_error.is_some() {
-            return;
-        }
-
-        if let Some(previous) = pending_token.replace(token) {
-            call.set_continues(true);
-            if let Err(e) = call.reply(previous) {
-                reply_error = Some(e);
+    let result =
+        container.stream_transcribe(audio_bytes, Some(&source_language_hint), task, |token| {
+            if !wants_more {
+                pending_token = Some(token);
+                return;
             }
-        }
-    });
+
+            if reply_error.is_some() {
+                return;
+            }
+
+            if let Some(previous) = pending_token.replace(token) {
+                call.set_continues(true);
+                if let Err(e) = call.reply(previous) {
+                    reply_error = Some(e);
+                }
+            }
+        });
 
     if let Some(e) = reply_error {
         return Err(SpeechError::Reply(e));
@@ -1208,10 +1215,11 @@ async fn predict_next_completions(
 
 async fn stream_guided_snapshots(
     state: &SharedState,
-    call: &mut dyn Call_StreamGuidedResponse,
+    call: &mut dyn Call_StreamRespondGuided,
     session_id: String,
     prompt: String,
     fields: Vec<GuidedField>,
+    tools: Vec<ToolDefinition>,
     options: GenerationOptions,
 ) -> Result<(), GenerationError> {
     let max_tokens = validate_options(&options).map_err(GenerationError::InvalidOptions)?;
@@ -1263,25 +1271,43 @@ async fn stream_guided_snapshots(
 
     let wants_more = call.wants_more();
     let mut pending_snapshot: Option<String> = None;
+    let mut pending_tool_calls: Option<Vec<ToolCall>> = None;
     let mut final_snapshot = String::new();
+    let mut emitted_tool_calls = false;
     let mut reply_error: Option<varlink::Error> = None;
+    let tools = tools.into_iter().map(varlink_tool_definition).collect();
     let result = container.stream_structured(
         Some(&instructions),
         &prompt,
         max_tokens,
         &schema,
-        |snapshot, done| {
-            final_snapshot = snapshot.clone();
+        tools,
+        |snapshot, tool_calls, done| {
+            if !snapshot.is_empty() {
+                final_snapshot = snapshot.clone();
+            }
             if !wants_more {
-                pending_snapshot = Some(snapshot);
+                if tool_calls.is_empty() {
+                    pending_snapshot = Some(snapshot);
+                } else {
+                    pending_tool_calls = Some(varlink_tool_calls(tool_calls));
+                }
                 return;
             }
             if reply_error.is_some() {
                 return;
             }
+            if !tool_calls.is_empty() {
+                call.set_continues(false);
+                emitted_tool_calls = true;
+                if let Err(e) = call.reply(String::new(), varlink_tool_calls(tool_calls)) {
+                    reply_error = Some(e);
+                }
+                return;
+            }
             if let Some(previous) = pending_snapshot.replace(snapshot) {
                 call.set_continues(true);
-                if let Err(e) = call.reply(previous) {
+                if let Err(e) = call.reply(previous, Vec::new()) {
                     reply_error = Some(e);
                 }
             }
@@ -1300,7 +1326,7 @@ async fn stream_guided_snapshots(
         }
         return Err(GenerationError::Failed(e.to_string()));
     }
-    if final_snapshot.is_empty() {
+    if final_snapshot.is_empty() && !emitted_tool_calls && pending_tool_calls.is_none() {
         return Err(GenerationError::Failed(
             "model returned no guided snapshots".to_string(),
         ));
@@ -1308,8 +1334,15 @@ async fn stream_guided_snapshots(
     if wants_more {
         call.set_continues(false);
     }
-    call.reply(pending_snapshot.unwrap_or(final_snapshot))
-        .map_err(GenerationError::Reply)
+    if let Some(tool_calls) = pending_tool_calls {
+        call.reply(String::new(), tool_calls)
+            .map_err(GenerationError::Reply)
+    } else if emitted_tool_calls {
+        Ok(())
+    } else {
+        call.reply(pending_snapshot.unwrap_or(final_snapshot), Vec::new())
+            .map_err(GenerationError::Reply)
+    }
 }
 
 async fn submit_guided_tool_results(

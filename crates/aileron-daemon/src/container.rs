@@ -483,7 +483,8 @@ impl Container {
         prompt: &str,
         max_tokens: u32,
         schema: &Value,
-        mut on_snapshot: impl FnMut(String, bool),
+        tools: Vec<ToolDefinition>,
+        mut on_event: impl FnMut(String, Vec<ToolCall>, bool),
     ) -> Result<()> {
         let id = Uuid::new_v4().to_string();
         let mut req = ContainerRequest::new(id.clone(), "generate_structured_stream");
@@ -494,6 +495,7 @@ impl Container {
             r#type: "json_schema".to_string(),
             schema: schema.clone(),
         });
+        req.tools = if tools.is_empty() { None } else { Some(tools) };
         let line = serde_json::to_string(&req)? + "\n";
         self.stdin.write_all(line.as_bytes())?;
         self.stdin.flush()?;
@@ -513,9 +515,12 @@ impl Container {
                 let reason = resp.reason.unwrap_or_else(|| error.clone());
                 bail!("container returned error {error}: {reason}");
             }
+            if let Some(tool_calls) = resp.tool_calls {
+                on_event(String::new(), tool_calls, resp.done.unwrap_or(true));
+            }
             if let Some(snapshot) = resp.snapshot.or(resp.result) {
                 validate_json_schema(&snapshot, schema)?;
-                on_snapshot(snapshot, resp.done.unwrap_or(false));
+                on_event(snapshot, Vec::new(), resp.done.unwrap_or(false));
             }
             if resp.done.unwrap_or(false) {
                 break;

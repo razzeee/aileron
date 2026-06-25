@@ -150,13 +150,12 @@ impl LanguagePortalBackend {
     async fn prewarm(
         &self,
         session_id: &str,
-        prompt_prefix: &str,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) -> zbus::fdo::Result<()> {
         LanguagePortalBackend::model_loading(&emitter, "starting model")
             .await
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-        prewarm_impl(&self.state, session_id, prompt_prefix)
+        prewarm_impl(&self.state, session_id)
     }
 
     #[zbus(signal)]
@@ -266,11 +265,12 @@ impl LanguagePortalBackend {
         done: bool,
     ) -> zbus::Result<()>;
 
-    async fn stream_guided_response(
+    async fn stream_respond_guided(
         &self,
         session_id: &str,
         prompt: &str,
         fields: Vec<GuidedFieldDbus>,
+        tools: Vec<ToolDefinitionDbus>,
         options: GenerationOptionsDbus,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) -> zbus::fdo::Result<()> {
@@ -281,12 +281,16 @@ impl LanguagePortalBackend {
         let conn =
             aileron_ipc::client::connect().map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn);
-        let mut call = client.stream_guided_response(
+        let mut call = client.stream_respond_guided(
             session_id.clone(),
             prompt.to_string(),
             fields
                 .into_iter()
                 .map(GuidedFieldDbus::into_varlink)
+                .collect(),
+            tools
+                .into_iter()
+                .map(ToolDefinitionDbus::into_varlink)
                 .collect(),
             options.into_varlink(),
         );
@@ -296,9 +300,25 @@ impl LanguagePortalBackend {
 
         let mut pending_snapshot: Option<String> = None;
         for reply in iter {
-            let snapshot = reply
-                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?
-                .snapshot_json;
+            let reply = reply.map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            let snapshot = reply.snapshot_json;
+            let tool_calls = reply
+                .tool_calls
+                .into_iter()
+                .map(ToolCallDbus::from_varlink)
+                .collect::<Vec<_>>();
+
+            if !tool_calls.is_empty() {
+                LanguagePortalBackend::guided_tool_calls_received(
+                    &emitter,
+                    &session_id,
+                    &tool_calls,
+                    true,
+                )
+                .await
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+                continue;
+            }
 
             if let Some(previous) = pending_snapshot.replace(snapshot) {
                 LanguagePortalBackend::guided_snapshot_received(
@@ -327,6 +347,14 @@ impl LanguagePortalBackend {
         emitter: &SignalEmitter<'_>,
         session_id: &str,
         snapshot_json: &str,
+        done: bool,
+    ) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    async fn guided_tool_calls_received(
+        emitter: &SignalEmitter<'_>,
+        session_id: &str,
+        tool_calls: &[ToolCallDbus],
         done: bool,
     ) -> zbus::Result<()>;
 
@@ -468,13 +496,12 @@ impl SpeechPortalBackend {
     async fn prewarm(
         &self,
         session_id: &str,
-        prompt_prefix: &str,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) -> zbus::fdo::Result<()> {
         SpeechPortalBackend::model_loading(&emitter, "starting model")
             .await
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-        prewarm_impl(&self.state, session_id, prompt_prefix)
+        prewarm_impl(&self.state, session_id)
     }
 
     #[zbus(signal)]
@@ -484,7 +511,7 @@ impl SpeechPortalBackend {
         &self,
         session_id: &str,
         audio_b64: &str,
-        language_hint: &str,
+        source_language_hint: &str,
     ) -> zbus::fdo::Result<String> {
         use aileron_varlink::aileron_Inference::VarlinkClientInterface;
 
@@ -495,7 +522,7 @@ impl SpeechPortalBackend {
             .transcribe(
                 session_id.to_string(),
                 audio_b64.to_string(),
-                language_hint.to_string(),
+                source_language_hint.to_string(),
             )
             .call()
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
@@ -506,7 +533,7 @@ impl SpeechPortalBackend {
         &self,
         session_id: &str,
         audio_b64: &str,
-        language_hint: &str,
+        source_language_hint: &str,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) -> zbus::fdo::Result<()> {
         use aileron_varlink::aileron_Inference::VarlinkClientInterface;
@@ -519,7 +546,7 @@ impl SpeechPortalBackend {
         let mut call = client.stream_transcribe(
             session_id.clone(),
             audio_b64.to_string(),
-            language_hint.to_string(),
+            source_language_hint.to_string(),
         );
         let iter = call
             .more()
@@ -599,13 +626,12 @@ impl VisionPortalBackend {
     async fn prewarm(
         &self,
         session_id: &str,
-        prompt_prefix: &str,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) -> zbus::fdo::Result<()> {
         VisionPortalBackend::model_loading(&emitter, "starting model")
             .await
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-        prewarm_impl(&self.state, session_id, prompt_prefix)
+        prewarm_impl(&self.state, session_id)
     }
 
     #[zbus(signal)]
@@ -749,18 +775,14 @@ fn create_session_impl(
     Ok(reply.session_id)
 }
 
-fn prewarm_impl(
-    state: &PortalState,
-    session_id: &str,
-    prompt_prefix: &str,
-) -> zbus::fdo::Result<()> {
+fn prewarm_impl(state: &PortalState, session_id: &str) -> zbus::fdo::Result<()> {
     use aileron_varlink::aileron_Inference::VarlinkClientInterface;
 
     let conn =
         aileron_ipc::client::connect().map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
     let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn);
     client
-        .prewarm(session_id.to_string(), prompt_prefix.to_string())
+        .prewarm(session_id.to_string())
         .call()
         .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
 

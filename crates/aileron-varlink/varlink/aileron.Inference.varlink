@@ -57,7 +57,7 @@ method GetUseCaseAvailability(app_id: string, use_case: string) -> (availability
 method CreateSession(app_id: string, use_case: string, instructions: string) -> (session_id: string)
 
 # Start the backing container before the first user-visible response.
-method Prewarm(session_id: string, prompt_prefix: string) -> ()
+method Prewarm(session_id: string) -> ()
 
 # Generate a complete response. Session must have been created with a language.* use_case.
 method Respond(session_id: string, prompt: string, options: GenerationOptions) -> (content: string)
@@ -73,7 +73,7 @@ method StreamResponse(session_id: string, prompt: string, options: GenerationOpt
 method RespondGuided(session_id: string, prompt: string, fields: []GuidedField, tools: []ToolDefinition, options: GenerationOptions) -> (content: string, tool_calls: []ToolCall)
 
 # Stream schema-valid guided output snapshots. The final reply has continues=false.
-method StreamGuidedResponse(session_id: string, prompt: string, fields: []GuidedField, options: GenerationOptions) -> (snapshot_json: string)
+method StreamRespondGuided(session_id: string, prompt: string, fields: []GuidedField, tools: []ToolDefinition, options: GenerationOptions) -> (snapshot_json: string, tool_calls: []ToolCall)
 
 # Continue guided generation after the app executes or rejects requested tools.
 method SubmitToolResultsGuided(session_id: string, prompt: string, results: []ToolResult, fields: []GuidedField, tools: []ToolDefinition, options: GenerationOptions) -> (content: string, tool_calls: []ToolCall)
@@ -85,13 +85,13 @@ method Embed(session_id: string, text: string) -> (embedding: []float)
 # Transcribe or translate audio. Session must have been created with
 # use_case: speech.transcribe (verbatim, source language) or speech.translate (translated to English).
 # audio: raw PCM bytes encoded as base64 (16kHz mono f32le)
-# language_hint: optional language hint; empty string means auto-detect/no hint
-method Transcribe(session_id: string, audio: string, language_hint: string) -> (text: string)
+# source_language_hint: optional spoken source language hint; empty string means auto-detect/no hint
+method Transcribe(session_id: string, audio: string, source_language_hint: string) -> (text: string)
 
 # Stream transcript or translation segments. Session must have been created with
 # use_case: speech.transcribe (verbatim, source language) or speech.translate (translated to English).
 # The final reply has continues=false.
-method StreamTranscribe(session_id: string, audio: string, language_hint: string) -> (token: string)
+method StreamTranscribe(session_id: string, audio: string, source_language_hint: string) -> (token: string)
 
 # Describe an image. Session must have been created with vision.describe
 # image: PNG or JPEG bytes encoded as base64

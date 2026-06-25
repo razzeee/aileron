@@ -321,7 +321,7 @@ Paste or fetch an article URL, then click **Summarize**. Tokens stream into the 
 
 Use-case tokens are the daemon's routing and policy keys. A token maps to one assigned profile, permissions are granted per app and token, and warm containers are pooled per profile. Assigning the same profile to multiple declared tokens is valid.
 
-Use-cases describe the task intent and modality; methods describe the operation shape. Full-response methods (`Respond`, `StreamResponse`, `RespondGuided`, `StreamGuidedResponse`, and `SubmitToolResultsGuided`) are for language generation use-cases other than `language.embed` and `language.complete`. `PredictNext` is for `language.complete`. `Embed` is for `language.embed`. `Transcribe` serves both `speech.transcribe` and `speech.translate` (the daemon runs the whisper transcribe or translate-to-English task based on the session use-case), while `StreamTranscribe` returns the same speech result as segment tokens. `Describe` is for `vision.describe`, `Ocr` is for `vision.ocr`, and `Segment` is for `vision.segment`. There is intentionally no separate `language.guided` token: guided generation is an output constraint for a real language task use-case, not a task intent of its own. Use `language.analyze` when one guided response combines multiple analytical intents, such as summary, extraction, and classification fields.
+Use-cases describe the task intent and modality; methods describe the operation shape. Full-response methods (`Respond`, `StreamResponse`, `RespondGuided`, `StreamRespondGuided`, and `SubmitToolResultsGuided`) are for language generation use-cases other than `language.embed` and `language.complete`. `PredictNext` is for `language.complete`. `Embed` is for `language.embed`. `Transcribe` serves both `speech.transcribe` and `speech.translate` (the daemon runs the whisper transcribe or translate-to-English task based on the session use-case), while `StreamTranscribe` returns the same speech result as segment tokens. `Describe` is for `vision.describe`, `Ocr` is for `vision.ocr`, and `Segment` is for `vision.segment`. There is intentionally no separate `language.guided` token: guided generation is an output constraint for a real language task use-case, not a task intent of its own. Use `language.analyze` when one guided response combines multiple analytical intents, such as summary, extraction, and classification fields.
 
 | Token | Task | Backend |
 |---|---|---|
@@ -358,16 +358,16 @@ type VisionSegment (label: string, confidence: float, x: float, y: float, width:
 
 method GetUseCaseAvailability(app_id: string, use_case: string) -> (availability: ModelAvailability)
 method CreateSession(app_id: string, use_case: string, instructions: string) -> (session_id: string)
-method Prewarm(session_id: string, prompt_prefix: string) -> ()
+method Prewarm(session_id: string) -> ()
 method Respond(session_id: string, prompt: string, options: GenerationOptions) -> (content: string)
 method PredictNext(session_id: string, prefix: string, options: GenerationOptions) -> (completions: []string)
 method StreamResponse(session_id: string, prompt: string, options: GenerationOptions) -> (token: string)
 method RespondGuided(session_id: string, prompt: string, fields: []GuidedField, tools: []ToolDefinition, options: GenerationOptions) -> (content: string, tool_calls: []ToolCall)
-method StreamGuidedResponse(session_id: string, prompt: string, fields: []GuidedField, options: GenerationOptions) -> (snapshot_json: string)
+method StreamRespondGuided(session_id: string, prompt: string, fields: []GuidedField, tools: []ToolDefinition, options: GenerationOptions) -> (snapshot_json: string, tool_calls: []ToolCall)
 method SubmitToolResultsGuided(session_id: string, prompt: string, results: []ToolResult, fields: []GuidedField, tools: []ToolDefinition, options: GenerationOptions) -> (content: string, tool_calls: []ToolCall)
 method Embed(session_id: string, text: string) -> (embedding: []float)
-method Transcribe(session_id: string, audio: string, language_hint: string) -> (text: string)
-method StreamTranscribe(session_id: string, audio: string, language_hint: string) -> (token: string)
+method Transcribe(session_id: string, audio: string, source_language_hint: string) -> (text: string)
+method StreamTranscribe(session_id: string, audio: string, source_language_hint: string) -> (token: string)
 method Describe(session_id: string, image: string) -> (text: string)
 method Ocr(session_id: string, image: string) -> (text: string)
 method Segment(session_id: string, image: string) -> (segments: []VisionSegment)
@@ -378,7 +378,7 @@ method EndSession(session_id: string) -> ()
 
 `GenerationOptions.maximum_response_tokens` must be greater than zero and fit in `u32`. `temperature` must be finite and non-negative. `sampling_mode` must be non-empty. `source_language_hint` and `target_language_hint` are optional strings for `language.translate`; pass empty strings when unspecified. Today the daemon validates sampling fields, forwards `maximum_response_tokens` to containers as `max_tokens`, and folds translation hints into the session instructions for `language.translate`.
 
-`GuidedField.kind` supports `string`, `number`, `integer`, `boolean`, and `string_array`. The daemon converts guided fields into a JSON Schema object with `additionalProperties: false`, sends it to the container as `response_format.schema`, then validates the returned JSON before replying. `StreamGuidedResponse` returns validated JSON snapshots rather than token deltas.
+`GuidedField.kind` supports `string`, `number`, `integer`, `boolean`, and `string_array`. The daemon converts guided fields into a JSON Schema object with `additionalProperties: false`, sends it to the container as `response_format.schema`, then validates the returned JSON before replying. `StreamRespondGuided` returns validated JSON snapshots or app-mediated tool calls rather than token deltas.
 
 Tool calls are app-mediated and per request: `RespondGuided` may return `ToolCall` objects when the app supplies tool definitions, the app executes or rejects them under its own policy, and `SubmitToolResultsGuided` continues generation with the same guided schema. The daemon and runtime do not execute tools. Aileron does not retain daemon-side transcripts; apps own conversation history and pass relevant context explicitly.
 
@@ -439,7 +439,7 @@ The portal does not talk to containers directly. It translates D-Bus calls into 
 
 | Interface | Use-case prefix | Methods |
 |---|---|---|
-| `org.freedesktop.impl.portal.Language` | `language.*` | `GetUseCaseAvailability`, `CreateSession`, `Prewarm`, `Respond`, `StreamResponse`, `RespondGuided`, `StreamGuidedResponse`, `SubmitToolResultsGuided`, `Embed`, `EndSession` |
+| `org.freedesktop.impl.portal.Language` | `language.*` | `GetUseCaseAvailability`, `CreateSession`, `Prewarm`, `Respond`, `StreamResponse`, `RespondGuided`, `StreamRespondGuided`, `SubmitToolResultsGuided`, `Embed`, `EndSession` |
 | `org.freedesktop.impl.portal.Speech` | `speech.*` | `GetUseCaseAvailability`, `CreateSession`, `Prewarm`, `Transcribe`, `StreamTranscribe`, `EndSession` |
 | `org.freedesktop.impl.portal.Vision` | `vision.*` | `GetUseCaseAvailability`, `CreateSession`, `Prewarm`, `Describe`, `Ocr`, `Segment`, `EndSession` |
 
@@ -451,7 +451,7 @@ The portal does not talk to containers directly. It translates D-Bus calls into 
 |---|---|---|---|
 | `GetUseCaseAvailability` | `app_id: s, use_case: s` | `(is_available: b, code: s, reason: s)` | Checks whether an assigned profile has local artifacts and a runtime image |
 | `CreateSession` | `app_id: s, use_case: s, instructions: s` | `session_id: s` | Creates a session bound to the assigned profile; does not start the container by itself |
-| `Prewarm` | `session_id: s, prompt_prefix: s` | `()` | Starts the backing container before the first user-visible operation; pass an empty prefix when no text prefix applies |
+| `Prewarm` | `session_id: s` | `()` | Starts the backing container before the first user-visible operation |
 | `EndSession` | `session_id: s` | `()` | Ends the session; the per-profile container remains pooled until idle timeout |
 
 ### Language Methods
@@ -464,7 +464,7 @@ Full-response methods reject `language.embed` and `language.complete`; use `Embe
 | `PredictNext` | `session_id: s, prefix: s, options: (xdsss)` | `completions: as` | `language.complete` sessions only; returns up to three short inline typing completions from the raw prefix |
 | `StreamResponse` | `session_id: s, prompt: s, options: (xdsss)` | `()` | Full language generation sessions only; emits `TokenReceived` signals; final token has `done=true` |
 | `RespondGuided` | `session_id: s, prompt: s, fields: a(sssb), tools: a(sss), options: (xdsss)` | `(content: s, tool_calls: a(sss))` | Full language generation sessions only; returns JSON matching guided output fields or requested tool calls |
-| `StreamGuidedResponse` | `session_id: s, prompt: s, fields: a(sssb), options: (xdsss)` | `()` | Full language generation sessions only; emits `GuidedSnapshotReceived` signals; final snapshot has `done=true` |
+| `StreamRespondGuided` | `session_id: s, prompt: s, fields: a(sssb), tools: a(sss), options: (xdsss)` | `()` | Full language generation sessions only; emits `GuidedSnapshotReceived` and/or `GuidedToolCallsReceived` signals; final event has `done=true` |
 | `SubmitToolResultsGuided` | `session_id: s, prompt: s, results: a(sss), fields: a(sssb), tools: a(sss), options: (xdsss)` | `(content: s, tool_calls: a(sss))` | Full language generation sessions only; continues after the app executes or rejects tool calls |
 | `Embed` | `session_id: s, text: s` | `embedding: ad` | `language.embed` sessions only; returns an embedding vector |
 
@@ -472,8 +472,8 @@ Full-response methods reject `language.embed` and `language.complete`; use `Embe
 
 | Method | Parameters | Returns | Notes |
 |---|---|---|---|
-| `Transcribe` | `session_id: s, audio_b64: s, language_hint: s` | `text: s` | 16 kHz mono f32le PCM, base64; empty hint means auto-detect/no hint; transcribes or translates per use-case |
-| `StreamTranscribe` | `session_id: s, audio_b64: s, language_hint: s` | `()` | Same input and use-cases as `Transcribe`; emits `TranscriptionReceived` signals; final segment has `done=true` |
+| `Transcribe` | `session_id: s, audio_b64: s, source_language_hint: s` | `text: s` | 16 kHz mono f32le PCM, base64; empty hint means auto-detect/no hint; use ISO 639-1 hints such as `de`; `speech.transcribe` returns a source-language transcript and `speech.translate` returns an English translation |
+| `StreamTranscribe` | `session_id: s, audio_b64: s, source_language_hint: s` | `()` | Same input and use-cases as `Transcribe`; emits `TranscriptionReceived` signals; final segment has `done=true` |
 
 Streaming D-Bus methods carry their payloads only through signals while the method call is in progress. Callers should subscribe before invoking a stream method and consume signals concurrently; the empty method reply only means the stream has finished.
 
@@ -485,7 +485,7 @@ Streaming D-Bus methods carry their payloads only through signals while the meth
 | `Ocr` | `session_id: s, image_b64: s` | `text: s` | `vision.ocr` sessions only; PNG or JPEG, base64; extracts text |
 | `Segment` | `session_id: s, image_b64: s` | `segments: []VisionSegment` | PNG or JPEG, base64; normalized boxes |
 
-These are D-Bus signatures: parentheses define a struct, and `a(...)` means an array of structs. `options: (xdsss)` is `GenerationOptions`: `maximum_response_tokens` as int64, `temperature` as float64, `sampling_mode` as string, `source_language_hint` as string, and `target_language_hint` as string. Empty language hints mean unspecified. The language hints only affect `language.translate`. `fields: a(sssb)` is an array of `GuidedField` structs: name, kind, description, required. Tool structs are `a(sss)`: definitions are name, description, schema JSON; calls are id, name, arguments JSON; results are id, content, content JSON.
+These are D-Bus signatures: parentheses define a struct, and `a(...)` means an array of structs. `options: (xdsss)` is `GenerationOptions`: `maximum_response_tokens` as int64, `temperature` as float64, `sampling_mode` as string, `source_language_hint` as string, and `target_language_hint` as string. Empty language hints mean unspecified. The generation option language hints only affect `language.translate`. Speech methods use their `source_language_hint` argument only to identify the spoken input language; the session use-case selects whether speech output is a transcript or English translation. `fields: a(sssb)` is an array of `GuidedField` structs: name, kind, description, required. Tool structs are `a(sss)`: definitions are name, description, schema JSON; calls are id, name, arguments JSON; results are id, content, content JSON.
 
 ### Signals
 
@@ -493,7 +493,8 @@ These are D-Bus signatures: parentheses define a struct, and `a(...)` means an a
 |---|---|---|
 | `ModelLoading` | `message: s` | The portal is about to start a cold backing container; available on each interface |
 | `TokenReceived` | `session_id: s, token: s, done: b` | Each token during `StreamResponse` on `Language` |
-| `GuidedSnapshotReceived` | `session_id: s, snapshot_json: s, done: b` | Each validated JSON snapshot during `StreamGuidedResponse` on `Language` |
+| `GuidedSnapshotReceived` | `session_id: s, snapshot_json: s, done: b` | Each validated JSON snapshot during `StreamRespondGuided` on `Language` |
+| `GuidedToolCallsReceived` | `session_id: s, tool_calls: a(sss), done: b` | Tool calls requested during `StreamRespondGuided` on `Language` |
 | `TranscriptionReceived` | `session_id: s, text: s, done: b` | Each segment during `StreamTranscribe` on `Speech` |
 
 D-Bus callers see underlying Varlink failures as `org.freedesktop.DBus.Error.Failed` with the Varlink error text.
@@ -533,7 +534,7 @@ Each OCI image implements a simple newline-delimited JSON protocol over stdin/st
 | `prompt` | string | `generate`, `predict_next`, structured generation, tool generation, optionally `describe` | User prompt, raw prediction prefix, or image prompt |
 | `max_tokens` | number | text, structured, and tool generation | Derived from `GenerationOptions.maximum_response_tokens` for text requests |
 | `audio` | string | `transcribe` | Base64-encoded raw PCM bytes, 16 kHz mono f32le |
-| `language_hint` | string | `transcribe` | Optional spoken language hint; omitted when unspecified |
+| `language_hint` | string | `transcribe` | Runtime protocol source-language hint for speech input; omitted when unspecified |
 | `image` | string | `describe` | Base64-encoded PNG or JPEG bytes |
 | `response_format` | object | structured generation | `{ "type": "json_schema", "schema": ... }` |
 | `tools` | array | `generate_structured` | Optional tool definitions with `name`, `description`, and `schema_json` |

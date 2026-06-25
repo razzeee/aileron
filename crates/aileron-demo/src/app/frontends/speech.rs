@@ -3,7 +3,9 @@ use super::super::{
 };
 use super::scrollable_page;
 use gtk4::prelude::*;
-use gtk4::{Align, Box, Button, Label, Orientation, ScrolledWindow, Spinner, TextBuffer, TextView};
+use gtk4::{
+    Align, Box, Button, Entry, Label, Orientation, ScrolledWindow, Spinner, TextBuffer, TextView,
+};
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -32,6 +34,7 @@ struct SpeechUi {
     translate_button: Button,
     live_transcribe_button: Button,
     live_translate_button: Button,
+    source_language_hint_entry: Entry,
     status_spinner: Spinner,
     status_title: Label,
     status_detail: Label,
@@ -73,6 +76,20 @@ pub(crate) fn build_page() -> gtk4::Widget {
     button_row.append(&live_transcribe_button);
     button_row.append(&live_translate_button);
     vbox.append(&button_row);
+
+    let hint_row = Box::new(Orientation::Horizontal, 8);
+    hint_row.append(
+        &Label::builder()
+            .label("Source language hint")
+            .xalign(0.0)
+            .build(),
+    );
+    let source_language_hint_entry = Entry::builder()
+        .placeholder_text("Optional, e.g. de or en")
+        .hexpand(true)
+        .build();
+    hint_row.append(&source_language_hint_entry);
+    vbox.append(&hint_row);
 
     let status_row = Box::new(Orientation::Horizontal, 12);
     status_row.add_css_class("card");
@@ -133,6 +150,7 @@ pub(crate) fn build_page() -> gtk4::Widget {
         translate_button,
         live_transcribe_button,
         live_translate_button,
+        source_language_hint_entry,
         status_spinner,
         status_title,
         status_detail,
@@ -267,13 +285,14 @@ fn wire_asr_action(
             "Opening an {use_case} session through the portal..."
         ));
         set_processing_controls(&ui);
+        let source_language_hint = ui.source_language_hint_entry.text().trim().to_string();
 
         let (tx, rx) = std::sync::mpsc::channel::<SpeechEvent>();
         start_speech_event_pump(ui.clone(), last_audio.clone(), rx);
 
         let error_tx = tx.clone();
         std::thread::spawn(move || {
-            if let Err(e) = transcribe_recording(&path, use_case, tx) {
+            if let Err(e) = transcribe_recording(&path, use_case, &source_language_hint, tx) {
                 eprintln!("[aileron-demo] speech error: {e}");
                 let _ = error_tx.send(SpeechEvent::Error(friendly_error(&e)));
             }
@@ -319,13 +338,16 @@ fn wire_live_action(
         ui.status_detail
             .set_text("Speak now. Interim text may change after the final pass.");
         set_recording_controls(&ui);
+        let source_language_hint = ui.source_language_hint_entry.text().trim().to_string();
 
         let (tx, rx) = std::sync::mpsc::channel::<SpeechEvent>();
         start_speech_event_pump(ui.clone(), last_audio.clone(), rx);
 
         let error_tx = tx.clone();
         std::thread::spawn(move || {
-            if let Err(e) = live_transcribe_recording(path, use_case, stop, tx) {
+            if let Err(e) =
+                live_transcribe_recording(path, use_case, &source_language_hint, stop, tx)
+            {
                 eprintln!("[aileron-demo] live speech error: {e}");
                 let _ = error_tx.send(SpeechEvent::Error(friendly_error(&e)));
             }
@@ -404,6 +426,7 @@ fn set_recording_controls(ui: &SpeechUi) {
     ui.translate_button.set_sensitive(false);
     ui.live_transcribe_button.set_sensitive(false);
     ui.live_translate_button.set_sensitive(false);
+    ui.source_language_hint_entry.set_sensitive(false);
 }
 
 fn set_processing_controls(ui: &SpeechUi) {
@@ -413,6 +436,7 @@ fn set_processing_controls(ui: &SpeechUi) {
     ui.translate_button.set_sensitive(false);
     ui.live_transcribe_button.set_sensitive(false);
     ui.live_translate_button.set_sensitive(false);
+    ui.source_language_hint_entry.set_sensitive(false);
 }
 
 fn set_idle_controls(ui: &SpeechUi, has_audio: bool) {
@@ -422,6 +446,7 @@ fn set_idle_controls(ui: &SpeechUi, has_audio: bool) {
     ui.translate_button.set_sensitive(has_audio);
     ui.live_transcribe_button.set_sensitive(true);
     ui.live_translate_button.set_sensitive(true);
+    ui.source_language_hint_entry.set_sensitive(true);
 }
 
 fn start_pw_record(path: &Path) -> std::io::Result<Child> {

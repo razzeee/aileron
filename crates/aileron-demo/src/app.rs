@@ -1145,7 +1145,7 @@ fn predict_inline_completion(
             "language.complete",
             "Inline typing prediction session.",
         )?;
-        let _: () = proxy.call("Prewarm", &(&handle, "", empty_options()))?;
+        let _: () = proxy.call("Prewarm", &(&handle, empty_options()))?;
         Ok(handle)
     };
     let mut session_handle = match existing_session {
@@ -1760,6 +1760,7 @@ fn speech_instructions(use_case: &str) -> &'static str {
 fn transcribe_recording(
     path: &PathBuf,
     use_case: &str,
+    source_language_hint: &str,
     tx: std::sync::mpsc::Sender<SpeechEvent>,
 ) -> anyhow::Result<()> {
     let audio = std::fs::read(path)?;
@@ -1784,6 +1785,7 @@ fn transcribe_recording(
             &sig_proxy,
             &session_handle,
             &audio,
+            source_language_hint,
             &tx,
             SpeechTranscriptMode::Replace,
         )?;
@@ -1799,9 +1801,11 @@ fn transcribe_recording(
 fn live_transcribe_recording(
     path: PathBuf,
     use_case: &str,
+    source_language_hint: &str,
     stop: Arc<AtomicBool>,
     tx: std::sync::mpsc::Sender<SpeechEvent>,
 ) -> anyhow::Result<()> {
+    let source_language_hint = source_language_hint.to_string();
     let call_conn = portal_connection()?;
     let signal_conn = zbus::blocking::Connection::session()?;
     let proxy = zbus::blocking::Proxy::new(&call_conn, PORTAL_BUS, PORTAL_PATH, SPEECH_IFACE)?;
@@ -1834,6 +1838,7 @@ fn live_transcribe_recording(
                         &sig_proxy,
                         &session_handle,
                         &chunk,
+                        &source_language_hint,
                         &tx,
                         SpeechTranscriptMode::Append,
                     )?;
@@ -1854,6 +1859,7 @@ fn live_transcribe_recording(
             &sig_proxy,
             &session_handle,
             &audio,
+            &source_language_hint,
             &tx,
             SpeechTranscriptMode::Replace,
         )?;
@@ -1871,6 +1877,7 @@ fn stream_speech_audio(
     sig_proxy: &zbus::blocking::Proxy<'_>,
     session_handle: &OwnedObjectPath,
     audio: &[u8],
+    source_language_hint: &str,
     tx: &std::sync::mpsc::Sender<SpeechEvent>,
     mode: SpeechTranscriptMode,
 ) -> anyhow::Result<String> {
@@ -1910,7 +1917,12 @@ fn stream_speech_audio(
 
     let stream_result: zbus::Result<()> = proxy.call(
         "StreamTranscribe",
-        &(session_handle, &audio_b64, "", empty_options()),
+        &(
+            session_handle,
+            &audio_b64,
+            source_language_hint,
+            empty_options(),
+        ),
     );
     if let Err(error) = stream_result {
         return Err(error.into());
