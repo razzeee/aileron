@@ -1301,18 +1301,21 @@ fn guided_chat_turn(
 ) -> anyhow::Result<()> {
     let conn = portal_connection()?;
     let proxy = zbus::blocking::Proxy::new(&conn, PORTAL_BUS, PORTAL_PATH, LANGUAGE_IFACE)?;
+    let used_existing_session = existing_session.is_some();
 
-    let session_handle = match existing_session {
+    let create_session = || -> anyhow::Result<OwnedObjectPath> {
+        let handle = create_public_session(
+            &proxy,
+            "language.extract",
+            "You answer chat turns and extract only durable user memory as guided JSON.",
+        )?;
+        tx.send(ChatEvent::SessionReady(handle.to_string()))?;
+        Ok(handle)
+    };
+
+    let mut session_handle = match existing_session {
         Some(id) => cached_session_handle(id)?,
-        None => {
-            let handle = create_public_session(
-                &proxy,
-                "language.extract",
-                "You answer chat turns and extract only durable user memory as guided JSON.",
-            )?;
-            tx.send(ChatEvent::SessionReady(handle.to_string()))?;
-            handle
-        }
+        None => create_session()?,
     };
 
     let fields = vec![
@@ -1337,16 +1340,39 @@ fn guided_chat_turn(
     ];
     let options = generation_options(512, 0.2, "default", "", "");
     let prompt = guided_chat_prompt(memory, &messages);
-    let (content, _): (String, Vec<ToolCallDbus>) = proxy.call(
+    let response_result: zbus::Result<(String, Vec<ToolCallDbus>)> = proxy.call(
         "RespondGuided",
         &(
             &session_handle,
             &prompt,
-            fields,
+            fields.clone(),
             Vec::<ToolDefinitionDbus>::new(),
             options,
         ),
-    )?;
+    );
+    let (content, _) = match response_result {
+        Ok(response) => response,
+        Err(e) if used_existing_session && is_session_not_found_message(&e.to_string()) => {
+            session_handle = create_session()?;
+            match proxy.call(
+                "RespondGuided",
+                &(
+                    &session_handle,
+                    &prompt,
+                    fields,
+                    Vec::<ToolDefinitionDbus>::new(),
+                    generation_options(512, 0.2, "default", "", ""),
+                ),
+            ) {
+                Ok(response) => response,
+                Err(e) => {
+                    let _ = close_public_session(&session_handle);
+                    return Err(e.into());
+                }
+            }
+        }
+        Err(e) => return Err(e.into()),
+    };
     let response: GuidedChatResponse = serde_json::from_str(&content)?;
     tx.send(ChatEvent::Response(response))?;
 
@@ -2167,6 +2193,9 @@ mod tests {
         let error = "org.freedesktop.DBus.Error.Failed: aileron.Inference.SessionNotFound: Some(SessionNotFound_Args { session_id: \"missing\" })";
 
         assert!(is_session_not_found_message(error));
+        assert!(is_session_not_found_message(
+            "org.freedesktop.DBus.Error.Failed: GDBus.Error:org.freedesktop.DBus.Error.Failed: aileron.Inference.SessionNotFound: Some(SessionNotFound_Args { session_id: \"missing\" })"
+        ));
         assert!(!is_session_not_found_message(
             "aileron.Inference.GenerationFailed"
         ));
