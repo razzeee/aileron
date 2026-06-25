@@ -54,8 +54,9 @@ jobs:
               RUNTIME_DESCRIPTION=Aileron combined LLM, vision, and Whisper runtime.
           - variant: vulkan
             build_args: |
+              FINAL_IMAGE=fedora:latest
               APT_PACKAGES=build-essential cmake git ninja-build libvulkan-dev glslc glslang-tools spirv-headers
-              RUNTIME_APT_PACKAGES=libgomp1 libstdc++6 libgcc-s1 ca-certificates libvulkan1 mesa-vulkan-drivers
+              RUNTIME_APT_PACKAGES=libgomp libstdc++ libgcc ca-certificates vulkan-loader mesa-vulkan-drivers
               CMAKE_ARGS=-DGGML_VULKAN=on
               RUNTIME_ID=llm-vision-whisper
               RUNTIME_VARIANT=vulkan

@@ -82,6 +82,15 @@ const NVIDIA_DRIVER_LIBRARIES: &[&str] = &[
     "libnvidia-nvvm.so.4",
     "libnvidia-nvvm.so",
 ];
+const NVIDIA_DEVICE_PATHS: &[&str] = &[
+    "/dev/nvidia0",
+    "/dev/nvidia1",
+    "/dev/nvidiactl",
+    "/dev/nvidia-modeset",
+    "/dev/nvidia-uvm",
+    "/dev/nvidia-uvm-tools",
+    "/dev/nvidia-caps",
+];
 const COMMON_LIBRARY_DIRS: &[&str] = &[
     "/usr/lib/x86_64-linux-gnu",
     "/usr/lib64",
@@ -96,15 +105,6 @@ const VULKAN_ICD_DIRS: &[&str] = &[
     "/usr/local/share/vulkan/icd.d",
     "/usr/share/vulkan/icd.d",
 ];
-const MESA_DRI_DIRS: &[&str] = &[
-    "/run/opengl-driver/lib/dri",
-    "/usr/lib/x86_64-linux-gnu/dri",
-    "/usr/lib64/dri",
-    "/usr/lib/dri",
-    "/lib/x86_64-linux-gnu/dri",
-    "/lib64/dri",
-];
-
 /// A running container for a single use-case.
 pub struct Container {
     #[allow(dead_code)]
@@ -913,7 +913,7 @@ fn runtime_config_json(
         env.push(format!("{key}={value}"));
     }
 
-    Ok(serde_json::json!({
+    let mut config = serde_json::json!({
         "ociVersion": "1.0.2",
         "process": {
             "terminal": false,
@@ -969,7 +969,15 @@ fn runtime_config_json(
                 "memory": { "limit": parse_memory_limit(memory_limit)? }
             }
         }
-    }))
+    });
+
+    if is_gpu_variant(variant) {
+        config["annotations"] = serde_json::json!({
+            "run.oci.keep_original_groups": "1"
+        });
+    }
+
+    Ok(config)
 }
 
 fn push_default_env(
@@ -1001,36 +1009,36 @@ fn add_nvidia_vulkan_mounts(
     mounts: &mut Vec<Value>,
     runtime_options: &mut HashMap<String, String>,
 ) -> Vec<String> {
+    if !has_nvidia_devices() {
+        return Vec::new();
+    }
+
     add_nvidia_device_mounts(mounts);
     add_nvidia_driver_library_mounts(mounts, runtime_options);
     add_nvidia_vulkan_icd_mounts(mounts)
 }
 
 fn add_host_vulkan_mounts(mounts: &mut Vec<Value>, runtime_options: &mut HashMap<String, String>) {
-    let mut driver_files = add_nvidia_vulkan_mounts(mounts, runtime_options);
-    driver_files.extend(add_intel_mesa_vulkan_mounts(mounts));
+    let driver_files = add_nvidia_vulkan_mounts(mounts, runtime_options);
+    // Mesa userspace drivers must match the container libc/LLVM stack. Use the
+    // runtime image's Mesa drivers for AMD/Intel instead of host bind mounts.
     set_default_vulkan_driver_files(runtime_options, driver_files);
 }
 
 fn add_nvidia_device_mounts(mounts: &mut Vec<Value>) {
-    add_existing_device_mounts(
-        mounts,
-        [
-            "/dev/nvidia0",
-            "/dev/nvidia1",
-            "/dev/nvidiactl",
-            "/dev/nvidia-modeset",
-            "/dev/nvidia-uvm",
-            "/dev/nvidia-uvm-tools",
-            "/dev/nvidia-caps",
-        ],
-    );
+    add_existing_device_mounts(mounts, NVIDIA_DEVICE_PATHS);
     if Path::new("/proc/driver/nvidia").exists() {
         add_readonly_mount(mounts, "/proc/driver/nvidia");
     }
 }
 
-fn add_existing_device_mounts<const N: usize>(mounts: &mut Vec<Value>, paths: [&str; N]) {
+fn has_nvidia_devices() -> bool {
+    NVIDIA_DEVICE_PATHS
+        .iter()
+        .any(|path| Path::new(path).exists())
+}
+
+fn add_existing_device_mounts(mounts: &mut Vec<Value>, paths: &[&str]) {
     for path in paths {
         if Path::new(path).exists() {
             add_device_mount(mounts, path);
@@ -1044,15 +1052,6 @@ fn add_readonly_mount(mounts: &mut Vec<Value>, path: &str) {
         "type": "bind",
         "source": path,
         "options": ["rbind", "ro", "nosuid", "nodev", "noexec"]
-    }));
-}
-
-fn add_readonly_library_dir_mount(mounts: &mut Vec<Value>, path: &Path) {
-    mounts.push(serde_json::json!({
-        "destination": path.display().to_string(),
-        "type": "bind",
-        "source": path.display().to_string(),
-        "options": ["rbind", "ro", "nosuid", "nodev"]
     }));
 }
 
@@ -1112,49 +1111,6 @@ fn add_nvidia_vulkan_icd_mounts_from(
     driver_files
 }
 
-fn add_intel_mesa_vulkan_mounts(mounts: &mut Vec<Value>) -> Vec<String> {
-    add_intel_mesa_vulkan_mounts_from(
-        mounts,
-        intel_mesa_vulkan_icd_files(),
-        MESA_DRI_DIRS.iter().map(PathBuf::from).collect(),
-    )
-}
-
-fn add_intel_mesa_vulkan_mounts_from(
-    mounts: &mut Vec<Value>,
-    icd_files: Vec<PathBuf>,
-    dri_dirs: Vec<PathBuf>,
-) -> Vec<String> {
-    let mut driver_files = Vec::new();
-    for source in icd_files {
-        let Some(file_name) = source.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        if !is_intel_mesa_vulkan_icd_file_name(file_name) {
-            continue;
-        }
-
-        let destination = Path::new(VULKAN_ICD_DIR).join(file_name);
-        let destination_string = destination.display().to_string();
-        if !driver_files.contains(&destination_string) {
-            add_readonly_file_mount(mounts, &source, &destination);
-            driver_files.push(destination_string);
-        }
-
-        if let Some(library_path) = vulkan_icd_library_path(&source) {
-            add_readonly_file_mount(mounts, &library_path, &library_path);
-        }
-    }
-
-    for dir in dri_dirs {
-        if dir.is_dir() {
-            add_readonly_library_dir_mount(mounts, &dir);
-        }
-    }
-
-    driver_files
-}
-
 fn set_default_vulkan_driver_files(
     runtime_options: &mut HashMap<String, String>,
     driver_files: Vec<String>,
@@ -1187,6 +1143,13 @@ fn prepend_ld_library_path(runtime_options: &mut HashMap<String, String>, path: 
 }
 
 fn add_readonly_file_mount(mounts: &mut Vec<Value>, source: &Path, destination: &Path) {
+    if mounts.iter().any(|mount| {
+        mount["source"] == source.display().to_string()
+            && mount["destination"] == destination.display().to_string()
+    }) {
+        return;
+    }
+
     mounts.push(serde_json::json!({
         "destination": destination.display().to_string(),
         "type": "bind",
@@ -1255,10 +1218,6 @@ fn nvidia_vulkan_icd_files() -> Vec<PathBuf> {
     vulkan_icd_files_matching(is_nvidia_vulkan_icd_file_name)
 }
 
-fn intel_mesa_vulkan_icd_files() -> Vec<PathBuf> {
-    vulkan_icd_files_matching(is_intel_mesa_vulkan_icd_file_name)
-}
-
 fn vulkan_icd_files_matching(matches: fn(&str) -> bool) -> Vec<PathBuf> {
     let mut files = Vec::new();
     for dir in VULKAN_ICD_DIRS {
@@ -1306,28 +1265,6 @@ fn is_nvidia_driver_library_name(name: &str) -> bool {
 fn is_nvidia_vulkan_icd_file_name(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     lower.ends_with(".json") && lower.contains("nvidia")
-}
-
-fn is_intel_mesa_vulkan_icd_file_name(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    lower.ends_with(".json")
-        && (lower.contains("intel") || lower.contains("hasvk") || lower.contains("anv"))
-}
-
-fn vulkan_icd_library_path(icd_file: &Path) -> Option<PathBuf> {
-    let data = fs::read_to_string(icd_file).ok()?;
-    let value: Value = serde_json::from_str(&data).ok()?;
-    let library_path = value
-        .get("ICD")
-        .and_then(|icd| icd.get("library_path"))
-        .or_else(|| value.get("library_path"))
-        .and_then(Value::as_str)?;
-    let path = PathBuf::from(library_path);
-    if path.is_absolute() {
-        path.exists().then_some(path)
-    } else {
-        find_host_library(library_path, &ldconfig_library_cache())
-    }
 }
 
 fn find_host_library(library_name: &str, ldconfig: &HashMap<String, PathBuf>) -> Option<PathBuf> {
@@ -2473,7 +2410,7 @@ mod tests {
         let mut mounts = Vec::new();
         add_existing_device_mounts(
             &mut mounts,
-            [present.to_str().unwrap(), missing.to_str().unwrap()],
+            &[present.to_str().unwrap(), missing.to_str().unwrap()],
         );
 
         let destinations = mounts
@@ -2610,123 +2547,20 @@ mod tests {
     }
 
     #[test]
-    fn intel_mesa_vulkan_mounts_force_host_driver_files() {
-        let root = std::env::temp_dir().join(format!("aileron-intel-icd-test-{}", Uuid::new_v4()));
-        let icd = root.join("intel_icd.x86_64.json");
-        let driver = root.join("libvulkan_intel.so");
-        let dri = root.join("dri");
-        std::fs::create_dir_all(&dri).expect("create temp driver dir");
-        std::fs::write(&driver, "intel vulkan driver placeholder").expect("write driver");
-        std::fs::write(
-            &icd,
-            format!(
-                r#"{{"ICD":{{"library_path":"{}","api_version":"1.3.0"}}}}"#,
-                driver.display()
-            ),
-        )
-        .expect("write icd");
-
-        let mut mounts = Vec::new();
-        let mut runtime_options = HashMap::new();
-        let driver_files =
-            add_intel_mesa_vulkan_mounts_from(&mut mounts, vec![icd.clone()], vec![dri.clone()]);
-        set_default_vulkan_driver_files(&mut runtime_options, driver_files);
-
-        let driver_files = "/usr/share/vulkan/icd.d/intel_icd.x86_64.json";
-        assert_eq!(
-            runtime_options.get("VK_DRIVER_FILES").map(String::as_str),
-            Some(driver_files)
-        );
-        assert_eq!(
-            runtime_options.get("VK_ICD_FILENAMES").map(String::as_str),
-            Some(driver_files)
-        );
-        assert!(mounts.iter().any(|mount| {
-            mount["source"] == icd.display().to_string()
-                && mount["destination"] == driver_files
-                && array_contains(&mount["options"], "ro")
-        }));
-        assert!(mounts.iter().any(|mount| {
-            mount["source"] == driver.display().to_string()
-                && mount["destination"] == driver.display().to_string()
-                && !array_contains(&mount["options"], "noexec")
-        }));
-        assert!(mounts.iter().any(|mount| {
-            mount["source"] == dri.display().to_string()
-                && mount["destination"] == dri.display().to_string()
-                && !array_contains(&mount["options"], "noexec")
-        }));
-
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn intel_mesa_vulkan_mounts_preserve_explicit_driver_files() {
-        let root = std::env::temp_dir().join(format!("aileron-intel-icd-test-{}", Uuid::new_v4()));
-        let icd = root.join("intel_hasvk_icd.x86_64.json");
-        std::fs::create_dir_all(&root).expect("create temp dir");
-        std::fs::write(
-            &icd,
-            r#"{"ICD":{"library_path":"libvulkan_intel_hasvk.so"}}"#,
-        )
-        .expect("write icd");
-        let mut mounts = Vec::new();
-        let mut runtime_options = HashMap::new();
-        runtime_options.insert(
-            "VK_DRIVER_FILES".to_string(),
-            "/custom/intel_icd.json".to_string(),
-        );
-
-        let driver_files =
-            add_intel_mesa_vulkan_mounts_from(&mut mounts, vec![icd.clone()], Vec::new());
-        set_default_vulkan_driver_files(&mut runtime_options, driver_files);
-
-        assert_eq!(
-            runtime_options.get("VK_DRIVER_FILES").map(String::as_str),
-            Some("/custom/intel_icd.json")
-        );
-        assert!(!runtime_options.contains_key("VK_ICD_FILENAMES"));
-        assert!(mounts.iter().any(|mount| {
-            mount["source"] == icd.display().to_string()
-                && mount["destination"] == "/usr/share/vulkan/icd.d/intel_hasvk_icd.x86_64.json"
-        }));
-
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn host_vulkan_mounts_include_nvidia_and_intel_driver_files() {
+    fn host_vulkan_mounts_include_only_nvidia_driver_files() {
         let root = std::env::temp_dir().join(format!("aileron-mixed-icd-test-{}", Uuid::new_v4()));
         let nvidia_icd = root.join("nvidia_icd.json");
-        let intel_icd = root.join("intel_icd.x86_64.json");
-        let intel_driver = root.join("libvulkan_intel.so");
         std::fs::create_dir_all(&root).expect("create temp dir");
         std::fs::write(&nvidia_icd, "{}").expect("write nvidia icd");
-        std::fs::write(&intel_driver, "intel vulkan driver placeholder").expect("write driver");
-        std::fs::write(
-            &intel_icd,
-            format!(
-                r#"{{"ICD":{{"library_path":"{}","api_version":"1.3.0"}}}}"#,
-                intel_driver.display()
-            ),
-        )
-        .expect("write intel icd");
 
         let mut mounts = Vec::new();
         let mut runtime_options = HashMap::new();
-        let mut driver_files = add_nvidia_vulkan_icd_mounts_from(&mut mounts, vec![nvidia_icd]);
-        driver_files.extend(add_intel_mesa_vulkan_mounts_from(
-            &mut mounts,
-            vec![intel_icd],
-            Vec::new(),
-        ));
+        let driver_files = add_nvidia_vulkan_icd_mounts_from(&mut mounts, vec![nvidia_icd]);
         set_default_vulkan_driver_files(&mut runtime_options, driver_files);
 
         assert_eq!(
             runtime_options.get("VK_DRIVER_FILES").map(String::as_str),
-            Some(
-                "/usr/share/vulkan/icd.d/nvidia_icd.json:/usr/share/vulkan/icd.d/intel_icd.x86_64.json"
-            )
+            Some("/usr/share/vulkan/icd.d/nvidia_icd.json")
         );
         assert_eq!(
             runtime_options.get("VK_ICD_FILENAMES").map(String::as_str),
@@ -2910,6 +2744,11 @@ mod tests {
             env(config).contains(&"N_GPU_LAYERS=-1"),
             "{image_ref} should enable GPU offload"
         );
+        assert_eq!(
+            config["annotations"]["run.oci.keep_original_groups"].as_str(),
+            Some("1"),
+            "{image_ref} should preserve render-device group access"
+        );
     }
 
     fn assert_cpu_runtime_mounts(image_ref: &str, config: &Value) {
@@ -2926,6 +2765,10 @@ mod tests {
         assert!(
             !env(config).contains(&"N_GPU_LAYERS=-1"),
             "{image_ref} should not enable GPU offload"
+        );
+        assert!(
+            config["annotations"].is_null(),
+            "{image_ref} should not preserve accelerator groups"
         );
     }
 

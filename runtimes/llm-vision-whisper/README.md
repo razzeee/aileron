@@ -27,7 +27,7 @@ One Dockerfile builds all accelerator variants with build args:
 | `cpu` | default | CPU | Default, works everywhere |
 | `cuda` | `BUILDER_IMAGE=nvidia/cuda:13.3.0-devel-ubuntu24.04`, `CMAKE_ARGS=-DGGML_CUDA=on` | NVIDIA GPU | Requires NVIDIA driver devices and `libcuda.so.1` on host |
 | `rocm` | `BUILDER_IMAGE=rocm/dev-ubuntu-22.04:7.2.4`, `CMAKE_ARGS=-DGGML_HIP=on ...` | AMD GPU | Requires ROCm devices on host and a ROCm-supported GPU architecture |
-| `vulkan` | `CMAKE_ARGS=-DGGML_VULKAN=on` plus Vulkan packages | Vulkan GPU | NVIDIA, AMD, Intel Arc, Xe, and integrated graphics |
+| `vulkan` | `FINAL_IMAGE=fedora:latest`, `CMAKE_ARGS=-DGGML_VULKAN=on` plus Vulkan packages | Vulkan GPU | NVIDIA, AMD, Intel Arc, Xe, and integrated graphics; uses the image Mesa stack for AMD/Intel |
 
 ## Build
 
@@ -69,8 +69,9 @@ podman build \
 # Vulkan
 podman build \
     -f runtimes/llm-vision-whisper/Dockerfile \
+    --build-arg FINAL_IMAGE=fedora:latest \
     --build-arg APT_PACKAGES="libvulkan-dev glslc glslang-tools spirv-headers" \
-    --build-arg RUNTIME_APT_PACKAGES="libgomp1 libstdc++6 libgcc-s1 ca-certificates libvulkan1 mesa-vulkan-drivers" \
+    --build-arg RUNTIME_APT_PACKAGES="libgomp libstdc++ libgcc ca-certificates vulkan-loader mesa-vulkan-drivers" \
     --build-arg CMAKE_ARGS="-DGGML_VULKAN=on" \
     --build-arg RUNTIME_VARIANT=vulkan \
     -t docker.io/example/aileron-runtime-llm-vision-whisper:vulkan \

@@ -26,9 +26,17 @@ ENV LD_LIBRARY_PATH="${ROCM_PATH}/lib"
 ENV AMDGPU_TARGETS="${AMDGPU_TARGETS}"
 ENV PATH="${ROCM_PATH}/bin:${PATH}"
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates curl build-essential cmake clang libclang-dev pkg-config git ninja-build ${APT_PACKAGES} \
-    && rm -rf /var/lib/apt/lists/* \
+RUN set -eux; \
+    if command -v apt-get >/dev/null 2>&1; then \
+    apt-get update; \
+    apt-get install -y --no-install-recommends ca-certificates curl build-essential cmake clang libclang-dev pkg-config git ninja-build ${APT_PACKAGES}; \
+    rm -rf /var/lib/apt/lists/*; \
+    elif command -v dnf >/dev/null 2>&1; then \
+    dnf install -y --setopt=install_weak_deps=False ca-certificates curl gcc gcc-c++ cmake clang-devel pkgconf-pkg-config git ninja-build ${APT_PACKAGES}; \
+    dnf clean all; \
+    else \
+    echo "unsupported builder package manager" >&2; exit 1; \
+    fi \
     && case " ${APT_PACKAGES} ${CMAKE_ARGS} " in \
     *[Vv][Uu][Ll][Kk][Aa][Nn]* ) \
     git clone --depth 1 --branch "${VULKAN_HEADERS_TAG}" https://github.com/KhronosGroup/Vulkan-Headers.git /tmp/vulkan-headers \
@@ -108,12 +116,21 @@ ENV HIP_PATH="${ROCM_PATH}"
 ENV LD_LIBRARY_PATH="${ROCM_PATH}/lib"
 ENV PATH="${ROCM_PATH}/bin:${PATH}"
 
-RUN apt-get update && apt-get install -y --no-install-recommends ${RUNTIME_APT_PACKAGES} \
+RUN set -eux; \
+    if command -v apt-get >/dev/null 2>&1; then \
+    apt-get update; \
+    apt-get install -y --no-install-recommends ${RUNTIME_APT_PACKAGES}; \
+    rm -rf /var/lib/apt/lists/*; \
+    elif command -v dnf >/dev/null 2>&1; then \
+    dnf install -y --setopt=install_weak_deps=False ${RUNTIME_APT_PACKAGES}; \
+    dnf clean all; \
+    else \
+    echo "unsupported runtime package manager" >&2; exit 1; \
+    fi \
     && if [ "$RUNTIME_VARIANT" = "vulkan" ]; then \
     rm -f /usr/share/vulkan/icd.d/lvp_icd*.json /usr/share/vulkan/icd.d/lavapipe*.json; \
     fi \
-    && mkdir -p /usr/local/nvidia/lib64 \
-    && rm -rf /var/lib/apt/lists/*
+    && mkdir -p /usr/local/nvidia/lib64
 
 COPY --from=builder /runtime-bins/* /usr/local/bin/
 COPY runtimes/llm-vision-whisper/entrypoint.sh /entrypoint
