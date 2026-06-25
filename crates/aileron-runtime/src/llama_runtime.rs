@@ -14,7 +14,7 @@ use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::{LogOptions, json_schema_to_grammar, send_logs_to_tracing};
 use serde_json::Value;
 
-use crate::{available_threads, field_as_string};
+use crate::{default_threads_for_device, field_as_string};
 
 pub const DEFAULT_SYSTEM: &str = "You are a helpful assistant. Always respond in the same language as the user's message. Be concise and accurate.";
 
@@ -24,10 +24,12 @@ pub struct LlamaRuntimeConfig {
     pub n_ctx: u32,
     pub n_threads: i32,
     pub n_gpu_layers: i32,
+    pub device: String,
 }
 
 impl LlamaRuntimeConfig {
     pub fn from_env() -> Self {
+        let device = env::var("AILERON_DEVICE").unwrap_or_else(|_| "cpu".to_string());
         Self {
             model_path: env::var("MODEL_PATH").unwrap_or_else(|_| "/model/model.gguf".to_string()),
             n_ctx: env::var("N_CTX")
@@ -37,11 +39,12 @@ impl LlamaRuntimeConfig {
             n_threads: env::var("N_THREADS")
                 .ok()
                 .and_then(|value| value.parse().ok())
-                .unwrap_or_else(available_threads),
+                .unwrap_or_else(|| default_threads_for_device(&device)),
             n_gpu_layers: env::var("N_GPU_LAYERS")
                 .ok()
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(0),
+            device,
         }
     }
 }
@@ -81,8 +84,13 @@ pub fn load_model(
         format!(" {loading_suffix}")
     };
     eprintln!(
-        "[{log_prefix}] loading {}{} (ctx={}, gpu_layers={}, threads={})",
-        config.model_path, suffix, config.n_ctx, config.n_gpu_layers, config.n_threads
+        "[{log_prefix}] loading {}{} (device={}, ctx={}, gpu_layers={}, threads={})",
+        config.model_path,
+        suffix,
+        config.device,
+        config.n_ctx,
+        config.n_gpu_layers,
+        config.n_threads
     );
     LlamaModel::load_from_file(backend, Path::new(&config.model_path), &model_params)
         .with_context(|| format!("load llama model from {}", config.model_path))

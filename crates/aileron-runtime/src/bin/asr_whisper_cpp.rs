@@ -1,4 +1,4 @@
-use aileron_runtime::{Request, available_threads, send, send_unsupported};
+use aileron_runtime::{Request, default_threads_for_device, send, send_unsupported};
 use anyhow::{Result, bail};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
@@ -7,11 +7,11 @@ use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextPar
 
 fn main() -> Result<()> {
     let model_path = std::env::var("MODEL_PATH").unwrap_or_else(|_| "/model/model.bin".to_string());
+    let device = std::env::var("AILERON_DEVICE").unwrap_or_else(|_| "cpu".to_string());
     let n_threads = std::env::var("N_THREADS")
         .ok()
         .and_then(|value| value.parse().ok())
-        .unwrap_or_else(available_threads);
-    let device = std::env::var("AILERON_DEVICE").unwrap_or_else(|_| "cpu".to_string());
+        .unwrap_or_else(|| default_threads_for_device(&device));
     let use_gpu = device != "cpu";
     eprintln!(
         "[aileron-asr] loading whisper model: {model_path} (device={device}, use_gpu={use_gpu}, threads={n_threads})"

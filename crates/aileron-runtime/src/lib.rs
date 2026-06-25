@@ -201,6 +201,15 @@ pub fn available_threads() -> i32 {
         .unwrap_or(4) as i32
 }
 
+pub fn default_threads_for_device(device: &str) -> i32 {
+    let available = available_threads();
+    if device == "cpu" {
+        available
+    } else {
+        available.clamp(1, 4)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,6 +239,14 @@ mod tests {
         assert_eq!(clamp_choices(Some(0)), 1);
         assert_eq!(clamp_choices(Some(2)), 2);
         assert_eq!(clamp_choices(Some(99)), 3);
+    }
+
+    #[test]
+    fn accelerator_thread_default_does_not_exceed_four() {
+        assert!(default_threads_for_device("vulkan") <= 4);
+        assert!(default_threads_for_device("cuda") <= 4);
+        assert!(default_threads_for_device("rocm") <= 4);
+        assert!(default_threads_for_device("vulkan") >= 1);
     }
 
     #[test]

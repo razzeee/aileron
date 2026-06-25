@@ -103,5 +103,5 @@ Use digest-pinned refs, such as `image@sha256:...`, for distribution manifests.
 | `MMPROJ_PATH` | `/model/mmproj.gguf` | Projection file that selects the vision runtime when present |
 | `N_CTX` | `4096` | llama.cpp context window size |
 | `N_GPU_LAYERS` | `0` | llama.cpp layers to offload; daemon starts GPU variants at `-1` and retries lower values unless explicitly set |
-| `N_THREADS` | all cores | CPU threads used by llama.cpp and whisper.cpp |
+| `N_THREADS` | all cores on CPU, up to 4 on accelerators | CPU helper threads used by llama.cpp and whisper.cpp |
 | `AILERON_DEVICE` | `cpu` | Device selected by the daemon (`cpu`, `cuda`, `rocm`, or `vulkan`) |
