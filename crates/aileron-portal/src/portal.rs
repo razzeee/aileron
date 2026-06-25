@@ -32,7 +32,16 @@ pub async fn run() -> Result<()> {
 #[derive(Default)]
 struct PortalState {
     warm: Mutex<HashSet<String>>,
-    session_use_cases: Mutex<HashMap<String, String>>,
+    sessions: Mutex<HashMap<String, PortalSession>>,
+    session_recreation: Mutex<()>,
+}
+
+#[derive(Clone)]
+struct PortalSession {
+    app_id: String,
+    use_case: String,
+    instructions: String,
+    daemon_session_id: String,
 }
 
 struct LanguagePortalBackend {
@@ -174,14 +183,15 @@ impl LanguagePortalBackend {
         let conn =
             aileron_ipc::client::connect().map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn);
-        let reply = client
-            .respond(
-                session_id.to_string(),
-                prompt.to_string(),
-                options.into_varlink(),
-            )
-            .call()
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        let reply = call_with_recreated_session(&self.state, session_id, |daemon_session_id| {
+            client
+                .respond(
+                    daemon_session_id,
+                    prompt.to_string(),
+                    options.clone().into_varlink(),
+                )
+                .call()
+        })?;
         self.mark_warm(session_id);
         Ok(reply.content)
     }
@@ -199,14 +209,15 @@ impl LanguagePortalBackend {
         let conn =
             aileron_ipc::client::connect().map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn);
-        let reply = client
-            .predict_next(
-                session_id.to_string(),
-                prefix.to_string(),
-                options.into_varlink(),
-            )
-            .call()
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        let reply = call_with_recreated_session(&self.state, session_id, |daemon_session_id| {
+            client
+                .predict_next(
+                    daemon_session_id,
+                    prefix.to_string(),
+                    options.clone().into_varlink(),
+                )
+                .call()
+        })?;
         self.mark_warm(session_id);
         Ok(reply.completions)
     }
@@ -221,18 +232,36 @@ impl LanguagePortalBackend {
         use aileron_varlink::aileron_Inference::VarlinkClientInterface;
 
         self.emit_loading_if_cold(session_id, &emitter).await?;
-        let session_id = session_id.to_string();
+        let public_session_id = session_id.to_string();
+        let daemon_session_id = daemon_session_id_or_public(&self.state, session_id);
+        let attempted_daemon_session_id = daemon_session_id.clone();
         let conn =
             aileron_ipc::client::connect().map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn);
         let mut call = client.stream_response(
-            session_id.clone(),
+            daemon_session_id,
             prompt.to_string(),
-            options.into_varlink(),
+            options.clone().into_varlink(),
         );
-        let iter = call
-            .more()
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        let iter = match call.more() {
+            Ok(iter) => iter,
+            Err(e) if is_session_not_found(&e) => {
+                let daemon_session_id = recreate_daemon_session(
+                    &self.state,
+                    session_id,
+                    &attempted_daemon_session_id,
+                    &e,
+                )?;
+                call = client.stream_response(
+                    daemon_session_id,
+                    prompt.to_string(),
+                    options.into_varlink(),
+                );
+                call.more()
+                    .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?
+            }
+            Err(e) => return Err(zbus::fdo::Error::Failed(e.to_string())),
+        };
 
         let mut pending_token: Option<String> = None;
         for reply in iter {
@@ -241,19 +270,24 @@ impl LanguagePortalBackend {
                 .token;
 
             if let Some(previous) = pending_token.replace(token) {
-                LanguagePortalBackend::token_received(&emitter, &session_id, &previous, false)
-                    .await
-                    .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+                LanguagePortalBackend::token_received(
+                    &emitter,
+                    &public_session_id,
+                    &previous,
+                    false,
+                )
+                .await
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
             }
         }
 
         if let Some(token) = pending_token {
-            LanguagePortalBackend::token_received(&emitter, &session_id, &token, true)
+            LanguagePortalBackend::token_received(&emitter, &public_session_id, &token, true)
                 .await
                 .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         }
 
-        self.mark_warm(&session_id);
+        self.mark_warm(&public_session_id);
         Ok(())
     }
 
@@ -277,26 +311,54 @@ impl LanguagePortalBackend {
         use aileron_varlink::aileron_Inference::VarlinkClientInterface;
 
         self.emit_loading_if_cold(session_id, &emitter).await?;
-        let session_id = session_id.to_string();
+        let public_session_id = session_id.to_string();
+        let daemon_session_id = daemon_session_id_or_public(&self.state, session_id);
+        let attempted_daemon_session_id = daemon_session_id.clone();
         let conn =
             aileron_ipc::client::connect().map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn);
         let mut call = client.stream_respond_guided(
-            session_id.clone(),
+            daemon_session_id,
             prompt.to_string(),
             fields
+                .clone()
                 .into_iter()
                 .map(GuidedFieldDbus::into_varlink)
                 .collect(),
             tools
+                .clone()
                 .into_iter()
                 .map(ToolDefinitionDbus::into_varlink)
                 .collect(),
-            options.into_varlink(),
+            options.clone().into_varlink(),
         );
-        let iter = call
-            .more()
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        let iter = match call.more() {
+            Ok(iter) => iter,
+            Err(e) if is_session_not_found(&e) => {
+                let daemon_session_id = recreate_daemon_session(
+                    &self.state,
+                    session_id,
+                    &attempted_daemon_session_id,
+                    &e,
+                )?;
+                call = client.stream_respond_guided(
+                    daemon_session_id,
+                    prompt.to_string(),
+                    fields
+                        .into_iter()
+                        .map(GuidedFieldDbus::into_varlink)
+                        .collect(),
+                    tools
+                        .into_iter()
+                        .map(ToolDefinitionDbus::into_varlink)
+                        .collect(),
+                    options.into_varlink(),
+                );
+                call.more()
+                    .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?
+            }
+            Err(e) => return Err(zbus::fdo::Error::Failed(e.to_string())),
+        };
 
         let mut pending_snapshot: Option<String> = None;
         for reply in iter {
@@ -311,7 +373,7 @@ impl LanguagePortalBackend {
             if !tool_calls.is_empty() {
                 LanguagePortalBackend::guided_tool_calls_received(
                     &emitter,
-                    &session_id,
+                    &public_session_id,
                     &tool_calls,
                     true,
                 )
@@ -323,7 +385,7 @@ impl LanguagePortalBackend {
             if let Some(previous) = pending_snapshot.replace(snapshot) {
                 LanguagePortalBackend::guided_snapshot_received(
                     &emitter,
-                    &session_id,
+                    &public_session_id,
                     &previous,
                     false,
                 )
@@ -333,12 +395,17 @@ impl LanguagePortalBackend {
         }
 
         if let Some(snapshot) = pending_snapshot {
-            LanguagePortalBackend::guided_snapshot_received(&emitter, &session_id, &snapshot, true)
-                .await
-                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            LanguagePortalBackend::guided_snapshot_received(
+                &emitter,
+                &public_session_id,
+                &snapshot,
+                true,
+            )
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         }
 
-        self.mark_warm(&session_id);
+        self.mark_warm(&public_session_id);
         Ok(())
     }
 
@@ -373,22 +440,25 @@ impl LanguagePortalBackend {
         let conn =
             aileron_ipc::client::connect().map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn);
-        let reply = client
-            .respond_guided(
-                session_id.to_string(),
-                prompt.to_string(),
-                fields
-                    .into_iter()
-                    .map(GuidedFieldDbus::into_varlink)
-                    .collect(),
-                tools
-                    .into_iter()
-                    .map(ToolDefinitionDbus::into_varlink)
-                    .collect(),
-                options.into_varlink(),
-            )
-            .call()
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        let reply = call_with_recreated_session(&self.state, session_id, |daemon_session_id| {
+            client
+                .respond_guided(
+                    daemon_session_id,
+                    prompt.to_string(),
+                    fields
+                        .clone()
+                        .into_iter()
+                        .map(GuidedFieldDbus::into_varlink)
+                        .collect(),
+                    tools
+                        .clone()
+                        .into_iter()
+                        .map(ToolDefinitionDbus::into_varlink)
+                        .collect(),
+                    options.clone().into_varlink(),
+                )
+                .call()
+        })?;
         self.mark_warm(session_id);
         Ok((
             reply.content,
@@ -417,26 +487,30 @@ impl LanguagePortalBackend {
         let conn =
             aileron_ipc::client::connect().map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn);
-        let reply = client
-            .submit_tool_results_guided(
-                session_id.to_string(),
-                prompt.to_string(),
-                results
-                    .into_iter()
-                    .map(ToolResultDbus::into_varlink)
-                    .collect(),
-                fields
-                    .into_iter()
-                    .map(GuidedFieldDbus::into_varlink)
-                    .collect(),
-                tools
-                    .into_iter()
-                    .map(ToolDefinitionDbus::into_varlink)
-                    .collect(),
-                options.into_varlink(),
-            )
-            .call()
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        let reply = call_with_recreated_session(&self.state, session_id, |daemon_session_id| {
+            client
+                .submit_tool_results_guided(
+                    daemon_session_id,
+                    prompt.to_string(),
+                    results
+                        .clone()
+                        .into_iter()
+                        .map(ToolResultDbus::into_varlink)
+                        .collect(),
+                    fields
+                        .clone()
+                        .into_iter()
+                        .map(GuidedFieldDbus::into_varlink)
+                        .collect(),
+                    tools
+                        .clone()
+                        .into_iter()
+                        .map(ToolDefinitionDbus::into_varlink)
+                        .collect(),
+                    options.clone().into_varlink(),
+                )
+                .call()
+        })?;
         self.mark_warm(session_id);
         Ok((
             reply.content,
@@ -454,10 +528,9 @@ impl LanguagePortalBackend {
         let conn =
             aileron_ipc::client::connect().map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn);
-        let reply = client
-            .embed(session_id.to_string(), text.to_string())
-            .call()
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        let reply = call_with_recreated_session(&self.state, session_id, |daemon_session_id| {
+            client.embed(daemon_session_id, text.to_string()).call()
+        })?;
         Ok(reply.embedding)
     }
 
@@ -518,14 +591,15 @@ impl SpeechPortalBackend {
         let conn =
             aileron_ipc::client::connect().map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn);
-        let reply = client
-            .transcribe(
-                session_id.to_string(),
-                audio_b64.to_string(),
-                source_language_hint.to_string(),
-            )
-            .call()
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        let reply = call_with_recreated_session(&self.state, session_id, |daemon_session_id| {
+            client
+                .transcribe(
+                    daemon_session_id,
+                    audio_b64.to_string(),
+                    source_language_hint.to_string(),
+                )
+                .call()
+        })?;
         Ok(reply.text)
     }
 
@@ -539,18 +613,36 @@ impl SpeechPortalBackend {
         use aileron_varlink::aileron_Inference::VarlinkClientInterface;
 
         self.emit_loading_if_cold(session_id, &emitter).await?;
-        let session_id = session_id.to_string();
+        let public_session_id = session_id.to_string();
+        let daemon_session_id = daemon_session_id_or_public(&self.state, session_id);
+        let attempted_daemon_session_id = daemon_session_id.clone();
         let conn =
             aileron_ipc::client::connect().map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn);
         let mut call = client.stream_transcribe(
-            session_id.clone(),
+            daemon_session_id,
             audio_b64.to_string(),
             source_language_hint.to_string(),
         );
-        let iter = call
-            .more()
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        let iter = match call.more() {
+            Ok(iter) => iter,
+            Err(e) if is_session_not_found(&e) => {
+                let daemon_session_id = recreate_daemon_session(
+                    &self.state,
+                    session_id,
+                    &attempted_daemon_session_id,
+                    &e,
+                )?;
+                call = client.stream_transcribe(
+                    daemon_session_id,
+                    audio_b64.to_string(),
+                    source_language_hint.to_string(),
+                );
+                call.more()
+                    .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?
+            }
+            Err(e) => return Err(zbus::fdo::Error::Failed(e.to_string())),
+        };
 
         let mut pending_text: Option<String> = None;
         for reply in iter {
@@ -561,7 +653,7 @@ impl SpeechPortalBackend {
             if let Some(previous) = pending_text.replace(text) {
                 SpeechPortalBackend::transcription_received(
                     &emitter,
-                    &session_id,
+                    &public_session_id,
                     &previous,
                     false,
                 )
@@ -572,14 +664,14 @@ impl SpeechPortalBackend {
 
         SpeechPortalBackend::transcription_received(
             &emitter,
-            &session_id,
+            &public_session_id,
             pending_text.as_deref().unwrap_or_default(),
             true,
         )
         .await
         .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
 
-        self.mark_warm(&session_id);
+        self.mark_warm(&public_session_id);
         Ok(())
     }
 
@@ -643,10 +735,11 @@ impl VisionPortalBackend {
         let conn =
             aileron_ipc::client::connect().map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn);
-        let reply = client
-            .describe(session_id.to_string(), image_b64.to_string())
-            .call()
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        let reply = call_with_recreated_session(&self.state, session_id, |daemon_session_id| {
+            client
+                .describe(daemon_session_id, image_b64.to_string())
+                .call()
+        })?;
         Ok(reply.text)
     }
 
@@ -656,10 +749,9 @@ impl VisionPortalBackend {
         let conn =
             aileron_ipc::client::connect().map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn);
-        let reply = client
-            .ocr(session_id.to_string(), image_b64.to_string())
-            .call()
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        let reply = call_with_recreated_session(&self.state, session_id, |daemon_session_id| {
+            client.ocr(daemon_session_id, image_b64.to_string()).call()
+        })?;
         Ok(reply.text)
     }
 
@@ -673,10 +765,11 @@ impl VisionPortalBackend {
         let conn =
             aileron_ipc::client::connect().map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn);
-        let reply = client
-            .segment(session_id.to_string(), image_b64.to_string())
-            .call()
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        let reply = call_with_recreated_session(&self.state, session_id, |daemon_session_id| {
+            client
+                .segment(daemon_session_id, image_b64.to_string())
+                .call()
+        })?;
         Ok(reply
             .segments
             .into_iter()
@@ -733,6 +826,24 @@ fn create_session_impl(
     use_case: &str,
     instructions: &str,
 ) -> zbus::fdo::Result<String> {
+    let daemon_session_id = create_daemon_session(app_id, use_case, instructions)?;
+    state.sessions.lock().unwrap().insert(
+        daemon_session_id.clone(),
+        PortalSession {
+            app_id: app_id.to_string(),
+            use_case: use_case.to_string(),
+            instructions: instructions.to_string(),
+            daemon_session_id: daemon_session_id.clone(),
+        },
+    );
+    Ok(daemon_session_id)
+}
+
+fn create_daemon_session(
+    app_id: &str,
+    use_case: &str,
+    instructions: &str,
+) -> zbus::fdo::Result<String> {
     use aileron_varlink::aileron_Inference::VarlinkClientInterface;
 
     let conn =
@@ -767,11 +878,6 @@ fn create_session_impl(
         Err(e) => return Err(zbus::fdo::Error::Failed(e.to_string())),
     };
 
-    state
-        .session_use_cases
-        .lock()
-        .unwrap()
-        .insert(reply.session_id.clone(), use_case.to_string());
     Ok(reply.session_id)
 }
 
@@ -781,18 +887,11 @@ fn prewarm_impl(state: &PortalState, session_id: &str) -> zbus::fdo::Result<()> 
     let conn =
         aileron_ipc::client::connect().map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
     let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn);
-    client
-        .prewarm(session_id.to_string())
-        .call()
-        .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+    call_with_recreated_session(state, session_id, |daemon_session_id| {
+        client.prewarm(daemon_session_id).call()
+    })?;
 
-    if let Some(use_case) = state
-        .session_use_cases
-        .lock()
-        .unwrap()
-        .get(session_id)
-        .cloned()
-    {
+    if let Some(use_case) = use_case_for_session(state, session_id) {
         state.warm.lock().unwrap().insert(use_case);
     }
     Ok(())
@@ -801,15 +900,141 @@ fn prewarm_impl(state: &PortalState, session_id: &str) -> zbus::fdo::Result<()> 
 fn end_session_impl(state: &PortalState, session_id: &str) -> zbus::fdo::Result<()> {
     use aileron_varlink::aileron_Inference::VarlinkClientInterface;
 
+    let _recreation_guard = state.session_recreation.lock().unwrap();
+    let daemon_session_id = daemon_session_id_or_public(state, session_id);
+
     let conn =
         aileron_ipc::client::connect().map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
     let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn);
-    client
-        .end_session(session_id.to_string())
-        .call()
-        .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-    state.session_use_cases.lock().unwrap().remove(session_id);
+    match client.end_session(daemon_session_id).call() {
+        Ok(_) => {}
+        Err(e) if is_session_not_found(&e) => {}
+        Err(e) => return Err(zbus::fdo::Error::Failed(e.to_string())),
+    }
+    state.sessions.lock().unwrap().remove(session_id);
     Ok(())
+}
+
+fn daemon_session_id_or_public(state: &PortalState, session_id: &str) -> String {
+    state
+        .sessions
+        .lock()
+        .unwrap()
+        .get(session_id)
+        .map(|session| session.daemon_session_id.clone())
+        .unwrap_or_else(|| session_id.to_string())
+}
+
+fn call_with_recreated_session<T, E>(
+    state: &PortalState,
+    session_id: &str,
+    mut call: impl FnMut(String) -> Result<T, E>,
+) -> zbus::fdo::Result<T>
+where
+    E: std::fmt::Display,
+{
+    let daemon_session_id = daemon_session_id_or_public(state, session_id);
+    let attempted_daemon_session_id = daemon_session_id.clone();
+    match call(daemon_session_id) {
+        Ok(reply) => Ok(reply),
+        Err(e) if is_session_not_found(&e) => {
+            let daemon_session_id =
+                recreate_daemon_session(state, session_id, &attempted_daemon_session_id, &e)?;
+            call(daemon_session_id).map_err(|e| zbus::fdo::Error::Failed(e.to_string()))
+        }
+        Err(e) => Err(zbus::fdo::Error::Failed(e.to_string())),
+    }
+}
+
+fn use_case_for_session(state: &PortalState, session_id: &str) -> Option<String> {
+    state
+        .sessions
+        .lock()
+        .unwrap()
+        .get(session_id)
+        .map(|session| session.use_case.clone())
+}
+
+fn recreate_daemon_session(
+    state: &PortalState,
+    session_id: &str,
+    attempted_daemon_session_id: &str,
+    original_error: &impl std::fmt::Display,
+) -> zbus::fdo::Result<String> {
+    let _recreation_guard = state.session_recreation.lock().unwrap();
+    let session = match refresh_state_for_session(state, session_id, attempted_daemon_session_id) {
+        Ok(SessionRefreshState::AlreadyRefreshed(daemon_session_id)) => {
+            return Ok(daemon_session_id);
+        }
+        Ok(SessionRefreshState::Stale(session)) => session,
+        Err(()) => return Err(zbus::fdo::Error::Failed(original_error.to_string())),
+    };
+
+    let daemon_session_id =
+        create_daemon_session(&session.app_id, &session.use_case, &session.instructions)?;
+
+    if !update_daemon_session_id(state, session_id, &daemon_session_id) {
+        best_effort_end_daemon_session(&daemon_session_id);
+        return Err(zbus::fdo::Error::Failed(original_error.to_string()));
+    }
+
+    Ok(daemon_session_id)
+}
+
+enum SessionRefreshState {
+    AlreadyRefreshed(String),
+    Stale(PortalSession),
+}
+
+fn refresh_state_for_session(
+    state: &PortalState,
+    session_id: &str,
+    attempted_daemon_session_id: &str,
+) -> Result<SessionRefreshState, ()> {
+    let session = state
+        .sessions
+        .lock()
+        .unwrap()
+        .get(session_id)
+        .cloned()
+        .ok_or(())?;
+
+    if session.daemon_session_id == attempted_daemon_session_id {
+        Ok(SessionRefreshState::Stale(session))
+    } else {
+        Ok(SessionRefreshState::AlreadyRefreshed(
+            session.daemon_session_id,
+        ))
+    }
+}
+
+fn update_daemon_session_id(
+    state: &PortalState,
+    session_id: &str,
+    daemon_session_id: &str,
+) -> bool {
+    if let Some(current) = state.sessions.lock().unwrap().get_mut(session_id) {
+        current.daemon_session_id = daemon_session_id.to_string();
+        true
+    } else {
+        false
+    }
+}
+
+fn best_effort_end_daemon_session(daemon_session_id: &str) {
+    use aileron_varlink::aileron_Inference::VarlinkClientInterface;
+
+    if let Ok(conn) = aileron_ipc::client::connect() {
+        let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn);
+        let _ = client.end_session(daemon_session_id.to_string()).call();
+    }
+}
+
+fn is_session_not_found(error: &impl std::fmt::Display) -> bool {
+    let message = error.to_string();
+    message.contains("aileron.Inference.SessionNotFound")
+        || message.contains("aileron.Inference.SessionNotFound_Args")
+        || message.contains("SessionNotFound_Args")
 }
 
 fn is_permission_denied(error: &impl std::fmt::Display) -> bool {
@@ -866,13 +1091,7 @@ impl LanguagePortalBackend {
         session_id: &str,
         emitter: &SignalEmitter<'_>,
     ) -> zbus::fdo::Result<()> {
-        let use_case = self
-            .state
-            .session_use_cases
-            .lock()
-            .unwrap()
-            .get(session_id)
-            .cloned();
+        let use_case = use_case_for_session(&self.state, session_id);
         let is_warm = use_case
             .as_ref()
             .is_some_and(|u| self.state.warm.lock().unwrap().contains(u));
@@ -885,14 +1104,7 @@ impl LanguagePortalBackend {
     }
 
     fn mark_warm(&self, session_id: &str) {
-        if let Some(use_case) = self
-            .state
-            .session_use_cases
-            .lock()
-            .unwrap()
-            .get(session_id)
-            .cloned()
-        {
+        if let Some(use_case) = use_case_for_session(&self.state, session_id) {
             self.state.warm.lock().unwrap().insert(use_case);
         }
     }
@@ -904,13 +1116,7 @@ impl SpeechPortalBackend {
         session_id: &str,
         emitter: &SignalEmitter<'_>,
     ) -> zbus::fdo::Result<()> {
-        let use_case = self
-            .state
-            .session_use_cases
-            .lock()
-            .unwrap()
-            .get(session_id)
-            .cloned();
+        let use_case = use_case_for_session(&self.state, session_id);
         let is_warm = use_case
             .as_ref()
             .is_some_and(|u| self.state.warm.lock().unwrap().contains(u));
@@ -923,14 +1129,7 @@ impl SpeechPortalBackend {
     }
 
     fn mark_warm(&self, session_id: &str) {
-        if let Some(use_case) = self
-            .state
-            .session_use_cases
-            .lock()
-            .unwrap()
-            .get(session_id)
-            .cloned()
-        {
+        if let Some(use_case) = use_case_for_session(&self.state, session_id) {
             self.state.warm.lock().unwrap().insert(use_case);
         }
     }
@@ -1110,5 +1309,101 @@ mod tests {
         assert!(!is_permission_denied(
             &"aileron.Inference.ProfileUnavailable"
         ));
+    }
+
+    #[test]
+    fn session_not_found_detection_matches_error_text() {
+        assert!(is_session_not_found(
+            &"aileron.Inference.SessionNotFound: Some(SessionNotFound_Args { session_id: \"old\" })"
+        ));
+        assert!(!is_session_not_found(&"aileron.Inference.GenerationFailed"));
+    }
+
+    #[test]
+    fn daemon_session_lookup_uses_updated_internal_id() {
+        let state = PortalState::default();
+        state.sessions.lock().unwrap().insert(
+            "public-session".to_string(),
+            PortalSession {
+                app_id: "org.example.App".to_string(),
+                use_case: "language.extract".to_string(),
+                instructions: "answer".to_string(),
+                daemon_session_id: "stale-daemon-session".to_string(),
+            },
+        );
+
+        assert_eq!(
+            daemon_session_id_or_public(&state, "public-session"),
+            "stale-daemon-session"
+        );
+        update_daemon_session_id(&state, "public-session", "replacement-daemon-session");
+        assert_eq!(
+            daemon_session_id_or_public(&state, "public-session"),
+            "replacement-daemon-session"
+        );
+        assert_eq!(
+            daemon_session_id_or_public(&state, "unknown-session"),
+            "unknown-session"
+        );
+        assert_eq!(
+            use_case_for_session(&state, "public-session").as_deref(),
+            Some("language.extract")
+        );
+        assert!(!update_daemon_session_id(
+            &state,
+            "missing-session",
+            "orphan-daemon-session"
+        ));
+    }
+
+    #[test]
+    fn refresh_state_reuses_concurrent_replacement() {
+        let state = PortalState::default();
+        state.sessions.lock().unwrap().insert(
+            "public-session".to_string(),
+            PortalSession {
+                app_id: "org.example.App".to_string(),
+                use_case: "language.extract".to_string(),
+                instructions: "answer".to_string(),
+                daemon_session_id: "replacement-daemon-session".to_string(),
+            },
+        );
+
+        let refresh_state =
+            refresh_state_for_session(&state, "public-session", "stale-daemon-session")
+                .expect("known portal session should resolve");
+
+        match refresh_state {
+            SessionRefreshState::AlreadyRefreshed(id) => {
+                assert_eq!(id, "replacement-daemon-session");
+            }
+            SessionRefreshState::Stale(_) => panic!("replacement should be reused"),
+        }
+    }
+
+    #[test]
+    fn refresh_state_marks_matching_attempt_as_stale() {
+        let state = PortalState::default();
+        state.sessions.lock().unwrap().insert(
+            "public-session".to_string(),
+            PortalSession {
+                app_id: "org.example.App".to_string(),
+                use_case: "language.extract".to_string(),
+                instructions: "answer".to_string(),
+                daemon_session_id: "stale-daemon-session".to_string(),
+            },
+        );
+
+        let refresh_state =
+            refresh_state_for_session(&state, "public-session", "stale-daemon-session")
+                .expect("known portal session should resolve");
+
+        match refresh_state {
+            SessionRefreshState::Stale(session) => {
+                assert_eq!(session.daemon_session_id, "stale-daemon-session");
+                assert_eq!(session.use_case, "language.extract");
+            }
+            SessionRefreshState::AlreadyRefreshed(_) => panic!("matching attempt should be stale"),
+        }
     }
 }
