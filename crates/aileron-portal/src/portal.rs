@@ -122,13 +122,19 @@ struct VisionSegmentDbus {
 
 #[interface(name = "org.freedesktop.impl.portal.Language")]
 impl LanguagePortalBackend {
+    #[zbus(property)]
+    fn version(&self) -> u32 {
+        1
+    }
+
+    #[zbus(out_args("availability"))]
     async fn get_use_case_availability(
         &self,
         app_id: &str,
         use_case: &str,
-    ) -> zbus::fdo::Result<ModelAvailabilityDbus> {
+    ) -> zbus::fdo::Result<(ModelAvailabilityDbus,)> {
         ensure_use_case_prefix(use_case, "language.", "Language")?;
-        get_use_case_availability_impl(app_id, use_case)
+        Ok((get_use_case_availability_impl(app_id, use_case)?,))
     }
 
     async fn create_session(
@@ -185,7 +191,6 @@ impl LanguagePortalBackend {
         &self,
         session_id: &str,
         prefix: &str,
-        count: i64,
         options: GenerationOptionsDbus,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) -> zbus::fdo::Result<Vec<String>> {
@@ -199,7 +204,6 @@ impl LanguagePortalBackend {
             .predict_next(
                 session_id.to_string(),
                 prefix.to_string(),
-                count,
                 options.into_varlink(),
             )
             .call()
@@ -436,13 +440,19 @@ impl LanguagePortalBackend {
 
 #[interface(name = "org.freedesktop.impl.portal.Speech")]
 impl SpeechPortalBackend {
+    #[zbus(property)]
+    fn version(&self) -> u32 {
+        1
+    }
+
+    #[zbus(out_args("availability"))]
     async fn get_use_case_availability(
         &self,
         app_id: &str,
         use_case: &str,
-    ) -> zbus::fdo::Result<ModelAvailabilityDbus> {
+    ) -> zbus::fdo::Result<(ModelAvailabilityDbus,)> {
         ensure_use_case_prefix(use_case, "speech.", "Speech")?;
-        get_use_case_availability_impl(app_id, use_case)
+        Ok((get_use_case_availability_impl(app_id, use_case)?,))
     }
 
     async fn create_session(
@@ -561,13 +571,19 @@ impl SpeechPortalBackend {
 
 #[interface(name = "org.freedesktop.impl.portal.Vision")]
 impl VisionPortalBackend {
+    #[zbus(property)]
+    fn version(&self) -> u32 {
+        1
+    }
+
+    #[zbus(out_args("availability"))]
     async fn get_use_case_availability(
         &self,
         app_id: &str,
         use_case: &str,
-    ) -> zbus::fdo::Result<ModelAvailabilityDbus> {
+    ) -> zbus::fdo::Result<(ModelAvailabilityDbus,)> {
         ensure_use_case_prefix(use_case, "vision.", "Vision")?;
-        get_use_case_availability_impl(app_id, use_case)
+        Ok((get_use_case_availability_impl(app_id, use_case)?,))
     }
 
     async fn create_session(

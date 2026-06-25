@@ -63,7 +63,7 @@ method Prewarm(session_id: string, prompt_prefix: string) -> ()
 method Respond(session_id: string, prompt: string, options: GenerationOptions) -> (content: string)
 
 # Predict up to three short inline continuations from the raw text prefix. Session must have been created with a language.* use_case.
-method PredictNext(session_id: string, prefix: string, count: int, options: GenerationOptions) -> (completions: []string)
+method PredictNext(session_id: string, prefix: string, options: GenerationOptions) -> (completions: []string)
 
 # Stream response tokens. Session must have been created with a language.* use_case.
 method StreamResponse(session_id: string, prompt: string, options: GenerationOptions) -> (token: string)

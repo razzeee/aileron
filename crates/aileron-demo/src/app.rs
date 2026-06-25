@@ -10,11 +10,95 @@ use libadwaita::{
 };
 use relm4::{ComponentParts, ComponentSender, RelmApp, SimpleComponent};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
-use zbus::zvariant::Type;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use zbus::zvariant::{OwnedObjectPath, OwnedValue, Type, Value};
+
+const PORTAL_BUS: &str = "org.freedesktop.portal.Desktop";
+const PORTAL_PATH: &str = "/org/freedesktop/portal/desktop";
+const LANGUAGE_IFACE: &str = "org.freedesktop.portal.Language";
+const SESSION_IFACE: &str = "org.freedesktop.portal.Session";
+const SPEECH_IFACE: &str = "org.freedesktop.portal.Speech";
+const VISION_IFACE: &str = "org.freedesktop.portal.Vision";
+
+static PORTAL_CONNECTION: OnceLock<zbus::blocking::Connection> = OnceLock::new();
+
+type PortalOptions = HashMap<String, OwnedValue>;
+
+fn empty_options() -> PortalOptions {
+    HashMap::new()
+}
+
+fn portal_connection() -> zbus::Result<zbus::blocking::Connection> {
+    if let Some(conn) = PORTAL_CONNECTION.get() {
+        return Ok(conn.clone());
+    }
+
+    let conn = zbus::blocking::Connection::session()?;
+    if PORTAL_CONNECTION.set(conn.clone()).is_ok() {
+        Ok(conn)
+    } else {
+        Ok(PORTAL_CONNECTION
+            .get()
+            .expect("portal connection was set")
+            .clone())
+    }
+}
+
+fn string_option_value(value: &str) -> OwnedValue {
+    OwnedValue::try_from(Value::from(value.to_string())).expect("string options are valid values")
+}
+
+fn generation_options(
+    maximum_response_tokens: i64,
+    temperature: f64,
+    sampling_mode: &str,
+    source_language_hint: &str,
+    target_language_hint: &str,
+) -> PortalOptions {
+    let mut options = HashMap::new();
+    options.insert(
+        "maximum_response_tokens".to_string(),
+        OwnedValue::from(maximum_response_tokens),
+    );
+    options.insert("temperature".to_string(), OwnedValue::from(temperature));
+    options.insert(
+        "sampling_mode".to_string(),
+        string_option_value(sampling_mode),
+    );
+    options.insert(
+        "source_language_hint".to_string(),
+        string_option_value(source_language_hint),
+    );
+    options.insert(
+        "target_language_hint".to_string(),
+        string_option_value(target_language_hint),
+    );
+    options
+}
+
+fn create_public_session(
+    proxy: &zbus::blocking::Proxy<'_>,
+    use_case: &str,
+    instructions: &str,
+) -> zbus::Result<OwnedObjectPath> {
+    proxy.call("CreateSession", &(use_case, instructions, empty_options()))
+}
+
+fn close_public_session(session_handle: &OwnedObjectPath) -> zbus::Result<()> {
+    let conn = portal_connection()?;
+    let proxy =
+        zbus::blocking::Proxy::new(&conn, PORTAL_BUS, session_handle.as_str(), SESSION_IFACE)?;
+    proxy.call("Close", &())
+}
+
+fn cached_session_handle(session_handle: String) -> anyhow::Result<OwnedObjectPath> {
+    OwnedObjectPath::try_from(session_handle)
+        .map_err(|e| anyhow::anyhow!("cached portal session handle is invalid: {e}"))
+}
 
 #[derive(Debug)]
 pub enum AppMsg {}
@@ -806,16 +890,16 @@ fn friendly_error_text(message: &str) -> String {
 }
 
 fn concise_error(message: &str) -> String {
-    if message.contains("org.freedesktop.impl.portal.desktop.aileron")
+    if message.contains("org.freedesktop.portal.Desktop")
         && message.contains("activation request failed: unknown unit")
     {
-        return "Aileron portal is not installed for D-Bus activation. Install systemd/aileron-portal.service to ~/.config/systemd/user/, run `systemctl --user daemon-reload`, then start `systemctl --user enable --now aileron-portal`.".to_string();
+        return "xdg-desktop-portal is not available for D-Bus activation. Install and start the patched xdg-desktop-portal with the Aileron portal interfaces enabled.".to_string();
     }
 
     if message.contains("org.freedesktop.DBus.Error.UnknownInterface")
-        && message.contains("org.freedesktop.impl.portal.Language")
+        && message.contains("org.freedesktop.portal.Language")
     {
-        return "The running Aileron portal is older than this demo and does not expose the Language interface. Restart the updated portal with `systemctl --user restart aileron-portal`, or rebuild/reinstall the portal service if it was installed from an older binary.".to_string();
+        return "The running xdg-desktop-portal does not expose org.freedesktop.portal.Language. Rebuild and restart the patched xdg-desktop-portal, then ensure the Aileron implementation backend is configured.".to_string();
     }
 
     if message.contains("huggingface.co") && message.contains("ggml-") {
@@ -825,23 +909,17 @@ fn concise_error(message: &str) -> String {
     message.to_string()
 }
 
-/// Call `StreamResponse` on the portal and forward tokens via `tx`.
-/// Sends `Some(token)` for each token, then `None` when done.
+/// Call `StreamResponse` on the portal and forward token signals via `tx`.
 fn summarize_streaming(text: &str, tx: std::sync::mpsc::Sender<DemoEvent>) -> anyhow::Result<()> {
-    use zbus::blocking::Connection;
-
-    const BUS: &str = "org.freedesktop.impl.portal.desktop.aileron";
-    const PATH: &str = "/org/freedesktop/portal/desktop";
-    const IFACE: &str = "org.freedesktop.impl.portal.Language";
-
     // Separate connections for method calls and signal subscriptions —
     // the blocking zbus connection is single-threaded; mixing signals and
     // method calls on the same connection causes deadlocks.
-    let call_conn = Connection::session()?;
-    let signal_conn = Connection::session()?;
+    let call_conn = portal_connection()?;
+    let signal_conn = zbus::blocking::Connection::session()?;
 
-    let proxy = zbus::blocking::Proxy::new(&call_conn, BUS, PATH, IFACE)?;
-    let sig_proxy = zbus::blocking::Proxy::new(&signal_conn, BUS, PATH, IFACE)?;
+    let proxy = zbus::blocking::Proxy::new(&call_conn, PORTAL_BUS, PORTAL_PATH, LANGUAGE_IFACE)?;
+    let sig_proxy =
+        zbus::blocking::Proxy::new(&signal_conn, PORTAL_BUS, PORTAL_PATH, LANGUAGE_IFACE)?;
 
     // Subscribe to ModelLoading on the signal connection before generation, so
     // no signals are missed during the model load.
@@ -857,13 +935,10 @@ fn summarize_streaming(text: &str, tx: std::sync::mpsc::Sender<DemoEvent>) -> an
     });
 
     tx.send(DemoEvent::Phase(DemoPhase::CreatingSession))?;
-    let session_id: String = proxy.call(
-        "CreateSession",
-        &(
-            "org.aileron.Demo",
-            DemoMode::Summarize.use_case(),
-            DemoMode::Summarize.instructions(),
-        ),
+    let session_handle = create_public_session(
+        &proxy,
+        DemoMode::Summarize.use_case(),
+        DemoMode::Summarize.instructions(),
     )?;
 
     drop(loading_thread);
@@ -871,49 +946,57 @@ fn summarize_streaming(text: &str, tx: std::sync::mpsc::Sender<DemoEvent>) -> an
 
     let prompt = DemoMode::Summarize.prompt(text);
 
-    // Subscribe to TokenReceived on the signal connection.
+    // Subscribe before generation and consume concurrently. The D-Bus method
+    // reply only marks stream completion; tokens are delivered as signals.
     let mut token_iter = sig_proxy.receive_signal("TokenReceived")?;
+    let token_session_handle = session_handle.clone();
+    let tx_tokens = tx.clone();
+    let (stream_done_tx, stream_done_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = (|| -> anyhow::Result<()> {
+            for msg in &mut token_iter {
+                let body = msg.body();
+                let (sig_session, token, done): (OwnedObjectPath, String, bool) =
+                    body.deserialize()?;
+                if sig_session.as_str() != token_session_handle.as_str() {
+                    continue;
+                }
+                tx_tokens.send(DemoEvent::Token(token))?;
+                if done {
+                    break;
+                }
+            }
+            Ok(())
+        })();
+        let _ = stream_done_tx.send(result);
+    });
 
-    // StreamResponse returns immediately; tokens arrive as D-Bus signals.
-    let options = (512_i64, 0.7_f64, "default", "", "");
+    let options = generation_options(512, 0.7, "default", "", "");
     tx.send(DemoEvent::Phase(DemoPhase::RequestingStream))?;
-    let _: () = proxy.call("StreamResponse", &(&session_id, &prompt, options))?;
-
-    for msg in &mut token_iter {
-        let body = msg.body();
-        let (sig_session, token, done): (String, String, bool) = body.deserialize()?;
-        if sig_session != session_id {
-            continue;
-        }
-        tx.send(DemoEvent::Token(token))?;
-        if done {
-            break;
-        }
+    let stream_result: zbus::Result<()> =
+        proxy.call("StreamResponse", &(&session_handle, &prompt, options));
+    if let Err(error) = stream_result {
+        let _ = close_public_session(&session_handle);
+        return Err(error.into());
     }
+    stream_done_rx
+        .recv_timeout(Duration::from_secs(2))
+        .map_err(|_| anyhow::anyhow!("stream completed without a final TokenReceived signal"))??;
 
-    let _: () = proxy.call("EndSession", &(&session_id,))?;
+    close_public_session(&session_handle)?;
     tx.send(DemoEvent::Done)?;
     Ok(())
 }
 
 fn extract_guided(text: &str, tx: std::sync::mpsc::Sender<DemoEvent>) -> anyhow::Result<()> {
-    use zbus::blocking::Connection;
-
-    const BUS: &str = "org.freedesktop.impl.portal.desktop.aileron";
-    const PATH: &str = "/org/freedesktop/portal/desktop";
-    const IFACE: &str = "org.freedesktop.impl.portal.Language";
-
-    let conn = Connection::session()?;
-    let proxy = zbus::blocking::Proxy::new(&conn, BUS, PATH, IFACE)?;
+    let conn = portal_connection()?;
+    let proxy = zbus::blocking::Proxy::new(&conn, PORTAL_BUS, PORTAL_PATH, LANGUAGE_IFACE)?;
 
     tx.send(DemoEvent::Phase(DemoPhase::CreatingSession))?;
-    let session_id: String = proxy.call(
-        "CreateSession",
-        &(
-            "org.aileron.Demo",
-            DemoMode::Extract.use_case(),
-            DemoMode::Extract.instructions(),
-        ),
+    let session_handle = create_public_session(
+        &proxy,
+        DemoMode::Extract.use_case(),
+        DemoMode::Extract.instructions(),
     )?;
 
     let prompt = DemoMode::Extract.prompt(text);
@@ -937,14 +1020,14 @@ fn extract_guided(text: &str, tx: std::sync::mpsc::Sender<DemoEvent>) -> anyhow:
             true,
         ),
     ];
-    let options = (128_i64, 0.2_f64, "default", "", "");
+    let options = generation_options(128, 0.2, "default", "", "");
 
     tx.send(DemoEvent::Phase(DemoPhase::WaitingForModel))?;
     tx.send(DemoEvent::Phase(DemoPhase::RequestingGuided))?;
     let (content, _): (String, Vec<ToolCallDbus>) = proxy.call(
         "RespondGuided",
         &(
-            &session_id,
+            &session_handle,
             &prompt,
             fields,
             Vec::<ToolDefinitionDbus>::new(),
@@ -957,29 +1040,20 @@ fn extract_guided(text: &str, tx: std::sync::mpsc::Sender<DemoEvent>) -> anyhow:
         .unwrap_or(content);
     tx.send(DemoEvent::Json(pretty))?;
 
-    let _: () = proxy.call("EndSession", &(&session_id,))?;
+    close_public_session(&session_handle)?;
     tx.send(DemoEvent::Done)?;
     Ok(())
 }
 
 fn classify_guided(text: &str, tx: std::sync::mpsc::Sender<DemoEvent>) -> anyhow::Result<()> {
-    use zbus::blocking::Connection;
-
-    const BUS: &str = "org.freedesktop.impl.portal.desktop.aileron";
-    const PATH: &str = "/org/freedesktop/portal/desktop";
-    const IFACE: &str = "org.freedesktop.impl.portal.Language";
-
-    let conn = Connection::session()?;
-    let proxy = zbus::blocking::Proxy::new(&conn, BUS, PATH, IFACE)?;
+    let conn = portal_connection()?;
+    let proxy = zbus::blocking::Proxy::new(&conn, PORTAL_BUS, PORTAL_PATH, LANGUAGE_IFACE)?;
 
     tx.send(DemoEvent::Phase(DemoPhase::CreatingSession))?;
-    let session_id: String = proxy.call(
-        "CreateSession",
-        &(
-            "org.aileron.Demo",
-            DemoMode::Classify.use_case(),
-            DemoMode::Classify.instructions(),
-        ),
+    let session_handle = create_public_session(
+        &proxy,
+        DemoMode::Classify.use_case(),
+        DemoMode::Classify.instructions(),
     )?;
 
     let fields = vec![
@@ -1008,14 +1082,14 @@ fn classify_guided(text: &str, tx: std::sync::mpsc::Sender<DemoEvent>) -> anyhow
             true,
         ),
     ];
-    let options = (512_i64, 0.2_f64, "default", "", "");
+    let options = generation_options(512, 0.2, "default", "", "");
 
     tx.send(DemoEvent::Phase(DemoPhase::WaitingForModel))?;
     tx.send(DemoEvent::Phase(DemoPhase::RequestingGuided))?;
     let (content, _): (String, Vec<ToolCallDbus>) = proxy.call(
         "RespondGuided",
         &(
-            &session_id,
+            &session_handle,
             &DemoMode::Classify.prompt(text),
             fields,
             Vec::<ToolDefinitionDbus>::new(),
@@ -1028,7 +1102,7 @@ fn classify_guided(text: &str, tx: std::sync::mpsc::Sender<DemoEvent>) -> anyhow
         .unwrap_or(content);
     tx.send(DemoEvent::Json(pretty))?;
 
-    let _: () = proxy.call("EndSession", &(&session_id,))?;
+    close_public_session(&session_handle)?;
     tx.send(DemoEvent::Done)?;
     Ok(())
 }
@@ -1038,31 +1112,22 @@ fn respond_text_task(
     text: &str,
     tx: std::sync::mpsc::Sender<DemoEvent>,
 ) -> anyhow::Result<()> {
-    use zbus::blocking::Connection;
-
-    const BUS: &str = "org.freedesktop.impl.portal.desktop.aileron";
-    const PATH: &str = "/org/freedesktop/portal/desktop";
-    const IFACE: &str = "org.freedesktop.impl.portal.Language";
-
-    let conn = Connection::session()?;
-    let proxy = zbus::blocking::Proxy::new(&conn, BUS, PATH, IFACE)?;
+    let conn = portal_connection()?;
+    let proxy = zbus::blocking::Proxy::new(&conn, PORTAL_BUS, PORTAL_PATH, LANGUAGE_IFACE)?;
 
     tx.send(DemoEvent::Phase(DemoPhase::CreatingSession))?;
-    let session_id: String = proxy.call(
-        "CreateSession",
-        &("org.aileron.Demo", mode.use_case(), mode.instructions()),
-    )?;
+    let session_handle = create_public_session(&proxy, mode.use_case(), mode.instructions())?;
 
     tx.send(DemoEvent::Phase(DemoPhase::WaitingForModel))?;
     tx.send(DemoEvent::Phase(DemoPhase::RequestingResponse))?;
     let options = match mode {
-        DemoMode::Translate => (512_i64, 0.3_f64, "default", "", "Spanish"),
-        _ => (512_i64, 0.5_f64, "default", "", ""),
+        DemoMode::Translate => generation_options(512, 0.3, "default", "", "Spanish"),
+        _ => generation_options(512, 0.5, "default", "", ""),
     };
-    let content: String = proxy.call("Respond", &(&session_id, &mode.prompt(text), options))?;
+    let content: String = proxy.call("Respond", &(&session_handle, &mode.prompt(text), options))?;
     tx.send(DemoEvent::Text(content))?;
 
-    let _: () = proxy.call("EndSession", &(&session_id,))?;
+    close_public_session(&session_handle)?;
     tx.send(DemoEvent::Done)?;
     Ok(())
 }
@@ -1071,29 +1136,20 @@ fn predict_inline_completion(
     existing_session: Option<String>,
     input: &str,
 ) -> anyhow::Result<(String, Vec<String>)> {
-    use zbus::blocking::Connection;
-
-    const BUS: &str = "org.freedesktop.impl.portal.desktop.aileron";
-    const PATH: &str = "/org/freedesktop/portal/desktop";
-    const IFACE: &str = "org.freedesktop.impl.portal.Language";
-
-    let conn = Connection::session()?;
-    let proxy = zbus::blocking::Proxy::new(&conn, BUS, PATH, IFACE)?;
+    let conn = portal_connection()?;
+    let proxy = zbus::blocking::Proxy::new(&conn, PORTAL_BUS, PORTAL_PATH, LANGUAGE_IFACE)?;
     let used_existing_session = existing_session.is_some();
-    let create_session = || -> anyhow::Result<String> {
-        let id: String = proxy.call(
-            "CreateSession",
-            &(
-                "org.aileron.Demo",
-                "language.complete",
-                "Inline typing prediction session.",
-            ),
+    let create_session = || -> anyhow::Result<OwnedObjectPath> {
+        let handle = create_public_session(
+            &proxy,
+            "language.complete",
+            "Inline typing prediction session.",
         )?;
-        let _: () = proxy.call("Prewarm", &(&id, ""))?;
-        Ok(id)
+        let _: () = proxy.call("Prewarm", &(&handle, "", empty_options()))?;
+        Ok(handle)
     };
-    let mut session_id = match existing_session {
-        Some(id) => id,
+    let mut session_handle = match existing_session {
+        Some(id) => cached_session_handle(id)?,
         None => create_session()?,
     };
 
@@ -1109,17 +1165,24 @@ fn predict_inline_completion(
     } else {
         input.to_string()
     };
-    let options = (4_i64, 0.0_f64, "greedy", "", "");
+    let options = generation_options(4, 0.0, "greedy", "", "");
     let completions_result: zbus::Result<Vec<String>> =
-        proxy.call("PredictNext", &(&session_id, &prompt_input, 3_i64, options));
+        proxy.call("PredictNext", &(&session_handle, &prompt_input, options));
     let completions = match completions_result {
         Ok(completions) => completions,
         Err(e) if used_existing_session && is_session_not_found_message(&e.to_string()) => {
-            session_id = create_session()?;
-            match proxy.call("PredictNext", &(&session_id, &prompt_input, 3_i64, options)) {
+            session_handle = create_session()?;
+            match proxy.call(
+                "PredictNext",
+                &(
+                    &session_handle,
+                    &prompt_input,
+                    generation_options(4, 0.0, "greedy", "", ""),
+                ),
+            ) {
                 Ok(completions) => completions,
                 Err(e) => {
-                    let _: zbus::Result<()> = proxy.call("EndSession", &(&session_id,));
+                    let _ = close_public_session(&session_handle);
                     return Err(e.into());
                 }
             }
@@ -1136,7 +1199,7 @@ fn predict_inline_completion(
             break;
         }
     }
-    Ok((session_id, cleaned))
+    Ok((session_handle.to_string(), cleaned))
 }
 
 fn clear_failed_prediction_session(
@@ -1158,15 +1221,7 @@ fn is_session_not_found_message(message: &str) -> bool {
 }
 
 fn end_prediction_session(session_id: &str) -> anyhow::Result<()> {
-    use zbus::blocking::Connection;
-
-    const BUS: &str = "org.freedesktop.impl.portal.desktop.aileron";
-    const PATH: &str = "/org/freedesktop/portal/desktop";
-    const IFACE: &str = "org.freedesktop.impl.portal.Language";
-
-    let conn = Connection::session()?;
-    let proxy = zbus::blocking::Proxy::new(&conn, BUS, PATH, IFACE)?;
-    let _: () = proxy.call("EndSession", &(session_id,))?;
+    close_public_session(&cached_session_handle(session_id.to_string())?)?;
     Ok(())
 }
 
@@ -1244,28 +1299,19 @@ fn guided_chat_turn(
     messages: Vec<ChatMessage>,
     tx: std::sync::mpsc::Sender<ChatEvent>,
 ) -> anyhow::Result<()> {
-    use zbus::blocking::Connection;
+    let conn = portal_connection()?;
+    let proxy = zbus::blocking::Proxy::new(&conn, PORTAL_BUS, PORTAL_PATH, LANGUAGE_IFACE)?;
 
-    const BUS: &str = "org.freedesktop.impl.portal.desktop.aileron";
-    const PATH: &str = "/org/freedesktop/portal/desktop";
-    const IFACE: &str = "org.freedesktop.impl.portal.Language";
-
-    let conn = Connection::session()?;
-    let proxy = zbus::blocking::Proxy::new(&conn, BUS, PATH, IFACE)?;
-
-    let session_id = match existing_session {
-        Some(id) => id,
+    let session_handle = match existing_session {
+        Some(id) => cached_session_handle(id)?,
         None => {
-            let id: String = proxy.call(
-                "CreateSession",
-                &(
-                    "org.aileron.Demo",
-                    "language.extract",
-                    "You answer chat turns and extract only durable user memory as guided JSON.",
-                ),
+            let handle = create_public_session(
+                &proxy,
+                "language.extract",
+                "You answer chat turns and extract only durable user memory as guided JSON.",
             )?;
-            tx.send(ChatEvent::SessionReady(id.clone()))?;
-            id
+            tx.send(ChatEvent::SessionReady(handle.to_string()))?;
+            handle
         }
     };
 
@@ -1289,12 +1335,12 @@ fn guided_chat_turn(
             true,
         ),
     ];
-    let options = (512_i64, 0.2_f64, "default", "", "");
+    let options = generation_options(512, 0.2, "default", "", "");
     let prompt = guided_chat_prompt(memory, &messages);
     let (content, _): (String, Vec<ToolCallDbus>) = proxy.call(
         "RespondGuided",
         &(
-            &session_id,
+            &session_handle,
             &prompt,
             fields,
             Vec::<ToolDefinitionDbus>::new(),
@@ -1309,15 +1355,7 @@ fn guided_chat_turn(
 }
 
 fn end_guided_chat_session(session_id: &str) -> anyhow::Result<()> {
-    use zbus::blocking::Connection;
-
-    const BUS: &str = "org.freedesktop.impl.portal.desktop.aileron";
-    const PATH: &str = "/org/freedesktop/portal/desktop";
-    const IFACE: &str = "org.freedesktop.impl.portal.Language";
-
-    let conn = Connection::session()?;
-    let proxy = zbus::blocking::Proxy::new(&conn, BUS, PATH, IFACE)?;
-    let _: () = proxy.call("EndSession", &(session_id,))?;
+    close_public_session(&cached_session_handle(session_id.to_string())?)?;
     Ok(())
 }
 
@@ -1351,30 +1389,21 @@ fn run_character_tool_demo(
     prompt: &str,
     tx: std::sync::mpsc::Sender<ToolEvent>,
 ) -> anyhow::Result<()> {
-    use zbus::blocking::Connection;
-
-    const BUS: &str = "org.freedesktop.impl.portal.desktop.aileron";
-    const PATH: &str = "/org/freedesktop/portal/desktop";
-    const IFACE: &str = "org.freedesktop.impl.portal.Language";
-
     tx.send(ToolEvent::Trace(
         "before_agent_loop: seed messages and register count_character_occurrences".to_string(),
     ))?;
 
-    let conn = Connection::session()?;
-    let proxy = zbus::blocking::Proxy::new(&conn, BUS, PATH, IFACE)?;
-    let session_id: String = proxy.call(
-        "CreateSession",
-        &(
-            "org.aileron.Demo",
-            "language.analyze",
-            "You are a small local agent. Return guided JSON. Use action=call_tool when exact character counting is needed. Use action=final only after tool_result is provided.",
-        ),
+    let conn = portal_connection()?;
+    let proxy = zbus::blocking::Proxy::new(&conn, PORTAL_BUS, PORTAL_PATH, LANGUAGE_IFACE)?;
+    let session_handle = create_public_session(
+        &proxy,
+        "language.analyze",
+        "You are a small local agent. Return guided JSON. Use action=call_tool when exact character counting is needed. Use action=final only after tool_result is provided.",
     )?;
 
     let fields = guided_tool_loop_fields();
     let tools = count_tool_definitions()?;
-    let options = (128_i64, 0.2_f64, "default", "", "");
+    let options = generation_options(128, 0.2, "default", "", "");
     let mut loop_prompt = format!(
         "Available app tool:\n- count_character_occurrences(word: string, character: string): exact deterministic count.\n\nUser request: {prompt}\n\nReturn action=call_tool with tool_name=count_character_occurrences, word, and character if this needs exact counting. Return action=final only if no tool is needed."
     );
@@ -1385,11 +1414,11 @@ fn run_character_tool_demo(
     let (content, tool_calls): (String, Vec<ToolCallDbus>) = proxy.call(
         "RespondGuided",
         &(
-            &session_id,
+            &session_handle,
             &loop_prompt,
             fields.clone(),
             tools.clone(),
-            options,
+            options.clone(),
         ),
     )?;
     let mut response = if content.trim().is_empty() && !tool_calls.is_empty() {
@@ -1421,12 +1450,12 @@ fn run_character_tool_demo(
         let answer = match initial_final_answer(response) {
             Ok(answer) => answer,
             Err(e) => {
-                let _: () = proxy.call("EndSession", &(&session_id,))?;
+                close_public_session(&session_handle)?;
                 return Err(e);
             }
         };
         tx.send(ToolEvent::Final(answer))?;
-        let _: () = proxy.call("EndSession", &(&session_id,))?;
+        close_public_session(&session_handle)?;
         tx.send(ToolEvent::Done)?;
         return Ok(());
     }
@@ -1475,13 +1504,20 @@ fn run_character_tool_demo(
     let final_content = if results.is_empty() {
         let (content, _): (String, Vec<ToolCallDbus>) = proxy.call(
             "RespondGuided",
-            &(&session_id, &loop_prompt, fields, tools, options),
+            &(&session_handle, &loop_prompt, fields, tools, options),
         )?;
         content
     } else {
         let (content, _): (String, Vec<ToolCallDbus>) = proxy.call(
             "SubmitToolResultsGuided",
-            &(&session_id, &loop_prompt, results, fields, tools, options),
+            &(
+                &session_handle,
+                &loop_prompt,
+                results,
+                fields,
+                tools,
+                options,
+            ),
         )?;
         content
     };
@@ -1501,7 +1537,7 @@ fn run_character_tool_demo(
         },
     ))?;
 
-    let _: () = proxy.call("EndSession", &(&session_id,))?;
+    close_public_session(&session_handle)?;
     tx.send(ToolEvent::Done)?;
     Ok(())
 }
@@ -1726,27 +1762,19 @@ fn transcribe_recording(
     use_case: &str,
     tx: std::sync::mpsc::Sender<SpeechEvent>,
 ) -> anyhow::Result<()> {
-    use zbus::blocking::Connection;
-
-    const BUS: &str = "org.freedesktop.impl.portal.desktop.aileron";
-    const PATH: &str = "/org/freedesktop/portal/desktop";
-    const IFACE: &str = "org.freedesktop.impl.portal.Speech";
-
     let audio = std::fs::read(path)?;
     if audio.is_empty() {
         anyhow::bail!("recording is empty");
     }
 
-    let call_conn = Connection::session()?;
-    let signal_conn = Connection::session()?;
-    let proxy = zbus::blocking::Proxy::new(&call_conn, BUS, PATH, IFACE)?;
-    let sig_proxy = zbus::blocking::Proxy::new(&signal_conn, BUS, PATH, IFACE)?;
+    let call_conn = portal_connection()?;
+    let signal_conn = zbus::blocking::Connection::session()?;
+    let proxy = zbus::blocking::Proxy::new(&call_conn, PORTAL_BUS, PORTAL_PATH, SPEECH_IFACE)?;
+    let sig_proxy =
+        zbus::blocking::Proxy::new(&signal_conn, PORTAL_BUS, PORTAL_PATH, SPEECH_IFACE)?;
 
     tx.send(SpeechEvent::Phase(SpeechPhase::CreatingSession))?;
-    let session_id: String = proxy.call(
-        "CreateSession",
-        &("org.aileron.Demo", use_case, speech_instructions(use_case)),
-    )?;
+    let session_handle = create_public_session(&proxy, use_case, speech_instructions(use_case))?;
 
     let result: anyhow::Result<()> = (|| {
         tx.send(SpeechEvent::Phase(SpeechPhase::LoadingModel))?;
@@ -1754,7 +1782,7 @@ fn transcribe_recording(
         stream_speech_audio(
             &proxy,
             &sig_proxy,
-            &session_id,
+            &session_handle,
             &audio,
             &tx,
             SpeechTranscriptMode::Replace,
@@ -1762,7 +1790,7 @@ fn transcribe_recording(
         Ok(())
     })();
 
-    end_speech_session(&proxy, &session_id);
+    end_speech_session(&session_handle);
     result?;
     tx.send(SpeechEvent::Done)?;
     Ok(())
@@ -1774,22 +1802,14 @@ fn live_transcribe_recording(
     stop: Arc<AtomicBool>,
     tx: std::sync::mpsc::Sender<SpeechEvent>,
 ) -> anyhow::Result<()> {
-    use zbus::blocking::Connection;
-
-    const BUS: &str = "org.freedesktop.impl.portal.desktop.aileron";
-    const PATH: &str = "/org/freedesktop/portal/desktop";
-    const IFACE: &str = "org.freedesktop.impl.portal.Speech";
-
-    let call_conn = Connection::session()?;
-    let signal_conn = Connection::session()?;
-    let proxy = zbus::blocking::Proxy::new(&call_conn, BUS, PATH, IFACE)?;
-    let sig_proxy = zbus::blocking::Proxy::new(&signal_conn, BUS, PATH, IFACE)?;
+    let call_conn = portal_connection()?;
+    let signal_conn = zbus::blocking::Connection::session()?;
+    let proxy = zbus::blocking::Proxy::new(&call_conn, PORTAL_BUS, PORTAL_PATH, SPEECH_IFACE)?;
+    let sig_proxy =
+        zbus::blocking::Proxy::new(&signal_conn, PORTAL_BUS, PORTAL_PATH, SPEECH_IFACE)?;
 
     tx.send(SpeechEvent::Phase(SpeechPhase::CreatingSession))?;
-    let session_id: String = proxy.call(
-        "CreateSession",
-        &("org.aileron.Demo", use_case, speech_instructions(use_case)),
-    )?;
+    let session_handle = create_public_session(&proxy, use_case, speech_instructions(use_case))?;
 
     let result: anyhow::Result<()> = (|| {
         tx.send(SpeechEvent::Phase(SpeechPhase::LiveRecording))?;
@@ -1812,7 +1832,7 @@ fn live_transcribe_recording(
                     stream_speech_audio(
                         &proxy,
                         &sig_proxy,
-                        &session_id,
+                        &session_handle,
                         &chunk,
                         &tx,
                         SpeechTranscriptMode::Append,
@@ -1832,7 +1852,7 @@ fn live_transcribe_recording(
         stream_speech_audio(
             &proxy,
             &sig_proxy,
-            &session_id,
+            &session_handle,
             &audio,
             &tx,
             SpeechTranscriptMode::Replace,
@@ -1840,7 +1860,7 @@ fn live_transcribe_recording(
         Ok(())
     })();
 
-    end_speech_session(&proxy, &session_id);
+    end_speech_session(&session_handle);
     result?;
     tx.send(SpeechEvent::Done)?;
     Ok(())
@@ -1849,37 +1869,57 @@ fn live_transcribe_recording(
 fn stream_speech_audio(
     proxy: &zbus::blocking::Proxy<'_>,
     sig_proxy: &zbus::blocking::Proxy<'_>,
-    session_id: &str,
+    session_handle: &OwnedObjectPath,
     audio: &[u8],
     tx: &std::sync::mpsc::Sender<SpeechEvent>,
     mode: SpeechTranscriptMode,
 ) -> anyhow::Result<String> {
     let audio_b64 = base64_encode(audio);
     let mut transcription_iter = sig_proxy.receive_signal("TranscriptionReceived")?;
-    let _: () = proxy.call("StreamTranscribe", &(session_id, &audio_b64, ""))?;
-
-    let mut transcript = String::new();
-    for msg in &mut transcription_iter {
-        let (sig_session, text, done): (String, String, bool) = msg.body().deserialize()?;
-        if sig_session != session_id {
-            continue;
-        }
-        transcript.push_str(&text);
-        match mode {
-            SpeechTranscriptMode::Replace => {
-                tx.send(SpeechEvent::Transcript(transcript.clone()))?;
-            }
-            SpeechTranscriptMode::Append => {
-                if !text.is_empty() {
-                    tx.send(SpeechEvent::AppendTranscript(text))?;
+    let transcript_session_handle = session_handle.clone();
+    let tx_transcript = tx.clone();
+    let (stream_done_tx, stream_done_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = (|| -> anyhow::Result<String> {
+            let mut transcript = String::new();
+            for msg in &mut transcription_iter {
+                let (sig_session, text, done): (OwnedObjectPath, String, bool) =
+                    msg.body().deserialize()?;
+                if sig_session.as_str() != transcript_session_handle.as_str() {
+                    continue;
+                }
+                transcript.push_str(&text);
+                match mode {
+                    SpeechTranscriptMode::Replace => {
+                        tx_transcript.send(SpeechEvent::Transcript(transcript.clone()))?;
+                    }
+                    SpeechTranscriptMode::Append => {
+                        if !text.is_empty() {
+                            tx_transcript.send(SpeechEvent::AppendTranscript(text))?;
+                        }
+                    }
+                }
+                if done {
+                    break;
                 }
             }
-        }
-        if done {
-            break;
-        }
+            Ok(transcript)
+        })();
+        let _ = stream_done_tx.send(result);
+    });
+
+    let stream_result: zbus::Result<()> = proxy.call(
+        "StreamTranscribe",
+        &(session_handle, &audio_b64, "", empty_options()),
+    );
+    if let Err(error) = stream_result {
+        return Err(error.into());
     }
-    Ok(transcript)
+    stream_done_rx
+        .recv_timeout(Duration::from_secs(2))
+        .map_err(|_| {
+            anyhow::anyhow!("stream completed without a final TranscriptionReceived signal")
+        })?
 }
 
 fn read_audio_range(path: &Path, start: u64, end: u64) -> anyhow::Result<Vec<u8>> {
@@ -1893,126 +1933,92 @@ fn read_audio_range(path: &Path, start: u64, end: u64) -> anyhow::Result<Vec<u8>
     Ok(bytes)
 }
 
-fn end_speech_session(proxy: &zbus::blocking::Proxy<'_>, session_id: &str) {
-    let _: zbus::Result<()> = proxy.call("EndSession", &(session_id,));
+fn end_speech_session(session_handle: &OwnedObjectPath) {
+    let _ = close_public_session(session_handle);
 }
 
 fn describe_image(image_b64: &str, tx: std::sync::mpsc::Sender<VisionEvent>) -> anyhow::Result<()> {
-    use zbus::blocking::Connection;
-
-    const BUS: &str = "org.freedesktop.impl.portal.desktop.aileron";
-    const PATH: &str = "/org/freedesktop/portal/desktop";
-    const IFACE: &str = "org.freedesktop.impl.portal.Vision";
-
-    let conn = Connection::session()?;
-    let proxy = zbus::blocking::Proxy::new(&conn, BUS, PATH, IFACE)?;
+    let conn = portal_connection()?;
+    let proxy = zbus::blocking::Proxy::new(&conn, PORTAL_BUS, PORTAL_PATH, VISION_IFACE)?;
 
     tx.send(VisionEvent::Phase(VisionPhase::CreatingSession))?;
-    let session_id: String = proxy.call(
-        "CreateSession",
-        &(
-            "org.aileron.Demo",
-            "vision.describe",
-            "Describe the provided image clearly and concisely.",
-        ),
+    let session_handle = create_public_session(
+        &proxy,
+        "vision.describe",
+        "Describe the provided image clearly and concisely.",
     )?;
 
     tx.send(VisionEvent::Phase(VisionPhase::LoadingModel))?;
     tx.send(VisionEvent::Phase(VisionPhase::Describing))?;
-    let description: String = proxy.call("Describe", &(&session_id, &image_b64))?;
+    let description: String =
+        proxy.call("Describe", &(&session_handle, &image_b64, empty_options()))?;
     tx.send(VisionEvent::Description(description))?;
 
-    let _: () = proxy.call("EndSession", &(&session_id,))?;
+    close_public_session(&session_handle)?;
     tx.send(VisionEvent::Done)?;
     Ok(())
 }
 
 fn ocr_image(image_b64: &str, tx: std::sync::mpsc::Sender<VisionEvent>) -> anyhow::Result<()> {
-    use zbus::blocking::Connection;
-
-    const BUS: &str = "org.freedesktop.impl.portal.desktop.aileron";
-    const PATH: &str = "/org/freedesktop/portal/desktop";
-    const IFACE: &str = "org.freedesktop.impl.portal.Vision";
-
-    let conn = Connection::session()?;
-    let proxy = zbus::blocking::Proxy::new(&conn, BUS, PATH, IFACE)?;
+    let conn = portal_connection()?;
+    let proxy = zbus::blocking::Proxy::new(&conn, PORTAL_BUS, PORTAL_PATH, VISION_IFACE)?;
 
     tx.send(VisionEvent::Phase(VisionPhase::CreatingSession))?;
-    let session_id: String = proxy.call(
-        "CreateSession",
-        &(
-            "org.aileron.Demo",
-            "vision.ocr",
-            "Extract all text visible in the provided image exactly as written.",
-        ),
+    let session_handle = create_public_session(
+        &proxy,
+        "vision.ocr",
+        "Extract all text visible in the provided image exactly as written.",
     )?;
 
     tx.send(VisionEvent::Phase(VisionPhase::LoadingModel))?;
     tx.send(VisionEvent::Phase(VisionPhase::Ocr))?;
-    let text: String = proxy.call("Ocr", &(&session_id, &image_b64))?;
+    let text: String = proxy.call("Ocr", &(&session_handle, &image_b64, empty_options()))?;
     tx.send(VisionEvent::Ocr(text))?;
 
-    let _: () = proxy.call("EndSession", &(&session_id,))?;
+    close_public_session(&session_handle)?;
     tx.send(VisionEvent::Done)?;
     Ok(())
 }
 
 fn segment_image(image_b64: &str, tx: std::sync::mpsc::Sender<VisionEvent>) -> anyhow::Result<()> {
-    use zbus::blocking::Connection;
-
-    const BUS: &str = "org.freedesktop.impl.portal.desktop.aileron";
-    const PATH: &str = "/org/freedesktop/portal/desktop";
-    const IFACE: &str = "org.freedesktop.impl.portal.Vision";
-
-    let conn = Connection::session()?;
-    let proxy = zbus::blocking::Proxy::new(&conn, BUS, PATH, IFACE)?;
+    let conn = portal_connection()?;
+    let proxy = zbus::blocking::Proxy::new(&conn, PORTAL_BUS, PORTAL_PATH, VISION_IFACE)?;
 
     tx.send(VisionEvent::Phase(VisionPhase::CreatingSession))?;
-    let session_id: String = proxy.call(
-        "CreateSession",
-        &(
-            "org.aileron.Demo",
-            "vision.segment",
-            "Identify visible objects and return normalized rectangular boxes.",
-        ),
+    let session_handle = create_public_session(
+        &proxy,
+        "vision.segment",
+        "Identify visible objects and return normalized rectangular boxes.",
     )?;
 
     tx.send(VisionEvent::Phase(VisionPhase::LoadingModel))?;
     tx.send(VisionEvent::Phase(VisionPhase::Segmenting))?;
-    let segments: Vec<VisionSegmentDbus> = proxy.call("Segment", &(&session_id, &image_b64))?;
+    let segments: Vec<VisionSegmentDbus> =
+        proxy.call("Segment", &(&session_handle, &image_b64, empty_options()))?;
     tx.send(VisionEvent::Segments(segments))?;
 
-    let _: () = proxy.call("EndSession", &(&session_id,))?;
+    close_public_session(&session_handle)?;
     tx.send(VisionEvent::Done)?;
     Ok(())
 }
 
 fn embed_text(text: &str, tx: std::sync::mpsc::Sender<EmbedEvent>) -> anyhow::Result<()> {
-    use zbus::blocking::Connection;
-
-    const BUS: &str = "org.freedesktop.impl.portal.desktop.aileron";
-    const PATH: &str = "/org/freedesktop/portal/desktop";
-    const IFACE: &str = "org.freedesktop.impl.portal.Language";
-
-    let conn = Connection::session()?;
-    let proxy = zbus::blocking::Proxy::new(&conn, BUS, PATH, IFACE)?;
+    let conn = portal_connection()?;
+    let proxy = zbus::blocking::Proxy::new(&conn, PORTAL_BUS, PORTAL_PATH, LANGUAGE_IFACE)?;
 
     tx.send(EmbedEvent::Phase(EmbedPhase::CreatingSession))?;
-    let session_id: String = proxy.call(
-        "CreateSession",
-        &(
-            "org.aileron.Demo",
-            "language.embed",
-            "Compute an embedding vector for the provided text.",
-        ),
+    let session_handle = create_public_session(
+        &proxy,
+        "language.embed",
+        "Compute an embedding vector for the provided text.",
     )?;
 
     tx.send(EmbedEvent::Phase(EmbedPhase::LoadingModel))?;
     tx.send(EmbedEvent::Phase(EmbedPhase::Embedding))?;
-    let embedding: Vec<f64> = proxy.call("Embed", &(&session_id, &text))?;
+    let embedding: Vec<f64> = proxy.call("Embed", &(&session_handle, &text, empty_options()))?;
     tx.send(EmbedEvent::Embedding(embedding))?;
 
-    let _: () = proxy.call("EndSession", &(&session_id,))?;
+    close_public_session(&session_handle)?;
     tx.send(EmbedEvent::Done)?;
     Ok(())
 }
@@ -2106,21 +2112,21 @@ mod tests {
 
     #[test]
     fn explains_missing_portal_systemd_unit() {
-        let error = "org.freedesktop.DBus.Error.NameHasNoOwner: Could not activate remote peer 'org.freedesktop.impl.portal.desktop.aileron': activation request failed: unknown unit";
+        let error = "org.freedesktop.DBus.Error.NameHasNoOwner: Could not activate remote peer 'org.freedesktop.portal.Desktop': activation request failed: unknown unit";
 
         assert_eq!(
             concise_error(error),
-            "Aileron portal is not installed for D-Bus activation. Install systemd/aileron-portal.service to ~/.config/systemd/user/, run `systemctl --user daemon-reload`, then start `systemctl --user enable --now aileron-portal`."
+            "xdg-desktop-portal is not available for D-Bus activation. Install and start the patched xdg-desktop-portal with the Aileron portal interfaces enabled."
         );
     }
 
     #[test]
     fn explains_stale_portal_language_interface() {
-        let error = "org.freedesktop.DBus.Error.UnknownInterface: Unknown interface 'org.freedesktop.impl.portal.Language'";
+        let error = "org.freedesktop.DBus.Error.UnknownInterface: Unknown interface 'org.freedesktop.portal.Language'";
 
         assert_eq!(
             concise_error(error),
-            "The running Aileron portal is older than this demo and does not expose the Language interface. Restart the updated portal with `systemctl --user restart aileron-portal`, or rebuild/reinstall the portal service if it was installed from an older binary."
+            "The running xdg-desktop-portal does not expose org.freedesktop.portal.Language. Rebuild and restart the patched xdg-desktop-portal, then ensure the Aileron implementation backend is configured."
         );
     }
 

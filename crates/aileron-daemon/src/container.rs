@@ -70,6 +70,7 @@ use crate::profiles::RuntimeCandidate;
 
 const NVIDIA_LIBRARY_DIR: &str = "/usr/local/nvidia/lib64";
 const ML_RUNTIME_ID: &str = "llm-vision-whisper";
+const PREDICTION_COMPLETION_COUNT: u32 = 3;
 const VULKAN_ICD_DIR: &str = "/usr/share/vulkan/icd.d";
 const NVIDIA_DRIVER_LIBRARIES: &[&str] = &[
     "libcuda.so.1",
@@ -319,7 +320,6 @@ impl Container {
     pub fn predict_next(
         &mut self,
         prefix: &str,
-        count: u32,
         max_tokens: u32,
         temperature: f64,
     ) -> Result<Vec<String>> {
@@ -327,7 +327,7 @@ impl Container {
         let mut req = ContainerRequest::new(id.clone(), "predict_next");
         req.prompt = Some(prefix.to_string());
         req.max_tokens = Some(max_tokens);
-        req.choices = Some(count);
+        req.choices = Some(PREDICTION_COMPLETION_COUNT);
         req.temperature = Some(temperature);
         let line = serde_json::to_string(&req)? + "\n";
         self.stdin.write_all(line.as_bytes())?;
@@ -353,14 +353,17 @@ impl Container {
                     resp.completions
                         .or_else(|| resp.completion.map(|c| vec![c]))
                         .unwrap_or_default(),
-                    count,
+                    PREDICTION_COMPLETION_COUNT,
                 ));
             }
             if let Some(completions) = resp.completions {
-                return Ok(limit_completions(completions, count));
+                return Ok(limit_completions(completions, PREDICTION_COMPLETION_COUNT));
             }
             if let Some(completion) = resp.completion {
-                return Ok(limit_completions(vec![completion], count));
+                return Ok(limit_completions(
+                    vec![completion],
+                    PREDICTION_COMPLETION_COUNT,
+                ));
             }
         }
     }

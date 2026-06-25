@@ -20,10 +20,13 @@ Aileron solves both. All IPC is over a Varlink Unix socket. Flatpak sandboxes ca
 ```
 ┌─────────────────────────────────────────┐
 │  Flatpak sandbox                        │
-│  aileron-demo  ──── D-Bus ────────────► │──► org.freedesktop.impl.portal.{Language,Speech,Vision}
+│  aileron-demo  ──── D-Bus ────────────► │──► org.freedesktop.portal.{Language,Speech,Vision}
 └─────────────────────────────────────────┘             │
+                                                        │ xdg-desktop-portal frontend
                                                         │ D-Bus
-                                                 aileron-portal
+                                                 org.freedesktop.impl.portal.{Language,Speech,Vision}
+                                                        │
+                                                 aileron-portal backend
                                                         │ Varlink (Unix socket)
                                                  aileron-daemon
                                                         │ stdin/stdout (hardened crun OCI bundle)
@@ -49,7 +52,7 @@ Further reading:
 | Crate | Type | Description |
 |---|---|---|
 | `aileron-daemon` | binary | systemd user service; Varlink socket; container and inference management |
-| `aileron-portal` | binary | xdg-desktop-portal backend; bridges D-Bus ↔ Varlink |
+| `aileron-portal` | binary | xdg-desktop-portal implementation backend; bridges D-Bus ↔ Varlink |
 | `aileron` | binary | GTK4/libadwaita management UI |
 | `aileron-demo` | binary | Sandboxed GTK4 article summarizer; end-to-end demo app |
 | `aileron-varlink` | library | Varlink IDL files and generated bindings |
@@ -357,7 +360,7 @@ method GetUseCaseAvailability(app_id: string, use_case: string) -> (availability
 method CreateSession(app_id: string, use_case: string, instructions: string) -> (session_id: string)
 method Prewarm(session_id: string, prompt_prefix: string) -> ()
 method Respond(session_id: string, prompt: string, options: GenerationOptions) -> (content: string)
-method PredictNext(session_id: string, prefix: string, count: int, options: GenerationOptions) -> (completions: []string)
+method PredictNext(session_id: string, prefix: string, options: GenerationOptions) -> (completions: []string)
 method StreamResponse(session_id: string, prompt: string, options: GenerationOptions) -> (token: string)
 method RespondGuided(session_id: string, prompt: string, fields: []GuidedField, tools: []ToolDefinition, options: GenerationOptions) -> (content: string, tool_calls: []ToolCall)
 method StreamGuidedResponse(session_id: string, prompt: string, fields: []GuidedField, options: GenerationOptions) -> (snapshot_json: string)
@@ -430,7 +433,7 @@ method KillSession(session_id: string) -> ()
 
 ## D-Bus portal interfaces
 
-`aileron-portal` is the sandbox-facing API. It registers on the session bus as `org.freedesktop.impl.portal.desktop.aileron` at path `/org/freedesktop/portal/desktop` and serves three task-clustered interfaces.
+`aileron-portal` is the xdg-desktop-portal implementation backend. It registers on the session bus as `org.freedesktop.impl.portal.desktop.aileron` at path `/org/freedesktop/portal/desktop` and serves three task-clustered implementation interfaces. In the upstream xdg-desktop-portal prototype, sandboxed apps call the public `org.freedesktop.portal.Language`, `org.freedesktop.portal.Speech`, and `org.freedesktop.portal.Vision` frontend interfaces; xdg-desktop-portal derives the app identity and forwards to this backend.
 
 The portal does not talk to containers directly. It translates D-Bus calls into `aileron.Inference` Varlink calls, and the daemon owns permissions, sessions, model assignments, and container stdio.
 
@@ -458,7 +461,7 @@ Full-response methods reject `language.embed` and `language.complete`; use `Embe
 | Method | Parameters | Returns | Notes |
 |---|---|---|---|
 | `Respond` | `session_id: s, prompt: s, options: (xdsss)` | `content: s` | Full language generation sessions only; returns full generated text |
-| `PredictNext` | `session_id: s, prefix: s, count: x, options: (xdsss)` | `completions: as` | `language.complete` sessions only; returns up to three short inline typing completions from the raw prefix |
+| `PredictNext` | `session_id: s, prefix: s, options: (xdsss)` | `completions: as` | `language.complete` sessions only; returns up to three short inline typing completions from the raw prefix |
 | `StreamResponse` | `session_id: s, prompt: s, options: (xdsss)` | `()` | Full language generation sessions only; emits `TokenReceived` signals; final token has `done=true` |
 | `RespondGuided` | `session_id: s, prompt: s, fields: a(sssb), tools: a(sss), options: (xdsss)` | `(content: s, tool_calls: a(sss))` | Full language generation sessions only; returns JSON matching guided output fields or requested tool calls |
 | `StreamGuidedResponse` | `session_id: s, prompt: s, fields: a(sssb), options: (xdsss)` | `()` | Full language generation sessions only; emits `GuidedSnapshotReceived` signals; final snapshot has `done=true` |
@@ -471,6 +474,8 @@ Full-response methods reject `language.embed` and `language.complete`; use `Embe
 |---|---|---|---|
 | `Transcribe` | `session_id: s, audio_b64: s, language_hint: s` | `text: s` | 16 kHz mono f32le PCM, base64; empty hint means auto-detect/no hint; transcribes or translates per use-case |
 | `StreamTranscribe` | `session_id: s, audio_b64: s, language_hint: s` | `()` | Same input and use-cases as `Transcribe`; emits `TranscriptionReceived` signals; final segment has `done=true` |
+
+Streaming D-Bus methods carry their payloads only through signals while the method call is in progress. Callers should subscribe before invoking a stream method and consume signals concurrently; the empty method reply only means the stream has finished.
 
 ### Vision Methods
 
@@ -557,7 +562,7 @@ All requests may include an optional `system` field (string) to set the system p
 {"id": "uuid", "completions": [" keeper", " stood", " beam"], "done": true}
 ```
 
-`predict_next` is intended for typing assistance. Runtimes should treat `prompt` as the raw text prefix rather than a chat instruction and should return at most `choices` word-like completions. The daemon caps `choices` at 3.
+`predict_next` is intended for typing assistance. Runtimes should treat `prompt` as the raw text prefix rather than a chat instruction and should return at most `choices` word-like completions. The daemon sends `choices: 3`.
 
 ### Structured output
 

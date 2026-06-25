@@ -233,11 +233,10 @@ impl VarlinkInterface for InferenceHandler {
         call: &mut dyn Call_PredictNext,
         session_id: String,
         prefix: String,
-        count: i64,
         options: GenerationOptions,
     ) -> varlink::Result<()> {
         self.rt.block_on(async {
-            match predict_next_completions(&self.state, session_id, prefix, count, options).await {
+            match predict_next_completions(&self.state, session_id, prefix, options).await {
                 Ok(completions) => call.reply(completions),
                 Err(GenerationError::SessionNotFound(id)) => call.reply_session_not_found(id),
                 Err(GenerationError::ModelUnavailable(reason)) => {
@@ -1163,11 +1162,9 @@ async fn predict_next_completions(
     state: &SharedState,
     session_id: String,
     prefix: String,
-    count: i64,
     options: GenerationOptions,
 ) -> Result<Vec<String>, GenerationError> {
     let max_tokens = validate_options(&options).map_err(GenerationError::InvalidOptions)?;
-    let count = validate_prediction_count(count).map_err(GenerationError::InvalidOptions)?;
     let mut guard = state.0.lock().await;
 
     let (app_id, use_case, profile_id, runtime_id, image_refs, artifact_path, runtime_options) =
@@ -1205,15 +1202,8 @@ async fn predict_next_completions(
         .map_err(|e| GenerationError::Failed(e.to_string()))?;
 
     container
-        .predict_next(&prefix, count, max_tokens, options.temperature)
+        .predict_next(&prefix, max_tokens, options.temperature)
         .map_err(|e| GenerationError::Failed(e.to_string()))
-}
-
-fn validate_prediction_count(count: i64) -> Result<u32, String> {
-    if count < 1 {
-        return Err("prediction count must be greater than zero".to_string());
-    }
-    Ok(count.min(3) as u32)
 }
 
 async fn stream_guided_snapshots(

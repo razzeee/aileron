@@ -74,7 +74,7 @@ Request:
 }
 ```
 
-`prompt` is the raw text prefix typed by the user. `choices` is optional and should be clamped by runtimes to a small value; the daemon caps app requests at 3. Runtimes should avoid chat templates or assistant-style instructions and return short word-like completions.
+`prompt` is the raw text prefix typed by the user. `choices` is optional and should be clamped by runtimes to a small value; the daemon sends `choices: 3`. Runtimes should avoid chat templates or assistant-style instructions and return short word-like completions.
 
 Response:
 
