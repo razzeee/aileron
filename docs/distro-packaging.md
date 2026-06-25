@@ -43,8 +43,10 @@ The daemon invokes `skopeo copy` to fetch OCI runtime images and `crun run` to s
 
 Recommended runtime dependencies:
 
-- `xdg-desktop-portal` for sandboxed app integration
+- `xdg-desktop-portal` with the public `org.freedesktop.portal.Language`, `org.freedesktop.portal.Speech`, and `org.freedesktop.portal.Vision` frontend interfaces for sandboxed app integration
 - `systemd --user` support for service activation
+
+Until those public model interfaces are available in a released `xdg-desktop-portal`, distributions need to package or carry the patched frontend from the `xdg-desktop-portal` submodule used by this repository. The `aileron-portal` package alone only provides the implementation backend interfaces.
 
 Hardware-specific dependencies are supplied by the host GPU stack and by runtime images. Aileron does not require packagers to depend on CUDA, ROCm, or Vulkan globally.
 

@@ -140,16 +140,33 @@ install -Dm644 systemd/aileron-portal.service \
 # xdg-desktop-portal descriptor (tells the portal frontend which interfaces
 # this backend implements)
 install -Dm644 portal/aileron.portal \
-    /usr/share/xdg-desktop-portal/portals/aileron.portal
+    ~/.local/share/xdg-desktop-portal/portals/aileron.portal
 
 # D-Bus session service activation file
 install -Dm644 \
     portal/org.freedesktop.impl.portal.desktop.aileron.service \
-    /usr/share/dbus-1/services/org.freedesktop.impl.portal.desktop.aileron.service
+    ~/.local/share/dbus-1/services/org.freedesktop.impl.portal.desktop.aileron.service
 
 systemctl --user daemon-reload
 systemctl --user enable --now aileron-portal
 ```
+
+System packages should install the portal descriptor under `/usr/share/xdg-desktop-portal/portals/` and the D-Bus activation file under `/usr/share/dbus-1/services/`; the commands above are for a per-user development install.
+
+### Public portal frontend prototype
+
+The public `org.freedesktop.portal.Language`, `org.freedesktop.portal.Speech`, and `org.freedesktop.portal.Vision` APIs require the patched `xdg-desktop-portal` frontend in this repository. A stock system `xdg-desktop-portal` does not expose these public interfaces yet. Sandboxed apps and the demo should call the public frontend interfaces; the frontend derives the app identity and forwards to the Aileron implementation backend.
+
+```sh
+git submodule update --init xdg-desktop-portal
+meson setup xdg-desktop-portal/build-aileron xdg-desktop-portal
+meson compile -C xdg-desktop-portal/build-aileron
+
+systemctl --user stop xdg-desktop-portal.service
+xdg-desktop-portal/build-aileron/desktop-portal/xdg-desktop-portal --replace -v
+```
+
+Keep that patched frontend process running while testing the public APIs. If the system portal reclaims `org.freedesktop.portal.Desktop`, restart the command above.
 
 ### Management UI
 
@@ -503,10 +520,11 @@ D-Bus callers see underlying Varlink failures as `org.freedesktop.DBus.Error.Fai
 
 There is no direct portal-to-container transport. The complete inference API path is:
 
-1. Sandboxed app calls `org.freedesktop.impl.portal.Language`, `org.freedesktop.impl.portal.Speech`, or `org.freedesktop.impl.portal.Vision` over session D-Bus.
-2. `aileron-portal` maps that call to `aileron.Inference` over the daemon's Varlink Unix socket.
-3. `aileron-daemon` validates permissions/options, resolves the assigned profile for the session use-case, and serializes one request at a time to the profile container over stdio.
-4. The container returns newline-delimited JSON chunks on stdout; the daemon aggregates or streams them back through Varlink, and the portal returns a D-Bus value or emits D-Bus signals.
+1. Sandboxed app calls `org.freedesktop.portal.Language`, `org.freedesktop.portal.Speech`, or `org.freedesktop.portal.Vision` over session D-Bus.
+2. The patched `xdg-desktop-portal` frontend derives the app identity and forwards to `org.freedesktop.impl.portal.Language`, `org.freedesktop.impl.portal.Speech`, or `org.freedesktop.impl.portal.Vision` on `aileron-portal`.
+3. `aileron-portal` maps that call to `aileron.Inference` over the daemon's Varlink Unix socket.
+4. `aileron-daemon` validates permissions/options, resolves the assigned profile for the session use-case, and serializes one request at a time to the profile container over stdio.
+5. The container returns newline-delimited JSON chunks on stdout; the daemon aggregates or streams them back through Varlink, and the portal returns a D-Bus value or emits D-Bus signals.
 
 The stable API surfaces are the D-Bus portal interface, the Varlink `aileron.Inference` interface, and the container stdio protocol below. Containers should not assume anything about D-Bus, and portal clients should not assume anything about container JSON beyond the semantics exposed by the portal methods.
 
