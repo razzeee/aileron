@@ -858,8 +858,10 @@ fn runtime_config_json(
     runtime_options: &HashMap<String, String>,
     memory_limit: &str,
 ) -> Result<Value> {
-    let mut env =
-        vec!["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string()];
+    let mut env = vec![
+        "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
+        "XDG_CACHE_HOME=/tmp".to_string(),
+    ];
     let mut env_options = runtime_options.clone();
     let mut mounts = vec![
         serde_json::json!({
@@ -1926,6 +1928,7 @@ mod tests {
             config["process"]["args"],
             serde_json::json!(["/entrypoint"])
         );
+        assert!(env(&config).contains(&"XDG_CACHE_HOME=/tmp"));
         assert_eq!(
             config["process"]["capabilities"]["bounding"]
                 .as_array()
