@@ -190,6 +190,13 @@ Runtime manifests provide explicit runtime image refs per variant such as `cpu`,
 
 Manifests are discovered from `$XDG_DATA_HOME/aileron/manifests`, `/etc/aileron/manifests`, `/usr/share/aileron/manifests`, and `manifests` in the current working directory. Override the search path with `AILERON_MANIFEST_DIRS`.
 
+For local development with the user service, deploy the repository catalog into the user manifest directory and restart the daemon so it reloads the runtime variants and profile catalog:
+
+```sh
+rsync -a --delete manifests/ ~/.local/share/aileron/manifests/
+systemctl --user restart aileron-daemon
+```
+
 Model manifests live under `models/`. A compact single-artifact text GGUF manifest only needs the metadata key plus an artifact URL and SHA-256:
 
 ```json

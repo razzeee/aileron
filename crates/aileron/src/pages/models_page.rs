@@ -1048,11 +1048,9 @@ fn render_readiness_list(
             let better = better_catalog_candidate(&catalog, &profile.profile_id, use_case);
             if let Some(candidate) = better {
                 let detail = format!(
-                    "Assigned to {} · {} · Better available: {} · {}",
-                    profile.profile_id,
-                    use_case_kind(use_case),
-                    candidate.profile_id,
-                    format_size(candidate.disk_size_gb)
+                    "Current: {} · Better: {}",
+                    installed_task_summary(profile, &catalog, use_case),
+                    task_catalog_summary(candidate, use_case)
                 );
                 let installed_better = profiles
                     .iter()
@@ -1125,10 +1123,9 @@ fn render_readiness_list(
                 better_catalog_candidate(&catalog, &profile.profile_id, use_case)
             {
                 let detail = format!(
-                    "{} is installed but not assigned · Better available: {} · {}",
-                    profile.profile_id,
-                    candidate.profile_id,
-                    format_size(candidate.disk_size_gb)
+                    "Installed: {} · Better: {}",
+                    installed_task_summary(profile, &catalog, use_case),
+                    task_catalog_summary(candidate, use_case)
                 );
                 let button = recommendation_button(candidate, profiles.as_slice(), use_case, lists);
                 let row = readiness_row(
@@ -1160,9 +1157,8 @@ fn render_readiness_list(
                     "Installed",
                     "accent",
                     &format!(
-                        "{} is installed but not assigned · {}",
-                        profile.profile_id,
-                        use_case_kind(use_case)
+                        "Installed: {} · Not assigned",
+                        installed_task_summary(profile, &catalog, use_case)
                     ),
                     Some(button),
                     None,
@@ -1181,10 +1177,8 @@ fn render_readiness_list(
                 fit_label(&profile.fit_level, profile.recommended)
             };
             let detail = format!(
-                "Recommended: {} · {} · {}",
-                profile.profile_id,
-                status,
-                format_size(profile.disk_size_gb)
+                "Recommended: {}",
+                task_catalog_summary_with_status(profile, use_case, status)
             );
             let button = Button::with_label("Install");
             button.set_valign(gtk4::Align::Center);
@@ -1286,6 +1280,76 @@ fn readiness_row(
     }
 
     row
+}
+
+fn installed_task_summary(
+    profile: &aileron_varlink::aileron_Models::ProfileInfo,
+    catalog: &[aileron_varlink::aileron_Models::CatalogProfileInfo],
+    use_case: &str,
+) -> String {
+    catalog
+        .iter()
+        .find(|candidate| candidate.profile_id == profile.profile_id)
+        .map(|candidate| task_catalog_summary(candidate, use_case))
+        .unwrap_or_else(|| format!("{} · {}", profile.profile_id, use_case_kind(use_case)))
+}
+
+fn task_catalog_summary(
+    profile: &aileron_varlink::aileron_Models::CatalogProfileInfo,
+    use_case: &str,
+) -> String {
+    let status = if profile.installing {
+        "Installing"
+    } else {
+        fit_label(&profile.fit_level, profile.recommended)
+    };
+    task_catalog_summary_with_status(profile, use_case, status)
+}
+
+fn task_catalog_summary_with_status(
+    profile: &aileron_varlink::aileron_Models::CatalogProfileInfo,
+    use_case: &str,
+    status: &str,
+) -> String {
+    format!(
+        "{} ({})",
+        profile.profile_id,
+        task_catalog_metadata(profile, use_case, status)
+    )
+}
+
+fn task_catalog_metadata(
+    profile: &aileron_varlink::aileron_Models::CatalogProfileInfo,
+    use_case: &str,
+    status: &str,
+) -> String {
+    let mut parts = vec![status.to_string()];
+    if let Some(score) = fit_score_label(task_fit_score(profile, use_case)) {
+        parts.push(format!("Fit {score}"));
+    }
+    parts.push(format_size(profile.disk_size_gb));
+    if let Some(memory) = task_memory_label(profile) {
+        parts.push(memory);
+    }
+    if profile.min_vram_gb > 0.0 {
+        parts.push(format!("{:.1} GB VRAM target", profile.min_vram_gb));
+    }
+    parts.join(" · ")
+}
+
+fn task_memory_label(
+    profile: &aileron_varlink::aileron_Models::CatalogProfileInfo,
+) -> Option<String> {
+    if profile.recommended_ram_gb > profile.min_ram_gb {
+        Some(format!(
+            "{:.1} GB min / {:.1} GB recommended RAM",
+            profile.min_ram_gb, profile.recommended_ram_gb
+        ))
+    } else if profile.min_ram_gb > 0.0 {
+        Some(format!("{:.1} GB RAM", profile.min_ram_gb))
+    } else {
+        None
+    }
 }
 
 fn recommendation_button(
@@ -1983,6 +2047,50 @@ mod tests {
         assert_eq!(fit_score_label(0.0), None);
     }
 
+    #[test]
+    fn task_catalog_metadata_includes_llmfit_fit_and_memory() {
+        let mut profile = catalog_profile("tinyllama-1.1b-f16", "small", 2.05);
+        profile.llmfit_model_id = "TinyLlama/TinyLlama-1.1B-Chat-v1.0".to_string();
+        profile.fit_score = 50.0;
+        profile.min_ram_gb = 1.0;
+        profile.recommended_ram_gb = 2.0;
+        profile.min_vram_gb = 0.6;
+        profile.use_case_fit_scores = vec![aileron_varlink::aileron_Models::UseCaseFitScore {
+            use_case: "language.summarize".to_string(),
+            score: 73.2,
+        }];
+
+        assert_eq!(
+            task_catalog_metadata(&profile, "language.summarize", "Recommended"),
+            "Recommended · Fit 73/100 · 2.0 GB · 1.0 GB min / 2.0 GB recommended RAM · 0.6 GB VRAM target"
+        );
+    }
+
+    #[test]
+    fn installed_task_summary_uses_current_catalog_fit_metadata() {
+        let installed = installed_profile("gemma-4-e4b-it-q4-k-xl");
+        let mut catalog = catalog_profile("gemma-4-e4b-it-q4-k-xl", "balanced", 4.85);
+        catalog.fit_level = "unknown".to_string();
+        catalog.llmfit_model_id = "unsloth/gemma-4-E4B-it-qat-GGUF".to_string();
+        catalog.min_ram_gb = 0.0;
+        catalog.recommended_ram_gb = 0.0;
+
+        assert_eq!(
+            installed_task_summary(&installed, &[catalog], "language.summarize"),
+            "gemma-4-e4b-it-q4-k-xl (Unknown fit · 4.8 GB)"
+        );
+    }
+
+    #[test]
+    fn installed_task_summary_falls_back_for_ad_hoc_profiles() {
+        let installed = installed_profile("local-profile");
+
+        assert_eq!(
+            installed_task_summary(&installed, &[], "vision.describe"),
+            "local-profile · Vision"
+        );
+    }
+
     #[hegel::test]
     fn fit_score_label_matches_generated_positive_rule(tc: TestCase) {
         let tenths = tc.draw(gs::integers::<i64>().min_value(-1000).max_value(1000));
@@ -2222,6 +2330,22 @@ mod tests {
             recommendation_reason: String::new(),
             use_cases: vec!["speech.transcribe".to_string()],
             specializations: Some(Vec::new()),
+        }
+    }
+
+    fn installed_profile(profile_id: &str) -> aileron_varlink::aileron_Models::ProfileInfo {
+        aileron_varlink::aileron_Models::ProfileInfo {
+            profile_id: profile_id.to_string(),
+            model_id: profile_id.to_string(),
+            runtime_id: "llm-vision-whisper".to_string(),
+            artifact_path: "/tmp/model".to_string(),
+            use_cases: vec!["language.summarize".to_string()],
+            specializations: Some(Vec::new()),
+            runtime_images: Vec::new(),
+            assigned_use_cases: vec!["language.summarize".to_string()],
+            installed_at: String::new(),
+            size_bytes: 0,
+            source: "user".to_string(),
         }
     }
 }
