@@ -88,6 +88,8 @@ Runtime manifests are small JSON files that map runtime IDs to OCI image refs. A
 
 Model catalog manifests are also small JSON files. They describe downloadable artifacts, checksums, sizes, use-cases, runtime IDs, and llmfit metadata IDs. Shipping a model manifest does not install the model weights. It only makes the profile visible in the management UI and available to `InstallManifest`; the user still chooses to download it.
 
+Catalog package upgrades should replace `/usr/share/aileron/manifests/models/` with the packaged manifest set, including removing stale JSON files that were dropped upstream. Do not remove user-downloaded model artifacts during a manifest package upgrade; those live under per-user model storage and are managed separately.
+
 If a distro chooses to ship model weights directly, install them under `/usr/lib/aileron/models/<model-id>/` only when the model license, redistribution terms, package size, and update policy are acceptable. Each packaged filename must match the corresponding model manifest artifact `filename` field, and the manifest should be installed under `/usr/share/aileron/manifests/models/` or provided by a dependency.
 
 Do not pre-populate `$XDG_DATA_HOME/aileron/oci/` or `$XDG_DATA_HOME/aileron/models/` from a system package. Those directories are per-user daemon state and may contain user-selected profiles, rendered root filesystems, runtime metadata, permissions, and assignments.
