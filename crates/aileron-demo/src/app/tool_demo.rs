@@ -640,24 +640,17 @@ fn build_linux_pc_diagnostics_plan(arguments_json: &str) -> LinuxDiagnosticsPlan
         .unwrap_or(120)
         .clamp(20, 300);
 
-    let mut commands = Vec::new();
-    commands.push(diagnostic_command(
-        "kernel and OS version",
-        "uname",
-        vec!["-a"],
-    ));
-    commands.push(diagnostic_command("uptime and load", "uptime", vec![]));
-    commands.push(diagnostic_command(
-        "disk usage",
-        "df",
-        vec!["-h", "-x", "tmpfs", "-x", "devtmpfs"],
-    ));
-    commands.push(diagnostic_command(
-        "memory and swap summary",
-        "free",
-        vec!["-h"],
-    ));
-    commands.push(diagnostic_command("swap devices", "swapon", vec!["--show"]));
+    let mut commands = vec![
+        diagnostic_command("kernel and OS version", "uname", vec!["-a"]),
+        diagnostic_command("uptime and load", "uptime", vec![]),
+        diagnostic_command(
+            "disk usage",
+            "df",
+            vec!["-h", "-x", "tmpfs", "-x", "devtmpfs"],
+        ),
+        diagnostic_command("memory and swap summary", "free", vec!["-h"]),
+        diagnostic_command("swap devices", "swapon", vec!["--show"]),
+    ];
 
     if scope == "all" || scope == "system" {
         commands.push(diagnostic_command(

@@ -1312,7 +1312,7 @@ fn select_hf_model_file<'a>(
         .filter(|sibling| is_model_gguf_candidate(sibling))
         .filter(|sibling| hf_match_key(&sibling.rfilename).contains(&quant_key))
         .collect::<Vec<_>>();
-    candidates.sort_by(|a, b| hf_file_score(&a.rfilename).cmp(&hf_file_score(&b.rfilename)));
+    candidates.sort_by_key(|sibling| hf_file_score(&sibling.rfilename));
     candidates
         .into_iter()
         .next()
@@ -1328,7 +1328,7 @@ fn select_hf_mmproj_file(siblings: &[HfSibling]) -> Option<&HfSibling> {
             filename.ends_with(".gguf") && filename.contains("mmproj")
         })
         .collect::<Vec<_>>();
-    candidates.sort_by(|a, b| hf_file_score(&a.rfilename).cmp(&hf_file_score(&b.rfilename)));
+    candidates.sort_by_key(|sibling| hf_file_score(&sibling.rfilename));
     candidates.into_iter().next()
 }
 
