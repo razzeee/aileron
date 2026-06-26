@@ -152,6 +152,7 @@ impl LanguagePortalBackend {
         session_id: &str,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) -> zbus::fdo::Result<()> {
+        ensure_known_session(&self.state, session_id)?;
         LanguagePortalBackend::model_loading(&emitter, "starting model")
             .await
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
@@ -451,6 +452,7 @@ impl LanguagePortalBackend {
     async fn embed(&self, session_id: &str, text: &str) -> zbus::fdo::Result<Vec<f64>> {
         use aileron_varlink::aileron_Inference::VarlinkClientInterface;
 
+        ensure_known_session(&self.state, session_id)?;
         let conn =
             aileron_ipc::client::connect().map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn);
@@ -498,6 +500,7 @@ impl SpeechPortalBackend {
         session_id: &str,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) -> zbus::fdo::Result<()> {
+        ensure_known_session(&self.state, session_id)?;
         SpeechPortalBackend::model_loading(&emitter, "starting model")
             .await
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
@@ -515,6 +518,7 @@ impl SpeechPortalBackend {
     ) -> zbus::fdo::Result<String> {
         use aileron_varlink::aileron_Inference::VarlinkClientInterface;
 
+        ensure_known_session(&self.state, session_id)?;
         let conn =
             aileron_ipc::client::connect().map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn);
@@ -628,6 +632,7 @@ impl VisionPortalBackend {
         session_id: &str,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) -> zbus::fdo::Result<()> {
+        ensure_known_session(&self.state, session_id)?;
         VisionPortalBackend::model_loading(&emitter, "starting model")
             .await
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
@@ -640,6 +645,7 @@ impl VisionPortalBackend {
     async fn describe(&self, session_id: &str, image_b64: &str) -> zbus::fdo::Result<String> {
         use aileron_varlink::aileron_Inference::VarlinkClientInterface;
 
+        ensure_known_session(&self.state, session_id)?;
         let conn =
             aileron_ipc::client::connect().map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn);
@@ -653,6 +659,7 @@ impl VisionPortalBackend {
     async fn ocr(&self, session_id: &str, image_b64: &str) -> zbus::fdo::Result<String> {
         use aileron_varlink::aileron_Inference::VarlinkClientInterface;
 
+        ensure_known_session(&self.state, session_id)?;
         let conn =
             aileron_ipc::client::connect().map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn);
@@ -670,6 +677,7 @@ impl VisionPortalBackend {
     ) -> zbus::fdo::Result<Vec<VisionSegmentDbus>> {
         use aileron_varlink::aileron_Inference::VarlinkClientInterface;
 
+        ensure_known_session(&self.state, session_id)?;
         let conn =
             aileron_ipc::client::connect().map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn);
@@ -775,9 +783,25 @@ fn create_session_impl(
     Ok(reply.session_id)
 }
 
+fn session_use_case(state: &PortalState, session_id: &str) -> Option<String> {
+    state
+        .session_use_cases
+        .lock()
+        .unwrap()
+        .get(session_id)
+        .cloned()
+}
+
+fn ensure_known_session(state: &PortalState, session_id: &str) -> zbus::fdo::Result<()> {
+    session_use_case(state, session_id)
+        .map(|_| ())
+        .ok_or_else(|| zbus::fdo::Error::AccessDenied(format!("Unknown session {session_id}")))
+}
+
 fn prewarm_impl(state: &PortalState, session_id: &str) -> zbus::fdo::Result<()> {
     use aileron_varlink::aileron_Inference::VarlinkClientInterface;
 
+    ensure_known_session(state, session_id)?;
     let conn =
         aileron_ipc::client::connect().map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
     let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn);
@@ -786,13 +810,7 @@ fn prewarm_impl(state: &PortalState, session_id: &str) -> zbus::fdo::Result<()> 
         .call()
         .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
 
-    if let Some(use_case) = state
-        .session_use_cases
-        .lock()
-        .unwrap()
-        .get(session_id)
-        .cloned()
-    {
+    if let Some(use_case) = session_use_case(state, session_id) {
         state.warm.lock().unwrap().insert(use_case);
     }
     Ok(())
@@ -801,6 +819,7 @@ fn prewarm_impl(state: &PortalState, session_id: &str) -> zbus::fdo::Result<()> 
 fn end_session_impl(state: &PortalState, session_id: &str) -> zbus::fdo::Result<()> {
     use aileron_varlink::aileron_Inference::VarlinkClientInterface;
 
+    ensure_known_session(state, session_id)?;
     let conn =
         aileron_ipc::client::connect().map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
     let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn);
@@ -866,16 +885,10 @@ impl LanguagePortalBackend {
         session_id: &str,
         emitter: &SignalEmitter<'_>,
     ) -> zbus::fdo::Result<()> {
-        let use_case = self
-            .state
-            .session_use_cases
-            .lock()
-            .unwrap()
-            .get(session_id)
-            .cloned();
-        let is_warm = use_case
-            .as_ref()
-            .is_some_and(|u| self.state.warm.lock().unwrap().contains(u));
+        let use_case = session_use_case(&self.state, session_id).ok_or_else(|| {
+            zbus::fdo::Error::AccessDenied(format!("Unknown session {session_id}"))
+        })?;
+        let is_warm = self.state.warm.lock().unwrap().contains(&use_case);
         if !is_warm {
             LanguagePortalBackend::model_loading(emitter, "starting model")
                 .await
@@ -904,16 +917,10 @@ impl SpeechPortalBackend {
         session_id: &str,
         emitter: &SignalEmitter<'_>,
     ) -> zbus::fdo::Result<()> {
-        let use_case = self
-            .state
-            .session_use_cases
-            .lock()
-            .unwrap()
-            .get(session_id)
-            .cloned();
-        let is_warm = use_case
-            .as_ref()
-            .is_some_and(|u| self.state.warm.lock().unwrap().contains(u));
+        let use_case = session_use_case(&self.state, session_id).ok_or_else(|| {
+            zbus::fdo::Error::AccessDenied(format!("Unknown session {session_id}"))
+        })?;
+        let is_warm = self.state.warm.lock().unwrap().contains(&use_case);
         if !is_warm {
             SpeechPortalBackend::model_loading(emitter, "starting model")
                 .await
