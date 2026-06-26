@@ -1,0 +1,14 @@
+{
+  "llmfit_model_id": "Qwen/Qwen2.5-Coder-14B-Instruct",
+  "tier": "large",
+  "use_cases": [
+    "language.complete",
+    "language.extract",
+    "language.analyze"
+  ],
+  "artifact": {
+    "url": "https://huggingface.co/bartowski/Qwen2.5-Coder-14B-Instruct-GGUF/resolve/main/Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf",
+    "sha256": "2946d28c9e1bb2bcae6d42e8678863a31775df6f740315c7d7e6d6b6411f5937",
+    "size_bytes": 8988111072
+  }
+}

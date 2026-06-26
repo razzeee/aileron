@@ -1,0 +1,14 @@
+{
+  "llmfit_model_id": "google/codegemma-2b",
+  "tier": "small",
+  "use_cases": [
+    "language.complete",
+    "language.extract",
+    "language.analyze"
+  ],
+  "artifact": {
+    "url": "https://huggingface.co/bartowski/codegemma-2b-GGUF/resolve/main/codegemma-2b-Q4_K_M.gguf",
+    "sha256": "4747caaf4dc51a6e7ad6df5fe26f4c485d847998bd58933eaf011f76e5273c14",
+    "size_bytes": 1630262400
+  }
+}

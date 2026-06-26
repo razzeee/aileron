@@ -126,7 +126,7 @@ fn build_widget(runtime_images_changed: Rc<dyn Fn()>) -> gtk4::Widget {
     let library_group = PreferencesGroup::new();
     library_group.set_title("Profile library");
     library_group.set_description(Some(
-        "Install manifest-backed profiles. Nothing is downloaded until you click Install.",
+        "Install curated manifest-backed profiles with fit data for this computer.",
     ));
 
     let library_box = ListBox::new();
@@ -422,7 +422,9 @@ fn render_library_list(
     if profiles.is_empty() {
         let row = ActionRow::new();
         row.set_title("No profiles found");
-        row.set_subtitle("Install model manifests under a manifests/models directory.");
+        row.set_subtitle(
+            "Install llmfit-backed model manifests under a manifests/models directory.",
+        );
         library.append(&row);
     }
 

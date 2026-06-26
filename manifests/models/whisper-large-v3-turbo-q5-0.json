@@ -2,7 +2,10 @@
   "llmfit_model_id": "openai/whisper-large-v3-turbo",
   "runtime_id": "llm-vision-whisper",
   "tier": "balanced",
-  "min_ram_gb": 2.0,
+  "use_cases": [
+    "speech.transcribe",
+    "speech.translate"
+  ],
   "artifact": {
     "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin",
     "sha256": "394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2",

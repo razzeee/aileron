@@ -71,7 +71,7 @@ Suggested install locations:
 
 ## Shipping Manifests, Runtimes, And Models
 
-Distributions should normally ship manifests. They may also ship read-only runtime rootfs trees and model weights for offline systems.
+Distributions should normally ship runtime manifests and the curated model manifest catalog. Distributions may also ship read-only runtime rootfs trees and model weights for offline systems.
 
 Recommended package split:
 
@@ -86,7 +86,7 @@ Recommended package split:
 
 Runtime manifests are small JSON files that map runtime IDs to OCI image refs. A distro can ship upstream runtime manifests as-is, replace image refs with distro-hosted registry refs, or split hardware families into separate packages. For example, a conservative base package can include only CPU runtime manifests, while separate packages add CUDA, ROCm, or Vulkan runtime manifests.
 
-Model catalog manifests are also small JSON files. They describe downloadable artifacts, checksums, sizes, use-cases, and runtime IDs. Shipping a model manifest does not install the model weights. It only makes the profile visible in the management UI and available to `InstallManifest`; the user still chooses to download it.
+Model catalog manifests are also small JSON files. They describe downloadable artifacts, checksums, sizes, use-cases, runtime IDs, and llmfit metadata IDs. Shipping a model manifest does not install the model weights. It only makes the profile visible in the management UI and available to `InstallManifest`; the user still chooses to download it.
 
 If a distro chooses to ship model weights directly, install them under `/usr/lib/aileron/models/<model-id>/` only when the model license, redistribution terms, package size, and update policy are acceptable. Each packaged filename must match the corresponding model manifest artifact `filename` field, and the manifest should be installed under `/usr/share/aileron/manifests/models/` or provided by a dependency.
 

@@ -1,0 +1,18 @@
+{
+  "llmfit_model_id": "mistralai/Mistral-7B-Instruct-v0.3",
+  "tier": "balanced",
+  "use_cases": [
+    "language.summarize",
+    "language.translate",
+    "language.rephrase",
+    "language.complete",
+    "language.classify",
+    "language.extract",
+    "language.analyze"
+  ],
+  "artifact": {
+    "url": "https://huggingface.co/bartowski/Mistral-7B-Instruct-v0.3-GGUF/resolve/main/Mistral-7B-Instruct-v0.3-Q4_K_M.gguf",
+    "sha256": "1270d22c0fbb3d092fb725d4d96c457b7b687a5f5a715abe1e818da303e562b6",
+    "size_bytes": 4372812000
+  }
+}

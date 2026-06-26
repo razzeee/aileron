@@ -1,9 +1,0 @@
-{
-  "tier": "balanced",
-  "min_ram_gb": 6.0,
-  "artifact": {
-    "url": "https://huggingface.co/ggml-org/models-moved/resolve/main/phi-2/ggml-model-q8_0.gguf",
-    "sha256": "26a44c5a2bc22f33a1271cdf1accb689028141a6cb12e97671740a9803d23c63",
-    "size_bytes": 2958032736
-  }
-}

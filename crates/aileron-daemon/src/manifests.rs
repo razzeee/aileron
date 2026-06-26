@@ -333,6 +333,11 @@ pub fn list_catalog_profiles() -> Result<Vec<CatalogProfileInfo>> {
                 continue;
             }
             let manifest = read_model_manifest_path(&path)?;
+            if manifest.llmfit_model_id.is_empty()
+                || crate::llmfit_metadata::find(&manifest.llmfit_model_id).is_none()
+            {
+                continue;
+            }
             let disk_size_gb = manifest_disk_size_gb(&manifest);
             profiles.push(CatalogProfileInfo {
                 profile_id: manifest.profile_id,
@@ -1324,36 +1329,34 @@ mod tests {
     }
 
     #[test]
-    fn validates_example_model_manifests() {
-        for path in [
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../manifests/examples/models/llama3.2-3b-instruct-q4-k-m.json"),
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../manifests/examples/models/whisper-large-v3-turbo-q5-0.json"),
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../manifests/examples/models/gemma-4-e4b-it-q4-k-xl.json"),
-        ] {
-            read_model_manifest_path(&path).expect("example model manifest should be valid");
-        }
-    }
-
-    #[test]
-    fn validates_profile_library_manifests() {
+    fn validates_profile_library_model_manifests() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../manifests/models");
         let mut count = 0;
+        let mut tiers = HashSet::new();
+        let mut use_cases = HashSet::new();
         for entry in std::fs::read_dir(&dir).expect("read profile library model manifests") {
             let path = entry.expect("read profile library model entry").path();
             if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
                 continue;
             }
-            read_model_manifest_path(&path)
+            let manifest = read_model_manifest_path(&path)
                 .expect("profile library model manifest should be valid");
+            assert!(!manifest.llmfit_model_id.is_empty());
+            assert!(crate::llmfit_metadata::find(&manifest.llmfit_model_id).is_some());
+            assert!(manifest_disk_size_gb(&manifest) > 0.0);
+            tiers.insert(manifest.tier.clone());
+            use_cases.extend(manifest.use_cases.iter().cloned());
             count += 1;
         }
-        assert!(
-            count >= 15,
-            "expected at least 15 profile library manifests"
-        );
+
+        assert!(count >= 8, "expected at least 8 curated model manifests");
+        assert!(tiers.contains("small"));
+        assert!(tiers.contains("balanced"));
+        assert!(tiers.contains("large"));
+        assert!(use_cases.contains("language.complete"));
+        assert!(use_cases.contains("language.extract"));
+        assert!(use_cases.contains("speech.transcribe"));
+        assert!(use_cases.contains("vision.describe"));
     }
 
     #[test]

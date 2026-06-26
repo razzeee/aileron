@@ -184,7 +184,7 @@ Runtime images can be built with any OCI/Docker-compatible builder. The daemon p
 | `runtimes/llm-vision-whisper/` | [LLM, vision, and Whisper runtime README](runtimes/llm-vision-whisper/README.md) |
 | `runtimes/stub/` | [Stub runtime README](runtimes/stub/README.md) |
 
-Runtime manifests provide explicit runtime image refs per variant such as `cpu`, `cuda`, `rocm`, or `vulkan`; see [Hardware variant selection](#hardware-variant-selection). Model manifests only need to reference the `runtime_id`.
+Runtime manifests provide explicit runtime image refs per variant such as `cpu`, `cuda`, `rocm`, or `vulkan`; see [Hardware variant selection](#hardware-variant-selection). Model manifests reference a `runtime_id` and the repository catalog is curated so every shipped model manifest has llmfit fit metadata.
 
 ## Manifests
 
@@ -237,7 +237,7 @@ Use `artifact` for a compact single-file manifest and `artifacts` for explicit o
 
 The `artifacts[].size_bytes` field is the preferred source for the user-facing install/download size, because it lives next to the exact URL and SHA-256 it describes. It is optional; install progress works without it but cannot show a precise total before download. `disk_size_gb` is still accepted as fallback catalog metadata when exact artifact byte sizes are unavailable. The optional `llmfit_model_id` field should be the model name used by `llmfit-core`; when present, Aileron uses llmfit metadata to show a simple fit label and RAM/VRAM requirements for the current PC and derive safe default use-cases. If it is absent or unknown, Aileron falls back to the manifest's explicit metadata or conservative runtime defaults. These fields do not trigger automatic downloads or automatic reassignment.
 
-Distributions should package Aileron, runtime manifests, and model catalog manifests. They do not need to ship model weights in the distro package. The user explicitly chooses a catalog profile to install, sees its size and recommendation metadata, then Aileron downloads and verifies the declared artifacts.
+Distributions should package Aileron, runtime manifests, and the curated model manifests. They do not need to ship model weights in the distro package. The shipped catalog should keep `llmfit_model_id` values resolvable so every visible default profile has RAM/VRAM fit metadata.
 
 Runtime manifests live under `runtimes/` and map the runtime ID to OCI images for each hardware variant:
 
