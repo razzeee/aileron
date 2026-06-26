@@ -49,9 +49,9 @@ pub(crate) fn build_page(stack: &ViewStack) -> gtk4::Widget {
     ));
     cards.append(&lab_card(
         "Tool Lab",
-        "Run a tiny agent loop where the model asks for an app-owned deterministic tool.",
+        "Run tiny agent loops where the model asks for app-owned tools, including whole-PC Linux diagnostics.",
         "CreateSession, RespondGuided, EndSession",
-        "Try: ask how many r's are in strawrberrry and watch the app loop decide when to run the tool.",
+        "Try: collect read-only PC diagnostics and ask for safe bugfix guidance.",
         "Open Tool Lab",
         "tools",
         stack,
