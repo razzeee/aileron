@@ -1050,11 +1050,11 @@ fn render_readiness_list(
         {
             let better = better_catalog_candidate(&catalog, &profile.profile_id, use_case);
             if let Some(candidate) = better {
-                let detail = format!(
-                    "Current: {} · Better: {}",
-                    installed_task_summary(profile, &catalog, use_case),
-                    task_catalog_summary(candidate, use_case)
-                );
+                let detail = current_task_detail(profile, &catalog, use_case, "Assigned");
+                let action_hint =
+                    better_action_hint(&catalog, &profile.profile_id, candidate, use_case);
+                let tooltip =
+                    better_candidate_tooltip(Some(profile), &catalog, candidate, use_case);
                 let installed_better = profiles
                     .iter()
                     .any(|installed| installed.profile_id == candidate.profile_id);
@@ -1097,7 +1097,8 @@ fn render_readiness_list(
                     "success",
                     &detail,
                     button,
-                    Some(&candidate.recommendation_reason),
+                    Some(&action_hint),
+                    Some(&tooltip),
                 );
                 rows.push((readiness_sort_key("Ready"), row));
             } else {
@@ -1110,6 +1111,7 @@ fn render_readiness_list(
                         profile.profile_id,
                         use_case_kind(use_case)
                     ),
+                    None,
                     None,
                     None,
                 );
@@ -1125,11 +1127,11 @@ fn render_readiness_list(
             if let Some(candidate) =
                 better_catalog_candidate(&catalog, &profile.profile_id, use_case)
             {
-                let detail = format!(
-                    "Installed: {} · Better: {}",
-                    installed_task_summary(profile, &catalog, use_case),
-                    task_catalog_summary(candidate, use_case)
-                );
+                let detail = current_task_detail(profile, &catalog, use_case, "Installed");
+                let action_hint =
+                    better_action_hint(&catalog, &profile.profile_id, candidate, use_case);
+                let tooltip =
+                    better_candidate_tooltip(Some(profile), &catalog, candidate, use_case);
                 let button = recommendation_button(candidate, profiles.as_slice(), use_case, lists);
                 let row = readiness_row(
                     use_case,
@@ -1137,7 +1139,8 @@ fn render_readiness_list(
                     "accent",
                     &detail,
                     Some(button),
-                    Some(&candidate.recommendation_reason),
+                    Some(&action_hint),
+                    Some(&tooltip),
                 );
                 rows.push((readiness_sort_key("Installed"), row));
             } else {
@@ -1164,6 +1167,7 @@ fn render_readiness_list(
                         installed_task_summary(profile, &catalog, use_case)
                     ),
                     Some(button),
+                    None,
                     None,
                 );
                 rows.push((readiness_sort_key("Installed"), row));
@@ -1203,6 +1207,7 @@ fn render_readiness_list(
                 "warning",
                 &detail,
                 Some(button),
+                None,
                 Some(&profile.recommendation_reason),
             );
             rows.push((
@@ -1219,6 +1224,7 @@ fn render_readiness_list(
                 "Missing",
                 "warning",
                 "No profile in the library advertises this task.",
+                None,
                 None,
                 None,
             );
@@ -1242,6 +1248,7 @@ fn readiness_row(
     status_style: &str,
     detail: &str,
     button: Option<Button>,
+    action_hint: Option<&str>,
     tooltip: Option<&str>,
 ) -> Box {
     let row = Box::new(Orientation::Horizontal, 12);
@@ -1277,12 +1284,104 @@ fn readiness_row(
     details.append(&subtitle);
     row.append(&details);
 
-    if let Some(button) = button {
-        button.set_valign(gtk4::Align::Center);
-        row.append(&button);
+    if button.is_some() || action_hint.is_some() {
+        let actions = Box::new(Orientation::Vertical, 6);
+        actions.set_valign(gtk4::Align::Center);
+        actions.set_halign(gtk4::Align::End);
+
+        if let Some(action_hint) = action_hint {
+            let hint = Label::new(Some(action_hint));
+            hint.add_css_class("caption");
+            hint.add_css_class("pill");
+            hint.add_css_class("accent");
+            actions.append(&hint);
+        }
+
+        if let Some(button) = button {
+            button.set_valign(gtk4::Align::Center);
+            actions.append(&button);
+        }
+
+        row.append(&actions);
     }
 
     row
+}
+
+fn current_task_detail(
+    profile: &aileron_varlink::aileron_Models::ProfileInfo,
+    catalog: &[aileron_varlink::aileron_Models::CatalogProfileInfo],
+    use_case: &str,
+    prefix: &str,
+) -> String {
+    catalog
+        .iter()
+        .find(|candidate| candidate.profile_id == profile.profile_id)
+        .map(|candidate| format!("{prefix}: {}", compact_task_summary(candidate, use_case)))
+        .unwrap_or_else(|| {
+            format!(
+                "{prefix}: {} · {}",
+                profile.profile_id,
+                use_case_kind(use_case)
+            )
+        })
+}
+
+fn compact_task_summary(
+    profile: &aileron_varlink::aileron_Models::CatalogProfileInfo,
+    use_case: &str,
+) -> String {
+    let mut parts = vec![profile.profile_id.clone()];
+    if let Some(score) = fit_score_label(task_fit_score(profile, use_case)) {
+        parts.push(format!("Fit {score}"));
+    } else {
+        parts.push(fit_label(&profile.fit_level, profile.recommended).to_string());
+    }
+    parts.push(format_size(profile.disk_size_gb));
+    parts.join(" · ")
+}
+
+fn better_action_hint(
+    catalog: &[aileron_varlink::aileron_Models::CatalogProfileInfo],
+    current_profile_id: &str,
+    candidate: &aileron_varlink::aileron_Models::CatalogProfileInfo,
+    use_case: &str,
+) -> String {
+    let candidate_score = task_fit_score(candidate, use_case);
+    let current_score = catalog
+        .iter()
+        .find(|profile| profile.profile_id == current_profile_id)
+        .map(|profile| task_fit_score(profile, use_case))
+        .unwrap_or_default();
+
+    if candidate_score > 0.0 && current_score > 0.0 && candidate_score > current_score {
+        format!("Better: +{:.0} fit", candidate_score - current_score)
+    } else if let Some(score) = fit_score_label(candidate_score) {
+        format!("Better: fit {score}")
+    } else {
+        "Better available".to_string()
+    }
+}
+
+fn better_candidate_tooltip(
+    current: Option<&aileron_varlink::aileron_Models::ProfileInfo>,
+    catalog: &[aileron_varlink::aileron_Models::CatalogProfileInfo],
+    candidate: &aileron_varlink::aileron_Models::CatalogProfileInfo,
+    use_case: &str,
+) -> String {
+    let mut tooltip = String::new();
+    if let Some(current) = current {
+        tooltip.push_str("Current: ");
+        tooltip.push_str(&installed_task_summary(current, catalog, use_case));
+        tooltip.push('\n');
+    }
+    tooltip.push_str("Better: ");
+    tooltip.push_str(&task_catalog_summary(candidate, use_case));
+    if !candidate.recommendation_reason.trim().is_empty() {
+        tooltip.push_str("\n\n");
+        tooltip.push_str(&candidate.recommendation_reason);
+    }
+    tooltip
 }
 
 fn installed_task_summary(
@@ -2101,6 +2200,34 @@ mod tests {
         assert_eq!(
             installed_task_summary(&installed, &[], "vision.describe"),
             "local-profile · Vision"
+        );
+    }
+
+    #[test]
+    fn compact_task_summary_keeps_task_rows_scannable() {
+        let mut profile = catalog_profile("gemma-4-e4b-it-q4-k-xl", "balanced", 4.85);
+        profile.fit_score = 70.0;
+        profile.use_case_fit_scores = vec![aileron_varlink::aileron_Models::UseCaseFitScore {
+            use_case: "language.summarize".to_string(),
+            score: 72.0,
+        }];
+
+        assert_eq!(
+            compact_task_summary(&profile, "language.summarize"),
+            "gemma-4-e4b-it-q4-k-xl · Fit 72/100 · 4.8 GB"
+        );
+    }
+
+    #[test]
+    fn better_action_hint_shows_score_delta() {
+        let mut current = catalog_profile("current", "balanced", 2.0);
+        current.fit_score = 70.0;
+        let mut better = catalog_profile("better", "balanced", 2.0);
+        better.fit_score = 79.0;
+
+        assert_eq!(
+            better_action_hint(&[current], "current", &better, "language.summarize"),
+            "Better: +9 fit"
         );
     }
 

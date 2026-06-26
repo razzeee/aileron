@@ -105,18 +105,17 @@ impl VarlinkInterface for ModelsHandler {
         profile_id: String,
     ) -> varlink::Result<()> {
         self.rt.block_on(async {
-            let path = match crate::manifests::find_model_manifest(&profile_id) {
-                Ok(Some(path)) => path,
-                Ok(None) => {
-                    return call.reply_install_failed(profile_id, "manifest not found".to_string());
+            let result = match crate::manifests::find_model_manifest(&profile_id) {
+                Ok(Some(path)) => {
+                    install_manifest_path(&self.state, path, Some(profile_id.clone())).await
                 }
+                Ok(None) => install_generated_llmfit_manifest(&self.state, &profile_id).await,
+                Err(e) => Err(e),
+            };
+            let (auto_assigned, conflicts) = match result {
+                Ok(result) => result,
                 Err(e) => return call.reply_install_failed(profile_id, e.to_string()),
             };
-            let (auto_assigned, conflicts) =
-                match install_manifest_path(&self.state, path, Some(profile_id.clone())).await {
-                    Ok(result) => result,
-                    Err(e) => return call.reply_install_failed(profile_id, e.to_string()),
-                };
 
             call.reply(
                 InstallProgress {
@@ -1201,6 +1200,187 @@ fn generated_model_id(runtime_id: &str, filename: &str, sha256: &str) -> String 
         .join("-");
     let prefix: String = sha256.chars().take(12).collect();
     format!("{runtime_id}-{stem}-{prefix}")
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct HfModelInfo {
+    #[serde(default)]
+    siblings: Vec<HfSibling>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct HfSibling {
+    rfilename: String,
+    #[serde(default)]
+    lfs: Option<HfLfs>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct HfLfs {
+    #[serde(alias = "oid")]
+    sha256: String,
+    size: u64,
+}
+
+async fn install_generated_llmfit_manifest(
+    state: &SharedState,
+    profile_id: &str,
+) -> anyhow::Result<(Vec<String>, Vec<UseCaseConflict>)> {
+    let model = manifests::find_generated_llmfit_catalog_model(profile_id)
+        .ok_or_else(|| anyhow::anyhow!("manifest not found"))?;
+    let artifacts = resolve_llmfit_hf_artifacts(model).await?;
+    let manifest = manifests::generated_llmfit_model_manifest(profile_id, artifacts)?;
+    install_manifest_data(state, manifest).await
+}
+
+async fn resolve_llmfit_hf_artifacts(
+    model: &llmfit_core::LlmModel,
+) -> anyhow::Result<Vec<ManifestArtifact>> {
+    let mut last_error = None;
+    for source in &model.gguf_sources {
+        match fetch_hf_model_info(&source.repo)
+            .await
+            .and_then(|info| hf_artifacts_from_model_info(&source.repo, &model.quantization, &info))
+        {
+            Ok(artifacts) => return Ok(artifacts),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    match last_error {
+        Some(error) => Err(error).context(format!(
+            "no installable GGUF artifact found for {}",
+            model.name
+        )),
+        None => anyhow::bail!("{} has no GGUF source repositories", model.name),
+    }
+}
+
+async fn fetch_hf_model_info(repo: &str) -> anyhow::Result<HfModelInfo> {
+    let url = format!(
+        "https://huggingface.co/api/models/{}?blobs=true",
+        hf_path(repo)
+    );
+    let body = reqwest::get(url).await?.error_for_status()?.text().await?;
+    serde_json::from_str(&body).context("parse Hugging Face model metadata")
+}
+
+fn hf_artifacts_from_model_info(
+    repo: &str,
+    quantization: &str,
+    info: &HfModelInfo,
+) -> anyhow::Result<Vec<ManifestArtifact>> {
+    let model_file = select_hf_model_file(quantization, &info.siblings)?;
+    let model_lfs = model_file
+        .lfs
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("selected model file has no LFS checksum"))?;
+    let mut artifacts = vec![ManifestArtifact {
+        role: "model".to_string(),
+        url: hf_resolve_url(repo, &model_file.rfilename),
+        filename: "model.gguf".to_string(),
+        sha256: model_lfs.sha256.clone(),
+        size_bytes: model_lfs.size,
+    }];
+
+    if let Some(mmproj_file) = select_hf_mmproj_file(&info.siblings) {
+        let mmproj_lfs = mmproj_file
+            .lfs
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("selected mmproj file has no LFS checksum"))?;
+        artifacts.push(ManifestArtifact {
+            role: "mmproj".to_string(),
+            url: hf_resolve_url(repo, &mmproj_file.rfilename),
+            filename: "mmproj.gguf".to_string(),
+            sha256: mmproj_lfs.sha256.clone(),
+            size_bytes: mmproj_lfs.size,
+        });
+    }
+
+    Ok(artifacts)
+}
+
+fn select_hf_model_file<'a>(
+    quantization: &str,
+    siblings: &'a [HfSibling],
+) -> anyhow::Result<&'a HfSibling> {
+    let quant_key = hf_match_key(quantization);
+    if quant_key.is_empty() {
+        anyhow::bail!("model quantization is empty");
+    }
+    let mut candidates = siblings
+        .iter()
+        .filter(|sibling| is_model_gguf_candidate(sibling))
+        .filter(|sibling| hf_match_key(&sibling.rfilename).contains(&quant_key))
+        .collect::<Vec<_>>();
+    candidates.sort_by(|a, b| hf_file_score(&a.rfilename).cmp(&hf_file_score(&b.rfilename)));
+    candidates
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("no GGUF file matches quantization {quantization}"))
+}
+
+fn select_hf_mmproj_file(siblings: &[HfSibling]) -> Option<&HfSibling> {
+    let mut candidates = siblings
+        .iter()
+        .filter(|sibling| sibling.lfs.is_some())
+        .filter(|sibling| {
+            let filename = sibling.rfilename.to_ascii_lowercase();
+            filename.ends_with(".gguf") && filename.contains("mmproj")
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|a, b| hf_file_score(&a.rfilename).cmp(&hf_file_score(&b.rfilename)));
+    candidates.into_iter().next()
+}
+
+fn is_model_gguf_candidate(sibling: &HfSibling) -> bool {
+    if sibling.lfs.is_none() {
+        return false;
+    }
+    let filename = sibling.rfilename.to_ascii_lowercase();
+    filename.ends_with(".gguf")
+        && !filename.contains("mmproj")
+        && !filename.contains("-of-")
+        && !filename.contains("/.")
+}
+
+fn hf_file_score(filename: &str) -> (usize, usize, String) {
+    let path_depth = filename.matches('/').count();
+    (path_depth, filename.len(), filename.to_ascii_lowercase())
+}
+
+fn hf_match_key(value: &str) -> String {
+    value
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+fn hf_resolve_url(repo: &str, filename: &str) -> String {
+    format!(
+        "https://huggingface.co/{}/resolve/main/{}",
+        hf_path(repo),
+        hf_path(filename)
+    )
+}
+
+fn hf_path(path: &str) -> String {
+    path.split('/')
+        .map(percent_encode_path_segment)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn percent_encode_path_segment(segment: &str) -> String {
+    let mut encoded = String::new();
+    for byte in segment.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
 }
 
 async fn install_manifest_path(
@@ -3256,6 +3436,105 @@ Writing manifest to image destination\n";
             status: "Pulling runtime image...".to_string(),
             cancel_requested: false,
             samples: std::collections::VecDeque::new(),
+        }
+    }
+
+    #[test]
+    fn hf_artifact_selection_prefers_matching_unsplit_quantized_file() {
+        let info = HfModelInfo {
+            siblings: vec![
+                hf_sibling(
+                    "Qwen2.5-7B-Instruct-Q8_0.gguf",
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    8,
+                ),
+                hf_sibling(
+                    "Qwen2.5-7B-Instruct-Q4_K_M-00001-of-00002.gguf",
+                    "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                    4,
+                ),
+                hf_sibling(
+                    "nested/Qwen2.5-7B-Instruct-Q4_K_M.gguf",
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    7,
+                ),
+                hf_sibling(
+                    "mmproj-F16.gguf",
+                    "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                    1,
+                ),
+            ],
+        };
+
+        let artifacts = hf_artifacts_from_model_info("owner/repo name", "Q4_K_M", &info)
+            .expect("artifacts should resolve");
+
+        assert_eq!(artifacts.len(), 2);
+        assert_eq!(artifacts[0].role, "model");
+        assert_eq!(artifacts[0].filename, "model.gguf");
+        assert_eq!(
+            artifacts[0].url,
+            "https://huggingface.co/owner/repo%20name/resolve/main/nested/Qwen2.5-7B-Instruct-Q4_K_M.gguf"
+        );
+        assert_eq!(artifacts[0].sha256, "a".repeat(64));
+        assert_eq!(artifacts[0].size_bytes, 7);
+        assert_eq!(artifacts[1].role, "mmproj");
+        assert_eq!(artifacts[1].filename, "mmproj.gguf");
+    }
+
+    #[test]
+    fn hf_artifact_selection_requires_lfs_checksum() {
+        let info = HfModelInfo {
+            siblings: vec![HfSibling {
+                rfilename: "model-Q4_K_M.gguf".to_string(),
+                lfs: None,
+            }],
+        };
+
+        let error = hf_artifacts_from_model_info("owner/repo", "Q4_K_M", &info)
+            .expect_err("non-LFS files cannot be installed safely");
+
+        assert!(error.to_string().contains("no GGUF file matches"));
+    }
+
+    #[test]
+    fn hf_lfs_metadata_accepts_sha256_field_from_api() {
+        let data = r#"
+        {
+          "siblings": [{
+            "rfilename": "mxbai-embed-xsmall-v1.Q4_K_M.gguf",
+            "lfs": {
+              "sha256": "801f60df3aba7622aff029773bf8ad19df4f33ccf0ccdfebd1972637e62f77a6",
+              "size": 26776320,
+              "pointerSize": 133
+            }
+          }]
+        }
+        "#;
+        let info = serde_json::from_str::<HfModelInfo>(data).expect("HF API shape should decode");
+
+        let artifacts = hf_artifacts_from_model_info(
+            "mradermacher/mxbai-embed-xsmall-v1-GGUF",
+            "Q4_K_M",
+            &info,
+        )
+        .expect("Q4_K_M artifact should resolve");
+
+        assert_eq!(artifacts[0].filename, "model.gguf");
+        assert_eq!(
+            artifacts[0].sha256,
+            "801f60df3aba7622aff029773bf8ad19df4f33ccf0ccdfebd1972637e62f77a6"
+        );
+        assert_eq!(artifacts[0].size_bytes, 26776320);
+    }
+
+    fn hf_sibling(filename: &str, oid: &str, size: u64) -> HfSibling {
+        HfSibling {
+            rfilename: filename.to_string(),
+            lfs: Some(HfLfs {
+                sha256: oid.to_string(),
+                size,
+            }),
         }
     }
 

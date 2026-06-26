@@ -18,6 +18,11 @@ pub fn find(model_id: &str) -> Option<&'static LlmModel> {
         .find(|model| model.name == model_id)
 }
 
+pub fn all() -> &'static [LlmModel] {
+    let database = DATABASE.get_or_init(ModelDatabase::embedded);
+    database.get_all_models().as_slice()
+}
+
 pub fn detect_system() -> SystemSpecs {
     SystemSpecs::detect()
 }

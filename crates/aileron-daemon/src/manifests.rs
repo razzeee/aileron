@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use llmfit_core::{Capability, ModelFormat, UseCase};
+use llmfit_core::{Capability, LlmModel, ModelFormat, UseCase};
 use serde::Deserialize;
 
 use crate::hardware::Variant;
@@ -319,6 +319,8 @@ pub(crate) fn read_model_manifest_path(path: &std::path::Path) -> Result<ModelMa
 
 pub fn list_catalog_profiles() -> Result<Vec<CatalogProfileInfo>> {
     let mut profiles = Vec::new();
+    let mut seen_profile_ids = HashSet::new();
+    let mut seen_llmfit_model_ids = HashSet::new();
     for dir in manifest_dirs() {
         let models_dir = dir.join("models");
         if !models_dir.exists() {
@@ -339,6 +341,8 @@ pub fn list_catalog_profiles() -> Result<Vec<CatalogProfileInfo>> {
                 continue;
             }
             let disk_size_gb = manifest_disk_size_gb(&manifest);
+            seen_profile_ids.insert(manifest.profile_id.clone());
+            seen_llmfit_model_ids.insert(manifest.llmfit_model_id.clone());
             profiles.push(CatalogProfileInfo {
                 profile_id: manifest.profile_id,
                 model_id: manifest.model_id,
@@ -352,9 +356,118 @@ pub fn list_catalog_profiles() -> Result<Vec<CatalogProfileInfo>> {
             });
         }
     }
+    profiles.extend(
+        generated_llmfit_catalog_profiles()
+            .into_iter()
+            .filter(|profile| {
+                !seen_profile_ids.contains(&profile.profile_id)
+                    && !seen_llmfit_model_ids.contains(&profile.llmfit_model_id)
+            }),
+    );
     profiles.sort_by(|a, b| a.profile_id.cmp(&b.profile_id));
     profiles.dedup_by(|a, b| a.profile_id == b.profile_id);
     Ok(profiles)
+}
+
+pub(crate) fn generated_llmfit_catalog_profiles() -> Vec<CatalogProfileInfo> {
+    crate::llmfit_metadata::all()
+        .iter()
+        .filter_map(generated_catalog_profile_from_model)
+        .collect()
+}
+
+pub(crate) fn find_generated_llmfit_catalog_model(profile_id: &str) -> Option<&'static LlmModel> {
+    crate::llmfit_metadata::all()
+        .iter()
+        .find(|model| generated_llmfit_profile_id(model).as_deref() == Some(profile_id))
+}
+
+pub(crate) fn generated_llmfit_model_manifest(
+    profile_id: &str,
+    artifacts: Vec<ManifestArtifact>,
+) -> Result<ModelManifest> {
+    let model = find_generated_llmfit_catalog_model(profile_id)
+        .ok_or_else(|| anyhow::anyhow!("generated catalog profile not found: {profile_id}"))?;
+    if artifacts.is_empty() {
+        bail!("generated catalog profile requires at least one artifact");
+    }
+    let disk_size_gb = artifacts
+        .iter()
+        .map(|artifact| artifact.size_bytes)
+        .sum::<u64>() as f64
+        / 1024.0
+        / 1024.0
+        / 1024.0;
+    let manifest = ModelManifest {
+        profile_id: profile_id.to_string(),
+        model_id: profile_id.to_string(),
+        llmfit_model_id: model.name.clone(),
+        runtime_id: ML_RUNTIME_ID.to_string(),
+        runtime_options: HashMap::new(),
+        tier: generated_catalog_tier(model).to_string(),
+        disk_size_gb,
+        min_ram_gb: model.min_ram_gb,
+        runtime_images: Vec::new(),
+        use_cases: generated_llmfit_use_cases(model),
+        specializations: Vec::new(),
+        artifacts,
+    };
+    validate_use_cases(&manifest.use_cases)?;
+    let mut artifact_roles = HashSet::new();
+    for artifact in &manifest.artifacts {
+        validate_artifact(artifact)?;
+        if !artifact.role.is_empty() && !artifact_roles.insert(artifact.role.as_str()) {
+            bail!("duplicate artifact role: {}", artifact.role);
+        }
+    }
+    Ok(manifest)
+}
+
+fn generated_catalog_profile_from_model(model: &LlmModel) -> Option<CatalogProfileInfo> {
+    if model.format != ModelFormat::Gguf || model.gguf_sources.is_empty() {
+        return None;
+    }
+    let profile_id = generated_llmfit_profile_id(model)?;
+    let disk_size_gb = model.estimate_disk_gb(&model.quantization);
+    Some(CatalogProfileInfo {
+        profile_id: profile_id.clone(),
+        model_id: profile_id,
+        llmfit_model_id: model.name.clone(),
+        runtime_id: ML_RUNTIME_ID.to_string(),
+        tier: generated_catalog_tier(model).to_string(),
+        disk_size_gb,
+        min_ram_gb: model.min_ram_gb,
+        use_cases: generated_llmfit_use_cases(model),
+        specializations: Vec::new(),
+    })
+}
+
+fn generated_llmfit_profile_id(model: &LlmModel) -> Option<String> {
+    if model.name.trim().is_empty() || model.quantization.trim().is_empty() {
+        return None;
+    }
+    normalize_manifest_id(&format!("{}-{}", model.name, model.quantization)).ok()
+}
+
+fn generated_catalog_tier(model: &LlmModel) -> &'static str {
+    if model.recommended_ram_gb <= 4.0 {
+        "small"
+    } else if model.recommended_ram_gb <= 16.0 {
+        "balanced"
+    } else {
+        "large"
+    }
+}
+
+fn generated_llmfit_use_cases(model: &LlmModel) -> Vec<String> {
+    let use_cases = match UseCase::from_model(model) {
+        UseCase::Embedding => vec!["language.embed"],
+        UseCase::Coding => vec!["language.extract", "language.analyze"],
+        UseCase::General | UseCase::Reasoning | UseCase::Chat | UseCase::Multimodal => {
+            default_language_use_cases()
+        }
+    };
+    dedup_use_cases(use_cases)
 }
 
 fn manifest_disk_size_gb(manifest: &ModelManifest) -> f64 {
@@ -1326,6 +1439,61 @@ mod tests {
         };
 
         assert_eq!(manifest_disk_size_gb(&manifest), 1.0);
+    }
+
+    #[test]
+    fn generated_llmfit_catalog_profile_uses_stable_id_and_language_use_cases() {
+        let model =
+            crate::llmfit_metadata::find("Qwen/Qwen2.5-7B-Instruct").expect("metadata exists");
+
+        let profile = generated_catalog_profile_from_model(model)
+            .expect("model should have generated catalog profile");
+
+        assert_eq!(profile.profile_id, "qwen_qwen2.5-7b-instruct-q4_k_m");
+        assert_eq!(profile.model_id, profile.profile_id);
+        assert_eq!(profile.llmfit_model_id, model.name);
+        assert_eq!(profile.runtime_id, ML_RUNTIME_ID);
+        assert!(
+            profile
+                .use_cases
+                .contains(&"language.summarize".to_string())
+        );
+        assert!(!profile.use_cases.contains(&"vision.describe".to_string()));
+        assert!(profile.disk_size_gb > 0.0);
+    }
+
+    #[test]
+    fn generated_llmfit_manifest_uses_resolved_artifacts() {
+        let manifest = generated_llmfit_model_manifest(
+            "qwen_qwen2.5-7b-instruct-q4_k_m",
+            vec![ManifestArtifact {
+                role: "model".to_string(),
+                url: "https://huggingface.co/unsloth/Qwen2.5-7B-Instruct-GGUF/resolve/main/model.gguf"
+                    .to_string(),
+                filename: "model.gguf".to_string(),
+                sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .to_string(),
+                size_bytes: 1024 * 1024 * 1024,
+            }],
+        )
+        .expect("generated manifest should be valid");
+
+        assert_eq!(manifest.profile_id, "qwen_qwen2.5-7b-instruct-q4_k_m");
+        assert_eq!(manifest.model_id, manifest.profile_id);
+        assert_eq!(manifest.llmfit_model_id, "Qwen/Qwen2.5-7B-Instruct");
+        assert_eq!(manifest.runtime_id, ML_RUNTIME_ID);
+        assert_eq!(manifest.disk_size_gb, 1.0);
+        assert_eq!(manifest.artifacts[0].filename, "model.gguf");
+    }
+
+    #[test]
+    fn generated_llmfit_catalog_profiles_include_models_without_manifests() {
+        let profiles = generated_llmfit_catalog_profiles();
+
+        assert!(profiles.iter().any(|profile| {
+            profile.profile_id == "qwen_qwen2.5-7b-instruct-q4_k_m"
+                && profile.llmfit_model_id == "Qwen/Qwen2.5-7B-Instruct"
+        }));
     }
 
     #[test]
