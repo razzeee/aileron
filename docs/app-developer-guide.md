@@ -48,7 +48,7 @@ Avoid treating model names as application requirements. A user may satisfy `lang
 2. Create a session with stable instructions.
 3. Optionally prewarm on the same portal interface before the first visible operation.
 4. Send task input through the appropriate method.
-5. End the session when the user-visible task is complete.
+5. Close the returned `org.freedesktop.portal.Session` handle when the user-visible task is complete.
 
 For conversational features, keep stable instructions in the session and send the relevant local history as part of the prompt with `StreamResponse` or `StreamRespondGuided`. The app owns conversation history and can trim it to fit its UI or context policy. For one-shot features such as "summarize this article", a short-lived session with `StreamResponse` is usually enough.
 
@@ -102,7 +102,7 @@ Live microphone chunking is app behavior in the current API. Apps that want inte
 
 Use `vision.describe` with `StreamDescribe`, `vision.ocr` with `StreamOcr`, and `vision.segment` with `StreamSegment`. Description and OCR stream text; segmentation emits one segment-list event with normalized rectangular boxes. Images are passed as base64-encoded PNG or JPEG bytes.
 
-Large media inputs can be expensive. Prefer user-initiated actions, visible progress, and cancellation-friendly UI.
+Large media inputs can be expensive and must fit within the session bus message limit in the current base64-string prototype. Prefer user-initiated actions, visible progress, resized images, app-side audio chunking, and cancellation-friendly UI.
 
 ## Privacy And Permissions
 
@@ -127,7 +127,7 @@ Recommended behavior:
 - Offer a non-AI fallback when possible.
 - Avoid model-specific instructions in the app UI.
 
-Handle specific inference errors when useful. `ContextWindowExceeded` can prompt the user to shorten input, `UnsupportedLanguage` can ask for another language, `SafetyRefusal` should be shown as a refusal rather than a crash, `RequestCancelled` should leave UI state clean, and `InvalidInput` means the app should fix or reject the submitted payload.
+Handle specific inference errors when useful. In the current prototype, these are forwarded as D-Bus failures whose message includes the Varlink error name. `ContextWindowExceeded` can prompt the user to shorten input, `UnsupportedLanguage` can ask for another language, `SafetyRefusal` should be shown as a refusal rather than a crash, `RequestCancelled` should leave UI state clean, and `InvalidInput` means the app should fix or reject the submitted payload.
 
 ## Development And Testing
 

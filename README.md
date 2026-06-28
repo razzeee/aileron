@@ -293,7 +293,7 @@ varlink call "unix:$XDG_RUNTIME_DIR/aileron.socket/aileron.Models.InstallManifes
 # 6. Create a session
 varlink call "unix:$XDG_RUNTIME_DIR/aileron.socket/aileron.Inference.CreateSession" \
     '{"app_id":"test","use_case":"language.summarize","instructions":"You are a concise test assistant."}'
-# → {"session_id": "..."}   copy the value
+# → {"session_id": "...", "profile_id": "stub"}   copy the session_id value
 
 # 7. Generate (replace SESSION_ID)
 varlink call --more "unix:$XDG_RUNTIME_DIR/aileron.socket/aileron.Inference.StreamResponse" \
@@ -381,7 +381,7 @@ type ToolResult (id: string, content: string, content_json: string)
 type VisionSegment (label: string, confidence: float, x: float, y: float, width: float, height: float)
 
 method GetUseCaseAvailability(app_id: string, use_case: string) -> (availability: ModelAvailability)
-method CreateSession(app_id: string, use_case: string, instructions: string) -> (session_id: string)
+method CreateSession(app_id: string, use_case: string, instructions: string) -> (session_id: string, profile_id: string)
 method Prewarm(session_id: string) -> ()
 method StreamResponse(session_id: string, prompt: string, options: GenerationOptions) -> (token: string)
 method StreamPredictNext(session_id: string, prefix: string, options: GenerationOptions) -> (completions: []string)
@@ -395,7 +395,7 @@ method StreamSegment(session_id: string, image: string) -> (segments: []VisionSe
 method EndSession(session_id: string) -> ()
 ```
 
-`instructions` are stored on the session and forwarded to text containers as the container `system` prompt. `StreamPredictNext` is for inline typing assistance on `language.complete` sessions: the daemon forwards the raw prefix to the runtime and streams one completions event with up to three short completions, typically word suffixes or next words. Newer `StreamPredictNext` calls for the same session supersede older in-flight prediction calls; superseded calls fail with `RequestCancelled` and do not emit completions. `audio` is raw 16 kHz mono f32le PCM bytes encoded as base64; `StreamTranscribe` streams a verbatim transcript for `speech.transcribe` sessions or an English translation for `speech.translate` sessions. `image` is PNG or JPEG bytes encoded as base64. `StreamEmbed` streams one embedding vector event for `text`. `VisionSegment` coordinates are normalized `0.0..1.0` rectangles relative to image dimensions.
+`CreateSession` returns the backend session id and selected profile id; the portal frontend exposes only an opaque public session handle to apps. `instructions` are stored on the session and forwarded to text containers as the container `system` prompt. `StreamPredictNext` is for inline typing assistance on `language.complete` sessions: the daemon forwards the raw prefix to the runtime and streams one completions event with up to three short completions, typically word suffixes or next words. Newer `StreamPredictNext` calls for the same session supersede older in-flight prediction calls; superseded calls fail with `RequestCancelled` and do not emit completions. `audio` is raw 16 kHz mono f32le PCM bytes encoded as base64; `StreamTranscribe` streams a verbatim transcript for `speech.transcribe` sessions or an English translation for `speech.translate` sessions. `image` is PNG or JPEG bytes encoded as base64. `StreamEmbed` streams one embedding vector event for `text`. `VisionSegment` coordinates are normalized `0.0..1.0` rectangles relative to image dimensions.
 
 `GenerationOptions.maximum_response_tokens` must be greater than zero and fit in `u32`. `temperature` must be finite and non-negative. `sampling_mode` must be non-empty. `source_language_hint` and `target_language_hint` are optional strings for `language.translate`; pass empty strings when unspecified. Today the daemon validates sampling fields, forwards `maximum_response_tokens` to containers as `max_tokens`, and folds translation hints into the session instructions for `language.translate`.
 
@@ -458,38 +458,39 @@ method KillSession(session_id: string) -> ()
 
 The portal does not talk to containers directly. It translates D-Bus calls into `aileron.Inference` Varlink calls, and the daemon owns permissions, sessions, model assignments, and container stdio.
 
-| Interface | Use-case prefix | Methods |
+| Public interface | Use-case prefix | Methods |
 |---|---|---|
-| `org.freedesktop.impl.portal.Language` | `language.*` | `GetUseCaseAvailability`, `CreateSession`, `Prewarm`, `StreamResponse`, `StreamPredictNext`, `StreamRespondGuided`, `StreamSubmitToolResultsGuided`, `StreamEmbed`, `EndSession` |
-| `org.freedesktop.impl.portal.Speech` | `speech.*` | `GetUseCaseAvailability`, `CreateSession`, `Prewarm`, `StreamTranscribe`, `EndSession` |
-| `org.freedesktop.impl.portal.Vision` | `vision.*` | `GetUseCaseAvailability`, `CreateSession`, `Prewarm`, `StreamDescribe`, `StreamOcr`, `StreamSegment`, `EndSession` |
+| `org.freedesktop.portal.Language` | `language.*` | `GetUseCaseAvailability`, `CreateSession`, `Prewarm`, `StreamResponse`, `StreamPredictNext`, `StreamRespondGuided`, `StreamSubmitToolResultsGuided`, `StreamEmbed` |
+| `org.freedesktop.portal.Speech` | `speech.*` | `GetUseCaseAvailability`, `CreateSession`, `Prewarm`, `StreamTranscribe` |
+| `org.freedesktop.portal.Vision` | `vision.*` | `GetUseCaseAvailability`, `CreateSession`, `Prewarm`, `StreamDescribe`, `StreamOcr`, `StreamSegment` |
 
-`GetUseCaseAvailability`, `CreateSession`, and `EndSession` have the same signatures on each interface. Each interface validates that the requested use-case token matches its prefix.
+Apps call the public interfaces on `org.freedesktop.portal.Desktop`. The public frontend derives the app identity, returns `session_handle: o` object paths, and closes backend sessions when the app calls `Close` on the corresponding `org.freedesktop.portal.Session` object. The implementation backend uses internal `app_id: s` and `session_id: s` strings and is only called by xdg-desktop-portal.
+
+`GetUseCaseAvailability`, `CreateSession`, and `Prewarm` have the same public signatures on each interface. Each interface validates that the requested use-case token matches its prefix.
 
 ### Shared Methods
 
 | Method | Parameters | Returns | Notes |
 |---|---|---|---|
-| `GetUseCaseAvailability` | `app_id: s, use_case: s` | `(is_available: b, code: s, reason: s)` | Checks whether an assigned profile has local artifacts and a runtime image |
-| `CreateSession` | `app_id: s, use_case: s, instructions: s` | `session_id: s` | Creates a session bound to the assigned profile; does not start the container by itself |
-| `Prewarm` | `session_id: s` | `()` | Starts the backing container before the first user-visible operation |
-| `EndSession` | `session_id: s` | `()` | Ends the session; the per-profile container remains pooled until idle timeout |
+| `GetUseCaseAvailability` | `use_case: s, options: a{sv}` | `(is_available: b, code: s, reason: s)` | Checks whether an assigned profile has local artifacts and a runtime image |
+| `CreateSession` | `use_case: s, instructions: s, options: a{sv}` | `session_handle: o` | Creates a session bound to the assigned profile; does not start the container by itself |
+| `Prewarm` | `session_handle: o, options: a{sv}` | `()` | Starts the backing container before the first user-visible operation |
 
 ### Language Methods
 
 | Method | Parameters | Returns | Notes |
 |---|---|---|---|
-| `StreamResponse` | `session_id: s, prompt: s, options: (xdsss)` | `()` | Full language generation sessions only; emits `TokenReceived` signals; final token has `done=true` |
-| `StreamPredictNext` | `session_id: s, prefix: s, options: (xdsss)` | `()` | `language.complete` sessions only; emits `PredictionReceived` signals for up to three short completions; newer calls for the same session cancel older in-flight prediction calls |
-| `StreamRespondGuided` | `session_id: s, prompt: s, fields: a(sssb), tools: a(sss), options: (xdsss)` | `()` | Full language generation sessions only; emits `GuidedSnapshotReceived` and/or `GuidedToolCallsReceived` signals; final event has `done=true` |
-| `StreamSubmitToolResultsGuided` | `session_id: s, prompt: s, results: a(sss), fields: a(sssb), tools: a(sss), options: (xdsss)` | `()` | Full language generation sessions only; continues after the app executes or rejects tool calls; emits guided signals |
-| `StreamEmbed` | `session_id: s, text: s` | `()` | `language.embed` sessions only; emits one `EmbeddingReceived` signal |
+| `StreamResponse` | `session_handle: o, prompt: s, options: a{sv}` | `()` | Full language generation sessions only; emits `TokenReceived` signals; final token has `done=true` |
+| `StreamPredictNext` | `session_handle: o, prefix: s, options: a{sv}` | `()` | `language.complete` sessions only; emits `PredictionReceived` signals for up to three short completions; newer calls for the same session cancel older in-flight prediction calls |
+| `StreamRespondGuided` | `session_handle: o, prompt: s, fields: a(sssb), tools: a(sss), options: a{sv}` | `()` | Full language generation sessions only; emits `GuidedSnapshotReceived` and/or `GuidedToolCallsReceived` signals; final event has `done=true` |
+| `StreamSubmitToolResultsGuided` | `session_handle: o, prompt: s, results: a(sss), fields: a(sssb), tools: a(sss), options: a{sv}` | `()` | Full language generation sessions only; continues after the app executes or rejects tool calls; emits guided signals |
+| `StreamEmbed` | `session_handle: o, text: s, options: a{sv}` | `()` | `language.embed` sessions only; emits one `EmbeddingReceived` signal |
 
 ### Speech Methods
 
 | Method | Parameters | Returns | Notes |
 |---|---|---|---|
-| `StreamTranscribe` | `session_id: s, audio_b64: s, source_language_hint: s` | `()` | 16 kHz mono f32le PCM, base64; empty hint means auto-detect/no hint; emits `TranscriptionReceived` signals; final segment has `done=true` |
+| `StreamTranscribe` | `session_handle: o, audio: s, source_language_hint: s, options: a{sv}` | `()` | 16 kHz mono f32le PCM, base64; empty hint means auto-detect/no hint; emits `TranscriptionReceived` signals; final segment has `done=true` |
 
 Streaming D-Bus methods carry their payloads only through signals while the method call is in progress. Callers should subscribe before invoking a stream method and consume signals concurrently; the empty method reply only means the stream has finished.
 
@@ -497,27 +498,31 @@ Streaming D-Bus methods carry their payloads only through signals while the meth
 
 | Method | Parameters | Returns | Notes |
 |---|---|---|---|
-| `StreamDescribe` | `session_id: s, image_b64: s` | `()` | `vision.describe` sessions only; emits `VisionTextReceived` signals |
-| `StreamOcr` | `session_id: s, image_b64: s` | `()` | `vision.ocr` sessions only; emits `VisionTextReceived` signals |
-| `StreamSegment` | `session_id: s, image_b64: s` | `()` | `vision.segment` sessions only; emits one `VisionSegmentsReceived` signal with normalized boxes |
+| `StreamDescribe` | `session_handle: o, image: s, options: a{sv}` | `()` | `vision.describe` sessions only; emits `VisionTextReceived` signals |
+| `StreamOcr` | `session_handle: o, image: s, options: a{sv}` | `()` | `vision.ocr` sessions only; emits `VisionTextReceived` signals |
+| `StreamSegment` | `session_handle: o, image: s, options: a{sv}` | `()` | `vision.segment` sessions only; emits one `VisionSegmentsReceived` signal with normalized boxes |
 
-These are D-Bus signatures: parentheses define a struct, and `a(...)` means an array of structs. `options: (xdsss)` is `GenerationOptions`: `maximum_response_tokens` as int64, `temperature` as float64, `sampling_mode` as string, `source_language_hint` as string, and `target_language_hint` as string. Empty language hints mean unspecified. The generation option language hints only affect `language.translate`. Speech methods use their `source_language_hint` argument only to identify the spoken input language; the session use-case selects whether speech output is a transcript or English translation. `fields: a(sssb)` is an array of `GuidedField` structs: name, kind, description, required. Tool structs are `a(sss)`: definitions are name, description, schema JSON; calls are id, name, arguments JSON; results are id, content, content JSON.
+These are D-Bus signatures: parentheses define a struct, `a(...)` means an array of structs, and `a{sv}` is an options vardict. Public language methods accept these option keys: `maximum_response_tokens` as int64, `temperature` as float64, `sampling_mode` as string, `source_language_hint` as string, and `target_language_hint` as string. Empty language hints mean unspecified. The generation option language hints only affect `language.translate`. Speech methods use their `source_language_hint` argument only to identify the spoken input language; the session use-case selects whether speech output is a transcript or English translation. `fields: a(sssb)` is an array of `GuidedField` structs: name, kind, description, required. Tool structs are `a(sss)`: definitions are name, description, schema JSON; calls are id, name, arguments JSON; results are id, content, content JSON.
+
+Audio and image payloads are base64 strings in the current prototype and must fit within the session bus message limit. Apps should resize images, chunk live audio on their side, and keep media requests user-initiated. A future fd/document-handle transport would be a separate API revision.
 
 ### Signals
 
 | Signal | Parameters | Fired when |
 |---|---|---|
 | `ModelLoading` | `session_handle: o, message: s` | The portal is about to start a cold backing container for a session; available on each interface |
-| `TokenReceived` | `session_id: s, token: s, done: b` | Each token during `StreamResponse` on `Language` |
-| `PredictionReceived` | `session_id: s, completion: s, done: b` | Each completion during `StreamPredictNext` on `Language` |
-| `GuidedSnapshotReceived` | `session_id: s, snapshot_json: s, done: b` | Each validated JSON snapshot during `StreamRespondGuided` on `Language` |
-| `GuidedToolCallsReceived` | `session_id: s, tool_calls: a(sss), done: b` | Tool calls requested during `StreamRespondGuided` on `Language` |
-| `EmbeddingReceived` | `session_id: s, embedding: ad, done: b` | Embedding vector during `StreamEmbed` on `Language` |
-| `TranscriptionReceived` | `session_id: s, text: s, done: b` | Each segment during `StreamTranscribe` on `Speech` |
-| `VisionTextReceived` | `session_id: s, text: s, done: b` | Each text token during `StreamDescribe` or `StreamOcr` on `Vision` |
-| `VisionSegmentsReceived` | `session_id: s, segments: a(sddddd), done: b` | Segmentation result during `StreamSegment` on `Vision` |
+| `TokenReceived` | `session_handle: o, token: s, done: b` | Each token during `StreamResponse` on `Language` |
+| `PredictionReceived` | `session_handle: o, completion: s, done: b` | Each completion during `StreamPredictNext` on `Language` |
+| `GuidedSnapshotReceived` | `session_handle: o, snapshot_json: s, done: b` | Each validated JSON snapshot during `StreamRespondGuided` on `Language` |
+| `GuidedToolCallsReceived` | `session_handle: o, tool_calls: a(sss), done: b` | Tool calls requested during `StreamRespondGuided` on `Language` |
+| `EmbeddingReceived` | `session_handle: o, embedding: ad, done: b` | Embedding vector during `StreamEmbed` on `Language` |
+| `TranscriptionReceived` | `session_handle: o, text: s, done: b` | Each segment during `StreamTranscribe` on `Speech` |
+| `VisionTextReceived` | `session_handle: o, text: s, done: b` | Each text token during `StreamDescribe` or `StreamOcr` on `Vision` |
+| `VisionSegmentsReceived` | `session_handle: o, segments: a(sddddd), done: b` | Segmentation result during `StreamSegment` on `Vision` |
 
-D-Bus callers see underlying Varlink failures as `org.freedesktop.DBus.Error.Failed` with the Varlink error text.
+The implementation backend exposes the same task methods with `app_id: s` and `session_id: s` instead of public session handles, plus `EndSession(session_id: s)` for the frontend's session-close path. Public apps should not call the implementation interfaces directly.
+
+The current prototype forwards underlying Varlink failures as D-Bus errors. Specific inference failures are currently surfaced as `org.freedesktop.DBus.Error.Failed` messages that include the Varlink error name, such as `aileron.Inference.RequestCancelled` or `aileron.Inference.InvalidInput`; apps should still branch on availability `code` values before creating sessions.
 
 ## Portal-to-container API boundary
 
@@ -648,9 +653,9 @@ The daemon sends a `response_format` object containing the caller's JSON Schema.
 
 - Containers start on demand when `Prewarm` or the first inference call needs an assigned profile runtime.
 - The daemon waits for the container to signal `ready` on stderr before using it.
-- The portal emits `ModelLoading(session_handle, "starting model")` before cold text-generation calls that may start a container.
+- The portal emits `ModelLoading(session_handle, "starting model")` before cold language, speech, or vision calls that may start a container.
 - One container runs per profile, shared across all sessions bound to that profile.
-- `EndSession` removes the session, but the per-profile container remains pooled until idle timeout.
+- Public session `Close` and backend `EndSession` remove the session, but the per-profile container remains pooled until idle timeout.
 - `KillSession` removes the session and stops the profile container if no other active session uses it.
 - Idle containers are terminated after 5 minutes by default (configurable via `--idle-timeout-secs`).
 - A crash in the container kills only that container, not the daemon.
