@@ -59,52 +59,39 @@ method CreateSession(app_id: string, use_case: string, instructions: string) -> 
 # Start the backing container before the first user-visible response.
 method Prewarm(session_id: string) -> ()
 
-# Generate a complete response. Session must have been created with a language.* use_case.
-method Respond(session_id: string, prompt: string, options: GenerationOptions) -> (content: string)
-
-# Predict up to three short inline continuations from the raw text prefix. Session must have been created with a language.* use_case.
-method PredictNext(session_id: string, prefix: string, options: GenerationOptions) -> (completions: []string)
-
 # Stream response tokens. Session must have been created with a language.* use_case.
 method StreamResponse(session_id: string, prompt: string, options: GenerationOptions) -> (token: string)
 
-# Generate JSON matching field guides converted to a JSON Schema object.
-# Session must have been created with a language.* use_case.
-method RespondGuided(session_id: string, prompt: string, fields: []GuidedField, tools: []ToolDefinition, options: GenerationOptions) -> (content: string, tool_calls: []ToolCall)
+# Stream up to three short inline continuations from the raw text prefix. Session must have been created with use_case: language.complete.
+method StreamPredictNext(session_id: string, prefix: string, options: GenerationOptions) -> (completions: []string)
 
 # Stream schema-valid guided output snapshots. The final reply has continues=false.
 method StreamRespondGuided(session_id: string, prompt: string, fields: []GuidedField, tools: []ToolDefinition, options: GenerationOptions) -> (snapshot_json: string, tool_calls: []ToolCall)
 
-# Continue guided generation after the app executes or rejects requested tools.
-method SubmitToolResultsGuided(session_id: string, prompt: string, results: []ToolResult, fields: []GuidedField, tools: []ToolDefinition, options: GenerationOptions) -> (content: string, tool_calls: []ToolCall)
+# Stream guided generation after the app executes or rejects requested tools.
+method StreamSubmitToolResultsGuided(session_id: string, prompt: string, results: []ToolResult, fields: []GuidedField, tools: []ToolDefinition, options: GenerationOptions) -> (snapshot_json: string, tool_calls: []ToolCall)
 
-# Compute embedding vectors for text. Session must have been created with use_case: language.embed
+# Stream embedding vectors for text. Session must have been created with use_case: language.embed
 # embedding: the embedding vector for the supplied text
-method Embed(session_id: string, text: string) -> (embedding: []float)
-
-# Transcribe or translate audio. Session must have been created with
-# use_case: speech.transcribe (verbatim, source language) or speech.translate (translated to English).
-# audio: raw PCM bytes encoded as base64 (16kHz mono f32le)
-# source_language_hint: optional spoken source language hint; empty string means auto-detect/no hint
-method Transcribe(session_id: string, audio: string, source_language_hint: string) -> (text: string)
+method StreamEmbed(session_id: string, text: string) -> (embedding: []float)
 
 # Stream transcript or translation segments. Session must have been created with
 # use_case: speech.transcribe (verbatim, source language) or speech.translate (translated to English).
 # The final reply has continues=false.
 method StreamTranscribe(session_id: string, audio: string, source_language_hint: string) -> (token: string)
 
-# Describe an image. Session must have been created with vision.describe
+# Stream image description tokens. Session must have been created with vision.describe
 # image: PNG or JPEG bytes encoded as base64
-method Describe(session_id: string, image: string) -> (text: string)
+method StreamDescribe(session_id: string, image: string) -> (token: string)
 
-# Extract text from an image (OCR). Session must have been created with vision.ocr
+# Stream OCR text tokens. Session must have been created with vision.ocr
 # image: PNG or JPEG bytes encoded as base64
-method Ocr(session_id: string, image: string) -> (text: string)
+method StreamOcr(session_id: string, image: string) -> (token: string)
 
-# Identify objects in an image. Session must have been created with vision.segment
+# Stream identified objects in an image. Session must have been created with vision.segment
 # Coordinates are normalized to 0.0..1.0, relative to the image dimensions.
 # image: PNG or JPEG bytes encoded as base64
-method Segment(session_id: string, image: string) -> (segments: []VisionSegment)
+method StreamSegment(session_id: string, image: string) -> (segments: []VisionSegment)
 
 # End a session. The per-profile container remains pooled until idle timeout.
 method EndSession(session_id: string) -> ()

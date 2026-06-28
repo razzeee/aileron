@@ -1,6 +1,7 @@
 use super::{
-    LANGUAGE_IFACE, PORTAL_BUS, PORTAL_PATH, ToolCallDbus, ToolDefinitionDbus, ToolResultDbus,
+    LANGUAGE_IFACE, PORTAL_BUS, PORTAL_PATH, ToolDefinitionDbus, ToolResultDbus,
     close_public_session, create_public_session, generation_options, portal_connection,
+    stream_guided_response, stream_guided_tool_results, stream_language_text,
 };
 use serde::Deserialize;
 use zbus::zvariant::OwnedObjectPath;
@@ -195,17 +196,14 @@ fn run_character_tool_demo(
     );
 
     tx.send(ToolEvent::Trace(
-        "before_llm_call: ask RespondGuided for app-loop action".to_string(),
+        "before_llm_call: ask StreamRespondGuided for app-loop action".to_string(),
     ))?;
-    let (content, tool_calls): (String, Vec<ToolCallDbus>) = proxy.call(
-        "RespondGuided",
-        &(
-            &session_handle,
-            &loop_prompt,
-            fields.clone(),
-            tools.clone(),
-            options.clone(),
-        ),
+    let (content, tool_calls) = stream_guided_response(
+        &session_handle,
+        &loop_prompt,
+        fields.clone(),
+        tools.clone(),
+        options.clone(),
     )?;
     let mut response = if content.trim().is_empty() && !tool_calls.is_empty() {
         GuidedToolLoopResponse {
@@ -296,28 +294,24 @@ fn run_character_tool_demo(
     };
 
     tx.send(ToolEvent::Trace(
-        "before_llm_call: append tool_result to prompt and call RespondGuided again".to_string(),
+        "before_llm_call: append tool_result to prompt and stream guided response again"
+            .to_string(),
     ))?;
     loop_prompt.push_str("\n\ntool_result from count_character_occurrences:\n");
     loop_prompt.push_str(&result_json.to_string());
     loop_prompt.push_str("\n\nNow return action=final and put the user-facing answer in answer.");
     let final_content = if results.is_empty() {
-        let (content, _): (String, Vec<ToolCallDbus>) = proxy.call(
-            "RespondGuided",
-            &(&session_handle, &loop_prompt, fields, tools, options),
-        )?;
+        let (content, _) =
+            stream_guided_response(&session_handle, &loop_prompt, fields, tools, options)?;
         content
     } else {
-        let (content, _): (String, Vec<ToolCallDbus>) = proxy.call(
-            "SubmitToolResultsGuided",
-            &(
-                &session_handle,
-                &loop_prompt,
-                results,
-                fields,
-                tools,
-                options,
-            ),
+        let (content, _) = stream_guided_tool_results(
+            &session_handle,
+            &loop_prompt,
+            results,
+            fields,
+            tools,
+            options,
         )?;
         content
     };
@@ -366,17 +360,14 @@ fn run_linux_diagnostics_tool_demo(
     );
 
     tx.send(ToolEvent::Trace(
-        "before_llm_call: ask RespondGuided for diagnostics action".to_string(),
+        "before_llm_call: ask StreamRespondGuided for diagnostics action".to_string(),
     ))?;
-    let (content, tool_calls): (String, Vec<ToolCallDbus>) = proxy.call(
-        "RespondGuided",
-        &(
-            &session_handle,
-            &loop_prompt,
-            fields.clone(),
-            tools.clone(),
-            options.clone(),
-        ),
+    let (content, tool_calls) = stream_guided_response(
+        &session_handle,
+        &loop_prompt,
+        fields.clone(),
+        tools.clone(),
+        options.clone(),
     )?;
     let mut response = if content.trim().is_empty() && !tool_calls.is_empty() {
         GuidedDiagnosticsLoopResponse {
@@ -461,7 +452,7 @@ fn run_linux_diagnostics_tool_demo(
         "User request: {prompt}\n\nRead-only diagnostics evidence follows. No changes were applied. Give a concise plain-text diagnosis with likely cause, evidence, and safe bugfix commands to review. Do not return JSON.\n\n{}",
         model_result_json
     );
-    let final_answer: String = proxy.call("Respond", &(&session_handle, &final_prompt, options))?;
+    let final_answer = stream_language_text(&session_handle, &final_prompt, options)?;
     tx.send(ToolEvent::Trace(format!(
         "after_llm_call: final plain-text answer={:?}",
         final_answer

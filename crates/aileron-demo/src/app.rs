@@ -592,7 +592,7 @@ impl DemoMode {
         match self {
             DemoMode::Summarize => "The local model finished streaming its response.",
             DemoMode::Translate | DemoMode::Rephrase | DemoMode::Analyze => {
-                "The local model returned the task result through Respond."
+                "The local model returned the task result through StreamResponse."
             }
             DemoMode::Classify | DemoMode::Extract => {
                 "The daemon validated the model output against the generated schema."
@@ -905,19 +905,6 @@ fn summarize_streaming(text: &str, tx: std::sync::mpsc::Sender<DemoEvent>) -> an
     let sig_proxy =
         zbus::blocking::Proxy::new(&signal_conn, PORTAL_BUS, PORTAL_PATH, LANGUAGE_IFACE)?;
 
-    // Subscribe to ModelLoading on the signal connection before generation, so
-    // no signals are missed during the model load.
-    let mut loading_iter = sig_proxy.receive_signal("ModelLoading")?;
-
-    let tx_loading = tx.clone();
-    let loading_thread = std::thread::spawn(move || {
-        for msg in &mut loading_iter {
-            if let Ok(body) = msg.body().deserialize::<(String,)>() {
-                let _ = tx_loading.send(DemoEvent::Status(body.0));
-            }
-        }
-    });
-
     tx.send(DemoEvent::Phase(DemoPhase::CreatingSession))?;
     let session_handle = create_public_session(
         &proxy,
@@ -925,7 +912,23 @@ fn summarize_streaming(text: &str, tx: std::sync::mpsc::Sender<DemoEvent>) -> an
         DemoMode::Summarize.instructions(),
     )?;
 
-    drop(loading_thread);
+    // Subscribe to ModelLoading before generation, so no signals are missed
+    // during the model load.
+    let mut loading_iter = sig_proxy.receive_signal("ModelLoading")?;
+    let loading_session_handle = session_handle.clone();
+    let tx_loading = tx.clone();
+    std::thread::spawn(move || {
+        for msg in &mut loading_iter {
+            if let Ok((sig_session, message)) =
+                msg.body().deserialize::<(OwnedObjectPath, String)>()
+                && sig_session.as_str() == loading_session_handle.as_str()
+            {
+                let _ = tx_loading.send(DemoEvent::Status(message));
+                break;
+            }
+        }
+    });
+
     tx.send(DemoEvent::Phase(DemoPhase::WaitingForModel))?;
 
     let prompt = DemoMode::Summarize.prompt(text);
@@ -972,6 +975,358 @@ fn summarize_streaming(text: &str, tx: std::sync::mpsc::Sender<DemoEvent>) -> an
     Ok(())
 }
 
+fn stream_language_text(
+    session_handle: &OwnedObjectPath,
+    prompt: &str,
+    options: PortalOptions,
+) -> anyhow::Result<String> {
+    let call_conn = portal_connection()?;
+    let signal_conn = zbus::blocking::Connection::session()?;
+    let proxy = zbus::blocking::Proxy::new(&call_conn, PORTAL_BUS, PORTAL_PATH, LANGUAGE_IFACE)?;
+    let sig_proxy =
+        zbus::blocking::Proxy::new(&signal_conn, PORTAL_BUS, PORTAL_PATH, LANGUAGE_IFACE)?;
+    let mut token_iter = sig_proxy.receive_signal("TokenReceived")?;
+    let token_session_handle = session_handle.clone();
+    let (stream_done_tx, stream_done_rx) = std::sync::mpsc::channel();
+
+    std::thread::spawn(move || {
+        let result = (|| -> anyhow::Result<String> {
+            let mut content = String::new();
+            for msg in &mut token_iter {
+                let (sig_session, token, done): (OwnedObjectPath, String, bool) =
+                    msg.body().deserialize()?;
+                if sig_session.as_str() != token_session_handle.as_str() {
+                    continue;
+                }
+                content.push_str(&token);
+                if done {
+                    break;
+                }
+            }
+            Ok(content)
+        })();
+        let _ = stream_done_tx.send(result);
+    });
+
+    let stream_result: zbus::Result<()> =
+        proxy.call("StreamResponse", &(session_handle, prompt, options));
+    if let Err(error) = stream_result {
+        return Err(error.into());
+    }
+    stream_done_rx
+        .recv_timeout(Duration::from_secs(2))
+        .map_err(|_| anyhow::anyhow!("stream completed without a final TokenReceived signal"))?
+}
+
+enum GuidedStreamEvent {
+    Snapshot(String, bool),
+    ToolCalls(Vec<ToolCallDbus>, bool),
+}
+
+fn stream_guided_response(
+    session_handle: &OwnedObjectPath,
+    prompt: &str,
+    fields: Vec<(String, String, String, bool)>,
+    tools: Vec<ToolDefinitionDbus>,
+    options: PortalOptions,
+) -> anyhow::Result<(String, Vec<ToolCallDbus>)> {
+    stream_guided_call(None, session_handle, prompt, fields, tools, options)
+}
+
+fn stream_guided_tool_results(
+    session_handle: &OwnedObjectPath,
+    prompt: &str,
+    results: Vec<ToolResultDbus>,
+    fields: Vec<(String, String, String, bool)>,
+    tools: Vec<ToolDefinitionDbus>,
+    options: PortalOptions,
+) -> anyhow::Result<(String, Vec<ToolCallDbus>)> {
+    stream_guided_call(
+        Some(results),
+        session_handle,
+        prompt,
+        fields,
+        tools,
+        options,
+    )
+}
+
+fn stream_guided_call(
+    results: Option<Vec<ToolResultDbus>>,
+    session_handle: &OwnedObjectPath,
+    prompt: &str,
+    fields: Vec<(String, String, String, bool)>,
+    tools: Vec<ToolDefinitionDbus>,
+    options: PortalOptions,
+) -> anyhow::Result<(String, Vec<ToolCallDbus>)> {
+    let call_conn = portal_connection()?;
+    let signal_conn = zbus::blocking::Connection::session()?;
+    let proxy = zbus::blocking::Proxy::new(&call_conn, PORTAL_BUS, PORTAL_PATH, LANGUAGE_IFACE)?;
+    let signal_proxy =
+        zbus::blocking::Proxy::new(&signal_conn, PORTAL_BUS, PORTAL_PATH, LANGUAGE_IFACE)?;
+    let mut signal_iter = signal_proxy.receive_all_signals()?;
+    let signal_session_handle = session_handle.clone();
+    let (event_tx, event_rx) = std::sync::mpsc::channel::<anyhow::Result<GuidedStreamEvent>>();
+
+    std::thread::spawn(move || {
+        for msg in &mut signal_iter {
+            let result = (|| -> anyhow::Result<Option<GuidedStreamEvent>> {
+                let header = msg.header();
+                let member = header
+                    .member()
+                    .map(|member| member.as_str())
+                    .unwrap_or_default();
+                match member {
+                    "GuidedSnapshotReceived" => {
+                        let (sig_session, snapshot, done): (OwnedObjectPath, String, bool) =
+                            msg.body().deserialize()?;
+                        if sig_session.as_str() != signal_session_handle.as_str() {
+                            return Ok(None);
+                        }
+                        Ok(Some(GuidedStreamEvent::Snapshot(snapshot, done)))
+                    }
+                    "GuidedToolCallsReceived" => {
+                        let (sig_session, tool_calls, done): (
+                            OwnedObjectPath,
+                            Vec<ToolCallDbus>,
+                            bool,
+                        ) = msg.body().deserialize()?;
+                        if sig_session.as_str() != signal_session_handle.as_str() {
+                            return Ok(None);
+                        }
+                        Ok(Some(GuidedStreamEvent::ToolCalls(tool_calls, done)))
+                    }
+                    _ => Ok(None),
+                }
+            })();
+            match result {
+                Ok(Some(event)) => {
+                    let done = matches!(
+                        &event,
+                        GuidedStreamEvent::Snapshot(_, true)
+                            | GuidedStreamEvent::ToolCalls(_, true)
+                    );
+                    let _ = event_tx.send(Ok(event));
+                    if done {
+                        break;
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    let _ = event_tx.send(Err(error));
+                    break;
+                }
+            }
+        }
+    });
+
+    let stream_result: zbus::Result<()> = if let Some(results) = results {
+        proxy.call(
+            "StreamSubmitToolResultsGuided",
+            &(session_handle, prompt, results, fields, tools, options),
+        )
+    } else {
+        proxy.call(
+            "StreamRespondGuided",
+            &(session_handle, prompt, fields, tools, options),
+        )
+    };
+    if let Err(error) = stream_result {
+        return Err(error.into());
+    }
+
+    loop {
+        match event_rx
+            .recv_timeout(Duration::from_secs(2))
+            .map_err(|_| anyhow::anyhow!("stream completed without a final guided signal"))??
+        {
+            GuidedStreamEvent::Snapshot(snapshot, done) => {
+                if done {
+                    return Ok((snapshot, Vec::new()));
+                }
+            }
+            GuidedStreamEvent::ToolCalls(tool_calls, done) => {
+                if done {
+                    return Ok((String::new(), tool_calls));
+                }
+            }
+        }
+    }
+}
+
+fn stream_prediction(
+    session_handle: &OwnedObjectPath,
+    prefix: &str,
+    options: PortalOptions,
+) -> anyhow::Result<Vec<String>> {
+    let call_conn = portal_connection()?;
+    let signal_conn = zbus::blocking::Connection::session()?;
+    let proxy = zbus::blocking::Proxy::new(&call_conn, PORTAL_BUS, PORTAL_PATH, LANGUAGE_IFACE)?;
+    let sig_proxy =
+        zbus::blocking::Proxy::new(&signal_conn, PORTAL_BUS, PORTAL_PATH, LANGUAGE_IFACE)?;
+    let mut prediction_iter = sig_proxy.receive_signal("PredictionReceived")?;
+    let prediction_session_handle = session_handle.clone();
+    let (stream_done_tx, stream_done_rx) = std::sync::mpsc::channel();
+
+    std::thread::spawn(move || {
+        let result = (|| -> anyhow::Result<Vec<String>> {
+            let mut completions = Vec::new();
+            for msg in &mut prediction_iter {
+                let (sig_session, completion, done): (OwnedObjectPath, String, bool) =
+                    msg.body().deserialize()?;
+                if sig_session.as_str() != prediction_session_handle.as_str() {
+                    continue;
+                }
+                if !completion.is_empty() {
+                    completions.push(completion);
+                }
+                if done {
+                    return Ok(completions);
+                }
+            }
+            Ok(Vec::new())
+        })();
+        let _ = stream_done_tx.send(result);
+    });
+
+    let stream_result: zbus::Result<()> =
+        proxy.call("StreamPredictNext", &(session_handle, prefix, options));
+    if let Err(error) = stream_result {
+        return Err(error.into());
+    }
+    stream_done_rx
+        .recv_timeout(Duration::from_secs(2))
+        .map_err(|_| {
+            anyhow::anyhow!("stream completed without a final PredictionReceived signal")
+        })?
+}
+
+fn stream_embedding(session_handle: &OwnedObjectPath, text: &str) -> anyhow::Result<Vec<f64>> {
+    let call_conn = portal_connection()?;
+    let signal_conn = zbus::blocking::Connection::session()?;
+    let proxy = zbus::blocking::Proxy::new(&call_conn, PORTAL_BUS, PORTAL_PATH, LANGUAGE_IFACE)?;
+    let sig_proxy =
+        zbus::blocking::Proxy::new(&signal_conn, PORTAL_BUS, PORTAL_PATH, LANGUAGE_IFACE)?;
+    let mut embedding_iter = sig_proxy.receive_signal("EmbeddingReceived")?;
+    let embedding_session_handle = session_handle.clone();
+    let (stream_done_tx, stream_done_rx) = std::sync::mpsc::channel();
+
+    std::thread::spawn(move || {
+        let result = (|| -> anyhow::Result<Vec<f64>> {
+            for msg in &mut embedding_iter {
+                let (sig_session, embedding, done): (OwnedObjectPath, Vec<f64>, bool) =
+                    msg.body().deserialize()?;
+                if sig_session.as_str() != embedding_session_handle.as_str() {
+                    continue;
+                }
+                if done {
+                    return Ok(embedding);
+                }
+            }
+            Ok(Vec::new())
+        })();
+        let _ = stream_done_tx.send(result);
+    });
+
+    let stream_result: zbus::Result<()> =
+        proxy.call("StreamEmbed", &(session_handle, text, empty_options()));
+    if let Err(error) = stream_result {
+        return Err(error.into());
+    }
+    stream_done_rx
+        .recv_timeout(Duration::from_secs(2))
+        .map_err(|_| anyhow::anyhow!("stream completed without a final EmbeddingReceived signal"))?
+}
+
+fn stream_vision_text(
+    session_handle: &OwnedObjectPath,
+    image_b64: &str,
+    method: &str,
+) -> anyhow::Result<String> {
+    let call_conn = portal_connection()?;
+    let signal_conn = zbus::blocking::Connection::session()?;
+    let proxy = zbus::blocking::Proxy::new(&call_conn, PORTAL_BUS, PORTAL_PATH, VISION_IFACE)?;
+    let sig_proxy =
+        zbus::blocking::Proxy::new(&signal_conn, PORTAL_BUS, PORTAL_PATH, VISION_IFACE)?;
+    let mut text_iter = sig_proxy.receive_signal("VisionTextReceived")?;
+    let text_session_handle = session_handle.clone();
+    let (stream_done_tx, stream_done_rx) = std::sync::mpsc::channel();
+
+    std::thread::spawn(move || {
+        let result = (|| -> anyhow::Result<String> {
+            let mut content = String::new();
+            for msg in &mut text_iter {
+                let (sig_session, text, done): (OwnedObjectPath, String, bool) =
+                    msg.body().deserialize()?;
+                if sig_session.as_str() != text_session_handle.as_str() {
+                    continue;
+                }
+                content.push_str(&text);
+                if done {
+                    break;
+                }
+            }
+            Ok(content)
+        })();
+        let _ = stream_done_tx.send(result);
+    });
+
+    let stream_result: zbus::Result<()> =
+        proxy.call(method, &(session_handle, image_b64, empty_options()));
+    if let Err(error) = stream_result {
+        return Err(error.into());
+    }
+    stream_done_rx
+        .recv_timeout(Duration::from_secs(2))
+        .map_err(|_| {
+            anyhow::anyhow!("stream completed without a final VisionTextReceived signal")
+        })?
+}
+
+fn stream_vision_segments(
+    session_handle: &OwnedObjectPath,
+    image_b64: &str,
+) -> anyhow::Result<Vec<VisionSegmentDbus>> {
+    let call_conn = portal_connection()?;
+    let signal_conn = zbus::blocking::Connection::session()?;
+    let proxy = zbus::blocking::Proxy::new(&call_conn, PORTAL_BUS, PORTAL_PATH, VISION_IFACE)?;
+    let sig_proxy =
+        zbus::blocking::Proxy::new(&signal_conn, PORTAL_BUS, PORTAL_PATH, VISION_IFACE)?;
+    let mut segment_iter = sig_proxy.receive_signal("VisionSegmentsReceived")?;
+    let segment_session_handle = session_handle.clone();
+    let (stream_done_tx, stream_done_rx) = std::sync::mpsc::channel();
+
+    std::thread::spawn(move || {
+        let result = (|| -> anyhow::Result<Vec<VisionSegmentDbus>> {
+            for msg in &mut segment_iter {
+                let (sig_session, segments, done): (OwnedObjectPath, Vec<VisionSegmentDbus>, bool) =
+                    msg.body().deserialize()?;
+                if sig_session.as_str() != segment_session_handle.as_str() {
+                    continue;
+                }
+                if done {
+                    return Ok(segments);
+                }
+            }
+            Ok(Vec::new())
+        })();
+        let _ = stream_done_tx.send(result);
+    });
+
+    let stream_result: zbus::Result<()> = proxy.call(
+        "StreamSegment",
+        &(session_handle, image_b64, empty_options()),
+    );
+    if let Err(error) = stream_result {
+        return Err(error.into());
+    }
+    stream_done_rx
+        .recv_timeout(Duration::from_secs(2))
+        .map_err(|_| {
+            anyhow::anyhow!("stream completed without a final VisionSegmentsReceived signal")
+        })?
+}
+
 fn extract_guided(text: &str, tx: std::sync::mpsc::Sender<DemoEvent>) -> anyhow::Result<()> {
     let conn = portal_connection()?;
     let proxy = zbus::blocking::Proxy::new(&conn, PORTAL_BUS, PORTAL_PATH, LANGUAGE_IFACE)?;
@@ -1008,15 +1363,12 @@ fn extract_guided(text: &str, tx: std::sync::mpsc::Sender<DemoEvent>) -> anyhow:
 
     tx.send(DemoEvent::Phase(DemoPhase::WaitingForModel))?;
     tx.send(DemoEvent::Phase(DemoPhase::RequestingGuided))?;
-    let (content, _): (String, Vec<ToolCallDbus>) = proxy.call(
-        "RespondGuided",
-        &(
-            &session_handle,
-            &prompt,
-            fields,
-            Vec::<ToolDefinitionDbus>::new(),
-            options,
-        ),
+    let (content, _) = stream_guided_response(
+        &session_handle,
+        &prompt,
+        fields,
+        Vec::<ToolDefinitionDbus>::new(),
+        options,
     )?;
     let pretty = serde_json::from_str::<serde_json::Value>(&content)
         .ok()
@@ -1070,15 +1422,12 @@ fn classify_guided(text: &str, tx: std::sync::mpsc::Sender<DemoEvent>) -> anyhow
 
     tx.send(DemoEvent::Phase(DemoPhase::WaitingForModel))?;
     tx.send(DemoEvent::Phase(DemoPhase::RequestingGuided))?;
-    let (content, _): (String, Vec<ToolCallDbus>) = proxy.call(
-        "RespondGuided",
-        &(
-            &session_handle,
-            &DemoMode::Classify.prompt(text),
-            fields,
-            Vec::<ToolDefinitionDbus>::new(),
-            options,
-        ),
+    let (content, _) = stream_guided_response(
+        &session_handle,
+        &DemoMode::Classify.prompt(text),
+        fields,
+        Vec::<ToolDefinitionDbus>::new(),
+        options,
     )?;
     let pretty = serde_json::from_str::<serde_json::Value>(&content)
         .ok()
@@ -1108,7 +1457,7 @@ fn respond_text_task(
         DemoMode::Translate => generation_options(512, 0.3, "default", "", "Spanish"),
         _ => generation_options(512, 0.5, "default", "", ""),
     };
-    let content: String = proxy.call("Respond", &(&session_handle, &mode.prompt(text), options))?;
+    let content = stream_language_text(&session_handle, &mode.prompt(text), options)?;
     tx.send(DemoEvent::Text(content))?;
 
     close_public_session(&session_handle)?;
@@ -1150,28 +1499,24 @@ fn predict_inline_completion(
         input.to_string()
     };
     let options = generation_options(4, 0.0, "greedy", "", "");
-    let completions_result: zbus::Result<Vec<String>> =
-        proxy.call("PredictNext", &(&session_handle, &prompt_input, options));
+    let completions_result = stream_prediction(&session_handle, &prompt_input, options);
     let completions = match completions_result {
         Ok(completions) => completions,
         Err(e) if used_existing_session && is_session_not_found_message(&e.to_string()) => {
             session_handle = create_session()?;
-            match proxy.call(
-                "PredictNext",
-                &(
-                    &session_handle,
-                    &prompt_input,
-                    generation_options(4, 0.0, "greedy", "", ""),
-                ),
+            match stream_prediction(
+                &session_handle,
+                &prompt_input,
+                generation_options(4, 0.0, "greedy", "", ""),
             ) {
                 Ok(completions) => completions,
                 Err(e) => {
                     let _ = close_public_session(&session_handle);
-                    return Err(e.into());
+                    return Err(e);
                 }
             }
         }
-        Err(e) => return Err(e.into()),
+        Err(e) => return Err(e),
     };
     let mut cleaned = Vec::new();
     for completion in completions {
@@ -1324,38 +1669,32 @@ fn guided_chat_turn(
     ];
     let options = generation_options(512, 0.2, "default", "", "");
     let prompt = guided_chat_prompt(memory, &messages);
-    let response_result: zbus::Result<(String, Vec<ToolCallDbus>)> = proxy.call(
-        "RespondGuided",
-        &(
-            &session_handle,
-            &prompt,
-            fields.clone(),
-            Vec::<ToolDefinitionDbus>::new(),
-            options,
-        ),
+    let response_result = stream_guided_response(
+        &session_handle,
+        &prompt,
+        fields.clone(),
+        Vec::<ToolDefinitionDbus>::new(),
+        options,
     );
     let (content, _) = match response_result {
         Ok(response) => response,
         Err(e) if used_existing_session && is_session_not_found_message(&e.to_string()) => {
             session_handle = create_session()?;
-            match proxy.call(
-                "RespondGuided",
-                &(
-                    &session_handle,
-                    &prompt,
-                    fields,
-                    Vec::<ToolDefinitionDbus>::new(),
-                    generation_options(512, 0.2, "default", "", ""),
-                ),
+            match stream_guided_response(
+                &session_handle,
+                &prompt,
+                fields,
+                Vec::<ToolDefinitionDbus>::new(),
+                generation_options(512, 0.2, "default", "", ""),
             ) {
                 Ok(response) => response,
                 Err(e) => {
                     let _ = close_public_session(&session_handle);
-                    return Err(e.into());
+                    return Err(e);
                 }
             }
         }
-        Err(e) => return Err(e.into()),
+        Err(e) => return Err(e),
     };
     let response: GuidedChatResponse = serde_json::from_str(&content)?;
     tx.send(ChatEvent::Response(response))?;
@@ -1614,8 +1953,7 @@ fn describe_image(image_b64: &str, tx: std::sync::mpsc::Sender<VisionEvent>) -> 
 
     tx.send(VisionEvent::Phase(VisionPhase::LoadingModel))?;
     tx.send(VisionEvent::Phase(VisionPhase::Describing))?;
-    let description: String =
-        proxy.call("Describe", &(&session_handle, &image_b64, empty_options()))?;
+    let description = stream_vision_text(&session_handle, image_b64, "StreamDescribe")?;
     tx.send(VisionEvent::Description(description))?;
 
     close_public_session(&session_handle)?;
@@ -1636,7 +1974,7 @@ fn ocr_image(image_b64: &str, tx: std::sync::mpsc::Sender<VisionEvent>) -> anyho
 
     tx.send(VisionEvent::Phase(VisionPhase::LoadingModel))?;
     tx.send(VisionEvent::Phase(VisionPhase::Ocr))?;
-    let text: String = proxy.call("Ocr", &(&session_handle, &image_b64, empty_options()))?;
+    let text = stream_vision_text(&session_handle, image_b64, "StreamOcr")?;
     tx.send(VisionEvent::Ocr(text))?;
 
     close_public_session(&session_handle)?;
@@ -1657,8 +1995,7 @@ fn segment_image(image_b64: &str, tx: std::sync::mpsc::Sender<VisionEvent>) -> a
 
     tx.send(VisionEvent::Phase(VisionPhase::LoadingModel))?;
     tx.send(VisionEvent::Phase(VisionPhase::Segmenting))?;
-    let segments: Vec<VisionSegmentDbus> =
-        proxy.call("Segment", &(&session_handle, &image_b64, empty_options()))?;
+    let segments = stream_vision_segments(&session_handle, image_b64)?;
     tx.send(VisionEvent::Segments(segments))?;
 
     close_public_session(&session_handle)?;
@@ -1679,7 +2016,7 @@ fn embed_text(text: &str, tx: std::sync::mpsc::Sender<EmbedEvent>) -> anyhow::Re
 
     tx.send(EmbedEvent::Phase(EmbedPhase::LoadingModel))?;
     tx.send(EmbedEvent::Phase(EmbedPhase::Embedding))?;
-    let embedding: Vec<f64> = proxy.call("Embed", &(&session_handle, &text, empty_options()))?;
+    let embedding = stream_embedding(&session_handle, text)?;
     tx.send(EmbedEvent::Embedding(embedding))?;
 
     close_public_session(&session_handle)?;

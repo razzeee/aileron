@@ -255,7 +255,7 @@ fn stop_recording(ui: &SpeechUi, last_audio: &Rc<RefCell<Option<PathBuf>>>) {
         ui.status_spinner.stop();
         ui.status_title.set_text("Recording saved");
         ui.status_detail
-            .set_text("Audio is ready. Transcribe or translate it through the portal.");
+            .set_text("Audio is ready. Stream transcribe or translate it through the portal.");
         set_idle_controls(ui, true);
     }
 }

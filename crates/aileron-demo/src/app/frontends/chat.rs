@@ -45,7 +45,7 @@ pub(crate) fn build_page() -> gtk4::Widget {
         .css_classes(vec!["heading"])
         .build();
     let status_detail = Label::builder()
-        .label("Ask a question. The app sends local history and memory to RespondGuided.")
+        .label("Ask a question. The app sends local history and memory to StreamRespondGuided.")
         .xalign(0.0)
         .wrap(true)
         .build();
@@ -114,7 +114,7 @@ pub(crate) fn build_page() -> gtk4::Widget {
             clear_button.set_sensitive(false);
             status_spinner.start();
             status_title.set_text("Starting guided chat turn");
-            status_detail.set_text("Sending history and memory through RespondGuided...");
+            status_detail.set_text("Sending history and memory through StreamRespondGuided...");
 
             history.borrow_mut().push(ChatMessage {
                 role: "user".to_string(),

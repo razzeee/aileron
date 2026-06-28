@@ -1,7 +1,7 @@
 use aileron_runtime::llama_runtime::{
     DEFAULT_SYSTEM, LlamaRuntimeConfig, clean_inline_completion, embedding, generate_chat,
     generate_completion, generate_from_evaluated_prompt, initialize_llama, load_model, new_context,
-    new_embedding_context, render_chat_prompt,
+    new_embedding_context, render_chat_prompt, render_tool_results,
 };
 use aileron_runtime::{Request, clamp_choices, first_json_value, send, send_unsupported};
 use anyhow::{Context, Result, bail};
@@ -197,7 +197,11 @@ fn structured_result(
         .as_ref()
         .map(|format| &format.schema)
         .unwrap_or(&Value::Null);
-    let prompt = structured_prompt(req.prompt.as_deref().unwrap_or_default(), schema);
+    let mut source_prompt = req.prompt.as_deref().unwrap_or_default().to_string();
+    if let Some(tool_results) = req.tool_results.as_deref() {
+        source_prompt = render_tool_results(&source_prompt, tool_results);
+    }
+    let prompt = structured_prompt(&source_prompt, schema);
     let max_tokens = req.max_tokens.unwrap_or(1024);
     let result = generate_chat(
         model,

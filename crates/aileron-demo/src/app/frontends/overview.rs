@@ -23,7 +23,7 @@ pub(crate) fn build_page(stack: &ViewStack) -> gtk4::Widget {
     cards.append(&lab_card(
         "Chat Lab",
         "Run chat-shaped turns through guided language.extract responses with local memory.",
-        "RespondGuided, CreateSession, EndSession",
+        "StreamRespondGuided, CreateSession, EndSession",
         "Try: tell it a preference, then ask a follow-up that uses memory.",
         "Open Chat Lab",
         "chat",
@@ -32,7 +32,7 @@ pub(crate) fn build_page(stack: &ViewStack) -> gtk4::Widget {
     cards.append(&lab_card(
         "Text Lab",
         "Fetch or paste text, then summarize, translate, rephrase, classify, extract JSON, or analyze.",
-        "StreamResponse, Respond, RespondGuided",
+        "StreamResponse, StreamRespondGuided",
         "Try: paste an article, classify it, then extract JSON facts.",
         "Open Text Lab",
         "text",
@@ -41,7 +41,7 @@ pub(crate) fn build_page(stack: &ViewStack) -> gtk4::Widget {
     cards.append(&lab_card(
         "Prediction Lab",
         "Type a sentence and preview a short ghost continuation from the local language model.",
-        "PredictNext",
+        "StreamPredictNext",
         "Try: The old lighthouse keeper opened the door and",
         "Open Prediction Lab",
         "predict",
@@ -50,7 +50,7 @@ pub(crate) fn build_page(stack: &ViewStack) -> gtk4::Widget {
     cards.append(&lab_card(
         "Tool Lab",
         "Run tiny agent loops where the model asks for app-owned tools, including whole-PC Linux diagnostics.",
-        "CreateSession, RespondGuided, EndSession",
+        "CreateSession, StreamRespondGuided, EndSession",
         "Try: collect read-only PC diagnostics and ask for safe bugfix guidance.",
         "Open Tool Lab",
         "tools",
@@ -59,7 +59,7 @@ pub(crate) fn build_page(stack: &ViewStack) -> gtk4::Widget {
     cards.append(&lab_card(
         "Speech Lab",
         "Record microphone audio and stream transcription or translation through the Speech portal path.",
-        "Transcribe, StreamTranscribe",
+        "StreamTranscribe",
         "Try: start Live Transcribe, speak for 5-10 seconds, then stop for the final pass.",
         "Open Speech Lab",
         "speech",
@@ -68,7 +68,7 @@ pub(crate) fn build_page(stack: &ViewStack) -> gtk4::Widget {
     cards.append(&lab_card(
         "Vision Lab",
         "Choose or paste an image and run description or segmentation through the vision portal path.",
-        "Describe, Segment",
+        "StreamDescribe, StreamSegment",
         "Try: choose a screenshot, describe it, then segment visible objects.",
         "Open Vision Lab",
         "vision",

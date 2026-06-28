@@ -9,10 +9,10 @@ use crate::state::SharedState;
 #[allow(unused_imports)]
 // VarlinkCallError is a supertrait; its methods reach us via Call_* dyn objects.
 use aileron_varlink::aileron_Inference::{
-    Call_CreateSession, Call_Describe, Call_Embed, Call_EndSession, Call_GetUseCaseAvailability,
-    Call_Ocr, Call_PredictNext, Call_Prewarm, Call_Respond, Call_RespondGuided, Call_Segment,
-    Call_StreamRespondGuided, Call_StreamResponse, Call_StreamTranscribe,
-    Call_SubmitToolResultsGuided, Call_Transcribe, GenerationOptions, GuidedField,
+    Call_CreateSession, Call_EndSession, Call_GetUseCaseAvailability, Call_Prewarm,
+    Call_StreamDescribe, Call_StreamEmbed, Call_StreamOcr, Call_StreamPredictNext,
+    Call_StreamRespondGuided, Call_StreamResponse, Call_StreamSegment,
+    Call_StreamSubmitToolResultsGuided, Call_StreamTranscribe, GenerationOptions, GuidedField,
     ModelAvailability, ToolCall, ToolDefinition, ToolResult, VarlinkCallError, VarlinkInterface,
     VisionSegment,
 };
@@ -176,30 +176,6 @@ impl VarlinkInterface for InferenceHandler {
         })
     }
 
-    fn respond(
-        &self,
-        call: &mut dyn Call_Respond,
-        session_id: String,
-        prompt: String,
-        options: GenerationOptions,
-    ) -> varlink::Result<()> {
-        self.rt.block_on(async {
-            let mut content = String::new();
-            match generate_tokens(&self.state, &mut content, session_id, prompt, options).await {
-                Ok(()) => call.reply(content),
-                Err(GenerationError::SessionNotFound(id)) => call.reply_session_not_found(id),
-                Err(GenerationError::ModelUnavailable(reason)) => {
-                    call.reply_model_unavailable(reason)
-                }
-                Err(GenerationError::InvalidOptions(reason)) => {
-                    call.reply_invalid_generation_options(reason)
-                }
-                Err(GenerationError::Failed(reason)) => reply_generation_failure(call, reason),
-                Err(GenerationError::Reply(e)) => Err(e),
-            }
-        })
-    }
-
     fn stream_response(
         &self,
         call: &mut dyn Call_StreamResponse,
@@ -223,9 +199,9 @@ impl VarlinkInterface for InferenceHandler {
         })
     }
 
-    fn predict_next(
+    fn stream_predict_next(
         &self,
-        call: &mut dyn Call_PredictNext,
+        call: &mut dyn Call_StreamPredictNext,
         session_id: String,
         prefix: String,
         options: GenerationOptions,
@@ -242,162 +218,6 @@ impl VarlinkInterface for InferenceHandler {
                 }
                 Err(GenerationError::Failed(reason)) => reply_generation_failure(call, reason),
                 Err(GenerationError::Reply(e)) => Err(e),
-            }
-        })
-    }
-
-    fn respond_guided(
-        &self,
-        call: &mut dyn Call_RespondGuided,
-        session_id: String,
-        prompt: String,
-        fields: Vec<GuidedField>,
-        tools: Vec<ToolDefinition>,
-        options: GenerationOptions,
-    ) -> varlink::Result<()> {
-        self.rt.block_on(async {
-            let max_tokens = match validate_options(&options) {
-                Ok(v) => v,
-                Err(reason) => return call.reply_invalid_generation_options(reason),
-            };
-            let schema = match guided_fields_schema(&fields) {
-                Ok(v) => v,
-                Err(reason) => return call.reply_guided_generation_failed(reason),
-            };
-
-            let mut guard = self.state.0.lock().await;
-            let (
-                app_id,
-                use_case,
-                profile_id,
-                runtime_id,
-                image_refs,
-                artifact_path,
-                runtime_options,
-                instructions,
-            ) = match guard.sessions.get(&session_id) {
-                Some(s) => {
-                    if let Err(reason) = ensure_language_generation_use_case(&s.use_case) {
-                        return call.reply_model_unavailable(reason);
-                    }
-                    let (profile_id, runtime_id, image_refs, artifact_path, runtime_options) =
-                        match profile_runtime(&guard, &s.profile_id) {
-                            Ok(resolved) => resolved,
-                            Err(reason) => return call.reply_model_unavailable(reason),
-                        };
-                    (
-                        s.app_id.clone(),
-                        s.use_case.clone(),
-                        profile_id,
-                        runtime_id,
-                        image_refs,
-                        artifact_path,
-                        runtime_options,
-                        s.instructions.clone(),
-                    )
-                }
-                None => return call.reply_session_not_found(session_id),
-            };
-
-            let _ = guard.permissions.touch(&app_id, &use_case);
-
-            let container = match guard.containers.get_or_spawn_any(
-                &profile_id,
-                &runtime_id,
-                &image_refs,
-                &artifact_path,
-                &runtime_options,
-                |_| {},
-            ) {
-                Ok(container) => container,
-                Err(e) => {
-                    tracing::error!("RespondGuided failed to start container: {e:#}");
-                    return call.reply_model_unavailable(e.to_string());
-                }
-            };
-
-            let runtime_tools = tools.into_iter().map(varlink_tool_definition).collect();
-            match container.generate_structured_with_tools(
-                Some(&instructions),
-                Some(&prompt),
-                max_tokens,
-                &schema,
-                runtime_tools,
-                Vec::new(),
-            ) {
-                Ok(result) => call.reply(result.content, varlink_tool_calls(result.tool_calls)),
-                Err(e) => {
-                    tracing::error!("RespondGuided failed: {e:#}");
-                    call.reply_guided_generation_failed(e.to_string())
-                }
-            }
-        })
-    }
-
-    fn transcribe(
-        &self,
-        call: &mut dyn Call_Transcribe,
-        session_id: String,
-        audio: String,
-        source_language_hint: String,
-    ) -> varlink::Result<()> {
-        self.rt.block_on(async {
-            let mut guard = self.state.0.lock().await;
-
-            let (
-                app_id,
-                use_case,
-                task,
-                profile_id,
-                runtime_id,
-                image_refs,
-                artifact_path,
-                runtime_options,
-            ) = match guard.sessions.get(&session_id) {
-                Some(s) => {
-                    let task = match ensure_speech_use_case(&s.use_case) {
-                        Ok(task) => task,
-                        Err(reason) => return call.reply_model_unavailable(reason),
-                    };
-                    let (profile_id, runtime_id, image_refs, artifact_path, runtime_options) =
-                        match profile_runtime(&guard, &s.profile_id) {
-                            Ok(resolved) => resolved,
-                            Err(reason) => return call.reply_model_unavailable(reason),
-                        };
-                    (
-                        s.app_id.clone(),
-                        s.use_case.clone(),
-                        task,
-                        profile_id,
-                        runtime_id,
-                        image_refs,
-                        artifact_path,
-                        runtime_options,
-                    )
-                }
-                None => return call.reply_session_not_found(session_id),
-            };
-
-            let _ = guard.permissions.touch(&app_id, &use_case);
-            let audio_bytes = match base64_decode(&audio) {
-                Ok(bytes) => bytes,
-                Err(reason) => return call.reply_invalid_input(reason),
-            };
-            let container = match guard.containers.get_or_spawn_any(
-                &profile_id,
-                &runtime_id,
-                &image_refs,
-                &artifact_path,
-                &runtime_options,
-                |_| {},
-            ) {
-                Ok(container) => container,
-                Err(e) => return call.reply_generation_failed(e.to_string()),
-            };
-
-            match container.transcribe(audio_bytes, Some(&source_language_hint), task) {
-                Ok(text) => call.reply(text),
-                Err(e) => call.reply_generation_failed(e.to_string()),
             }
         })
     }
@@ -423,272 +243,79 @@ impl VarlinkInterface for InferenceHandler {
         })
     }
 
-    fn describe(
+    fn stream_describe(
         &self,
-        call: &mut dyn Call_Describe,
+        call: &mut dyn Call_StreamDescribe,
         session_id: String,
         image: String,
     ) -> varlink::Result<()> {
         self.rt.block_on(async {
-            let mut guard = self.state.0.lock().await;
-
-            let (
-                app_id,
-                use_case,
-                profile_id,
-                runtime_id,
-                image_refs,
-                artifact_path,
-                runtime_options,
-            ) = match guard.sessions.get(&session_id) {
-                Some(s) => {
-                    if let Err(reason) =
-                        ensure_exact_use_case(&s.use_case, "vision.describe", "Describe")
-                    {
-                        return call.reply_model_unavailable(reason);
-                    }
-                    let (profile_id, runtime_id, image_refs, artifact_path, runtime_options) =
-                        match profile_runtime(&guard, &s.profile_id) {
-                            Ok(resolved) => resolved,
-                            Err(reason) => return call.reply_model_unavailable(reason),
-                        };
-                    (
-                        s.app_id.clone(),
-                        s.use_case.clone(),
-                        profile_id,
-                        runtime_id,
-                        image_refs,
-                        artifact_path,
-                        runtime_options,
-                    )
-                }
-                None => return call.reply_session_not_found(session_id),
-            };
-
-            let _ = guard.permissions.touch(&app_id, &use_case);
-            let image_bytes = match base64_decode(&image) {
-                Ok(bytes) => bytes,
-                Err(reason) => return call.reply_invalid_input(reason),
-            };
-            let container = match guard.containers.get_or_spawn_any(
-                &profile_id,
-                &runtime_id,
-                &image_refs,
-                &artifact_path,
-                &runtime_options,
-                |_| {},
-            ) {
-                Ok(container) => container,
-                Err(e) => return call.reply_generation_failed(e.to_string()),
-            };
-
-            match container.describe(image_bytes) {
-                Ok(text) => call.reply(text),
-                Err(e) => call.reply_generation_failed(e.to_string()),
+            match stream_vision_text(&self.state, call, session_id, image, "vision.describe").await
+            {
+                Ok(()) => Ok(()),
+                Err(VisionError::SessionNotFound(id)) => call.reply_session_not_found(id),
+                Err(VisionError::ModelUnavailable(reason)) => call.reply_model_unavailable(reason),
+                Err(VisionError::InvalidInput(reason)) => call.reply_invalid_input(reason),
+                Err(VisionError::Failed(reason)) => call.reply_generation_failed(reason),
+                Err(VisionError::Reply(e)) => Err(e),
             }
         })
     }
 
-    fn ocr(
+    fn stream_ocr(
         &self,
-        call: &mut dyn Call_Ocr,
+        call: &mut dyn Call_StreamOcr,
         session_id: String,
         image: String,
     ) -> varlink::Result<()> {
         self.rt.block_on(async {
-            let mut guard = self.state.0.lock().await;
-
-            let (
-                app_id,
-                use_case,
-                profile_id,
-                runtime_id,
-                image_refs,
-                artifact_path,
-                runtime_options,
-            ) = match guard.sessions.get(&session_id) {
-                Some(s) => {
-                    if let Err(reason) = ensure_exact_use_case(&s.use_case, "vision.ocr", "Ocr") {
-                        return call.reply_model_unavailable(reason);
-                    }
-                    let (profile_id, runtime_id, image_refs, artifact_path, runtime_options) =
-                        match profile_runtime(&guard, &s.profile_id) {
-                            Ok(resolved) => resolved,
-                            Err(reason) => return call.reply_model_unavailable(reason),
-                        };
-                    (
-                        s.app_id.clone(),
-                        s.use_case.clone(),
-                        profile_id,
-                        runtime_id,
-                        image_refs,
-                        artifact_path,
-                        runtime_options,
-                    )
-                }
-                None => return call.reply_session_not_found(session_id),
-            };
-
-            let _ = guard.permissions.touch(&app_id, &use_case);
-            let image_bytes = match base64_decode(&image) {
-                Ok(bytes) => bytes,
-                Err(reason) => return call.reply_invalid_input(reason),
-            };
-            let container = match guard.containers.get_or_spawn_any(
-                &profile_id,
-                &runtime_id,
-                &image_refs,
-                &artifact_path,
-                &runtime_options,
-                |_| {},
-            ) {
-                Ok(container) => container,
-                Err(e) => return call.reply_generation_failed(e.to_string()),
-            };
-
-            match container.ocr(image_bytes) {
-                Ok(text) => call.reply(text),
-                Err(e) => call.reply_generation_failed(e.to_string()),
+            match stream_vision_text(&self.state, call, session_id, image, "vision.ocr").await {
+                Ok(()) => Ok(()),
+                Err(VisionError::SessionNotFound(id)) => call.reply_session_not_found(id),
+                Err(VisionError::ModelUnavailable(reason)) => call.reply_model_unavailable(reason),
+                Err(VisionError::InvalidInput(reason)) => call.reply_invalid_input(reason),
+                Err(VisionError::Failed(reason)) => call.reply_generation_failed(reason),
+                Err(VisionError::Reply(e)) => Err(e),
             }
         })
     }
 
-    fn segment(
+    fn stream_segment(
         &self,
-        call: &mut dyn Call_Segment,
+        call: &mut dyn Call_StreamSegment,
         session_id: String,
         image: String,
     ) -> varlink::Result<()> {
         self.rt.block_on(async {
-            let mut guard = self.state.0.lock().await;
-
-            let (
-                app_id,
-                use_case,
-                profile_id,
-                runtime_id,
-                image_refs,
-                artifact_path,
-                runtime_options,
-            ) = match guard.sessions.get(&session_id) {
-                Some(s) => {
-                    if let Err(reason) =
-                        ensure_exact_use_case(&s.use_case, "vision.segment", "Segment")
-                    {
-                        return call.reply_model_unavailable(reason);
-                    }
-                    let (profile_id, runtime_id, image_refs, artifact_path, runtime_options) =
-                        match profile_runtime(&guard, &s.profile_id) {
-                            Ok(resolved) => resolved,
-                            Err(reason) => return call.reply_model_unavailable(reason),
-                        };
-                    (
-                        s.app_id.clone(),
-                        s.use_case.clone(),
-                        profile_id,
-                        runtime_id,
-                        image_refs,
-                        artifact_path,
-                        runtime_options,
-                    )
-                }
-                None => return call.reply_session_not_found(session_id),
-            };
-
-            let _ = guard.permissions.touch(&app_id, &use_case);
-            let image_bytes = match base64_decode(&image) {
-                Ok(bytes) => bytes,
-                Err(reason) => return call.reply_invalid_input(reason),
-            };
-            let container = match guard.containers.get_or_spawn_any(
-                &profile_id,
-                &runtime_id,
-                &image_refs,
-                &artifact_path,
-                &runtime_options,
-                |_| {},
-            ) {
-                Ok(container) => container,
-                Err(e) => return call.reply_generation_failed(e.to_string()),
-            };
-
-            match container.segment(image_bytes) {
-                Ok(segments) => call.reply(
-                    segments
-                        .into_iter()
-                        .map(|segment| VisionSegment {
-                            label: segment.label,
-                            confidence: segment.confidence,
-                            x: segment.x,
-                            y: segment.y,
-                            width: segment.width,
-                            height: segment.height,
-                        })
-                        .collect(),
-                ),
-                Err(e) => call.reply_generation_failed(e.to_string()),
+            match vision_segments(&self.state, session_id, image).await {
+                Ok(segments) => call.reply(segments),
+                Err(VisionError::SessionNotFound(id)) => call.reply_session_not_found(id),
+                Err(VisionError::ModelUnavailable(reason)) => call.reply_model_unavailable(reason),
+                Err(VisionError::InvalidInput(reason)) => call.reply_invalid_input(reason),
+                Err(VisionError::Failed(reason)) => call.reply_generation_failed(reason),
+                Err(VisionError::Reply(e)) => Err(e),
             }
         })
     }
 
-    fn embed(
+    fn stream_embed(
         &self,
-        call: &mut dyn Call_Embed,
+        call: &mut dyn Call_StreamEmbed,
         session_id: String,
         text: String,
     ) -> varlink::Result<()> {
         self.rt.block_on(async {
-            let mut guard = self.state.0.lock().await;
-
-            let (
-                app_id,
-                use_case,
-                profile_id,
-                runtime_id,
-                image_refs,
-                artifact_path,
-                runtime_options,
-            ) = match guard.sessions.get(&session_id) {
-                Some(s) => {
-                    if let Err(reason) =
-                        ensure_exact_use_case(&s.use_case, "language.embed", "Embed")
-                    {
-                        return call.reply_model_unavailable(reason);
-                    }
-                    let (profile_id, runtime_id, image_refs, artifact_path, runtime_options) =
-                        match profile_runtime(&guard, &s.profile_id) {
-                            Ok(resolved) => resolved,
-                            Err(reason) => return call.reply_model_unavailable(reason),
-                        };
-                    (
-                        s.app_id.clone(),
-                        s.use_case.clone(),
-                        profile_id,
-                        runtime_id,
-                        image_refs,
-                        artifact_path,
-                        runtime_options,
-                    )
+            match embedding_vector(&self.state, session_id, text).await {
+                Ok(embedding) => call.reply(embedding),
+                Err(GenerationError::SessionNotFound(id)) => call.reply_session_not_found(id),
+                Err(GenerationError::ModelUnavailable(reason)) => {
+                    call.reply_model_unavailable(reason)
                 }
-                None => return call.reply_session_not_found(session_id),
-            };
-
-            let _ = guard.permissions.touch(&app_id, &use_case);
-            let container = match guard.containers.get_or_spawn_any(
-                &profile_id,
-                &runtime_id,
-                &image_refs,
-                &artifact_path,
-                &runtime_options,
-                |_| {},
-            ) {
-                Ok(container) => container,
-                Err(e) => return call.reply_generation_failed(e.to_string()),
-            };
-
-            match container.embed(&text) {
-                Ok(embedding) => call.reply(embedding.into_iter().map(f64::from).collect()),
-                Err(e) => call.reply_generation_failed(e.to_string()),
+                Err(GenerationError::InvalidOptions(reason)) => {
+                    call.reply_invalid_generation_options(reason)
+                }
+                Err(GenerationError::Failed(reason)) => call.reply_generation_failed(reason),
+                Err(GenerationError::Reply(e)) => Err(e),
             }
         })
     }
@@ -728,9 +355,9 @@ impl VarlinkInterface for InferenceHandler {
         })
     }
 
-    fn submit_tool_results_guided(
+    fn stream_submit_tool_results_guided(
         &self,
-        call: &mut dyn Call_SubmitToolResultsGuided,
+        call: &mut dyn Call_StreamSubmitToolResultsGuided,
         session_id: String,
         prompt: String,
         results: Vec<ToolResult>,
@@ -739,8 +366,9 @@ impl VarlinkInterface for InferenceHandler {
         options: GenerationOptions,
     ) -> varlink::Result<()> {
         self.rt.block_on(async {
-            match submit_guided_tool_results(
+            match stream_guided_tool_results(
                 &self.state,
+                call,
                 session_id,
                 prompt,
                 results,
@@ -750,9 +378,7 @@ impl VarlinkInterface for InferenceHandler {
             )
             .await
             {
-                Ok(response) => {
-                    call.reply(response.content, varlink_tool_calls(response.tool_calls))
-                }
+                Ok(()) => Ok(()),
                 Err(GenerationError::SessionNotFound(id)) => call.reply_session_not_found(id),
                 Err(GenerationError::ModelUnavailable(reason)) => {
                     call.reply_model_unavailable(reason)
@@ -948,6 +574,243 @@ async fn stream_transcription(
         .map_err(SpeechError::Reply)
 }
 
+async fn stream_vision_text<C: TextStreamCall + ?Sized>(
+    state: &SharedState,
+    call: &mut C,
+    session_id: String,
+    image: String,
+    expected_use_case: &str,
+) -> Result<(), VisionError> {
+    let mut guard = state.0.lock().await;
+
+    let (app_id, use_case, profile_id, runtime_id, image_refs, artifact_path, runtime_options) =
+        match guard.sessions.get(&session_id) {
+            Some(s) => {
+                let method = if expected_use_case == "vision.describe" {
+                    "StreamDescribe"
+                } else {
+                    "StreamOcr"
+                };
+                ensure_exact_use_case(&s.use_case, expected_use_case, method)
+                    .map_err(VisionError::ModelUnavailable)?;
+                let (profile_id, runtime_id, image_refs, artifact_path, runtime_options) =
+                    profile_runtime(&guard, &s.profile_id)
+                        .map_err(VisionError::ModelUnavailable)?;
+                (
+                    s.app_id.clone(),
+                    s.use_case.clone(),
+                    profile_id,
+                    runtime_id,
+                    image_refs,
+                    artifact_path,
+                    runtime_options,
+                )
+            }
+            None => return Err(VisionError::SessionNotFound(session_id)),
+        };
+
+    let _ = guard.permissions.touch(&app_id, &use_case);
+    let image_bytes = base64_decode(&image).map_err(VisionError::InvalidInput)?;
+    let container = guard
+        .containers
+        .get_or_spawn_any(
+            &profile_id,
+            &runtime_id,
+            &image_refs,
+            &artifact_path,
+            &runtime_options,
+            |_| {},
+        )
+        .map_err(|e| VisionError::Failed(e.to_string()))?;
+
+    let wants_more = call.wants_more();
+    let mut pending_token: Option<String> = None;
+    let mut reply_error: Option<varlink::Error> = None;
+    let mut saw_token = false;
+
+    let result = if expected_use_case == "vision.describe" {
+        container.stream_describe(image_bytes, |token| {
+            forward_text_stream_token(
+                call,
+                wants_more,
+                token,
+                &mut pending_token,
+                &mut saw_token,
+                &mut reply_error,
+            );
+        })
+    } else {
+        container.stream_ocr(image_bytes, |token| {
+            forward_text_stream_token(
+                call,
+                wants_more,
+                token,
+                &mut pending_token,
+                &mut saw_token,
+                &mut reply_error,
+            );
+        })
+    };
+
+    if let Some(e) = reply_error {
+        return Err(VisionError::Reply(e));
+    }
+    if let Err(e) = result {
+        if wants_more {
+            call.set_continues(false);
+        }
+        return Err(VisionError::Failed(e.to_string()));
+    }
+    if !saw_token && !vision_text_allows_empty_output(expected_use_case) {
+        return Err(VisionError::Failed("model returned no output".to_string()));
+    }
+
+    if wants_more {
+        call.set_continues(false);
+    }
+    call.reply_token(pending_token.unwrap_or_default())
+        .map_err(VisionError::Reply)
+}
+
+fn forward_text_stream_token<C: TextStreamCall + ?Sized>(
+    call: &mut C,
+    wants_more: bool,
+    token: String,
+    pending_token: &mut Option<String>,
+    saw_token: &mut bool,
+    reply_error: &mut Option<varlink::Error>,
+) {
+    if !token.is_empty() {
+        *saw_token = true;
+    }
+    if !wants_more {
+        *pending_token = Some(token);
+        return;
+    }
+
+    if reply_error.is_some() {
+        return;
+    }
+
+    if let Some(previous) = pending_token.replace(token) {
+        call.set_continues(true);
+        if let Err(e) = call.reply_token(previous) {
+            *reply_error = Some(e);
+        }
+    }
+}
+
+fn vision_text_allows_empty_output(expected_use_case: &str) -> bool {
+    expected_use_case == "vision.ocr"
+}
+
+async fn vision_segments(
+    state: &SharedState,
+    session_id: String,
+    image: String,
+) -> Result<Vec<VisionSegment>, VisionError> {
+    let mut guard = state.0.lock().await;
+
+    let (app_id, use_case, profile_id, runtime_id, image_refs, artifact_path, runtime_options) =
+        match guard.sessions.get(&session_id) {
+            Some(s) => {
+                ensure_exact_use_case(&s.use_case, "vision.segment", "StreamSegment")
+                    .map_err(VisionError::ModelUnavailable)?;
+                let (profile_id, runtime_id, image_refs, artifact_path, runtime_options) =
+                    profile_runtime(&guard, &s.profile_id)
+                        .map_err(VisionError::ModelUnavailable)?;
+                (
+                    s.app_id.clone(),
+                    s.use_case.clone(),
+                    profile_id,
+                    runtime_id,
+                    image_refs,
+                    artifact_path,
+                    runtime_options,
+                )
+            }
+            None => return Err(VisionError::SessionNotFound(session_id)),
+        };
+
+    let _ = guard.permissions.touch(&app_id, &use_case);
+    let image_bytes = base64_decode(&image).map_err(VisionError::InvalidInput)?;
+    let container = guard
+        .containers
+        .get_or_spawn_any(
+            &profile_id,
+            &runtime_id,
+            &image_refs,
+            &artifact_path,
+            &runtime_options,
+            |_| {},
+        )
+        .map_err(|e| VisionError::Failed(e.to_string()))?;
+
+    container
+        .segment(image_bytes)
+        .map(|segments| {
+            segments
+                .into_iter()
+                .map(|segment| VisionSegment {
+                    label: segment.label,
+                    confidence: segment.confidence,
+                    x: segment.x,
+                    y: segment.y,
+                    width: segment.width,
+                    height: segment.height,
+                })
+                .collect()
+        })
+        .map_err(|e| VisionError::Failed(e.to_string()))
+}
+
+async fn embedding_vector(
+    state: &SharedState,
+    session_id: String,
+    text: String,
+) -> Result<Vec<f64>, GenerationError> {
+    let mut guard = state.0.lock().await;
+
+    let (app_id, use_case, profile_id, runtime_id, image_refs, artifact_path, runtime_options) =
+        match guard.sessions.get(&session_id) {
+            Some(s) => {
+                ensure_exact_use_case(&s.use_case, "language.embed", "StreamEmbed")
+                    .map_err(GenerationError::ModelUnavailable)?;
+                let (profile_id, runtime_id, image_refs, artifact_path, runtime_options) =
+                    profile_runtime(&guard, &s.profile_id)
+                        .map_err(GenerationError::ModelUnavailable)?;
+                (
+                    s.app_id.clone(),
+                    s.use_case.clone(),
+                    profile_id,
+                    runtime_id,
+                    image_refs,
+                    artifact_path,
+                    runtime_options,
+                )
+            }
+            None => return Err(GenerationError::SessionNotFound(session_id)),
+        };
+
+    let _ = guard.permissions.touch(&app_id, &use_case);
+    let container = guard
+        .containers
+        .get_or_spawn_any(
+            &profile_id,
+            &runtime_id,
+            &image_refs,
+            &artifact_path,
+            &runtime_options,
+            |_| {},
+        )
+        .map_err(|e| GenerationError::Failed(e.to_string()))?;
+
+    container
+        .embed(&text)
+        .map(|embedding| embedding.into_iter().map(f64::from).collect())
+        .map_err(|e| GenerationError::Failed(e.to_string()))
+}
+
 async fn stream_tokens(
     state: &SharedState,
     call: &mut dyn Call_StreamResponse,
@@ -1067,6 +930,52 @@ enum SpeechError {
     Reply(varlink::Error),
 }
 
+enum VisionError {
+    SessionNotFound(String),
+    ModelUnavailable(String),
+    InvalidInput(String),
+    Failed(String),
+    Reply(varlink::Error),
+}
+
+trait TextStreamCall {
+    fn wants_more(&self) -> bool;
+    fn set_continues(&mut self, continues: bool);
+    fn reply_token(&mut self, token: String) -> varlink::Result<()>;
+}
+
+impl TextStreamCall for dyn Call_StreamDescribe + '_ {
+    fn wants_more(&self) -> bool {
+        let call: &dyn Call_StreamDescribe = self;
+        call.wants_more()
+    }
+
+    fn set_continues(&mut self, continues: bool) {
+        let call: &mut dyn Call_StreamDescribe = self;
+        call.set_continues(continues);
+    }
+
+    fn reply_token(&mut self, token: String) -> varlink::Result<()> {
+        self.reply(token)
+    }
+}
+
+impl TextStreamCall for dyn Call_StreamOcr + '_ {
+    fn wants_more(&self) -> bool {
+        let call: &dyn Call_StreamOcr = self;
+        call.wants_more()
+    }
+
+    fn set_continues(&mut self, continues: bool) {
+        let call: &mut dyn Call_StreamOcr = self;
+        call.set_continues(continues);
+    }
+
+    fn reply_token(&mut self, token: String) -> varlink::Result<()> {
+        self.reply(token)
+    }
+}
+
 fn reply_generation_failure(
     call: &mut dyn VarlinkCallError,
     reason: String,
@@ -1088,83 +997,6 @@ fn runtime_error_code(reason: &str) -> Option<&str> {
         .map(|(code, _)| code.trim())
 }
 
-trait TokenSink {
-    fn push_token(&mut self, token: String);
-}
-
-impl TokenSink for String {
-    fn push_token(&mut self, token: String) {
-        self.push_str(&token);
-    }
-}
-
-impl TokenSink for Vec<String> {
-    fn push_token(&mut self, token: String) {
-        self.push(token);
-    }
-}
-
-async fn generate_tokens(
-    state: &SharedState,
-    sink: &mut impl TokenSink,
-    session_id: String,
-    prompt: String,
-    options: GenerationOptions,
-) -> Result<(), GenerationError> {
-    let max_tokens = validate_options(&options).map_err(GenerationError::InvalidOptions)?;
-    let mut guard = state.0.lock().await;
-
-    let (
-        app_id,
-        use_case,
-        profile_id,
-        runtime_id,
-        image_refs,
-        artifact_path,
-        runtime_options,
-        instructions,
-    ) = match guard.sessions.get(&session_id) {
-        Some(s) => {
-            ensure_language_generation_use_case(&s.use_case)
-                .map_err(GenerationError::ModelUnavailable)?;
-            let (profile_id, runtime_id, image_refs, artifact_path, runtime_options) =
-                profile_runtime(&guard, &s.profile_id)
-                    .map_err(GenerationError::ModelUnavailable)?;
-            (
-                s.app_id.clone(),
-                s.use_case.clone(),
-                profile_id,
-                runtime_id,
-                image_refs,
-                artifact_path,
-                runtime_options,
-                s.instructions.clone(),
-            )
-        }
-        None => return Err(GenerationError::SessionNotFound(session_id)),
-    };
-
-    let _ = guard.permissions.touch(&app_id, &use_case);
-    let container = guard
-        .containers
-        .get_or_spawn_any(
-            &profile_id,
-            &runtime_id,
-            &image_refs,
-            &artifact_path,
-            &runtime_options,
-            |_| {},
-        )
-        .map_err(|e| GenerationError::Failed(e.to_string()))?;
-
-    let instructions = apply_translation_hints(&use_case, instructions, &options);
-    container
-        .generate(Some(&instructions), &prompt, max_tokens, |token| {
-            sink.push_token(token)
-        })
-        .map_err(|e| GenerationError::Failed(e.to_string()))
-}
-
 async fn predict_next_completions(
     state: &SharedState,
     session_id: String,
@@ -1177,7 +1009,7 @@ async fn predict_next_completions(
     let (app_id, use_case, profile_id, runtime_id, image_refs, artifact_path, runtime_options) =
         match guard.sessions.get(&session_id) {
             Some(s) => {
-                ensure_exact_use_case(&s.use_case, "language.complete", "PredictNext")
+                ensure_exact_use_case(&s.use_case, "language.complete", "StreamPredictNext")
                     .map_err(GenerationError::ModelUnavailable)?;
                 let (profile_id, runtime_id, image_refs, artifact_path, runtime_options) =
                     profile_runtime(&guard, &s.profile_id)
@@ -1282,6 +1114,7 @@ async fn stream_guided_snapshots(
         max_tokens,
         &schema,
         tools,
+        Vec::new(),
         |snapshot, tool_calls, done| {
             if !snapshot.is_empty() {
                 final_snapshot = snapshot.clone();
@@ -1345,15 +1178,17 @@ async fn stream_guided_snapshots(
     }
 }
 
-async fn submit_guided_tool_results(
+#[allow(clippy::too_many_arguments)]
+async fn stream_guided_tool_results(
     state: &SharedState,
+    call: &mut dyn Call_StreamSubmitToolResultsGuided,
     session_id: String,
     prompt: String,
     results: Vec<ToolResult>,
     fields: Vec<GuidedField>,
     tools: Vec<ToolDefinition>,
     options: GenerationOptions,
-) -> Result<crate::container::GuidedToolResponse, GenerationError> {
+) -> Result<(), GenerationError> {
     let max_tokens = validate_options(&options).map_err(GenerationError::InvalidOptions)?;
     let schema = guided_fields_schema(&fields).map_err(GenerationError::Failed)?;
     let mut guard = state.0.lock().await;
@@ -1401,16 +1236,82 @@ async fn submit_guided_tool_results(
         )
         .map_err(|e| GenerationError::Failed(e.to_string()))?;
 
-    container
-        .generate_structured_with_tools(
-            Some(&instructions),
-            Some(&prompt),
-            max_tokens,
-            &schema,
-            tools.into_iter().map(varlink_tool_definition).collect(),
-            results.into_iter().map(varlink_tool_result).collect(),
-        )
-        .map_err(|e| GenerationError::Failed(e.to_string()))
+    let wants_more = call.wants_more();
+    let mut pending_snapshot: Option<String> = None;
+    let mut pending_tool_calls: Option<Vec<ToolCall>> = None;
+    let mut final_snapshot = String::new();
+    let mut emitted_tool_calls = false;
+    let mut reply_error: Option<varlink::Error> = None;
+    let tools = tools.into_iter().map(varlink_tool_definition).collect();
+    let tool_results = results.into_iter().map(varlink_tool_result).collect();
+    let result = container.stream_structured(
+        Some(&instructions),
+        &prompt,
+        max_tokens,
+        &schema,
+        tools,
+        tool_results,
+        |snapshot, tool_calls, done| {
+            if !snapshot.is_empty() {
+                final_snapshot = snapshot.clone();
+            }
+            if !wants_more {
+                if tool_calls.is_empty() {
+                    pending_snapshot = Some(snapshot);
+                } else {
+                    pending_tool_calls = Some(varlink_tool_calls(tool_calls));
+                }
+                return;
+            }
+            if reply_error.is_some() {
+                return;
+            }
+            if !tool_calls.is_empty() {
+                call.set_continues(false);
+                emitted_tool_calls = true;
+                if let Err(e) = call.reply(String::new(), varlink_tool_calls(tool_calls)) {
+                    reply_error = Some(e);
+                }
+                return;
+            }
+            if let Some(previous) = pending_snapshot.replace(snapshot) {
+                call.set_continues(true);
+                if let Err(e) = call.reply(previous, Vec::new()) {
+                    reply_error = Some(e);
+                }
+            }
+            if done {
+                call.set_continues(false);
+            }
+        },
+    );
+
+    if let Some(e) = reply_error {
+        return Err(GenerationError::Reply(e));
+    }
+    if let Err(e) = result {
+        if wants_more {
+            call.set_continues(false);
+        }
+        return Err(GenerationError::Failed(e.to_string()));
+    }
+    if final_snapshot.is_empty() && !emitted_tool_calls && pending_tool_calls.is_none() {
+        return Err(GenerationError::Failed(
+            "model returned no guided snapshots".to_string(),
+        ));
+    }
+    if wants_more {
+        call.set_continues(false);
+    }
+    if let Some(tool_calls) = pending_tool_calls {
+        call.reply(String::new(), tool_calls)
+            .map_err(GenerationError::Reply)
+    } else if emitted_tool_calls {
+        Ok(())
+    } else {
+        call.reply(pending_snapshot.unwrap_or(final_snapshot), Vec::new())
+            .map_err(GenerationError::Reply)
+    }
 }
 
 fn varlink_tool_definition(tool: ToolDefinition) -> crate::container::ToolDefinition {
@@ -1567,14 +1468,14 @@ fn ensure_exact_use_case(use_case: &str, expected: &str, method: &str) -> Result
     }
 }
 
-/// Validate the session use-case for the Transcribe method and return the
+/// Validate the session use-case for the StreamTranscribe method and return the
 /// whisper task to run: "transcribe" (verbatim) or "translate" (to English).
 fn ensure_speech_use_case(use_case: &str) -> Result<&'static str, String> {
     match use_case {
         "speech.transcribe" => Ok("transcribe"),
         "speech.translate" => Ok("translate"),
         other => Err(format!(
-            "Transcribe requires use-case speech.transcribe or speech.translate, got {other}"
+            "StreamTranscribe requires use-case speech.transcribe or speech.translate, got {other}"
         )),
     }
 }
@@ -1782,12 +1683,21 @@ mod tests {
     #[test]
     fn predict_next_requires_completion_use_case() {
         assert!(
-            ensure_exact_use_case("language.complete", "language.complete", "PredictNext").is_ok()
+            ensure_exact_use_case(
+                "language.complete",
+                "language.complete",
+                "StreamPredictNext"
+            )
+            .is_ok()
         );
         assert_eq!(
-            ensure_exact_use_case("language.rephrase", "language.complete", "PredictNext"),
+            ensure_exact_use_case(
+                "language.rephrase",
+                "language.complete",
+                "StreamPredictNext"
+            ),
             Err(
-                "PredictNext requires use-case language.complete, got language.rephrase"
+                "StreamPredictNext requires use-case language.complete, got language.rephrase"
                     .to_string()
             )
         );
@@ -1801,6 +1711,12 @@ mod tests {
         );
         assert_eq!(ensure_speech_use_case("speech.translate"), Ok("translate"));
         assert!(ensure_speech_use_case("language.extract").is_err());
+    }
+
+    #[test]
+    fn vision_ocr_allows_empty_output() {
+        assert!(vision_text_allows_empty_output("vision.ocr"));
+        assert!(!vision_text_allows_empty_output("vision.describe"));
     }
 
     #[hegel::test]

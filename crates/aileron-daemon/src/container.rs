@@ -477,6 +477,7 @@ impl Container {
     }
 
     /// Send a structured-output request and stream schema-valid snapshots.
+    #[allow(clippy::too_many_arguments)]
     pub fn stream_structured(
         &mut self,
         system: Option<&str>,
@@ -484,6 +485,7 @@ impl Container {
         max_tokens: u32,
         schema: &Value,
         tools: Vec<ToolDefinition>,
+        tool_results: Vec<ToolResult>,
         mut on_event: impl FnMut(String, Vec<ToolCall>, bool),
     ) -> Result<()> {
         let id = Uuid::new_v4().to_string();
@@ -496,6 +498,11 @@ impl Container {
             schema: schema.clone(),
         });
         req.tools = if tools.is_empty() { None } else { Some(tools) };
+        req.tool_results = if tool_results.is_empty() {
+            None
+        } else {
+            Some(tool_results)
+        };
         let line = serde_json::to_string(&req)? + "\n";
         self.stdin.write_all(line.as_bytes())?;
         self.stdin.flush()?;
@@ -560,26 +567,26 @@ impl Container {
 
     /// Send a vision describe request and return the full description.
     pub fn describe(&mut self, image: Vec<u8>) -> Result<String> {
-        let id = Uuid::new_v4().to_string();
-        let mut req = ContainerRequest::new(id.clone(), "describe");
-        req.image = Some(base64_encode(&image));
-        let line = serde_json::to_string(&req)? + "\n";
-        self.stdin.write_all(line.as_bytes())?;
-        self.stdin.flush()?;
-        self.last_used = std::time::Instant::now();
-        self.read_text_response(&id)
+        let mut result = String::new();
+        self.stream_describe(image, |token| result.push_str(&token))?;
+        Ok(result)
+    }
+
+    /// Send a vision describe request and call `on_token` for each returned token.
+    pub fn stream_describe(&mut self, image: Vec<u8>, on_token: impl FnMut(String)) -> Result<()> {
+        self.stream_vision_text("describe", image, on_token)
     }
 
     /// Send a vision OCR request and return the extracted text.
     pub fn ocr(&mut self, image: Vec<u8>) -> Result<String> {
-        let id = Uuid::new_v4().to_string();
-        let mut req = ContainerRequest::new(id.clone(), "ocr");
-        req.image = Some(base64_encode(&image));
-        let line = serde_json::to_string(&req)? + "\n";
-        self.stdin.write_all(line.as_bytes())?;
-        self.stdin.flush()?;
-        self.last_used = std::time::Instant::now();
-        self.read_text_response(&id)
+        let mut result = String::new();
+        self.stream_ocr(image, |token| result.push_str(&token))?;
+        Ok(result)
+    }
+
+    /// Send a vision OCR request and call `on_token` for each returned token.
+    pub fn stream_ocr(&mut self, image: Vec<u8>, on_token: impl FnMut(String)) -> Result<()> {
+        self.stream_vision_text("ocr", image, on_token)
     }
 
     /// Send a vision segment request and return normalized object boxes.
@@ -643,10 +650,20 @@ impl Container {
         }
     }
 
-    fn read_text_response(&mut self, id: &str) -> Result<String> {
-        let mut result = String::new();
-        read_text_stream_response(&mut self.stdout, id, |token| result.push_str(&token))?;
-        Ok(result)
+    fn stream_vision_text(
+        &mut self,
+        request_type: &str,
+        image: Vec<u8>,
+        on_token: impl FnMut(String),
+    ) -> Result<()> {
+        let id = Uuid::new_v4().to_string();
+        let mut req = ContainerRequest::new(id.clone(), request_type);
+        req.image = Some(base64_encode(&image));
+        let line = serde_json::to_string(&req)? + "\n";
+        self.stdin.write_all(line.as_bytes())?;
+        self.stdin.flush()?;
+        self.last_used = std::time::Instant::now();
+        read_text_stream_response(&mut self.stdout, &id, on_token)
     }
 }
 

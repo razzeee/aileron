@@ -50,11 +50,11 @@ Avoid treating model names as application requirements. A user may satisfy `lang
 4. Send task input through the appropriate method.
 5. End the session when the user-visible task is complete.
 
-For conversational features, keep stable instructions in the session and send the relevant local history as part of the prompt with `Respond`, `StreamResponse`, or `RespondGuided`. The app owns conversation history and can trim it to fit its UI or context policy. For one-shot features such as "summarize this article", a short-lived session with `Respond` or `StreamResponse` is usually enough.
+For conversational features, keep stable instructions in the session and send the relevant local history as part of the prompt with `StreamResponse` or `StreamRespondGuided`. The app owns conversation history and can trim it to fit its UI or context policy. For one-shot features such as "summarize this article", a short-lived session with `StreamResponse` is usually enough.
 
 ## Text Generation
 
-Use task-specific language generation use cases with `Respond` for full responses or `StreamResponse` for token streaming. `language.complete` is reserved for inline completion through `PredictNext`; do not use `language.rephrase` for ghost text or next-word suggestions.
+Use task-specific language generation use cases with `StreamResponse`. `language.complete` is reserved for inline completion through `StreamPredictNext`; do not use `language.rephrase` for ghost text or next-word suggestions.
 
 Good prompt shape:
 
@@ -70,7 +70,7 @@ For `language.translate`, `GenerationOptions` includes optional `source_language
 
 ## Inline Completion
 
-Use `language.complete` with `PredictNext` for ghost text, current-word endings, or next-word suggestions. Send the raw text prefix the user typed, not an instruction prompt. The daemon caps results at three short completions.
+Use `language.complete` with `StreamPredictNext` for ghost text, current-word endings, or next-word suggestions. Send the raw text prefix the user typed, not an instruction prompt. The daemon caps results at three short completions and emits each completion as a stream event.
 
 ## Guided Output
 
@@ -78,11 +78,11 @@ Use guided generation when the app needs structured data. The portal API accepts
 
 This is appropriate for extraction, classification, and form-filling workflows. It is not a replacement for validating untrusted data in the app; keep normal app-side validation.
 
-Use `StreamRespondGuided` when the UI benefits from progressive structured updates. It accepts the same guided fields and tool definitions as `RespondGuided`, then emits JSON snapshots or tool-call requests instead of token deltas; each snapshot is validated against the same guided schema before the daemon returns it.
+Use `StreamRespondGuided` for structured updates. It accepts guided fields and tool definitions, then emits JSON snapshots or tool-call requests instead of token deltas; each snapshot is validated against the same guided schema before the daemon forwards it.
 
 ## Tool Calling
 
-Use guided tool calls when the model should ask the app for app-local data or actions. Pass tool definitions to `RespondGuided`, execute or reject any returned `ToolCall` objects in the app, then send results back with `SubmitToolResultsGuided` using the same guided fields.
+Use guided tool calls when the model should ask the app for app-local data or actions. Pass tool definitions to `StreamRespondGuided`, execute or reject any streamed `ToolCall` objects in the app, then send results back with `StreamSubmitToolResultsGuided` using the same guided fields.
 
 The daemon and runtime never execute tools. Tool execution stays app-mediated so sandbox policy, user confirmation, and app-specific authorization remain under the app's control.
 
@@ -92,15 +92,15 @@ Aileron sessions do not retain conversation transcripts. Apps own chat history, 
 
 ## Embeddings
 
-Use `language.embed` with `Embed` to turn text into a fixed-length vector for semantic search, clustering, deduplication, or retrieval-augmented generation. `Embed` returns the embedding as a list of floats. Embed documents and queries with the same assigned profile so the vectors share a space
+Use `language.embed` with `StreamEmbed` to turn text into a fixed-length vector for semantic search, clustering, deduplication, or retrieval-augmented generation. `StreamEmbed` emits one embedding event as a list of floats. Embed documents and queries with the same assigned profile so the vectors share a space.
 
 ## Speech And Vision
 
-Use `speech.transcribe` for verbatim speech-to-text and `speech.translate` to translate spoken audio into English text. Both use `Transcribe` for a single final result or `StreamTranscribe` for progressive segment updates; the daemon selects the whisper transcribe or translate task from the session use-case. Audio is passed as base64-encoded raw PCM bytes through the portal-facing API. Both speech methods accept an optional `source_language_hint` string; pass an empty string to let the runtime auto-detect or use its default behavior. This hint describes the spoken input language only; it does not select translation or the output language.
+Use `speech.transcribe` for verbatim speech-to-text and `speech.translate` to translate spoken audio into English text. Both use `StreamTranscribe`; the daemon selects the whisper transcribe or translate task from the session use-case. Audio is passed as base64-encoded raw PCM bytes through the portal-facing API. The method accepts an optional `source_language_hint` string; pass an empty string to let the runtime auto-detect or use its default behavior. This hint describes the spoken input language only; it does not select translation or the output language.
 
 Live microphone chunking is app behavior in the current API. Apps that want interim text can keep recording locally, periodically send sufficiently large aligned PCM chunks through `StreamTranscribe`, and run one final `StreamTranscribe` pass over the complete recording when capture stops.
 
-Use `vision.describe` for image description and `vision.ocr` to extract text from an image with the `Ocr` method. Use `vision.segment` to identify visible objects with normalized rectangular boxes. Images are passed as base64-encoded PNG or JPEG bytes.
+Use `vision.describe` with `StreamDescribe`, `vision.ocr` with `StreamOcr`, and `vision.segment` with `StreamSegment`. Description and OCR stream text; segmentation emits one segment-list event with normalized rectangular boxes. Images are passed as base64-encoded PNG or JPEG bytes.
 
 Large media inputs can be expensive. Prefer user-initiated actions, visible progress, and cancellation-friendly UI.
 

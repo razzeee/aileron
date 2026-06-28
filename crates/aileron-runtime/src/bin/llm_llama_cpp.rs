@@ -3,9 +3,7 @@ use aileron_runtime::llama_runtime::{
     generate_completion, initialize_llama, load_model, new_context, new_embedding_context,
     render_tool_results,
 };
-use aileron_runtime::{
-    Request, clamp_choices, first_json_value, first_tool_name, send, send_unsupported,
-};
+use aileron_runtime::{Request, clamp_choices, first_json_value, send, send_unsupported};
 use anyhow::Result;
 use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::llama_backend::LlamaBackend;
@@ -105,20 +103,6 @@ fn handle_generate_structured(
     ctx: &mut LlamaContext<'_>,
     req: &Request,
 ) -> Result<()> {
-    if req.tools.as_ref().is_some_and(|tools| !tools.is_empty())
-        && req.tool_results.as_ref().is_none_or(Vec::is_empty)
-    {
-        return send(json!({
-            "id": req.id,
-            "tool_calls": [{
-                "id": "stub-tool-call-1",
-                "name": first_tool_name(req.tools.as_deref()),
-                "arguments_json": "{}",
-            }],
-            "done": true,
-        }));
-    }
-
     match structured_result(model, ctx, req) {
         Ok(result) => send(json!({"id": req.id, "result": result, "done": true})),
         Err(reason) => send(json!({

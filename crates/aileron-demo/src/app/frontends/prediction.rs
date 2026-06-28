@@ -115,8 +115,9 @@ pub(crate) fn build_page() -> gtk4::Widget {
                         if seq == active_seq.get() {
                             status_spinner.start();
                             status_title.set_text("Predicting");
-                            status_detail
-                                .set_text("Requesting a short continuation through PredictNext...");
+                            status_detail.set_text(
+                                "Requesting a short continuation through StreamPredictNext...",
+                            );
                         }
                     }
                     Ok(PredictionEvent::Suggestion {

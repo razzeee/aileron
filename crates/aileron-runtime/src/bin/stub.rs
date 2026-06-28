@@ -114,6 +114,20 @@ fn handle_generate_structured(req: &Request) -> Result<()> {
 }
 
 fn handle_generate_structured_stream(req: &Request) -> Result<()> {
+    if req.tools.as_ref().is_some_and(|tools| !tools.is_empty())
+        && req.tool_results.as_ref().is_none_or(Vec::is_empty)
+    {
+        return send(json!({
+            "id": req.id,
+            "tool_calls": [{
+                "id": "stub-tool-call-1",
+                "name": first_tool_name(req.tools.as_deref()),
+                "arguments_json": "{}",
+            }],
+            "done": true,
+        }));
+    }
+
     let schema = req
         .response_format
         .as_ref()
