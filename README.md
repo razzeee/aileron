@@ -327,7 +327,7 @@ In the **Models** page, click **Add Profile...**, choose one of the available ru
 
 ### 2. Grant permission to an app
 
-The first time an app requests inference, Aileron denies it (no entry exists). Grant access in the **Permissions** page, or directly via Varlink:
+The first time an app requests inference through the portal, Aileron prompts and stores the decision. For direct Varlink testing or pre-approval, grant access in the **Permissions** page, or directly via Varlink:
 
 ```
 aileron.Permissions.SetAppPermission(
@@ -399,7 +399,7 @@ method StreamSegment(session_id: string, image: string) -> (segments: []VisionSe
 method EndSession(session_id: string) -> ()
 ```
 
-`CreateSession` returns the backend session id and selected profile id; the portal frontend exposes only an opaque public session handle to apps. `instructions` are stored on the session and forwarded to text containers as the container `system` prompt. `StreamPredictNext` is for inline typing assistance on `language.complete` sessions: the daemon forwards the raw prefix to the runtime and streams one completions event with up to three short completions, typically word suffixes or next words. Newer `StreamPredictNext` calls for the same session supersede older in-flight prediction calls; superseded calls fail with `RequestCancelled` and do not emit completions. `audio` is raw 16 kHz mono f32le PCM bytes encoded as base64; `StreamTranscribe` streams a verbatim transcript for `speech.transcribe` sessions or an English translation for `speech.translate` sessions. `image` is PNG or JPEG bytes encoded as base64. `StreamEmbed` streams one embedding vector event for `text`. `VisionSegment` coordinates are normalized `0.0..1.0` rectangles relative to image dimensions.
+`CreateSession` returns the backend session id and selected profile id; the portal frontend exposes only an opaque public session handle to apps. Missing app permissions fail with `PermissionPromptRequired` so the portal backend can prompt once and persist the decision; explicit denials fail with `PermissionDenied` and are not re-prompted. `instructions` are stored on the session and forwarded to text containers as the container `system` prompt. `StreamPredictNext` is for inline typing assistance on `language.complete` sessions: the daemon forwards the raw prefix to the runtime and streams one completions event with up to three short completions, typically word suffixes or next words. Newer `StreamPredictNext` calls for the same session supersede older in-flight prediction calls; superseded calls fail with `RequestCancelled` and do not emit completions. `audio` is raw 16 kHz mono f32le PCM bytes encoded as base64; `StreamTranscribe` streams a verbatim transcript for `speech.transcribe` sessions or an English translation for `speech.translate` sessions. `image` is PNG or JPEG bytes encoded as base64. `StreamEmbed` streams one embedding vector event for `text`. `VisionSegment` coordinates are normalized `0.0..1.0` rectangles relative to image dimensions.
 
 `GenerationOptions.maximum_response_tokens` must be greater than zero and fit in `u32`. `temperature` must be finite and non-negative. `sampling_mode` must be non-empty. `source_language_hint` and `target_language_hint` are optional strings for `language.translate`; pass empty strings when unspecified. Today the daemon validates sampling fields, forwards `maximum_response_tokens` to containers as `max_tokens`, and folds translation hints into the session instructions for `language.translate`.
 
@@ -409,7 +409,7 @@ Tool calls are app-mediated and per request: `StreamRespondGuided` may stream `T
 
 `ModelAvailability.code` is stable and machine-readable. Known values are `available`, `permission_denied`, `no_profile_assigned`, `profile_not_installed`, `artifact_missing`, `runtime_unsupported`, `runtime_missing`, `hardware_unsupported`, and `busy`. `reason` is human-readable detail.
 
-Inference errors are represented as Varlink errors: `PermissionDenied`, `SessionNotFound`, `ModelUnavailable`, `InvalidGenerationOptions`, `GuidedGenerationFailed`, `GenerationFailed`, `ContextWindowExceeded`, `UnsupportedLanguage`, `SafetyRefusal`, `RequestCancelled`, and `InvalidInput`.
+Inference errors are represented as Varlink errors: `PermissionPromptRequired`, `PermissionDenied`, `SessionNotFound`, `ModelUnavailable`, `InvalidGenerationOptions`, `GuidedGenerationFailed`, `GenerationFailed`, `ContextWindowExceeded`, `UnsupportedLanguage`, `SafetyRefusal`, `RequestCancelled`, and `InvalidInput`.
 
 ### `aileron.Models`
 

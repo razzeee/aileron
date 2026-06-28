@@ -138,6 +138,9 @@ impl VarlinkInterface for InferenceHandler {
         self.rt.block_on(async {
             match create_session_record(&self.state, app_id, use_case, instructions).await {
                 Ok((session_id, profile_id)) => call.reply(session_id, profile_id),
+                Err(CreateSessionError::PermissionPromptRequired(app_id, use_case)) => {
+                    call.reply_permission_prompt_required(app_id, use_case)
+                }
                 Err(CreateSessionError::PermissionDenied(app_id, use_case)) => {
                     call.reply_permission_denied(app_id, use_case)
                 }
@@ -409,6 +412,7 @@ impl VarlinkInterface for InferenceHandler {
 }
 
 enum CreateSessionError {
+    PermissionPromptRequired(String, String),
     PermissionDenied(String, String),
     ModelUnavailable(String),
 }
@@ -435,10 +439,9 @@ async fn create_session_record(
                         tracing::warn!("failed to persist auto-grant: {e}");
                     }
                 } else {
-                    if let Err(e) = guard.permissions.deny_if_missing(&app_id, &use_case) {
-                        tracing::warn!("failed to persist denied permission: {e}");
-                    }
-                    return Err(CreateSessionError::PermissionDenied(app_id, use_case));
+                    return Err(CreateSessionError::PermissionPromptRequired(
+                        app_id, use_case,
+                    ));
                 }
             }
         }

@@ -1098,6 +1098,11 @@ fn create_session_impl(
     {
         Ok(reply) => reply,
         Err(e) if is_permission_denied(&e) => {
+            return Err(zbus::fdo::Error::AccessDenied(format!(
+                "Permission denied for {app_id} / {use_case}"
+            )));
+        }
+        Err(e) if is_permission_prompt_required(&e) => {
             if !prompt_permission(app_id, use_case)? {
                 set_permission(app_id, use_case, false)?;
                 return Err(zbus::fdo::Error::AccessDenied(format!(
@@ -1196,6 +1201,10 @@ fn end_session_impl(
 
 fn is_permission_denied(error: &impl std::fmt::Display) -> bool {
     error.to_string().contains("PermissionDenied")
+}
+
+fn is_permission_prompt_required(error: &impl std::fmt::Display) -> bool {
+    error.to_string().contains("PermissionPromptRequired")
 }
 
 fn set_permission(app_id: &str, use_case: &str, allowed: bool) -> zbus::fdo::Result<()> {
@@ -1523,6 +1532,12 @@ mod tests {
         assert!(is_permission_denied(&"aileron.Inference.PermissionDenied"));
         assert!(!is_permission_denied(
             &"aileron.Inference.ProfileUnavailable"
+        ));
+        assert!(!is_permission_denied(
+            &"aileron.Inference.PermissionPromptRequired"
+        ));
+        assert!(is_permission_prompt_required(
+            &"aileron.Inference.PermissionPromptRequired"
         ));
     }
 

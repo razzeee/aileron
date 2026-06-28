@@ -97,6 +97,7 @@ method StreamSegment(session_id: string, image: string) -> (segments: []VisionSe
 # End a session. The per-profile container remains pooled until idle timeout.
 method EndSession(session_id: string) -> ()
 
+error PermissionPromptRequired(app_id: string, use_case: string)
 error PermissionDenied(app_id: string, use_case: string)
 error SessionNotFound(session_id: string)
 error ModelUnavailable(reason: string)
