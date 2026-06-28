@@ -323,6 +323,7 @@ impl LanguagePortalBackend {
         done: bool,
     ) -> zbus::Result<()>;
 
+    #[allow(clippy::too_many_arguments)]
     async fn stream_respond_guided(
         &self,
         session_id: &str,
@@ -396,17 +397,10 @@ impl LanguagePortalBackend {
             }
         }
 
-        if !emitted_terminal_tool_calls {
-            if let Some(snapshot) = pending_snapshot {
-                LanguagePortalBackend::guided_snapshot_received(
-                    &emitter,
-                    &session_id,
-                    &snapshot,
-                    true,
-                )
+        if !emitted_terminal_tool_calls && let Some(snapshot) = pending_snapshot {
+            LanguagePortalBackend::guided_snapshot_received(&emitter, &session_id, &snapshot, true)
                 .await
                 .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-            }
         }
 
         self.mark_warm(&session_id);
@@ -508,17 +502,10 @@ impl LanguagePortalBackend {
             }
         }
 
-        if !emitted_terminal_tool_calls {
-            if let Some(snapshot) = pending_snapshot {
-                LanguagePortalBackend::guided_snapshot_received(
-                    &emitter,
-                    &session_id,
-                    &snapshot,
-                    true,
-                )
+        if !emitted_terminal_tool_calls && let Some(snapshot) = pending_snapshot {
+            LanguagePortalBackend::guided_snapshot_received(&emitter, &session_id, &snapshot, true)
                 .await
                 .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-            }
         }
 
         self.mark_warm(&session_id);
