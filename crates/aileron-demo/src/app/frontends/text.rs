@@ -203,9 +203,12 @@ pub(crate) fn build_page() -> gtk4::Widget {
                             output_buffer_clone.insert(&mut output_buffer_clone.end_iter(), &token);
                         }
                         Ok(DemoEvent::Json(content)) => {
-                            status_title.set_text("Validated JSON received");
-                            status_detail
-                                .set_text("Guided generation returned schema-checked JSON.");
+                            if !saw_token {
+                                saw_token = true;
+                                status_title.set_text("Streaming guided JSON");
+                                status_detail
+                                    .set_text("Rendering guided snapshots as they arrive.");
+                            }
                             output_buffer_clone.set_text(&content);
                         }
                         Ok(DemoEvent::Text(content)) => {

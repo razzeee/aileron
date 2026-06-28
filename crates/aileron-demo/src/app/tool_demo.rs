@@ -452,7 +452,7 @@ fn run_linux_diagnostics_tool_demo(
         "User request: {prompt}\n\nRead-only diagnostics evidence follows. No changes were applied. Give a concise plain-text diagnosis with likely cause, evidence, and safe bugfix commands to review. Do not return JSON.\n\n{}",
         model_result_json
     );
-    let final_answer = stream_language_text(&session_handle, &final_prompt, options)?;
+    let final_answer = stream_language_text(&session_handle, &final_prompt, options, None)?;
     tx.send(ToolEvent::Trace(format!(
         "after_llm_call: final plain-text answer={:?}",
         final_answer

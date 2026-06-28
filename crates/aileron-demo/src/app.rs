@@ -451,6 +451,7 @@ enum DemoEvent {
 
 enum ChatEvent {
     SessionReady(String),
+    Draft(String),
     Response(GuidedChatResponse),
     Error(String),
     Done,
@@ -759,6 +760,12 @@ enum VisionEvent {
     Done,
 }
 
+#[derive(Clone, Copy)]
+enum VisionTextKind {
+    Description,
+    Ocr,
+}
+
 enum VisionPhase {
     CreatingSession,
     LoadingModel,
@@ -979,6 +986,7 @@ fn stream_language_text(
     session_handle: &OwnedObjectPath,
     prompt: &str,
     options: PortalOptions,
+    token_tx: Option<std::sync::mpsc::Sender<DemoEvent>>,
 ) -> anyhow::Result<String> {
     let call_conn = portal_connection()?;
     let signal_conn = zbus::blocking::Connection::session()?;
@@ -999,6 +1007,9 @@ fn stream_language_text(
                     continue;
                 }
                 content.push_str(&token);
+                if let Some(tx) = &token_tx {
+                    tx.send(DemoEvent::Token(token))?;
+                }
                 if done {
                     break;
                 }
@@ -1030,7 +1041,49 @@ fn stream_guided_response(
     tools: Vec<ToolDefinitionDbus>,
     options: PortalOptions,
 ) -> anyhow::Result<(String, Vec<ToolCallDbus>)> {
-    stream_guided_call(None, session_handle, prompt, fields, tools, options)
+    stream_guided_call(None, session_handle, prompt, fields, tools, options, None)
+}
+
+fn stream_guided_response_with_snapshots(
+    session_handle: &OwnedObjectPath,
+    prompt: &str,
+    fields: Vec<(String, String, String, bool)>,
+    tools: Vec<ToolDefinitionDbus>,
+    options: PortalOptions,
+    snapshot_tx: std::sync::mpsc::Sender<DemoEvent>,
+) -> anyhow::Result<(String, Vec<ToolCallDbus>)> {
+    let mut send_snapshot = move |snapshot: &str| {
+        snapshot_tx.send(DemoEvent::Json(snapshot.to_string()))?;
+        Ok(())
+    };
+
+    stream_guided_response_with_snapshot_handler(
+        session_handle,
+        prompt,
+        fields,
+        tools,
+        options,
+        &mut send_snapshot,
+    )
+}
+
+fn stream_guided_response_with_snapshot_handler(
+    session_handle: &OwnedObjectPath,
+    prompt: &str,
+    fields: Vec<(String, String, String, bool)>,
+    tools: Vec<ToolDefinitionDbus>,
+    options: PortalOptions,
+    snapshot_handler: &mut dyn FnMut(&str) -> anyhow::Result<()>,
+) -> anyhow::Result<(String, Vec<ToolCallDbus>)> {
+    stream_guided_call(
+        None,
+        session_handle,
+        prompt,
+        fields,
+        tools,
+        options,
+        Some(snapshot_handler),
+    )
 }
 
 fn stream_guided_tool_results(
@@ -1048,6 +1101,7 @@ fn stream_guided_tool_results(
         fields,
         tools,
         options,
+        None,
     )
 }
 
@@ -1058,6 +1112,7 @@ fn stream_guided_call(
     fields: Vec<(String, String, String, bool)>,
     tools: Vec<ToolDefinitionDbus>,
     options: PortalOptions,
+    mut snapshot_handler: Option<&mut dyn FnMut(&str) -> anyhow::Result<()>>,
 ) -> anyhow::Result<(String, Vec<ToolCallDbus>)> {
     let call_conn = portal_connection()?;
     let signal_conn = zbus::blocking::Connection::session()?;
@@ -1141,6 +1196,9 @@ fn stream_guided_call(
             .map_err(|_| anyhow::anyhow!("stream completed without a final guided signal"))??
         {
             GuidedStreamEvent::Snapshot(snapshot, done) => {
+                if let Some(handler) = snapshot_handler.as_mut() {
+                    handler(&snapshot)?;
+                }
                 if done {
                     return Ok((snapshot, Vec::new()));
                 }
@@ -1242,6 +1300,7 @@ fn stream_vision_text(
     session_handle: &OwnedObjectPath,
     image_b64: &str,
     method: &str,
+    text_tx: Option<(std::sync::mpsc::Sender<VisionEvent>, VisionTextKind)>,
 ) -> anyhow::Result<String> {
     let call_conn = portal_connection()?;
     let signal_conn = zbus::blocking::Connection::session()?;
@@ -1262,6 +1321,13 @@ fn stream_vision_text(
                     continue;
                 }
                 content.push_str(&text);
+                if let Some((tx, kind)) = &text_tx {
+                    let event = match kind {
+                        VisionTextKind::Description => VisionEvent::Description(content.clone()),
+                        VisionTextKind::Ocr => VisionEvent::Ocr(content.clone()),
+                    };
+                    tx.send(event)?;
+                }
                 if done {
                     break;
                 }
@@ -1363,12 +1429,13 @@ fn extract_guided(text: &str, tx: std::sync::mpsc::Sender<DemoEvent>) -> anyhow:
 
     tx.send(DemoEvent::Phase(DemoPhase::WaitingForModel))?;
     tx.send(DemoEvent::Phase(DemoPhase::RequestingGuided))?;
-    let (content, _) = stream_guided_response(
+    let (content, _) = stream_guided_response_with_snapshots(
         &session_handle,
         &prompt,
         fields,
         Vec::<ToolDefinitionDbus>::new(),
         options,
+        tx.clone(),
     )?;
     let pretty = serde_json::from_str::<serde_json::Value>(&content)
         .ok()
@@ -1422,12 +1489,13 @@ fn classify_guided(text: &str, tx: std::sync::mpsc::Sender<DemoEvent>) -> anyhow
 
     tx.send(DemoEvent::Phase(DemoPhase::WaitingForModel))?;
     tx.send(DemoEvent::Phase(DemoPhase::RequestingGuided))?;
-    let (content, _) = stream_guided_response(
+    let (content, _) = stream_guided_response_with_snapshots(
         &session_handle,
         &DemoMode::Classify.prompt(text),
         fields,
         Vec::<ToolDefinitionDbus>::new(),
         options,
+        tx.clone(),
     )?;
     let pretty = serde_json::from_str::<serde_json::Value>(&content)
         .ok()
@@ -1457,7 +1525,12 @@ fn respond_text_task(
         DemoMode::Translate => generation_options(512, 0.3, "default", "", "Spanish"),
         _ => generation_options(512, 0.5, "default", "", ""),
     };
-    let content = stream_language_text(&session_handle, &mode.prompt(text), options)?;
+    let content = stream_language_text(
+        &session_handle,
+        &mode.prompt(text),
+        options,
+        Some(tx.clone()),
+    )?;
     tx.send(DemoEvent::Text(content))?;
 
     close_public_session(&session_handle)?;
@@ -1669,23 +1742,31 @@ fn guided_chat_turn(
     ];
     let options = generation_options(512, 0.2, "default", "", "");
     let prompt = guided_chat_prompt(memory, &messages);
-    let response_result = stream_guided_response(
+    let mut send_draft = |snapshot: &str| {
+        if let Some(answer) = guided_chat_answer_draft(snapshot) {
+            tx.send(ChatEvent::Draft(answer))?;
+        }
+        Ok(())
+    };
+    let response_result = stream_guided_response_with_snapshot_handler(
         &session_handle,
         &prompt,
         fields.clone(),
         Vec::<ToolDefinitionDbus>::new(),
         options,
+        &mut send_draft,
     );
     let (content, _) = match response_result {
         Ok(response) => response,
         Err(e) if used_existing_session && is_session_not_found_message(&e.to_string()) => {
             session_handle = create_session()?;
-            match stream_guided_response(
+            match stream_guided_response_with_snapshot_handler(
                 &session_handle,
                 &prompt,
                 fields,
                 Vec::<ToolDefinitionDbus>::new(),
                 generation_options(512, 0.2, "default", "", ""),
+                &mut send_draft,
             ) {
                 Ok(response) => response,
                 Err(e) => {
@@ -1732,6 +1813,61 @@ fn guided_chat_prompt(memory: &[String], messages: &[ChatMessage]) -> String {
     }
 
     prompt
+}
+
+fn guided_chat_answer_draft(snapshot: &str) -> Option<String> {
+    let answer = serde_json::from_str::<serde_json::Value>(snapshot)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("answer")
+                .and_then(|answer| answer.as_str())
+                .map(str::to_string)
+        })
+        .or_else(|| partial_json_string_field(snapshot, "answer"))?;
+    let answer = answer.trim().to_string();
+    if answer.is_empty() {
+        None
+    } else {
+        Some(answer)
+    }
+}
+
+fn partial_json_string_field(input: &str, field: &str) -> Option<String> {
+    let needle = format!("\"{field}\"");
+    let field_start = input.find(&needle)?;
+    let after_field = &input[field_start + needle.len()..];
+    let colon = after_field.find(':')?;
+    let after_colon = after_field[colon + 1..].trim_start();
+    let mut chars = after_colon.chars();
+    if chars.next()? != '"' {
+        return None;
+    }
+
+    let mut value = String::new();
+    let mut escaped = false;
+    for ch in chars {
+        if escaped {
+            match ch {
+                'n' => value.push('\n'),
+                'r' => value.push('\r'),
+                't' => value.push('\t'),
+                '"' => value.push('"'),
+                '\\' => value.push('\\'),
+                '/' => value.push('/'),
+                other => value.push(other),
+            }
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == '"' {
+            break;
+        } else {
+            value.push(ch);
+        }
+    }
+
+    Some(value)
 }
 
 #[derive(Clone, Copy)]
@@ -1953,7 +2089,12 @@ fn describe_image(image_b64: &str, tx: std::sync::mpsc::Sender<VisionEvent>) -> 
 
     tx.send(VisionEvent::Phase(VisionPhase::LoadingModel))?;
     tx.send(VisionEvent::Phase(VisionPhase::Describing))?;
-    let description = stream_vision_text(&session_handle, image_b64, "StreamDescribe")?;
+    let description = stream_vision_text(
+        &session_handle,
+        image_b64,
+        "StreamDescribe",
+        Some((tx.clone(), VisionTextKind::Description)),
+    )?;
     tx.send(VisionEvent::Description(description))?;
 
     close_public_session(&session_handle)?;
@@ -1974,7 +2115,12 @@ fn ocr_image(image_b64: &str, tx: std::sync::mpsc::Sender<VisionEvent>) -> anyho
 
     tx.send(VisionEvent::Phase(VisionPhase::LoadingModel))?;
     tx.send(VisionEvent::Phase(VisionPhase::Ocr))?;
-    let text = stream_vision_text(&session_handle, image_b64, "StreamOcr")?;
+    let text = stream_vision_text(
+        &session_handle,
+        image_b64,
+        "StreamOcr",
+        Some((tx.clone(), VisionTextKind::Ocr)),
+    )?;
     tx.send(VisionEvent::Ocr(text))?;
 
     close_public_session(&session_handle)?;
@@ -2105,7 +2251,7 @@ fn base64_encode(data: &[u8]) -> String {
 mod tests {
     use super::{
         DemoMode, base64_encode, clear_failed_prediction_session, concise_error,
-        is_session_not_found_message,
+        guided_chat_answer_draft, is_session_not_found_message,
     };
     use hegel::TestCase;
     use hegel::generators as gs;
@@ -2161,6 +2307,23 @@ mod tests {
         assert!(!is_session_not_found_message(
             "aileron.Inference.GenerationFailed"
         ));
+    }
+
+    #[test]
+    fn guided_chat_answer_draft_reads_complete_snapshot() {
+        assert_eq!(
+            guided_chat_answer_draft(r#"{"answer":"Streaming now","memory":"","confidence":88}"#)
+                .as_deref(),
+            Some("Streaming now")
+        );
+    }
+
+    #[test]
+    fn guided_chat_answer_draft_reads_partial_snapshot() {
+        assert_eq!(
+            guided_chat_answer_draft(r#"{"answer":"Streaming in fl"#).as_deref(),
+            Some("Streaming in fl")
+        );
     }
 
     #[hegel::test]

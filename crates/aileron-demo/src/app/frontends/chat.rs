@@ -146,6 +146,12 @@ pub(crate) fn build_page() -> gtk4::Widget {
                                 "Reusing this language.extract session for future turns.",
                             );
                         }
+                        Ok(ChatEvent::Draft(answer)) => {
+                            status_title_for_rx.set_text("Streaming guided response");
+                            status_detail_for_rx
+                                .set_text("Rendering the answer field as guided snapshots arrive.");
+                            render_chat(&chat_box_for_rx, &history_for_rx.borrow(), Some(&answer));
+                        }
                         Ok(ChatEvent::Response(response)) => {
                             let answer = response.answer.trim().to_string();
                             if !answer.is_empty() {
