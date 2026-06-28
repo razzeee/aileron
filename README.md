@@ -514,7 +514,7 @@ Audio and image payloads are base64 strings in the current prototype and must fi
 
 | Signal | Parameters | Fired when |
 |---|---|---|
-| `ModelLoading` | `request_handle: o, session_handle: o, message: s` | The portal is about to start a cold backing container for a request; available on each interface |
+| `ModelLoading` | `request_handle: o, session_handle: o, message: s` | The portal is preparing the backing model/runtime for a request; available on each interface |
 | `TokenReceived` | `request_handle: o, session_handle: o, token: s, done: b` | Each token during `StreamResponse` on `Language` |
 | `PredictionReceived` | `request_handle: o, session_handle: o, completion: s, done: b` | Each completion during `StreamPredictNext` on `Language` |
 | `GuidedSnapshotReceived` | `request_handle: o, session_handle: o, snapshot_json: s, done: b` | Each validated JSON snapshot during `StreamRespondGuided` on `Language` |
@@ -526,7 +526,7 @@ Audio and image payloads are base64 strings in the current prototype and must fi
 
 The implementation backend exposes the same task methods with implementation-oriented identifiers: `CreateSession` receives `app_id: s` and `parent_window: s`, streaming methods receive `request_id: s` and `session_id: s`, and `EndSession(session_id: s)` supports the frontend's session-close path. Public apps should not call the implementation interfaces directly.
 
-The current prototype returns stream failures through the request `Response` signal with response code `2` and an `error` string that includes the underlying Varlink error name, such as `aileron.Inference.RequestCancelled` or `aileron.Inference.InvalidInput`. Apps should still branch on availability `code` values before creating sessions.
+The current prototype returns stream failures through the request `Response` signal with response code `2`, an `error` string, and when available an `error_name` string such as `aileron.Inference.RequestCancelled` or `aileron.Inference.InvalidInput`. Apps should still branch on availability `code` values before creating sessions.
 
 ## Portal-to-container API boundary
 
@@ -657,7 +657,7 @@ The daemon sends a `response_format` object containing the caller's JSON Schema.
 
 - Containers start on demand when `Prewarm` or the first inference call needs an assigned profile runtime.
 - The daemon waits for the container to signal `ready` on stderr before using it.
-- The portal emits `ModelLoading(session_handle, "starting model")` before cold language, speech, or vision calls that may start a container.
+- The portal emits `ModelLoading(request_handle, session_handle, "preparing model")` before language, speech, or vision operations that may touch the backing runtime.
 - One container runs per profile, shared across all sessions bound to that profile.
 - Public session `Close` and backend `EndSession` remove the session, but the per-profile container remains pooled until idle timeout.
 - `KillSession` removes the session and stops the profile container if no other active session uses it.

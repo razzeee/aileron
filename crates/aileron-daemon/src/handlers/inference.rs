@@ -197,6 +197,7 @@ impl VarlinkInterface for InferenceHandler {
                 Err(GenerationError::InvalidOptions(reason)) => {
                     call.reply_invalid_generation_options(reason)
                 }
+                Err(GenerationError::InvalidInput(reason)) => call.reply_invalid_input(reason),
                 Err(GenerationError::Failed(reason)) => reply_generation_failure(call, reason),
                 Err(GenerationError::Reply(e)) => Err(e),
             }
@@ -220,6 +221,7 @@ impl VarlinkInterface for InferenceHandler {
                 Err(GenerationError::InvalidOptions(reason)) => {
                     call.reply_invalid_generation_options(reason)
                 }
+                Err(GenerationError::InvalidInput(reason)) => call.reply_invalid_input(reason),
                 Err(GenerationError::Failed(reason)) => reply_generation_failure(call, reason),
                 Err(GenerationError::Reply(e)) => Err(e),
             }
@@ -318,6 +320,7 @@ impl VarlinkInterface for InferenceHandler {
                 Err(GenerationError::InvalidOptions(reason)) => {
                     call.reply_invalid_generation_options(reason)
                 }
+                Err(GenerationError::InvalidInput(reason)) => call.reply_invalid_input(reason),
                 Err(GenerationError::Failed(reason)) => call.reply_generation_failed(reason),
                 Err(GenerationError::Reply(e)) => Err(e),
             }
@@ -353,6 +356,7 @@ impl VarlinkInterface for InferenceHandler {
                 Err(GenerationError::InvalidOptions(reason)) => {
                     call.reply_invalid_generation_options(reason)
                 }
+                Err(GenerationError::InvalidInput(reason)) => call.reply_invalid_input(reason),
                 Err(GenerationError::Failed(reason)) => call.reply_guided_generation_failed(reason),
                 Err(GenerationError::Reply(e)) => Err(e),
             }
@@ -390,6 +394,7 @@ impl VarlinkInterface for InferenceHandler {
                 Err(GenerationError::InvalidOptions(reason)) => {
                     call.reply_invalid_generation_options(reason)
                 }
+                Err(GenerationError::InvalidInput(reason)) => call.reply_invalid_input(reason),
                 Err(GenerationError::Failed(reason)) => call.reply_guided_generation_failed(reason),
                 Err(GenerationError::Reply(e)) => Err(e),
             }
@@ -513,8 +518,7 @@ async fn stream_transcription(
         runtime_options,
     ) = match guard.sessions.get(&session_id) {
         Some(s) => {
-            let task =
-                ensure_speech_use_case(&s.use_case).map_err(SpeechError::ModelUnavailable)?;
+            let task = ensure_speech_use_case(&s.use_case).map_err(SpeechError::InvalidInput)?;
             let (profile_id, runtime_id, image_refs, artifact_path, runtime_options) =
                 profile_runtime(&guard, &s.profile_id).map_err(SpeechError::ModelUnavailable)?;
             (
@@ -604,7 +608,7 @@ async fn stream_vision_text<C: TextStreamCall + ?Sized>(
                     "StreamOcr"
                 };
                 ensure_exact_use_case(&s.use_case, expected_use_case, method)
-                    .map_err(VisionError::ModelUnavailable)?;
+                    .map_err(VisionError::InvalidInput)?;
                 let (profile_id, runtime_id, image_refs, artifact_path, runtime_options) =
                     profile_runtime(&guard, &s.profile_id)
                         .map_err(VisionError::ModelUnavailable)?;
@@ -727,7 +731,7 @@ async fn vision_segments(
         match guard.sessions.get(&session_id) {
             Some(s) => {
                 ensure_exact_use_case(&s.use_case, "vision.segment", "StreamSegment")
-                    .map_err(VisionError::ModelUnavailable)?;
+                    .map_err(VisionError::InvalidInput)?;
                 let (profile_id, runtime_id, image_refs, artifact_path, runtime_options) =
                     profile_runtime(&guard, &s.profile_id)
                         .map_err(VisionError::ModelUnavailable)?;
@@ -787,7 +791,7 @@ async fn embedding_vector(
         match guard.sessions.get(&session_id) {
             Some(s) => {
                 ensure_exact_use_case(&s.use_case, "language.embed", "StreamEmbed")
-                    .map_err(GenerationError::ModelUnavailable)?;
+                    .map_err(GenerationError::InvalidInput)?;
                 let (profile_id, runtime_id, image_refs, artifact_path, runtime_options) =
                     profile_runtime(&guard, &s.profile_id)
                         .map_err(GenerationError::ModelUnavailable)?;
@@ -845,7 +849,7 @@ async fn stream_tokens(
     ) = match guard.sessions.get(&session_id) {
         Some(s) => {
             ensure_language_generation_use_case(&s.use_case)
-                .map_err(GenerationError::ModelUnavailable)?;
+                .map_err(GenerationError::InvalidInput)?;
             let (profile_id, runtime_id, image_refs, artifact_path, runtime_options) =
                 profile_runtime(&guard, &s.profile_id)
                     .map_err(GenerationError::ModelUnavailable)?;
@@ -930,6 +934,7 @@ enum GenerationError {
     SessionNotFound(String),
     ModelUnavailable(String),
     InvalidOptions(String),
+    InvalidInput(String),
     Failed(String),
     Reply(varlink::Error),
 }
@@ -1023,7 +1028,7 @@ async fn predict_next_completions(
         match guard.sessions.get(&session_id) {
             Some(s) => {
                 ensure_exact_use_case(&s.use_case, "language.complete", "StreamPredictNext")
-                    .map_err(GenerationError::ModelUnavailable)?;
+                    .map_err(GenerationError::InvalidInput)?;
                 let (profile_id, runtime_id, image_refs, artifact_path, runtime_options) =
                     profile_runtime(&guard, &s.profile_id)
                         .map_err(GenerationError::ModelUnavailable)?;
@@ -1092,7 +1097,7 @@ async fn stream_guided_snapshots(
     ) = match guard.sessions.get(&session_id) {
         Some(s) => {
             ensure_language_generation_use_case(&s.use_case)
-                .map_err(GenerationError::ModelUnavailable)?;
+                .map_err(GenerationError::InvalidInput)?;
             let (profile_id, runtime_id, image_refs, artifact_path, runtime_options) =
                 profile_runtime(&guard, &s.profile_id)
                     .map_err(GenerationError::ModelUnavailable)?;
@@ -1227,7 +1232,7 @@ async fn stream_guided_tool_results(
     ) = match guard.sessions.get(&session_id) {
         Some(s) => {
             ensure_language_generation_use_case(&s.use_case)
-                .map_err(GenerationError::ModelUnavailable)?;
+                .map_err(GenerationError::InvalidInput)?;
             let (profile_id, runtime_id, image_refs, artifact_path, runtime_options) =
                 profile_runtime(&guard, &s.profile_id)
                     .map_err(GenerationError::ModelUnavailable)?;

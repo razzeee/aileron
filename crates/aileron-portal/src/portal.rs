@@ -194,7 +194,7 @@ impl LanguagePortalBackend {
     ) -> zbus::fdo::Result<()> {
         ensure_portal_frontend(conn, &header).await?;
         ensure_known_session(&self.state, session_id, PortalInterface::Language)?;
-        LanguagePortalBackend::model_loading(&emitter, request_id, session_id, "starting model")
+        LanguagePortalBackend::model_loading(&emitter, request_id, session_id, "preparing model")
             .await
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         prewarm_impl(&self.state, session_id, PortalInterface::Language)
@@ -665,7 +665,7 @@ impl SpeechPortalBackend {
     ) -> zbus::fdo::Result<()> {
         ensure_portal_frontend(conn, &header).await?;
         ensure_known_session(&self.state, session_id, PortalInterface::Speech)?;
-        SpeechPortalBackend::model_loading(&emitter, request_id, session_id, "starting model")
+        SpeechPortalBackend::model_loading(&emitter, request_id, session_id, "preparing model")
             .await
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         prewarm_impl(&self.state, session_id, PortalInterface::Speech)
@@ -811,7 +811,7 @@ impl VisionPortalBackend {
     ) -> zbus::fdo::Result<()> {
         ensure_portal_frontend(conn, &header).await?;
         ensure_known_session(&self.state, session_id, PortalInterface::Vision)?;
-        VisionPortalBackend::model_loading(&emitter, request_id, session_id, "starting model")
+        VisionPortalBackend::model_loading(&emitter, request_id, session_id, "preparing model")
             .await
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         prewarm_impl(&self.state, session_id, PortalInterface::Vision)
@@ -1292,18 +1292,10 @@ impl LanguagePortalBackend {
         session_id: &str,
         emitter: &SignalEmitter<'_>,
     ) -> zbus::fdo::Result<()> {
-        let record = ensure_known_session(&self.state, session_id, PortalInterface::Language)?;
-        let is_warm = self
-            .state
-            .warm_profiles
-            .lock()
-            .unwrap()
-            .contains(&record.profile_id);
-        if !is_warm {
-            LanguagePortalBackend::model_loading(emitter, request_id, session_id, "starting model")
-                .await
-                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-        }
+        ensure_known_session(&self.state, session_id, PortalInterface::Language)?;
+        LanguagePortalBackend::model_loading(emitter, request_id, session_id, "preparing model")
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         Ok(())
     }
 
@@ -1328,18 +1320,10 @@ impl SpeechPortalBackend {
         session_id: &str,
         emitter: &SignalEmitter<'_>,
     ) -> zbus::fdo::Result<()> {
-        let record = ensure_known_session(&self.state, session_id, PortalInterface::Speech)?;
-        let is_warm = self
-            .state
-            .warm_profiles
-            .lock()
-            .unwrap()
-            .contains(&record.profile_id);
-        if !is_warm {
-            SpeechPortalBackend::model_loading(emitter, request_id, session_id, "starting model")
-                .await
-                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-        }
+        ensure_known_session(&self.state, session_id, PortalInterface::Speech)?;
+        SpeechPortalBackend::model_loading(emitter, request_id, session_id, "preparing model")
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         Ok(())
     }
 
@@ -1364,18 +1348,10 @@ impl VisionPortalBackend {
         session_id: &str,
         emitter: &SignalEmitter<'_>,
     ) -> zbus::fdo::Result<()> {
-        let record = ensure_known_session(&self.state, session_id, PortalInterface::Vision)?;
-        let is_warm = self
-            .state
-            .warm_profiles
-            .lock()
-            .unwrap()
-            .contains(&record.profile_id);
-        if !is_warm {
-            VisionPortalBackend::model_loading(emitter, request_id, session_id, "starting model")
-                .await
-                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-        }
+        ensure_known_session(&self.state, session_id, PortalInterface::Vision)?;
+        VisionPortalBackend::model_loading(emitter, request_id, session_id, "preparing model")
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         Ok(())
     }
 
