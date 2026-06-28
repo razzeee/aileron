@@ -54,7 +54,7 @@ type VisionSegment (
 method GetUseCaseAvailability(app_id: string, use_case: string) -> (availability: ModelAvailability)
 
 # Create an inference session with stable system instructions.
-method CreateSession(app_id: string, use_case: string, instructions: string) -> (session_id: string)
+method CreateSession(app_id: string, use_case: string, instructions: string) -> (session_id: string, profile_id: string)
 
 # Start the backing container before the first user-visible response.
 method Prewarm(session_id: string) -> ()

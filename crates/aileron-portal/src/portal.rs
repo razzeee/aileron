@@ -31,7 +31,7 @@ pub async fn run() -> Result<()> {
 
 #[derive(Default)]
 struct PortalState {
-    warm: Mutex<HashSet<String>>,
+    warm_profiles: Mutex<HashSet<String>>,
     sessions: Mutex<HashMap<String, SessionRecord>>,
 }
 
@@ -54,7 +54,7 @@ impl PortalInterface {
 
 #[derive(Debug, Clone)]
 struct SessionRecord {
-    use_case: String,
+    profile_id: String,
     interface: PortalInterface,
 }
 
@@ -191,14 +191,18 @@ impl LanguagePortalBackend {
     ) -> zbus::fdo::Result<()> {
         ensure_portal_frontend(conn, &header).await?;
         ensure_known_session(&self.state, session_id, PortalInterface::Language)?;
-        LanguagePortalBackend::model_loading(&emitter, "starting model")
+        LanguagePortalBackend::model_loading(&emitter, session_id, "starting model")
             .await
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         prewarm_impl(&self.state, session_id, PortalInterface::Language)
     }
 
     #[zbus(signal)]
-    async fn model_loading(emitter: &SignalEmitter<'_>, message: &str) -> zbus::Result<()>;
+    async fn model_loading(
+        emitter: &SignalEmitter<'_>,
+        session_id: &str,
+        message: &str,
+    ) -> zbus::Result<()>;
 
     async fn stream_response(
         &self,
@@ -356,6 +360,7 @@ impl LanguagePortalBackend {
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
 
         let mut pending_snapshot: Option<String> = None;
+        let mut emitted_terminal_tool_calls = false;
         for reply in iter {
             let reply = reply.map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
             let snapshot = reply.snapshot_json;
@@ -366,6 +371,8 @@ impl LanguagePortalBackend {
                 .collect::<Vec<_>>();
 
             if !tool_calls.is_empty() {
+                pending_snapshot = None;
+                emitted_terminal_tool_calls = true;
                 LanguagePortalBackend::guided_tool_calls_received(
                     &emitter,
                     &session_id,
@@ -389,10 +396,17 @@ impl LanguagePortalBackend {
             }
         }
 
-        if let Some(snapshot) = pending_snapshot {
-            LanguagePortalBackend::guided_snapshot_received(&emitter, &session_id, &snapshot, true)
+        if !emitted_terminal_tool_calls {
+            if let Some(snapshot) = pending_snapshot {
+                LanguagePortalBackend::guided_snapshot_received(
+                    &emitter,
+                    &session_id,
+                    &snapshot,
+                    true,
+                )
                 .await
                 .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            }
         }
 
         self.mark_warm(&session_id);
@@ -458,6 +472,7 @@ impl LanguagePortalBackend {
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
 
         let mut pending_snapshot: Option<String> = None;
+        let mut emitted_terminal_tool_calls = false;
         for reply in iter {
             let reply = reply.map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
             let snapshot = reply.snapshot_json;
@@ -468,6 +483,8 @@ impl LanguagePortalBackend {
                 .collect::<Vec<_>>();
 
             if !tool_calls.is_empty() {
+                pending_snapshot = None;
+                emitted_terminal_tool_calls = true;
                 LanguagePortalBackend::guided_tool_calls_received(
                     &emitter,
                     &session_id,
@@ -491,10 +508,17 @@ impl LanguagePortalBackend {
             }
         }
 
-        if let Some(snapshot) = pending_snapshot {
-            LanguagePortalBackend::guided_snapshot_received(&emitter, &session_id, &snapshot, true)
+        if !emitted_terminal_tool_calls {
+            if let Some(snapshot) = pending_snapshot {
+                LanguagePortalBackend::guided_snapshot_received(
+                    &emitter,
+                    &session_id,
+                    &snapshot,
+                    true,
+                )
                 .await
                 .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            }
         }
 
         self.mark_warm(&session_id);
@@ -603,14 +627,18 @@ impl SpeechPortalBackend {
     ) -> zbus::fdo::Result<()> {
         ensure_portal_frontend(conn, &header).await?;
         ensure_known_session(&self.state, session_id, PortalInterface::Speech)?;
-        SpeechPortalBackend::model_loading(&emitter, "starting model")
+        SpeechPortalBackend::model_loading(&emitter, session_id, "starting model")
             .await
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         prewarm_impl(&self.state, session_id, PortalInterface::Speech)
     }
 
     #[zbus(signal)]
-    async fn model_loading(emitter: &SignalEmitter<'_>, message: &str) -> zbus::Result<()>;
+    async fn model_loading(
+        emitter: &SignalEmitter<'_>,
+        session_id: &str,
+        message: &str,
+    ) -> zbus::Result<()>;
 
     async fn stream_transcribe(
         &self,
@@ -736,14 +764,18 @@ impl VisionPortalBackend {
     ) -> zbus::fdo::Result<()> {
         ensure_portal_frontend(conn, &header).await?;
         ensure_known_session(&self.state, session_id, PortalInterface::Vision)?;
-        VisionPortalBackend::model_loading(&emitter, "starting model")
+        VisionPortalBackend::model_loading(&emitter, session_id, "starting model")
             .await
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         prewarm_impl(&self.state, session_id, PortalInterface::Vision)
     }
 
     #[zbus(signal)]
-    async fn model_loading(emitter: &SignalEmitter<'_>, message: &str) -> zbus::Result<()>;
+    async fn model_loading(
+        emitter: &SignalEmitter<'_>,
+        session_id: &str,
+        message: &str,
+    ) -> zbus::Result<()>;
 
     async fn stream_describe(
         &self,
@@ -1008,7 +1040,7 @@ fn create_session_impl(
     state.sessions.lock().unwrap().insert(
         reply.session_id.clone(),
         SessionRecord {
-            use_case: use_case.to_string(),
+            profile_id: reply.profile_id,
             interface,
         },
     );
@@ -1017,10 +1049,6 @@ fn create_session_impl(
 
 fn session_record(state: &PortalState, session_id: &str) -> Option<SessionRecord> {
     state.sessions.lock().unwrap().get(session_id).cloned()
-}
-
-fn session_use_case(state: &PortalState, session_id: &str) -> Option<String> {
-    session_record(state, session_id).map(|record| record.use_case)
 }
 
 fn ensure_known_session(
@@ -1057,8 +1085,12 @@ fn prewarm_impl(
         .call()
         .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
 
-    if let Some(use_case) = session_use_case(state, session_id) {
-        state.warm.lock().unwrap().insert(use_case);
+    if let Some(record) = session_record(state, session_id) {
+        state
+            .warm_profiles
+            .lock()
+            .unwrap()
+            .insert(record.profile_id);
     }
     Ok(())
 }
@@ -1136,11 +1168,15 @@ impl LanguagePortalBackend {
         session_id: &str,
         emitter: &SignalEmitter<'_>,
     ) -> zbus::fdo::Result<()> {
-        let use_case =
-            ensure_known_session(&self.state, session_id, PortalInterface::Language)?.use_case;
-        let is_warm = self.state.warm.lock().unwrap().contains(&use_case);
+        let record = ensure_known_session(&self.state, session_id, PortalInterface::Language)?;
+        let is_warm = self
+            .state
+            .warm_profiles
+            .lock()
+            .unwrap()
+            .contains(&record.profile_id);
         if !is_warm {
-            LanguagePortalBackend::model_loading(emitter, "starting model")
+            LanguagePortalBackend::model_loading(emitter, session_id, "starting model")
                 .await
                 .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         }
@@ -1148,15 +1184,15 @@ impl LanguagePortalBackend {
     }
 
     fn mark_warm(&self, session_id: &str) {
-        if let Some(use_case) = self
+        if let Some(profile_id) = self
             .state
             .sessions
             .lock()
             .unwrap()
             .get(session_id)
-            .map(|record| record.use_case.clone())
+            .map(|record| record.profile_id.clone())
         {
-            self.state.warm.lock().unwrap().insert(use_case);
+            self.state.warm_profiles.lock().unwrap().insert(profile_id);
         }
     }
 }
@@ -1167,11 +1203,15 @@ impl SpeechPortalBackend {
         session_id: &str,
         emitter: &SignalEmitter<'_>,
     ) -> zbus::fdo::Result<()> {
-        let use_case =
-            ensure_known_session(&self.state, session_id, PortalInterface::Speech)?.use_case;
-        let is_warm = self.state.warm.lock().unwrap().contains(&use_case);
+        let record = ensure_known_session(&self.state, session_id, PortalInterface::Speech)?;
+        let is_warm = self
+            .state
+            .warm_profiles
+            .lock()
+            .unwrap()
+            .contains(&record.profile_id);
         if !is_warm {
-            SpeechPortalBackend::model_loading(emitter, "starting model")
+            SpeechPortalBackend::model_loading(emitter, session_id, "starting model")
                 .await
                 .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         }
@@ -1179,15 +1219,15 @@ impl SpeechPortalBackend {
     }
 
     fn mark_warm(&self, session_id: &str) {
-        if let Some(use_case) = self
+        if let Some(profile_id) = self
             .state
             .sessions
             .lock()
             .unwrap()
             .get(session_id)
-            .map(|record| record.use_case.clone())
+            .map(|record| record.profile_id.clone())
         {
-            self.state.warm.lock().unwrap().insert(use_case);
+            self.state.warm_profiles.lock().unwrap().insert(profile_id);
         }
     }
 }
@@ -1198,11 +1238,15 @@ impl VisionPortalBackend {
         session_id: &str,
         emitter: &SignalEmitter<'_>,
     ) -> zbus::fdo::Result<()> {
-        let use_case =
-            ensure_known_session(&self.state, session_id, PortalInterface::Vision)?.use_case;
-        let is_warm = self.state.warm.lock().unwrap().contains(&use_case);
+        let record = ensure_known_session(&self.state, session_id, PortalInterface::Vision)?;
+        let is_warm = self
+            .state
+            .warm_profiles
+            .lock()
+            .unwrap()
+            .contains(&record.profile_id);
         if !is_warm {
-            VisionPortalBackend::model_loading(emitter, "starting model")
+            VisionPortalBackend::model_loading(emitter, session_id, "starting model")
                 .await
                 .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         }
@@ -1210,15 +1254,15 @@ impl VisionPortalBackend {
     }
 
     fn mark_warm(&self, session_id: &str) {
-        if let Some(use_case) = self
+        if let Some(profile_id) = self
             .state
             .sessions
             .lock()
             .unwrap()
             .get(session_id)
-            .map(|record| record.use_case.clone())
+            .map(|record| record.profile_id.clone())
         {
-            self.state.warm.lock().unwrap().insert(use_case);
+            self.state.warm_profiles.lock().unwrap().insert(profile_id);
         }
     }
 }
@@ -1405,7 +1449,7 @@ mod tests {
         state.sessions.lock().unwrap().insert(
             "session-1".to_string(),
             SessionRecord {
-                use_case: "language.summarize".to_string(),
+                profile_id: "profile-1".to_string(),
                 interface: PortalInterface::Language,
             },
         );
