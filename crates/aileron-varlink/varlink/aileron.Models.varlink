@@ -51,10 +51,23 @@ type UseCaseFitScore (
     score: float
 )
 
+type FitScoreComponents (
+    quality: float,
+    speed: float,
+    fit: float,
+    context: float
+)
+
 type CatalogProfileInfo (
     profile_id: string,
     model_id: string,
     llmfit_model_id: string,
+    llmfit_provider: ?string,
+    parameter_count: ?string,
+    quantization: ?string,
+    context_length: ?int,
+    release_date: ?string,
+    capabilities: ?[]string,
     spdx_license: ?string,
     runtime_id: string,
     tier: string,
@@ -65,6 +78,16 @@ type CatalogProfileInfo (
     fit_score: float,
     use_case_fit_scores: []UseCaseFitScore,
     fit_level: string,
+    run_mode: ?string,
+    inference_runtime: ?string,
+    memory_required_gb: ?float,
+    memory_available_gb: ?float,
+    utilization_pct: ?float,
+    estimated_tps: ?float,
+    best_quant: ?string,
+    effective_context_length: ?int,
+    fit_notes: ?[]string,
+    score_components: ?FitScoreComponents,
     recommended: bool,
     installing: bool,
     recommendation_reason: string,

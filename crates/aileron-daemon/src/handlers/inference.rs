@@ -1395,13 +1395,42 @@ fn profile_runtime(
             profile.artifact_path.display()
         ));
     }
+    let runtime_options = profile_runtime_options(profile);
     Ok((
         profile.profile_id.clone(),
         profile.runtime_id.clone(),
         candidates,
         profile.artifact_path.clone(),
-        profile.runtime_options.clone(),
+        runtime_options,
     ))
+}
+
+fn profile_runtime_options(profile: &crate::profiles::Profile) -> HashMap<String, String> {
+    let llmfit_model_id = profile_llmfit_model_id(profile);
+    let mut runtime_options = profile.runtime_options.clone();
+    if crate::container::runtime_supports_llama_runtime_options(&profile.runtime_id) {
+        crate::llmfit_metadata::apply_llama_runtime_options(
+            &llmfit_model_id,
+            &mut runtime_options,
+            &crate::llmfit_metadata::detect_system(),
+        );
+    }
+    runtime_options
+}
+
+fn profile_llmfit_model_id(profile: &crate::profiles::Profile) -> String {
+    if !profile.llmfit_model_id.trim().is_empty() {
+        return profile.llmfit_model_id.clone();
+    }
+    crate::manifests::list_catalog_profiles()
+        .ok()
+        .and_then(|profiles| {
+            profiles
+                .into_iter()
+                .find(|candidate| candidate.profile_id == profile.profile_id)
+        })
+        .map(|candidate| candidate.llmfit_model_id)
+        .unwrap_or_default()
 }
 
 fn resolve_runtime_candidates(
@@ -1728,6 +1757,29 @@ mod tests {
     fn vision_ocr_allows_empty_output() {
         assert!(vision_text_allows_empty_output("vision.ocr"));
         assert!(!vision_text_allows_empty_output("vision.describe"));
+    }
+
+    #[test]
+    fn profile_runtime_options_do_not_apply_llama_options_to_other_runtimes() {
+        let profile = crate::profiles::Profile {
+            profile_id: "test-profile".to_string(),
+            model_id: "test-model".to_string(),
+            llmfit_model_id: "tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf".to_string(),
+            runtime_id: "not-a-llama-runtime".to_string(),
+            runtime_options: std::collections::HashMap::new(),
+            artifact_path: PathBuf::from("/tmp/test-model.gguf"),
+            runtime_images: Vec::new(),
+            use_cases: vec!["language.generate".to_string()],
+            specializations: Vec::new(),
+            artifact_hashes: Vec::new(),
+            installed_at: "2026-01-01T00:00:00Z".to_string(),
+            source: "test".to_string(),
+        };
+
+        let runtime_options = profile_runtime_options(&profile);
+
+        assert!(!runtime_options.contains_key("N_CTX"));
+        assert!(!runtime_options.contains_key("N_GPU_LAYERS"));
     }
 
     #[hegel::test]

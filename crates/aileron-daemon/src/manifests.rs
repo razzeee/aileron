@@ -93,6 +93,7 @@ impl ModelManifest {
         crate::profiles::Profile {
             profile_id: self.profile_id,
             model_id: self.model_id,
+            llmfit_model_id: self.llmfit_model_id,
             runtime_id: self.runtime_id,
             runtime_options: self.runtime_options,
             artifact_path,
@@ -1143,6 +1144,7 @@ mod tests {
         let profile = manifest.into_profile(artifact_path.clone());
 
         assert_eq!(profile.profile_id, "profile");
+        assert_eq!(profile.llmfit_model_id, "llmfit");
         assert_eq!(profile.artifact_path, artifact_path);
         assert_eq!(profile.runtime_options["VISION_HANDLER"], "gemma4");
         assert_eq!(profile.artifact_hashes[0].filename, "model.gguf");

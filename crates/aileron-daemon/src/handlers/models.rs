@@ -21,9 +21,9 @@ use aileron_varlink::aileron_Models::{
     Call_AssignUseCase, Call_CancelInstall, Call_DeleteProfile, Call_InstallManifest,
     Call_InstallUrlProfile, Call_List, Call_ListCatalog, Call_ListInstalls, Call_ListRuntimeImages,
     Call_ListRuntimeManifests, Call_PruneUnusedRuntimeImages, Call_RemoveRuntimeImage,
-    Call_UpdateRuntimeImage, CatalogProfileInfo, InstallProgress, InstallStatus, OciRuntimeImage,
-    ProfileInfo, RuntimeImage, RuntimeImageCleanupError, RuntimeManifestInfo, UseCaseConflict,
-    UseCaseFitScore, VarlinkCallError, VarlinkInterface,
+    Call_UpdateRuntimeImage, CatalogProfileInfo, FitScoreComponents, InstallProgress,
+    InstallStatus, OciRuntimeImage, ProfileInfo, RuntimeImage, RuntimeImageCleanupError,
+    RuntimeManifestInfo, UseCaseConflict, UseCaseFitScore, VarlinkCallError, VarlinkInterface,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -291,6 +291,8 @@ impl VarlinkInterface for ModelsHandler {
                 } else {
                     crate::llmfit_metadata::find(&profile.llmfit_model_id)
                 };
+                let fit_analysis =
+                    metadata.map(|model| llmfit_core::ModelFit::analyze(model, &llmfit_system));
                 let tier = if profile.tier.is_empty() {
                     "balanced".to_string()
                 } else {
@@ -311,11 +313,16 @@ impl VarlinkInterface for ModelsHandler {
                 let has_recommended_memory = memory_gb
                     .map(|gb| recommended_ram_gb <= 0.0 || gb >= recommended_ram_gb)
                     .unwrap_or(recommended_ram_gb <= 0.0);
-                let fit_level = fit_level(
-                    has_enough_memory,
-                    has_recommended_memory,
-                    has_fit_metadata,
-                    metadata.is_some(),
+                let fit_level = fit_analysis.as_ref().map_or_else(
+                    || {
+                        fit_level(
+                            has_enough_memory,
+                            has_recommended_memory,
+                            has_fit_metadata,
+                            metadata.is_some(),
+                        )
+                    },
+                    catalog_fit_level_from_llmfit,
                 );
                 let recommended = fit_level == "recommended";
                 let installing = installing_profiles.contains(&profile.profile_id);
@@ -328,13 +335,36 @@ impl VarlinkInterface for ModelsHandler {
                     .reduce(f64::max)
                     .unwrap_or_else(|| {
                         metadata
-                            .map(|model| crate::llmfit_metadata::fit_score(model, &llmfit_system))
+                            .and_then(|_| fit_analysis.as_ref().map(|fit| fit.score))
                             .unwrap_or(0.0)
                     });
+                let recommendation_reason = fit_analysis.as_ref().map_or_else(
+                    || {
+                        recommendation_reason(CatalogFit {
+                            has_enough_memory,
+                            has_recommended_memory,
+                            has_fit_metadata,
+                            has_llmfit_metadata: metadata.is_some(),
+                            tier: &tier,
+                            memory_gb,
+                            min_ram_gb,
+                            recommended_ram_gb,
+                            min_vram_gb: metadata.and_then(|model| model.min_vram_gb),
+                            variant,
+                        })
+                    },
+                    llmfit_recommendation_reason,
+                );
                 CatalogProfileInfo {
                     profile_id: profile.profile_id,
                     model_id: profile.model_id,
                     llmfit_model_id: profile.llmfit_model_id,
+                    llmfit_provider: metadata.map(|model| model.provider.clone()),
+                    parameter_count: metadata.map(|model| model.parameter_count.clone()),
+                    quantization: metadata.map(|model| model.quantization.clone()),
+                    context_length: metadata.map(|model| i64::from(model.context_length)),
+                    release_date: metadata.and_then(|model| model.release_date.clone()),
+                    capabilities: metadata.map(llmfit_capability_ids),
                     spdx_license: Some(
                         metadata
                             .and_then(|model| model.license.clone())
@@ -349,20 +379,29 @@ impl VarlinkInterface for ModelsHandler {
                     fit_score,
                     use_case_fit_scores,
                     fit_level: fit_level.to_string(),
+                    run_mode: fit_analysis.as_ref().map(llmfit_run_mode_id),
+                    inference_runtime: fit_analysis.as_ref().map(llmfit_inference_runtime_id),
+                    memory_required_gb: fit_analysis
+                        .as_ref()
+                        .map(|fit| finite_or_zero(fit.memory_required_gb)),
+                    memory_available_gb: fit_analysis
+                        .as_ref()
+                        .map(|fit| finite_or_zero(fit.memory_available_gb)),
+                    utilization_pct: fit_analysis
+                        .as_ref()
+                        .map(|fit| finite_or_zero(fit.utilization_pct)),
+                    estimated_tps: fit_analysis
+                        .as_ref()
+                        .map(|fit| finite_or_zero(fit.estimated_tps)),
+                    best_quant: fit_analysis.as_ref().map(|fit| fit.best_quant.clone()),
+                    effective_context_length: fit_analysis
+                        .as_ref()
+                        .map(|fit| i64::from(fit.effective_context_length)),
+                    fit_notes: fit_analysis.as_ref().map(|fit| fit.notes.clone()),
+                    score_components: fit_analysis.as_ref().map(llmfit_score_components),
                     recommended,
                     installing,
-                    recommendation_reason: recommendation_reason(CatalogFit {
-                        has_enough_memory,
-                        has_recommended_memory,
-                        has_fit_metadata,
-                        has_llmfit_metadata: metadata.is_some(),
-                        tier: &tier,
-                        memory_gb,
-                        min_ram_gb,
-                        recommended_ram_gb,
-                        min_vram_gb: metadata.and_then(|model| model.min_vram_gb),
-                        variant,
-                    }),
+                    recommendation_reason,
                     use_cases: profile.use_cases,
                     specializations: Some(profile.specializations),
                 }
@@ -525,6 +564,88 @@ fn fit_level(
     } else {
         "unknown"
     }
+}
+
+fn catalog_fit_level_from_llmfit(fit: &llmfit_core::ModelFit) -> &'static str {
+    match fit.fit_level {
+        llmfit_core::FitLevel::Perfect | llmfit_core::FitLevel::Good => "recommended",
+        llmfit_core::FitLevel::Marginal => "fits_minimum",
+        llmfit_core::FitLevel::TooTight => "too_large",
+    }
+}
+
+fn llmfit_run_mode_id(fit: &llmfit_core::ModelFit) -> String {
+    match fit.run_mode {
+        llmfit_core::RunMode::Gpu => "gpu",
+        llmfit_core::RunMode::MoeOffload => "moe_offload",
+        llmfit_core::RunMode::CpuOffload => "cpu_offload",
+        llmfit_core::RunMode::CpuOnly => "cpu_only",
+        llmfit_core::RunMode::TensorParallel => "tensor_parallel",
+    }
+    .to_string()
+}
+
+fn llmfit_inference_runtime_id(fit: &llmfit_core::ModelFit) -> String {
+    match fit.runtime {
+        llmfit_core::InferenceRuntime::LlamaCpp => "llama_cpp",
+        llmfit_core::InferenceRuntime::Mlx => "mlx",
+        llmfit_core::InferenceRuntime::Vllm => "vllm",
+    }
+    .to_string()
+}
+
+fn llmfit_capability_ids(model: &llmfit_core::LlmModel) -> Vec<String> {
+    llmfit_core::Capability::infer(model)
+        .into_iter()
+        .map(|capability| match capability {
+            llmfit_core::Capability::Vision => "vision".to_string(),
+            llmfit_core::Capability::ToolUse => "tool_use".to_string(),
+            llmfit_core::Capability::Audio => "audio".to_string(),
+        })
+        .collect()
+}
+
+fn llmfit_score_components(fit: &llmfit_core::ModelFit) -> FitScoreComponents {
+    FitScoreComponents {
+        quality: finite_or_zero(fit.score_components.quality),
+        speed: finite_or_zero(fit.score_components.speed),
+        fit: finite_or_zero(fit.score_components.fit),
+        context: finite_or_zero(fit.score_components.context),
+    }
+}
+
+fn finite_or_zero(value: f64) -> f64 {
+    if value.is_finite() { value } else { 0.0 }
+}
+
+fn llmfit_recommendation_reason(fit: &llmfit_core::ModelFit) -> String {
+    let mut reason = format!(
+        "llmfit estimates {} fit via {} on {}: {:.1} GB required of {:.1} GB available",
+        fit.fit_text(),
+        fit.run_mode_text(),
+        fit.runtime_text(),
+        finite_or_zero(fit.memory_required_gb),
+        finite_or_zero(fit.memory_available_gb)
+    );
+    if !fit.best_quant.trim().is_empty() {
+        reason.push_str(&format!(" at {}", fit.best_quant));
+    }
+    let estimated_tps = finite_or_zero(fit.estimated_tps);
+    if estimated_tps > 0.0 {
+        reason.push_str(&format!(", about {:.1} tok/s", estimated_tps));
+    }
+    if fit.effective_context_length > 0 {
+        reason.push_str(&format!(
+            ", estimated at {} context tokens",
+            fit.effective_context_length
+        ));
+    }
+    reason.push('.');
+    if let Some(note) = fit.notes.first().filter(|note| !note.trim().is_empty()) {
+        reason.push(' ');
+        reason.push_str(note);
+    }
+    reason
 }
 
 fn profile_supports_use_case(profile: &Profile, use_case: &str) -> bool {
@@ -2510,6 +2631,7 @@ mod tests {
         Profile {
             profile_id: "profile".to_string(),
             model_id: "model".to_string(),
+            llmfit_model_id: String::new(),
             runtime_id: runtime_id.to_string(),
             runtime_options: HashMap::new(),
             artifact_path: PathBuf::from("/tmp/model"),
@@ -2519,6 +2641,42 @@ mod tests {
             artifact_hashes: Vec::new(),
             installed_at: "2026-06-19T00:00:00Z".to_string(),
             source: "user".to_string(),
+        }
+    }
+
+    fn llmfit_test_manifest() -> ModelManifest {
+        ModelManifest {
+            profile_id: "llama3.2-3b".to_string(),
+            model_id: "llama3.2-3b".to_string(),
+            llmfit_model_id: "meta-llama/Llama-3.2-3B-Instruct".to_string(),
+            runtime_id: "llm-vision-whisper".to_string(),
+            runtime_options: HashMap::new(),
+            tier: "small".to_string(),
+            disk_size_gb: 1.0,
+            min_ram_gb: 1.0,
+            runtime_images: Vec::new(),
+            use_cases: vec!["language.summarize".to_string()],
+            specializations: Vec::new(),
+            artifacts: Vec::new(),
+        }
+    }
+
+    fn cpu_only_system_specs() -> llmfit_core::SystemSpecs {
+        llmfit_core::SystemSpecs {
+            total_ram_gb: 16.0,
+            available_ram_gb: 16.0,
+            total_cpu_cores: 8,
+            cpu_name: "test cpu".to_string(),
+            has_gpu: false,
+            gpu_vram_gb: None,
+            total_gpu_vram_gb: None,
+            gpu_name: None,
+            gpu_count: 0,
+            unified_memory: false,
+            backend: llmfit_core::GpuBackend::CpuX86,
+            gpus: Vec::new(),
+            cluster_mode: false,
+            cluster_node_count: 1,
         }
     }
 
@@ -2537,6 +2695,54 @@ mod tests {
             profile_with_runtime_and_use_cases("llm-vision-whisper", &["speech.transcribe"]);
 
         assert!(profile_supports_use_case(&profile, "speech.translate"));
+    }
+
+    #[test]
+    fn llmfit_runtime_options_set_context_and_cpu_only_layers() {
+        let mut manifest = llmfit_test_manifest();
+        let system = cpu_only_system_specs();
+
+        crate::llmfit_metadata::apply_llama_runtime_options(
+            &manifest.llmfit_model_id,
+            &mut manifest.runtime_options,
+            &system,
+        );
+
+        assert_eq!(
+            manifest.runtime_options.get("N_CTX"),
+            Some(&"8192".to_string())
+        );
+        assert_eq!(
+            manifest.runtime_options.get("N_GPU_LAYERS"),
+            Some(&"0".to_string())
+        );
+    }
+
+    #[test]
+    fn llmfit_runtime_options_preserve_manifest_overrides() {
+        let mut manifest = llmfit_test_manifest();
+        manifest
+            .runtime_options
+            .insert("N_CTX".to_string(), "2048".to_string());
+        manifest
+            .runtime_options
+            .insert("N_GPU_LAYERS".to_string(), "12".to_string());
+        let system = cpu_only_system_specs();
+
+        crate::llmfit_metadata::apply_llama_runtime_options(
+            &manifest.llmfit_model_id,
+            &mut manifest.runtime_options,
+            &system,
+        );
+
+        assert_eq!(
+            manifest.runtime_options.get("N_CTX"),
+            Some(&"2048".to_string())
+        );
+        assert_eq!(
+            manifest.runtime_options.get("N_GPU_LAYERS"),
+            Some(&"12".to_string())
+        );
     }
 
     #[hegel::test]

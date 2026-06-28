@@ -262,6 +262,12 @@ struct ProfileDetails {
 struct CatalogProfileDetails {
     profile_id: String,
     model_id: String,
+    llmfit_provider: String,
+    parameter_count: String,
+    quantization: String,
+    context_length: i64,
+    release_date: String,
+    capabilities: Vec<String>,
     spdx_license: String,
     runtime_id: String,
     tier: String,
@@ -271,6 +277,19 @@ struct CatalogProfileDetails {
     min_vram_gb: f64,
     fit_score: f64,
     fit_level: String,
+    run_mode: String,
+    inference_runtime: String,
+    memory_required_gb: f64,
+    memory_available_gb: f64,
+    utilization_pct: f64,
+    estimated_tps: f64,
+    best_quant: String,
+    effective_context_length: i64,
+    fit_notes: Vec<String>,
+    score_quality: f64,
+    score_speed: f64,
+    score_fit: f64,
+    score_context: f64,
     recommended: bool,
     installing: bool,
     recommendation_reason: String,
@@ -459,9 +478,23 @@ fn render_library_list(
         ));
         row.set_tooltip_text(Some(&recommendation_reason));
 
+        let score_components = profile.score_components.unwrap_or({
+            aileron_varlink::aileron_Models::FitScoreComponents {
+                quality: 0.0,
+                speed: 0.0,
+                fit: 0.0,
+                context: 0.0,
+            }
+        });
         let details = CatalogProfileDetails {
             profile_id: profile.profile_id.clone(),
             model_id: profile.model_id,
+            llmfit_provider: profile.llmfit_provider.unwrap_or_default(),
+            parameter_count: profile.parameter_count.unwrap_or_default(),
+            quantization: profile.quantization.unwrap_or_default(),
+            context_length: profile.context_length.unwrap_or_default(),
+            release_date: profile.release_date.unwrap_or_default(),
+            capabilities: profile.capabilities.unwrap_or_default(),
             spdx_license: profile.spdx_license.unwrap_or_default(),
             runtime_id: profile.runtime_id,
             tier: profile.tier,
@@ -471,6 +504,19 @@ fn render_library_list(
             min_vram_gb: profile.min_vram_gb,
             fit_score: profile.fit_score,
             fit_level: profile.fit_level,
+            run_mode: profile.run_mode.unwrap_or_default(),
+            inference_runtime: profile.inference_runtime.unwrap_or_default(),
+            memory_required_gb: profile.memory_required_gb.unwrap_or_default(),
+            memory_available_gb: profile.memory_available_gb.unwrap_or_default(),
+            utilization_pct: profile.utilization_pct.unwrap_or_default(),
+            estimated_tps: profile.estimated_tps.unwrap_or_default(),
+            best_quant: profile.best_quant.unwrap_or_default(),
+            effective_context_length: profile.effective_context_length.unwrap_or_default(),
+            fit_notes: profile.fit_notes.unwrap_or_default(),
+            score_quality: score_components.quality,
+            score_speed: score_components.speed,
+            score_fit: score_components.fit,
+            score_context: score_components.context,
             recommended: profile.recommended,
             installing: profile.installing,
             recommendation_reason,
@@ -505,11 +551,37 @@ fn show_catalog_profile_details(window: Option<&gtk4::Window>, details: &Catalog
     list.set_selection_mode(gtk4::SelectionMode::None);
     list.add_css_class("boxed-list");
     add_detail_row(&list, "Model", &details.model_id);
+    if !details.llmfit_provider.is_empty() {
+        add_detail_row(&list, "Provider", &details.llmfit_provider);
+    }
+    if !details.parameter_count.is_empty() {
+        add_detail_row(&list, "Parameters", &details.parameter_count);
+    }
     if !details.spdx_license.is_empty() {
         add_detail_row(&list, "License", &details.spdx_license);
     }
+    if !details.release_date.is_empty() {
+        add_detail_row(&list, "Release date", &details.release_date);
+    }
+    if !details.capabilities.is_empty() {
+        add_detail_row(
+            &list,
+            "Capabilities",
+            &capability_labels(&details.capabilities),
+        );
+    }
     add_detail_row(&list, "Runtime", &details.runtime_id);
     add_detail_row(&list, "Tier", &details.tier);
+    if !details.quantization.is_empty() {
+        add_detail_row(&list, "Published quant", &details.quantization);
+    }
+    if details.context_length > 0 {
+        add_detail_row(
+            &list,
+            "Context length",
+            &format_tokens(details.context_length),
+        );
+    }
     add_detail_row(&list, "Install size", &format_size(details.disk_size_gb));
     add_detail_row(
         &list,
@@ -533,6 +605,46 @@ fn show_catalog_profile_details(window: Option<&gtk4::Window>, details: &Catalog
     if details.fit_score > 0.0 {
         add_detail_row(&list, "Fit", &fit_score_label(details.fit_score).unwrap());
     }
+    if !details.run_mode.is_empty() || !details.inference_runtime.is_empty() {
+        add_detail_row(&list, "Run path", &fit_run_path(details));
+    }
+    if details.memory_required_gb > 0.0 || details.memory_available_gb > 0.0 {
+        add_detail_row(
+            &list,
+            "Estimated memory",
+            &format!(
+                "{:.1} GB required / {:.1} GB available",
+                details.memory_required_gb, details.memory_available_gb
+            ),
+        );
+    }
+    if details.utilization_pct > 0.0 {
+        add_detail_row(
+            &list,
+            "Memory use",
+            &format!("{:.0}%", details.utilization_pct),
+        );
+    }
+    if details.estimated_tps > 0.0 {
+        add_detail_row(
+            &list,
+            "Estimated speed",
+            &format!("{:.1} tok/s", details.estimated_tps),
+        );
+    }
+    if !details.best_quant.is_empty() {
+        add_detail_row(&list, "Best quant", &details.best_quant);
+    }
+    if details.effective_context_length > 0 {
+        add_detail_row(
+            &list,
+            "Estimation context",
+            &format_tokens(details.effective_context_length),
+        );
+    }
+    if catalog_score_components_present(details) {
+        add_detail_row(&list, "Score breakdown", &score_component_summary(details));
+    }
     add_detail_row(
         &list,
         "Recommendation",
@@ -548,6 +660,10 @@ fn show_catalog_profile_details(window: Option<&gtk4::Window>, details: &Catalog
         "Supported use-cases",
         &join_or_none(&details.use_cases),
     );
+    let fit_notes = non_empty_notes(&details.fit_notes);
+    if !fit_notes.is_empty() {
+        add_detail_row(&list, "Fit notes", &fit_notes);
+    }
 
     let scrolled = ScrolledWindow::builder()
         .min_content_width(520)
@@ -649,6 +765,92 @@ fn fit_score_label(score: f64) -> Option<String> {
     } else {
         None
     }
+}
+
+fn capability_labels(capabilities: &[String]) -> String {
+    capabilities
+        .iter()
+        .map(|capability| capability_label(capability).to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn capability_label(capability: &str) -> &str {
+    match capability {
+        "vision" => "Vision",
+        "tool_use" => "Tool use",
+        "audio" => "Audio",
+        _ => capability,
+    }
+}
+
+fn format_tokens(tokens: i64) -> String {
+    if tokens >= 1000 {
+        format!("{}k tokens", tokens / 1000)
+    } else {
+        format!("{tokens} tokens")
+    }
+}
+
+fn fit_run_path(details: &CatalogProfileDetails) -> String {
+    match (
+        details.run_mode.trim().is_empty(),
+        details.inference_runtime.trim().is_empty(),
+    ) {
+        (false, false) => format!(
+            "{} on {}",
+            run_mode_label(&details.run_mode),
+            inference_runtime_label(&details.inference_runtime)
+        ),
+        (false, true) => run_mode_label(&details.run_mode).to_string(),
+        (true, false) => inference_runtime_label(&details.inference_runtime).to_string(),
+        (true, true) => String::new(),
+    }
+}
+
+fn run_mode_label(run_mode: &str) -> &str {
+    match run_mode {
+        "gpu" => "GPU",
+        "moe_offload" => "MoE offload",
+        "cpu_offload" => "CPU offload",
+        "cpu_only" => "CPU-only",
+        "tensor_parallel" => "Tensor parallel",
+        _ => run_mode,
+    }
+}
+
+fn inference_runtime_label(runtime: &str) -> &str {
+    match runtime {
+        "llama_cpp" => "llama.cpp",
+        "mlx" => "MLX",
+        "vllm" => "vLLM",
+        _ => runtime,
+    }
+}
+
+fn catalog_score_components_present(details: &CatalogProfileDetails) -> bool {
+    details.score_quality > 0.0
+        || details.score_speed > 0.0
+        || details.score_fit > 0.0
+        || details.score_context > 0.0
+}
+
+fn score_component_summary(details: &CatalogProfileDetails) -> String {
+    format!(
+        "Quality {:.0}, speed {:.0}, fit {:.0}, context {:.0}",
+        details.score_quality, details.score_speed, details.score_fit, details.score_context
+    )
+}
+
+fn non_empty_notes(notes: &[String]) -> String {
+    notes
+        .iter()
+        .filter_map(|note| {
+            let note = note.trim();
+            (!note.is_empty()).then_some(note)
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn format_size(gb: f64) -> String {
@@ -2455,6 +2657,12 @@ mod tests {
             profile_id: profile_id.to_string(),
             model_id: profile_id.to_string(),
             llmfit_model_id: String::new(),
+            llmfit_provider: Some(String::new()),
+            parameter_count: Some(String::new()),
+            quantization: Some(String::new()),
+            context_length: Some(0),
+            release_date: Some(String::new()),
+            capabilities: Some(Vec::new()),
             spdx_license: Some(String::new()),
             runtime_id: "llm-vision-whisper".to_string(),
             tier: tier.to_string(),
@@ -2465,6 +2673,21 @@ mod tests {
             fit_score: 0.0,
             use_case_fit_scores: Vec::new(),
             fit_level: "fits_minimum".to_string(),
+            run_mode: Some(String::new()),
+            inference_runtime: Some(String::new()),
+            memory_required_gb: Some(0.0),
+            memory_available_gb: Some(0.0),
+            utilization_pct: Some(0.0),
+            estimated_tps: Some(0.0),
+            best_quant: Some(String::new()),
+            effective_context_length: Some(0),
+            fit_notes: Some(Vec::new()),
+            score_components: Some(aileron_varlink::aileron_Models::FitScoreComponents {
+                quality: 0.0,
+                speed: 0.0,
+                fit: 0.0,
+                context: 0.0,
+            }),
             recommended: false,
             installing: false,
             recommendation_reason: String::new(),

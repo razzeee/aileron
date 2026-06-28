@@ -1799,7 +1799,7 @@ fn runtime_spawn_attempts(
         });
 
         if !is_gpu_variant(candidate.variant)
-            || !runtime_supports_gpu_layer_offload(runtime_id)
+            || !runtime_supports_llama_runtime_options(runtime_id)
             || runtime_options.contains_key("N_GPU_LAYERS")
         {
             continue;
@@ -1822,7 +1822,7 @@ fn is_gpu_variant(variant: Variant) -> bool {
     matches!(variant, Variant::Cuda | Variant::Rocm | Variant::Vulkan)
 }
 
-fn runtime_supports_gpu_layer_offload(runtime_id: &str) -> bool {
+pub(crate) fn runtime_supports_llama_runtime_options(runtime_id: &str) -> bool {
     runtime_id == ML_RUNTIME_ID
 }
 

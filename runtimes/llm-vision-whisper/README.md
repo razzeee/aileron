@@ -102,7 +102,7 @@ Use digest-pinned refs, such as `image@sha256:...`, for distribution manifests.
 |---|---|---|
 | `MODEL_PATH` | derived from `/model/model.bin` or `/model/model.gguf` | Mounted model path |
 | `MMPROJ_PATH` | `/model/mmproj.gguf` | Projection file that selects the vision runtime when present |
-| `N_CTX` | `4096` | llama.cpp context window size |
-| `N_GPU_LAYERS` | `0` | llama.cpp layers to offload; daemon starts GPU variants at `-1` and retries lower values unless explicitly set |
+| `N_CTX` | `4096`, or llmfit's effective context for llmfit-backed GGUF profiles | llama.cpp context window size |
+| `N_GPU_LAYERS` | `0` on CPU; `-1` on GPU variants unless llmfit selects CPU-only or the manifest sets an explicit value | llama.cpp layers to offload; daemon starts GPU variants at `-1` and retries lower values unless explicitly set |
 | `N_THREADS` | all cores on CPU, up to 4 on accelerators | CPU helper threads used by llama.cpp and whisper.cpp |
 | `AILERON_DEVICE` | `cpu` | Device selected by the daemon (`cpu`, `cuda`, `rocm`, or `vulkan`) |

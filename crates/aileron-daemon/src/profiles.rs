@@ -35,6 +35,8 @@ pub struct ArtifactHash {
 pub struct Profile {
     pub profile_id: String,
     pub model_id: String,
+    #[serde(default)]
+    pub llmfit_model_id: String,
     pub runtime_id: String,
     #[serde(default)]
     pub runtime_options: HashMap<String, String>,
@@ -327,6 +329,7 @@ mod tests {
         Profile {
             profile_id: "profile".to_string(),
             model_id: "model".to_string(),
+            llmfit_model_id: String::new(),
             runtime_id: "runtime".to_string(),
             runtime_options: HashMap::new(),
             artifact_path: PathBuf::from("/tmp/model"),

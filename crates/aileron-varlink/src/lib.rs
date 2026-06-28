@@ -88,9 +88,11 @@ mod tests {
                 "recommendation_reason": "test",
                 "use_cases": ["language.extract"]
             }))
-            .expect("missing spdx_license should decode from older daemons");
+            .expect("missing optional catalog fields should decode from older daemons");
 
         assert_eq!(profile.spdx_license, None);
+        assert!(profile.llmfit_provider.is_none());
+        assert!(profile.score_components.is_none());
     }
 
     #[hegel::test]
@@ -105,6 +107,12 @@ mod tests {
             "profile_id": "profile",
             "model_id": "model",
             "llmfit_model_id": "",
+            "llmfit_provider": "",
+            "parameter_count": "",
+            "quantization": "",
+            "context_length": 0,
+            "release_date": "",
+            "capabilities": [],
             "runtime_id": "llm-vision-whisper",
             "tier": "balanced",
             "disk_size_gb": 1.0,
@@ -114,6 +122,21 @@ mod tests {
             "fit_score": 0.0,
             "use_case_fit_scores": [],
             "fit_level": "recommended",
+            "run_mode": "",
+            "inference_runtime": "",
+            "memory_required_gb": 0.0,
+            "memory_available_gb": 0.0,
+            "utilization_pct": 0.0,
+            "estimated_tps": 0.0,
+            "best_quant": "",
+            "effective_context_length": 0,
+            "fit_notes": [],
+            "score_components": {
+                "quality": 0.0,
+                "speed": 0.0,
+                "fit": 0.0,
+                "context": 0.0
+            },
             "recommended": true,
             "installing": false,
             "recommendation_reason": "test",
