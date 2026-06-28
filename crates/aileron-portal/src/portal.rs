@@ -208,6 +208,7 @@ impl LanguagePortalBackend {
         message: &str,
     ) -> zbus::Result<()>;
 
+    #[allow(clippy::too_many_arguments)]
     async fn stream_response(
         &self,
         request_id: &str,
@@ -274,6 +275,7 @@ impl LanguagePortalBackend {
         done: bool,
     ) -> zbus::Result<()>;
 
+    #[allow(clippy::too_many_arguments)]
     async fn stream_predict_next(
         &self,
         request_id: &str,
@@ -679,6 +681,7 @@ impl SpeechPortalBackend {
         message: &str,
     ) -> zbus::Result<()>;
 
+    #[allow(clippy::too_many_arguments)]
     async fn stream_transcribe(
         &self,
         request_id: &str,
