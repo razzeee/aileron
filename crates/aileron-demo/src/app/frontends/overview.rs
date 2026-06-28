@@ -23,7 +23,7 @@ pub(crate) fn build_page(stack: &ViewStack) -> gtk4::Widget {
     cards.append(&lab_card(
         "Chat Lab",
         "Run chat-shaped turns through guided language.extract responses with local memory.",
-        "StreamRespondGuided, CreateSession, EndSession",
+        "CreateSession, StreamRespondGuided, Session.Close",
         "Try: tell it a preference, then ask a follow-up that uses memory.",
         "Open Chat Lab",
         "chat",
@@ -50,7 +50,7 @@ pub(crate) fn build_page(stack: &ViewStack) -> gtk4::Widget {
     cards.append(&lab_card(
         "Tool Lab",
         "Run tiny agent loops where the model asks for app-owned tools, including whole-PC Linux diagnostics.",
-        "CreateSession, StreamRespondGuided, EndSession",
+        "CreateSession, StreamRespondGuided, Session.Close",
         "Try: collect read-only PC diagnostics and ask for safe bugfix guidance.",
         "Open Tool Lab",
         "tools",

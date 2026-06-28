@@ -137,7 +137,7 @@ impl VarlinkInterface for InferenceHandler {
     ) -> varlink::Result<()> {
         self.rt.block_on(async {
             match create_session_record(&self.state, app_id, use_case, instructions).await {
-                Ok(session_id) => call.reply(session_id),
+                Ok((session_id, profile_id)) => call.reply(session_id, profile_id),
                 Err(CreateSessionError::PermissionDenied(app_id, use_case)) => {
                     call.reply_permission_denied(app_id, use_case)
                 }
@@ -418,7 +418,7 @@ async fn create_session_record(
     app_id: String,
     use_case: String,
     instructions: String,
-) -> Result<String, CreateSessionError> {
+) -> Result<(String, String), CreateSessionError> {
     let mut guard = state.0.lock().await;
 
     if !guard.config.allow_all {
@@ -458,12 +458,12 @@ async fn create_session_record(
         session_id: session_id.clone(),
         app_id,
         use_case,
-        profile_id,
+        profile_id: profile_id.clone(),
         instructions,
         started_at: chrono::Utc::now(),
     };
     guard.sessions.insert(session_id.clone(), session);
-    Ok(session_id)
+    Ok((session_id, profile_id))
 }
 
 fn assigned_profile_id_for_use_case(guard: &crate::state::Inner, use_case: &str) -> Option<String> {
