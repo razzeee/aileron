@@ -21,6 +21,7 @@ use zbus::zvariant::{OwnedObjectPath, OwnedValue, Type, Value};
 const PORTAL_BUS: &str = "org.freedesktop.portal.Desktop";
 const PORTAL_PATH: &str = "/org/freedesktop/portal/desktop";
 const LANGUAGE_IFACE: &str = "org.freedesktop.portal.Language";
+const REQUEST_IFACE: &str = "org.freedesktop.portal.Request";
 const SESSION_IFACE: &str = "org.freedesktop.portal.Session";
 const SPEECH_IFACE: &str = "org.freedesktop.portal.Speech";
 const VISION_IFACE: &str = "org.freedesktop.portal.Vision";
@@ -85,8 +86,42 @@ fn create_public_session(
     proxy: &zbus::blocking::Proxy<'_>,
     use_case: &str,
     instructions: &str,
-) -> zbus::Result<OwnedObjectPath> {
-    proxy.call("CreateSession", &(use_case, instructions, empty_options()))
+) -> anyhow::Result<OwnedObjectPath> {
+    let request_handle: OwnedObjectPath =
+        proxy.call("CreateSession", &(use_case, instructions, empty_options()))?;
+    let mut results = wait_request_response(&request_handle)?;
+    let session_handle = results
+        .remove("session_handle")
+        .ok_or_else(|| anyhow::anyhow!("CreateSession response omitted session_handle"))?;
+    OwnedObjectPath::try_from(session_handle)
+        .map_err(|e| anyhow::anyhow!("CreateSession returned invalid session handle: {e}"))
+}
+
+fn wait_request_response(
+    request_handle: &OwnedObjectPath,
+) -> anyhow::Result<HashMap<String, OwnedValue>> {
+    let conn = portal_connection()?;
+    let proxy =
+        zbus::blocking::Proxy::new(&conn, PORTAL_BUS, request_handle.as_str(), REQUEST_IFACE)?;
+    let mut response_iter = proxy.receive_signal("Response")?;
+    let msg = response_iter
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("request closed without a Response signal"))?;
+    let (response, results): (u32, HashMap<String, OwnedValue>) = msg.body().deserialize()?;
+
+    if response != 0 {
+        let message = results
+            .get("error")
+            .and_then(|value| String::try_from(value.clone()).ok())
+            .unwrap_or_else(|| format!("portal request failed with response {response}"));
+        anyhow::bail!(message);
+    }
+
+    Ok(results)
+}
+
+fn wait_request_success(request_handle: &OwnedObjectPath) -> anyhow::Result<()> {
+    wait_request_response(request_handle).map(|_| ())
 }
 
 fn close_public_session(session_handle: &OwnedObjectPath) -> zbus::Result<()> {
@@ -926,8 +961,9 @@ fn summarize_streaming(text: &str, tx: std::sync::mpsc::Sender<DemoEvent>) -> an
     let tx_loading = tx.clone();
     std::thread::spawn(move || {
         for msg in &mut loading_iter {
-            if let Ok((sig_session, message)) =
-                msg.body().deserialize::<(OwnedObjectPath, String)>()
+            if let Ok((_sig_request, sig_session, message)) =
+                msg.body()
+                    .deserialize::<(OwnedObjectPath, OwnedObjectPath, String)>()
                 && sig_session.as_str() == loading_session_handle.as_str()
             {
                 let _ = tx_loading.send(DemoEvent::Status(message));
@@ -950,8 +986,12 @@ fn summarize_streaming(text: &str, tx: std::sync::mpsc::Sender<DemoEvent>) -> an
         let result = (|| -> anyhow::Result<()> {
             for msg in &mut token_iter {
                 let body = msg.body();
-                let (sig_session, token, done): (OwnedObjectPath, String, bool) =
-                    body.deserialize()?;
+                let (_sig_request, sig_session, token, done): (
+                    OwnedObjectPath,
+                    OwnedObjectPath,
+                    String,
+                    bool,
+                ) = body.deserialize()?;
                 if sig_session.as_str() != token_session_handle.as_str() {
                     continue;
                 }
@@ -967,15 +1007,19 @@ fn summarize_streaming(text: &str, tx: std::sync::mpsc::Sender<DemoEvent>) -> an
 
     let options = generation_options(512, 0.7, "default", "", "");
     tx.send(DemoEvent::Phase(DemoPhase::RequestingStream))?;
-    let stream_result: zbus::Result<()> =
+    let stream_result: zbus::Result<OwnedObjectPath> =
         proxy.call("StreamResponse", &(&session_handle, &prompt, options));
-    if let Err(error) = stream_result {
-        let _ = close_public_session(&session_handle);
-        return Err(error.into());
-    }
+    let request_handle = match stream_result {
+        Ok(handle) => handle,
+        Err(error) => {
+            let _ = close_public_session(&session_handle);
+            return Err(error.into());
+        }
+    };
     stream_done_rx
         .recv_timeout(Duration::from_secs(2))
         .map_err(|_| anyhow::anyhow!("stream completed without a final TokenReceived signal"))??;
+    wait_request_success(&request_handle)?;
 
     close_public_session(&session_handle)?;
     tx.send(DemoEvent::Done)?;
@@ -1001,8 +1045,12 @@ fn stream_language_text(
         let result = (|| -> anyhow::Result<String> {
             let mut content = String::new();
             for msg in &mut token_iter {
-                let (sig_session, token, done): (OwnedObjectPath, String, bool) =
-                    msg.body().deserialize()?;
+                let (_sig_request, sig_session, token, done): (
+                    OwnedObjectPath,
+                    OwnedObjectPath,
+                    String,
+                    bool,
+                ) = msg.body().deserialize()?;
                 if sig_session.as_str() != token_session_handle.as_str() {
                     continue;
                 }
@@ -1019,14 +1067,14 @@ fn stream_language_text(
         let _ = stream_done_tx.send(result);
     });
 
-    let stream_result: zbus::Result<()> =
+    let stream_result: zbus::Result<OwnedObjectPath> =
         proxy.call("StreamResponse", &(session_handle, prompt, options));
-    if let Err(error) = stream_result {
-        return Err(error.into());
-    }
-    stream_done_rx
+    let request_handle = stream_result?;
+    let content = stream_done_rx
         .recv_timeout(Duration::from_secs(2))
-        .map_err(|_| anyhow::anyhow!("stream completed without a final TokenReceived signal"))?
+        .map_err(|_| anyhow::anyhow!("stream completed without a final TokenReceived signal"))??;
+    wait_request_success(&request_handle)?;
+    Ok(content)
 }
 
 enum GuidedStreamEvent {
@@ -1135,15 +1183,20 @@ fn stream_guided_call(
                     .unwrap_or_default();
                 match member {
                     "GuidedSnapshotReceived" => {
-                        let (sig_session, snapshot, done): (OwnedObjectPath, String, bool) =
-                            msg.body().deserialize()?;
+                        let (_sig_request, sig_session, snapshot, done): (
+                            OwnedObjectPath,
+                            OwnedObjectPath,
+                            String,
+                            bool,
+                        ) = msg.body().deserialize()?;
                         if sig_session.as_str() != signal_session_handle.as_str() {
                             return Ok(None);
                         }
                         Ok(Some(GuidedStreamEvent::Snapshot(snapshot, done)))
                     }
                     "GuidedToolCallsReceived" => {
-                        let (sig_session, tool_calls, done): (
+                        let (_sig_request, sig_session, tool_calls, done): (
+                            OwnedObjectPath,
                             OwnedObjectPath,
                             Vec<ToolCallDbus>,
                             bool,
@@ -1177,20 +1230,17 @@ fn stream_guided_call(
         }
     });
 
-    let stream_result: zbus::Result<()> = if let Some(results) = results {
+    let request_handle: OwnedObjectPath = if let Some(results) = results {
         proxy.call(
             "StreamSubmitToolResultsGuided",
             &(session_handle, prompt, results, fields, tools, options),
-        )
+        )?
     } else {
         proxy.call(
             "StreamRespondGuided",
             &(session_handle, prompt, fields, tools, options),
-        )
+        )?
     };
-    if let Err(error) = stream_result {
-        return Err(error.into());
-    }
 
     loop {
         match event_rx
@@ -1202,11 +1252,13 @@ fn stream_guided_call(
                     handler(&snapshot)?;
                 }
                 if done {
+                    wait_request_success(&request_handle)?;
                     return Ok((snapshot, Vec::new()));
                 }
             }
             GuidedStreamEvent::ToolCalls(tool_calls, done) => {
                 if done {
+                    wait_request_success(&request_handle)?;
                     return Ok((String::new(), tool_calls));
                 }
             }
@@ -1232,8 +1284,12 @@ fn stream_prediction(
         let result = (|| -> anyhow::Result<Vec<String>> {
             let mut completions = Vec::new();
             for msg in &mut prediction_iter {
-                let (sig_session, completion, done): (OwnedObjectPath, String, bool) =
-                    msg.body().deserialize()?;
+                let (_sig_request, sig_session, completion, done): (
+                    OwnedObjectPath,
+                    OwnedObjectPath,
+                    String,
+                    bool,
+                ) = msg.body().deserialize()?;
                 if sig_session.as_str() != prediction_session_handle.as_str() {
                     continue;
                 }
@@ -1249,16 +1305,16 @@ fn stream_prediction(
         let _ = stream_done_tx.send(result);
     });
 
-    let stream_result: zbus::Result<()> =
+    let stream_result: zbus::Result<OwnedObjectPath> =
         proxy.call("StreamPredictNext", &(session_handle, prefix, options));
-    if let Err(error) = stream_result {
-        return Err(error.into());
-    }
-    stream_done_rx
+    let request_handle = stream_result?;
+    let completions = stream_done_rx
         .recv_timeout(Duration::from_secs(2))
         .map_err(|_| {
             anyhow::anyhow!("stream completed without a final PredictionReceived signal")
-        })?
+        })??;
+    wait_request_success(&request_handle)?;
+    Ok(completions)
 }
 
 fn stream_embedding(session_handle: &OwnedObjectPath, text: &str) -> anyhow::Result<Vec<f64>> {
@@ -1274,8 +1330,12 @@ fn stream_embedding(session_handle: &OwnedObjectPath, text: &str) -> anyhow::Res
     std::thread::spawn(move || {
         let result = (|| -> anyhow::Result<Vec<f64>> {
             for msg in &mut embedding_iter {
-                let (sig_session, embedding, done): (OwnedObjectPath, Vec<f64>, bool) =
-                    msg.body().deserialize()?;
+                let (_sig_request, sig_session, embedding, done): (
+                    OwnedObjectPath,
+                    OwnedObjectPath,
+                    Vec<f64>,
+                    bool,
+                ) = msg.body().deserialize()?;
                 if sig_session.as_str() != embedding_session_handle.as_str() {
                     continue;
                 }
@@ -1288,14 +1348,16 @@ fn stream_embedding(session_handle: &OwnedObjectPath, text: &str) -> anyhow::Res
         let _ = stream_done_tx.send(result);
     });
 
-    let stream_result: zbus::Result<()> =
+    let stream_result: zbus::Result<OwnedObjectPath> =
         proxy.call("StreamEmbed", &(session_handle, text, empty_options()));
-    if let Err(error) = stream_result {
-        return Err(error.into());
-    }
-    stream_done_rx
+    let request_handle = stream_result?;
+    let embedding = stream_done_rx
         .recv_timeout(Duration::from_secs(2))
-        .map_err(|_| anyhow::anyhow!("stream completed without a final EmbeddingReceived signal"))?
+        .map_err(|_| {
+            anyhow::anyhow!("stream completed without a final EmbeddingReceived signal")
+        })??;
+    wait_request_success(&request_handle)?;
+    Ok(embedding)
 }
 
 fn stream_vision_text(
@@ -1317,8 +1379,12 @@ fn stream_vision_text(
         let result = (|| -> anyhow::Result<String> {
             let mut content = String::new();
             for msg in &mut text_iter {
-                let (sig_session, text, done): (OwnedObjectPath, String, bool) =
-                    msg.body().deserialize()?;
+                let (_sig_request, sig_session, text, done): (
+                    OwnedObjectPath,
+                    OwnedObjectPath,
+                    String,
+                    bool,
+                ) = msg.body().deserialize()?;
                 if sig_session.as_str() != text_session_handle.as_str() {
                     continue;
                 }
@@ -1339,16 +1405,16 @@ fn stream_vision_text(
         let _ = stream_done_tx.send(result);
     });
 
-    let stream_result: zbus::Result<()> =
+    let stream_result: zbus::Result<OwnedObjectPath> =
         proxy.call(method, &(session_handle, image_b64, empty_options()));
-    if let Err(error) = stream_result {
-        return Err(error.into());
-    }
-    stream_done_rx
+    let request_handle = stream_result?;
+    let content = stream_done_rx
         .recv_timeout(Duration::from_secs(2))
         .map_err(|_| {
             anyhow::anyhow!("stream completed without a final VisionTextReceived signal")
-        })?
+        })??;
+    wait_request_success(&request_handle)?;
+    Ok(content)
 }
 
 fn stream_vision_segments(
@@ -1367,8 +1433,12 @@ fn stream_vision_segments(
     std::thread::spawn(move || {
         let result = (|| -> anyhow::Result<Vec<VisionSegmentDbus>> {
             for msg in &mut segment_iter {
-                let (sig_session, segments, done): (OwnedObjectPath, Vec<VisionSegmentDbus>, bool) =
-                    msg.body().deserialize()?;
+                let (_sig_request, sig_session, segments, done): (
+                    OwnedObjectPath,
+                    OwnedObjectPath,
+                    Vec<VisionSegmentDbus>,
+                    bool,
+                ) = msg.body().deserialize()?;
                 if sig_session.as_str() != segment_session_handle.as_str() {
                     continue;
                 }
@@ -1381,18 +1451,18 @@ fn stream_vision_segments(
         let _ = stream_done_tx.send(result);
     });
 
-    let stream_result: zbus::Result<()> = proxy.call(
+    let stream_result: zbus::Result<OwnedObjectPath> = proxy.call(
         "StreamSegment",
         &(session_handle, image_b64, empty_options()),
     );
-    if let Err(error) = stream_result {
-        return Err(error.into());
-    }
-    stream_done_rx
+    let request_handle = stream_result?;
+    let segments = stream_done_rx
         .recv_timeout(Duration::from_secs(2))
         .map_err(|_| {
             anyhow::anyhow!("stream completed without a final VisionSegmentsReceived signal")
-        })?
+        })??;
+    wait_request_success(&request_handle)?;
+    Ok(segments)
 }
 
 fn extract_guided(text: &str, tx: std::sync::mpsc::Sender<DemoEvent>) -> anyhow::Result<()> {
@@ -1553,7 +1623,8 @@ fn predict_inline_completion(
             "language.complete",
             "Inline typing prediction session.",
         )?;
-        let _: () = proxy.call("Prewarm", &(&handle, empty_options()))?;
+        let request_handle: OwnedObjectPath = proxy.call("Prewarm", &(&handle, empty_options()))?;
+        wait_request_success(&request_handle)?;
         Ok(handle)
     };
     let mut session_handle = match existing_session {
@@ -2021,8 +2092,12 @@ fn stream_speech_audio(
         let result = (|| -> anyhow::Result<String> {
             let mut transcript = String::new();
             for msg in &mut transcription_iter {
-                let (sig_session, text, done): (OwnedObjectPath, String, bool) =
-                    msg.body().deserialize()?;
+                let (_sig_request, sig_session, text, done): (
+                    OwnedObjectPath,
+                    OwnedObjectPath,
+                    String,
+                    bool,
+                ) = msg.body().deserialize()?;
                 if sig_session.as_str() != transcript_session_handle.as_str() {
                     continue;
                 }
@@ -2046,7 +2121,7 @@ fn stream_speech_audio(
         let _ = stream_done_tx.send(result);
     });
 
-    let stream_result: zbus::Result<()> = proxy.call(
+    let stream_result: zbus::Result<OwnedObjectPath> = proxy.call(
         "StreamTranscribe",
         &(
             session_handle,
@@ -2055,14 +2130,14 @@ fn stream_speech_audio(
             empty_options(),
         ),
     );
-    if let Err(error) = stream_result {
-        return Err(error.into());
-    }
-    stream_done_rx
+    let request_handle = stream_result?;
+    let transcript = stream_done_rx
         .recv_timeout(Duration::from_secs(2))
         .map_err(|_| {
             anyhow::anyhow!("stream completed without a final TranscriptionReceived signal")
-        })?
+        })??;
+    wait_request_success(&request_handle)?;
+    Ok(transcript)
 }
 
 fn read_audio_range(path: &Path, start: u64, end: u64) -> anyhow::Result<Vec<u8>> {

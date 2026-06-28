@@ -63,6 +63,7 @@ Suggested install locations:
 | `systemd/aileron-daemon.service` | `/usr/lib/systemd/user/aileron-daemon.service` |
 | `systemd/aileron-portal.service` | `/usr/lib/systemd/user/aileron-portal.service` |
 | `portal/aileron.portal` | `/usr/share/xdg-desktop-portal/portals/aileron.portal` |
+| `portal/aileron-portals.conf` | `/usr/share/xdg-desktop-portal/<desktop>-portals.conf` or merged into the distro portal preference file |
 | `portal/org.freedesktop.impl.portal.desktop.aileron.service` | `/usr/share/dbus-1/services/org.freedesktop.impl.portal.desktop.aileron.service` |
 | `manifests/` | `/usr/share/aileron/manifests/` |
 | packaged runtime rootfs trees | `/usr/lib/aileron/oci/rootfs/<store-key>/` |
@@ -78,7 +79,7 @@ Recommended package split:
 | Package | Contents | Notes |
 |---|---|---|
 | `aileron-daemon` | daemon binary, user service, Varlink support files | Depends on `skopeo` and `crun` |
-| `aileron-portal` | portal backend, D-Bus service file, portal descriptor | Depends on `xdg-desktop-portal` integration according to distro policy |
+| `aileron-portal` | portal backend, D-Bus service file, portal descriptor, portal preference snippet | Depends on `xdg-desktop-portal` integration according to distro policy |
 | `aileron` | management UI | Optional on minimal/headless systems |
 | `aileron-manifests` | curated model and runtime manifests under `/usr/share/aileron/manifests/` | Recommended default catalog package |
 | `aileron-runtimes-*` | optional runtime manifests or pre-rendered rootfs trees | Use this when the distro wants offline runtime availability or curated image refs |

@@ -45,10 +45,12 @@ Avoid treating model names as application requirements. A user may satisfy `lang
 ## Recommended Flow
 
 1. Check availability for all use cases.
-2. Create a session with stable instructions.
+2. Create a session with stable instructions and read `session_handle` from the returned request's `Response` signal.
 3. Optionally prewarm on the same portal interface before the first visible operation.
-4. Send task input through the appropriate method.
+4. Send task input through the appropriate method and correlate stream signals by `request_handle`.
 5. Close the returned `org.freedesktop.portal.Session` handle when the user-visible task is complete.
+
+Operations that may prompt, load a model, or stream output return `org.freedesktop.portal.Request` handles. Use `handle_token` and `session_handle_token` option values when you need race-free signal subscription. Closing the request cancels the in-flight operation; closing the session releases the model session.
 
 For conversational features, keep stable instructions in the session and send the relevant local history as part of the prompt with `StreamResponse` or `StreamRespondGuided`. The app owns conversation history and can trim it to fit its UI or context policy. For one-shot features such as "summarize this article", a short-lived session with `StreamResponse` is usually enough.
 
@@ -70,7 +72,7 @@ For `language.translate`, `GenerationOptions` includes optional `source_language
 
 ## Inline Completion
 
-Use `language.complete` with `StreamPredictNext` for ghost text, current-word endings, or next-word suggestions. Send the raw text prefix the user typed, not an instruction prompt. The daemon caps results at three short completions and emits each completion as a stream event. A newer `StreamPredictNext` call for the same session supersedes any older in-flight prediction call; handle `RequestCancelled` as a normal stale-result path.
+Use `language.complete` with `StreamPredictNext` for ghost text, current-word endings, or next-word suggestions. Send the raw text prefix the user typed, not an instruction prompt. The daemon caps results at three short completions and emits each completion as a stream event. A newer `StreamPredictNext` call for the same session supersedes any older in-flight prediction call; handle a cancelled request response or `RequestCancelled` error text as a normal stale-result path.
 
 ## Guided Output
 
@@ -127,7 +129,7 @@ Recommended behavior:
 - Offer a non-AI fallback when possible.
 - Avoid model-specific instructions in the app UI.
 
-Handle specific inference errors when useful. In the current prototype, these are forwarded as D-Bus failures whose message includes the Varlink error name. `ContextWindowExceeded` can prompt the user to shorten input, `UnsupportedLanguage` can ask for another language, `SafetyRefusal` should be shown as a refusal rather than a crash, `RequestCancelled` should leave UI state clean, and `InvalidInput` means the app should fix or reject the submitted payload.
+Handle specific inference errors when useful. In the current prototype, stream failures are returned through the request `Response` signal with response code `2` and an `error` string that includes the Varlink error name. `ContextWindowExceeded` can prompt the user to shorten input, `UnsupportedLanguage` can ask for another language, `SafetyRefusal` should be shown as a refusal rather than a crash, `RequestCancelled` should leave UI state clean, and `InvalidInput` means the app should fix or reject the submitted payload.
 
 ## Development And Testing
 

@@ -142,6 +142,10 @@ install -Dm644 systemd/aileron-portal.service \
 install -Dm644 portal/aileron.portal \
     ~/.local/share/xdg-desktop-portal/portals/aileron.portal
 
+# xdg-desktop-portal backend preference (selects Aileron for these interfaces)
+install -Dm644 portal/aileron-portals.conf \
+    ~/.config/xdg-desktop-portal/portals.conf
+
 # D-Bus session service activation file
 install -Dm644 \
     portal/org.freedesktop.impl.portal.desktop.aileron.service \
@@ -151,7 +155,7 @@ systemctl --user daemon-reload
 systemctl --user enable --now aileron-portal
 ```
 
-System packages should install the portal descriptor under `/usr/share/xdg-desktop-portal/portals/` and the D-Bus activation file under `/usr/share/dbus-1/services/`; the commands above are for a per-user development install.
+System packages should install the portal descriptor under `/usr/share/xdg-desktop-portal/portals/`, a desktop/vendor `portals.conf` entry under `/usr/share/xdg-desktop-portal/`, and the D-Bus activation file under `/usr/share/dbus-1/services/`; the commands above are for a per-user development install.
 
 ### Public portal frontend prototype
 
@@ -464,7 +468,7 @@ The portal does not talk to containers directly. It translates D-Bus calls into 
 | `org.freedesktop.portal.Speech` | `speech.*` | `GetUseCaseAvailability`, `CreateSession`, `Prewarm`, `StreamTranscribe` |
 | `org.freedesktop.portal.Vision` | `vision.*` | `GetUseCaseAvailability`, `CreateSession`, `Prewarm`, `StreamDescribe`, `StreamOcr`, `StreamSegment` |
 
-Apps call the public interfaces on `org.freedesktop.portal.Desktop`. The public frontend derives the app identity, returns `session_handle: o` object paths, and closes backend sessions when the app calls `Close` on the corresponding `org.freedesktop.portal.Session` object. The implementation backend uses internal `app_id: s` and `session_id: s` strings and is only called by xdg-desktop-portal.
+Apps call the public interfaces on `org.freedesktop.portal.Desktop`. The public frontend derives the app identity, returns request handles for operations that may prompt, load, or stream, and closes backend sessions when the app calls `Close` on the corresponding `org.freedesktop.portal.Session` object. The implementation backend uses internal `app_id: s`, `request_id: s`, and `session_id: s` strings and is only called by xdg-desktop-portal.
 
 `GetUseCaseAvailability`, `CreateSession`, and `Prewarm` have the same public signatures on each interface. Each interface validates that the requested use-case token matches its prefix.
 
@@ -473,34 +477,34 @@ Apps call the public interfaces on `org.freedesktop.portal.Desktop`. The public 
 | Method | Parameters | Returns | Notes |
 |---|---|---|---|
 | `GetUseCaseAvailability` | `use_case: s, options: a{sv}` | `(is_available: b, code: s, reason: s)` | Checks whether an assigned profile has local artifacts and a runtime image |
-| `CreateSession` | `use_case: s, instructions: s, options: a{sv}` | `session_handle: o` | Creates a session bound to the assigned profile; does not start the container by itself |
-| `Prewarm` | `session_handle: o, options: a{sv}` | `()` | Starts the backing container before the first user-visible operation |
+| `CreateSession` | `use_case: s, instructions: s, options: a{sv}` | `handle: o` | Creates a session bound to the assigned profile; the request response contains `session_handle: o` |
+| `Prewarm` | `session_handle: o, options: a{sv}` | `handle: o` | Starts the backing container before the first user-visible operation; close the request to cancel |
 
 ### Language Methods
 
 | Method | Parameters | Returns | Notes |
 |---|---|---|---|
-| `StreamResponse` | `session_handle: o, prompt: s, options: a{sv}` | `()` | Full language generation sessions only; emits `TokenReceived` signals; final token has `done=true` |
-| `StreamPredictNext` | `session_handle: o, prefix: s, options: a{sv}` | `()` | `language.complete` sessions only; emits `PredictionReceived` signals for up to three short completions; newer calls for the same session cancel older in-flight prediction calls |
-| `StreamRespondGuided` | `session_handle: o, prompt: s, fields: a(sssb), tools: a(sss), options: a{sv}` | `()` | Full language generation sessions only; emits `GuidedSnapshotReceived` and/or `GuidedToolCallsReceived` signals; final event has `done=true` |
-| `StreamSubmitToolResultsGuided` | `session_handle: o, prompt: s, results: a(sss), fields: a(sssb), tools: a(sss), options: a{sv}` | `()` | Full language generation sessions only; continues after the app executes or rejects tool calls; emits guided signals |
-| `StreamEmbed` | `session_handle: o, text: s, options: a{sv}` | `()` | `language.embed` sessions only; emits one `EmbeddingReceived` signal |
+| `StreamResponse` | `session_handle: o, prompt: s, options: a{sv}` | `handle: o` | Full language generation sessions only; emits `TokenReceived` signals; final token has `done=true` |
+| `StreamPredictNext` | `session_handle: o, prefix: s, options: a{sv}` | `handle: o` | `language.complete` sessions only; emits `PredictionReceived` signals for up to three short completions; newer calls for the same session cancel older in-flight prediction calls |
+| `StreamRespondGuided` | `session_handle: o, prompt: s, fields: a(sssb), tools: a(sss), options: a{sv}` | `handle: o` | Full language generation sessions only; emits `GuidedSnapshotReceived` and/or `GuidedToolCallsReceived` signals; final event has `done=true` |
+| `StreamSubmitToolResultsGuided` | `session_handle: o, prompt: s, results: a(sss), fields: a(sssb), tools: a(sss), options: a{sv}` | `handle: o` | Full language generation sessions only; continues after the app executes or rejects tool calls; emits guided signals |
+| `StreamEmbed` | `session_handle: o, text: s, options: a{sv}` | `handle: o` | `language.embed` sessions only; emits one `EmbeddingReceived` signal |
 
 ### Speech Methods
 
 | Method | Parameters | Returns | Notes |
 |---|---|---|---|
-| `StreamTranscribe` | `session_handle: o, audio: s, source_language_hint: s, options: a{sv}` | `()` | 16 kHz mono f32le PCM, base64; empty hint means auto-detect/no hint; emits `TranscriptionReceived` signals; final segment has `done=true` |
+| `StreamTranscribe` | `session_handle: o, audio: s, source_language_hint: s, options: a{sv}` | `handle: o` | 16 kHz mono f32le PCM, base64; empty hint means auto-detect/no hint; emits `TranscriptionReceived` signals; final segment has `done=true` |
 
-Streaming D-Bus methods carry their payloads only through signals while the method call is in progress. Callers should subscribe before invoking a stream method and consume signals concurrently; the empty method reply only means the stream has finished.
+Streaming D-Bus methods return an `org.freedesktop.portal.Request` handle immediately. Callers should subscribe to both the stream signal and the request's `Response` signal before invoking a stream method when using caller-chosen `handle_token` values. Stream payload signals are correlated by `request_handle`; the request response indicates success, cancellation, or failure.
 
 ### Vision Methods
 
 | Method | Parameters | Returns | Notes |
 |---|---|---|---|
-| `StreamDescribe` | `session_handle: o, image: s, options: a{sv}` | `()` | `vision.describe` sessions only; emits `VisionTextReceived` signals |
-| `StreamOcr` | `session_handle: o, image: s, options: a{sv}` | `()` | `vision.ocr` sessions only; emits `VisionTextReceived` signals |
-| `StreamSegment` | `session_handle: o, image: s, options: a{sv}` | `()` | `vision.segment` sessions only; emits one `VisionSegmentsReceived` signal with normalized boxes |
+| `StreamDescribe` | `session_handle: o, image: s, options: a{sv}` | `handle: o` | `vision.describe` sessions only; emits `VisionTextReceived` signals |
+| `StreamOcr` | `session_handle: o, image: s, options: a{sv}` | `handle: o` | `vision.ocr` sessions only; emits `VisionTextReceived` signals |
+| `StreamSegment` | `session_handle: o, image: s, options: a{sv}` | `handle: o` | `vision.segment` sessions only; emits one `VisionSegmentsReceived` signal with normalized boxes |
 
 These are D-Bus signatures: parentheses define a struct, `a(...)` means an array of structs, and `a{sv}` is an options vardict. Public language methods accept these option keys: `maximum_response_tokens` as int64, `temperature` as float64, `sampling_mode` as string, `source_language_hint` as string, and `target_language_hint` as string. Empty language hints mean unspecified. The generation option language hints only affect `language.translate`. Speech methods use their `source_language_hint` argument only to identify the spoken input language; the session use-case selects whether speech output is a transcript or English translation. `fields: a(sssb)` is an array of `GuidedField` structs: name, kind, description, required. Tool structs are `a(sss)`: definitions are name, description, schema JSON; calls are id, name, arguments JSON; results are id, content, content JSON.
 
@@ -510,19 +514,19 @@ Audio and image payloads are base64 strings in the current prototype and must fi
 
 | Signal | Parameters | Fired when |
 |---|---|---|
-| `ModelLoading` | `session_handle: o, message: s` | The portal is about to start a cold backing container for a session; available on each interface |
-| `TokenReceived` | `session_handle: o, token: s, done: b` | Each token during `StreamResponse` on `Language` |
-| `PredictionReceived` | `session_handle: o, completion: s, done: b` | Each completion during `StreamPredictNext` on `Language` |
-| `GuidedSnapshotReceived` | `session_handle: o, snapshot_json: s, done: b` | Each validated JSON snapshot during `StreamRespondGuided` on `Language` |
-| `GuidedToolCallsReceived` | `session_handle: o, tool_calls: a(sss), done: b` | Tool calls requested during `StreamRespondGuided` on `Language` |
-| `EmbeddingReceived` | `session_handle: o, embedding: ad, done: b` | Embedding vector during `StreamEmbed` on `Language` |
-| `TranscriptionReceived` | `session_handle: o, text: s, done: b` | Each segment during `StreamTranscribe` on `Speech` |
-| `VisionTextReceived` | `session_handle: o, text: s, done: b` | Each text token during `StreamDescribe` or `StreamOcr` on `Vision` |
-| `VisionSegmentsReceived` | `session_handle: o, segments: a(sddddd), done: b` | Segmentation result during `StreamSegment` on `Vision` |
+| `ModelLoading` | `request_handle: o, session_handle: o, message: s` | The portal is about to start a cold backing container for a request; available on each interface |
+| `TokenReceived` | `request_handle: o, session_handle: o, token: s, done: b` | Each token during `StreamResponse` on `Language` |
+| `PredictionReceived` | `request_handle: o, session_handle: o, completion: s, done: b` | Each completion during `StreamPredictNext` on `Language` |
+| `GuidedSnapshotReceived` | `request_handle: o, session_handle: o, snapshot_json: s, done: b` | Each validated JSON snapshot during `StreamRespondGuided` on `Language` |
+| `GuidedToolCallsReceived` | `request_handle: o, session_handle: o, tool_calls: a(sss), done: b` | Tool calls requested during `StreamRespondGuided` on `Language` |
+| `EmbeddingReceived` | `request_handle: o, session_handle: o, embedding: ad, done: b` | Embedding vector during `StreamEmbed` on `Language` |
+| `TranscriptionReceived` | `request_handle: o, session_handle: o, text: s, done: b` | Each segment during `StreamTranscribe` on `Speech` |
+| `VisionTextReceived` | `request_handle: o, session_handle: o, text: s, done: b` | Each text token during `StreamDescribe` or `StreamOcr` on `Vision` |
+| `VisionSegmentsReceived` | `request_handle: o, session_handle: o, segments: a(sddddd), done: b` | Segmentation result during `StreamSegment` on `Vision` |
 
-The implementation backend exposes the same task methods with `app_id: s` and `session_id: s` instead of public session handles, plus `EndSession(session_id: s)` for the frontend's session-close path. Public apps should not call the implementation interfaces directly.
+The implementation backend exposes the same task methods with `app_id: s`, `request_id: s`, and `session_id: s` instead of public request/session handles, plus `EndSession(session_id: s)` for the frontend's session-close path. Public apps should not call the implementation interfaces directly.
 
-The current prototype forwards underlying Varlink failures as D-Bus errors. Specific inference failures are currently surfaced as `org.freedesktop.DBus.Error.Failed` messages that include the Varlink error name, such as `aileron.Inference.RequestCancelled` or `aileron.Inference.InvalidInput`; apps should still branch on availability `code` values before creating sessions.
+The current prototype returns stream failures through the request `Response` signal with response code `2` and an `error` string that includes the underlying Varlink error name, such as `aileron.Inference.RequestCancelled` or `aileron.Inference.InvalidInput`. Apps should still branch on availability `code` values before creating sessions.
 
 ## Portal-to-container API boundary
 
