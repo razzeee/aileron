@@ -147,6 +147,7 @@ impl VarlinkInterface for InferenceHandler {
                 Err(CreateSessionError::ModelUnavailable(reason)) => {
                     call.reply_model_unavailable(reason)
                 }
+                Err(CreateSessionError::InvalidInput(reason)) => call.reply_invalid_input(reason),
             }
         })
     }
@@ -415,6 +416,7 @@ enum CreateSessionError {
     PermissionPromptRequired(String, String),
     PermissionDenied(String, String),
     ModelUnavailable(String),
+    InvalidInput(String),
 }
 
 async fn create_session_record(
@@ -424,6 +426,12 @@ async fn create_session_record(
     instructions: String,
 ) -> Result<(String, String), CreateSessionError> {
     let mut guard = state.0.lock().await;
+
+    if app_id.trim().is_empty() {
+        return Err(CreateSessionError::InvalidInput(
+            "app id is required".to_string(),
+        ));
+    }
 
     if !guard.config.allow_all {
         match guard.permissions.check(&app_id, &use_case) {

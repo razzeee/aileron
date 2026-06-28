@@ -87,8 +87,10 @@ fn create_public_session(
     use_case: &str,
     instructions: &str,
 ) -> anyhow::Result<OwnedObjectPath> {
-    let request_handle: OwnedObjectPath =
-        proxy.call("CreateSession", &(use_case, instructions, empty_options()))?;
+    let request_handle: OwnedObjectPath = proxy.call(
+        "CreateSession",
+        &("", use_case, instructions, empty_options()),
+    )?;
     let mut results = wait_request_response(&request_handle)?;
     let session_handle = results
         .remove("session_handle")

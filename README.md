@@ -470,14 +470,14 @@ The portal does not talk to containers directly. It translates D-Bus calls into 
 
 Apps call the public interfaces on `org.freedesktop.portal.Desktop`. The public frontend derives the app identity, returns request handles for operations that may prompt, load, or stream, and closes backend sessions when the app calls `Close` on the corresponding `org.freedesktop.portal.Session` object. The implementation backend uses internal `app_id: s`, `request_id: s`, and `session_id: s` strings and is only called by xdg-desktop-portal.
 
-`GetUseCaseAvailability`, `CreateSession`, and `Prewarm` have the same public signatures on each interface. Each interface validates that the requested use-case token matches its prefix.
+`GetUseCaseAvailability`, `CreateSession`, and `Prewarm` have the same public signatures on each interface. `CreateSession` takes a `parent_window` string so permission prompts can be associated with the triggering app window where the platform supports it. Each interface validates that the requested use-case token matches its prefix.
 
 ### Shared Methods
 
 | Method | Parameters | Returns | Notes |
 |---|---|---|---|
 | `GetUseCaseAvailability` | `use_case: s, options: a{sv}` | `(is_available: b, code: s, reason: s)` | Checks whether an assigned profile has local artifacts and a runtime image |
-| `CreateSession` | `use_case: s, instructions: s, options: a{sv}` | `handle: o` | Creates a session bound to the assigned profile; the request response contains `session_handle: o` |
+| `CreateSession` | `parent_window: s, use_case: s, instructions: s, options: a{sv}` | `handle: o` | Creates a session bound to the assigned profile; the request response contains `session_handle: o` |
 | `Prewarm` | `session_handle: o, options: a{sv}` | `handle: o` | Starts the backing container before the first user-visible operation; close the request to cancel |
 
 ### Language Methods
@@ -506,7 +506,7 @@ Streaming D-Bus methods return an `org.freedesktop.portal.Request` handle immedi
 | `StreamOcr` | `session_handle: o, image: s, options: a{sv}` | `handle: o` | `vision.ocr` sessions only; emits `VisionTextReceived` signals |
 | `StreamSegment` | `session_handle: o, image: s, options: a{sv}` | `handle: o` | `vision.segment` sessions only; emits one `VisionSegmentsReceived` signal with normalized boxes |
 
-These are D-Bus signatures: parentheses define a struct, `a(...)` means an array of structs, and `a{sv}` is an options vardict. Public language methods accept these option keys: `maximum_response_tokens` as int64, `temperature` as float64, `sampling_mode` as string, `source_language_hint` as string, and `target_language_hint` as string. Empty language hints mean unspecified. The generation option language hints only affect `language.translate`. Speech methods use their `source_language_hint` argument only to identify the spoken input language; the session use-case selects whether speech output is a transcript or English translation. `fields: a(sssb)` is an array of `GuidedField` structs: name, kind, description, required. Tool structs are `a(sss)`: definitions are name, description, schema JSON; calls are id, name, arguments JSON; results are id, content, content JSON.
+These are D-Bus signatures: parentheses define a struct, `a(...)` means an array of structs, and `a{sv}` is an options vardict. `parent_window` follows xdg-desktop-portal window identifier rules such as `x11:<XID>` or `wayland:<HANDLE>`; pass an empty string when no suitable handle exists. Public language methods accept these option keys: `maximum_response_tokens` as int64, `temperature` as float64, `sampling_mode` as string, `source_language_hint` as string, and `target_language_hint` as string. Empty language hints mean unspecified. The generation option language hints only affect `language.translate`. Speech methods use their `source_language_hint` argument only to identify the spoken input language; the session use-case selects whether speech output is a transcript or English translation. `fields: a(sssb)` is an array of `GuidedField` structs: name, kind, description, required. Tool structs are `a(sss)`: definitions are name, description, schema JSON; calls are id, name, arguments JSON; results are id, content, content JSON.
 
 Audio and image payloads are base64 strings in the current prototype and must fit within the session bus message limit. Apps should resize images, chunk live audio on their side, and keep media requests user-initiated. A future fd/document-handle transport would be a separate API revision.
 
@@ -524,7 +524,7 @@ Audio and image payloads are base64 strings in the current prototype and must fi
 | `VisionTextReceived` | `request_handle: o, session_handle: o, text: s, done: b` | Each text token during `StreamDescribe` or `StreamOcr` on `Vision` |
 | `VisionSegmentsReceived` | `request_handle: o, session_handle: o, segments: a(sddddd), done: b` | Segmentation result during `StreamSegment` on `Vision` |
 
-The implementation backend exposes the same task methods with `app_id: s`, `request_id: s`, and `session_id: s` instead of public request/session handles, plus `EndSession(session_id: s)` for the frontend's session-close path. Public apps should not call the implementation interfaces directly.
+The implementation backend exposes the same task methods with implementation-oriented identifiers: `CreateSession` receives `app_id: s` and `parent_window: s`, streaming methods receive `request_id: s` and `session_id: s`, and `EndSession(session_id: s)` supports the frontend's session-close path. Public apps should not call the implementation interfaces directly.
 
 The current prototype returns stream failures through the request `Response` signal with response code `2` and an `error` string that includes the underlying Varlink error name, such as `aileron.Inference.RequestCancelled` or `aileron.Inference.InvalidInput`. Apps should still branch on availability `code` values before creating sessions.
 

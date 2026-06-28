@@ -147,7 +147,7 @@ struct VisionSegmentDbus {
 impl LanguagePortalBackend {
     #[zbus(property, name = "version")]
     fn version(&self) -> u32 {
-        3
+        4
     }
 
     #[zbus(out_args("availability"))]
@@ -168,6 +168,7 @@ impl LanguagePortalBackend {
         #[zbus(connection)] conn: &zbus::Connection,
         #[zbus(header)] header: Header<'_>,
         app_id: &str,
+        parent_window: &str,
         use_case: &str,
         instructions: &str,
     ) -> zbus::fdo::Result<String> {
@@ -176,6 +177,7 @@ impl LanguagePortalBackend {
         create_session_impl(
             &self.state,
             app_id,
+            parent_window,
             use_case,
             instructions,
             PortalInterface::Language,
@@ -616,7 +618,7 @@ impl LanguagePortalBackend {
 impl SpeechPortalBackend {
     #[zbus(property, name = "version")]
     fn version(&self) -> u32 {
-        3
+        4
     }
 
     #[zbus(out_args("availability"))]
@@ -637,6 +639,7 @@ impl SpeechPortalBackend {
         #[zbus(connection)] conn: &zbus::Connection,
         #[zbus(header)] header: Header<'_>,
         app_id: &str,
+        parent_window: &str,
         use_case: &str,
         instructions: &str,
     ) -> zbus::fdo::Result<String> {
@@ -645,6 +648,7 @@ impl SpeechPortalBackend {
         create_session_impl(
             &self.state,
             app_id,
+            parent_window,
             use_case,
             instructions,
             PortalInterface::Speech,
@@ -760,7 +764,7 @@ impl SpeechPortalBackend {
 impl VisionPortalBackend {
     #[zbus(property, name = "version")]
     fn version(&self) -> u32 {
-        3
+        4
     }
 
     #[zbus(out_args("availability"))]
@@ -781,6 +785,7 @@ impl VisionPortalBackend {
         #[zbus(connection)] conn: &zbus::Connection,
         #[zbus(header)] header: Header<'_>,
         app_id: &str,
+        parent_window: &str,
         use_case: &str,
         instructions: &str,
     ) -> zbus::fdo::Result<String> {
@@ -789,6 +794,7 @@ impl VisionPortalBackend {
         create_session_impl(
             &self.state,
             app_id,
+            parent_window,
             use_case,
             instructions,
             PortalInterface::Vision,
@@ -1079,6 +1085,7 @@ fn get_use_case_availability_impl(
 fn create_session_impl(
     state: &PortalState,
     app_id: &str,
+    parent_window: &str,
     use_case: &str,
     instructions: &str,
     interface: PortalInterface,
@@ -1103,7 +1110,7 @@ fn create_session_impl(
             )));
         }
         Err(e) if is_permission_prompt_required(&e) => {
-            if !prompt_permission(app_id, use_case)? {
+            if !prompt_permission(app_id, parent_window, use_case)? {
                 set_permission(app_id, use_case, false)?;
                 return Err(zbus::fdo::Error::AccessDenied(format!(
                     "Permission denied for {app_id} / {use_case}"
@@ -1220,28 +1227,36 @@ fn set_permission(app_id: &str, use_case: &str, allowed: bool) -> zbus::fdo::Res
     Ok(())
 }
 
-fn prompt_permission(app_id: &str, use_case: &str) -> zbus::fdo::Result<bool> {
+fn prompt_permission(app_id: &str, parent_window: &str, use_case: &str) -> zbus::fdo::Result<bool> {
     let text = format!(
         "Allow {app_id} to use the local model capability {use_case}?\n\nAileron will process this request locally using the assigned model."
     );
+    let parent_xid = x11_parent_window_id(parent_window);
 
-    if let Ok(status) = Command::new("zenity")
-        .args([
-            "--question",
-            "--title=Aileron Permission Request",
-            "--ok-label=Allow",
-            "--cancel-label=Deny",
-            "--text",
-            &text,
-        ])
-        .status()
+    if parent_xid.is_some()
+        && let Ok(status) = run_kdialog_permission_prompt(&text, parent_xid)
     {
         return Ok(status.success());
     }
 
-    if let Ok(status) = Command::new("kdialog")
-        .args(["--title", "Aileron Permission Request", "--yesno", &text])
-        .status()
+    let mut zenity = Command::new("zenity");
+    zenity.args([
+        "--question",
+        "--title=Aileron Permission Request",
+        "--ok-label=Allow",
+        "--cancel-label=Deny",
+        "--text",
+        &text,
+    ]);
+    if let Some(xid) = parent_xid {
+        zenity.arg(format!("--attach={xid}"));
+    }
+    if let Ok(status) = zenity.status() {
+        return Ok(status.success());
+    }
+
+    if parent_xid.is_none()
+        && let Ok(status) = run_kdialog_permission_prompt(&text, None)
     {
         return Ok(status.success());
     }
@@ -1249,6 +1264,25 @@ fn prompt_permission(app_id: &str, use_case: &str) -> zbus::fdo::Result<bool> {
     Err(zbus::fdo::Error::Failed(
         "No permission prompt helper found; install zenity or kdialog, grant permission in the Aileron Permissions page, or start the daemon with AILERON_AUTO_GRANT=true for development".to_string(),
     ))
+}
+
+fn run_kdialog_permission_prompt(
+    text: &str,
+    parent_xid: Option<&str>,
+) -> std::io::Result<std::process::ExitStatus> {
+    let mut kdialog = Command::new("kdialog");
+    kdialog.args(["--title", "Aileron Permission Request"]);
+    if let Some(xid) = parent_xid {
+        kdialog.args(["--attach", xid]);
+    }
+    kdialog.args(["--yesno", text]);
+    kdialog.status()
+}
+
+fn x11_parent_window_id(parent_window: &str) -> Option<&str> {
+    parent_window
+        .strip_prefix("x11:")
+        .filter(|xid| !xid.is_empty())
 }
 
 impl LanguagePortalBackend {
@@ -1539,6 +1573,14 @@ mod tests {
         assert!(is_permission_prompt_required(
             &"aileron.Inference.PermissionPromptRequired"
         ));
+    }
+
+    #[test]
+    fn x11_parent_window_id_extracts_xid_only_for_x11_handles() {
+        assert_eq!(x11_parent_window_id("x11:1234"), Some("1234"));
+        assert_eq!(x11_parent_window_id("x11:1a2b"), Some("1a2b"));
+        assert_eq!(x11_parent_window_id("wayland:surface"), None);
+        assert_eq!(x11_parent_window_id(""), None);
     }
 
     #[test]
