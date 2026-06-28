@@ -402,6 +402,7 @@ impl VarlinkInterface for InferenceHandler {
             if guard.sessions.remove(&session_id).is_none() {
                 return call.reply_session_not_found(session_id);
             }
+            self.state.clear_predict_next(&session_id);
             call.reply()
         })
     }
@@ -1004,6 +1005,7 @@ async fn predict_next_completions(
     options: GenerationOptions,
 ) -> Result<Vec<String>, GenerationError> {
     let max_tokens = validate_options(&options).map_err(GenerationError::InvalidOptions)?;
+    let generation = state.begin_predict_next(&session_id);
     let mut guard = state.0.lock().await;
 
     let (app_id, use_case, profile_id, runtime_id, image_refs, artifact_path, runtime_options) =
@@ -1024,11 +1026,14 @@ async fn predict_next_completions(
                     runtime_options,
                 )
             }
-            None => return Err(GenerationError::SessionNotFound(session_id)),
+            None => {
+                state.clear_predict_next(&session_id);
+                return Err(GenerationError::SessionNotFound(session_id));
+            }
         };
 
     let _ = guard.permissions.touch(&app_id, &use_case);
-    let container = guard
+    let result = guard
         .containers
         .get_or_spawn_any(
             &profile_id,
@@ -1038,11 +1043,17 @@ async fn predict_next_completions(
             &runtime_options,
             |_| {},
         )
-        .map_err(|e| GenerationError::Failed(e.to_string()))?;
+        .and_then(|container| container.predict_next(&prefix, max_tokens, options.temperature))
+        .map_err(|e| e.to_string());
 
-    container
-        .predict_next(&prefix, max_tokens, options.temperature)
-        .map_err(|e| GenerationError::Failed(e.to_string()))
+    if !state.is_current_predict_next(&session_id, generation) {
+        return Err(GenerationError::Failed(
+            "container returned error request_cancelled: superseded by newer StreamPredictNext request"
+                .to_string(),
+        ));
+    }
+
+    result.map_err(GenerationError::Failed)
 }
 
 async fn stream_guided_snapshots(

@@ -70,7 +70,7 @@ For `language.translate`, `GenerationOptions` includes optional `source_language
 
 ## Inline Completion
 
-Use `language.complete` with `StreamPredictNext` for ghost text, current-word endings, or next-word suggestions. Send the raw text prefix the user typed, not an instruction prompt. The daemon caps results at three short completions and emits each completion as a stream event.
+Use `language.complete` with `StreamPredictNext` for ghost text, current-word endings, or next-word suggestions. Send the raw text prefix the user typed, not an instruction prompt. The daemon caps results at three short completions and emits each completion as a stream event. A newer `StreamPredictNext` call for the same session supersedes any older in-flight prediction call; handle `RequestCancelled` as a normal stale-result path.
 
 ## Guided Output
 

@@ -346,11 +346,13 @@ pub fn embedding(model: &LlamaModel, ctx: &mut LlamaContext<'_>, text: &str) -> 
 }
 
 pub fn clean_inline_completion(prefix: &str, raw: &str) -> String {
-    let suffix_mode = prefix
-        .chars()
-        .next_back()
-        .map(|ch| ch.is_alphanumeric() || ch == '_' || ch == '-')
-        .unwrap_or(false);
+    let starts_with_boundary = raw.chars().next().is_some_and(char::is_whitespace);
+    let suffix_mode = !starts_with_boundary
+        && prefix
+            .chars()
+            .next_back()
+            .map(|ch| ch.is_alphanumeric() || ch == '_' || ch == '-')
+            .unwrap_or(false);
     let text = if suffix_mode {
         raw.trim().to_string()
     } else {
@@ -402,12 +404,13 @@ mod tests {
     #[test]
     fn inline_completion_keeps_suffix_word_characters() {
         assert_eq!(clean_inline_completion("hel", "lo world"), "lo");
-        assert_eq!(clean_inline_completion("hello", " world"), "world");
+        assert_eq!(clean_inline_completion("runn", "ing"), "ing");
     }
 
     #[test]
     fn inline_completion_adds_space_for_mid_sentence_prefix() {
         assert_eq!(clean_inline_completion("hello,", "world!"), " world");
         assert_eq!(clean_inline_completion("hello ", "world!"), "world");
+        assert_eq!(clean_inline_completion("hello", " world"), " world");
     }
 }

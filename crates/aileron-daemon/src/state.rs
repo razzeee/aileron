@@ -1,6 +1,7 @@
-/// Shared mutable daemon state, behind a single `Arc<Mutex<…>>`.
+/// Shared mutable daemon state.
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use tokio::sync::Mutex;
 
 use crate::assignments::Assignments;
@@ -64,7 +65,10 @@ pub struct Inner {
 }
 
 #[derive(Clone)]
-pub struct SharedState(pub Arc<Mutex<Inner>>);
+pub struct SharedState(
+    pub Arc<Mutex<Inner>>,
+    pub Arc<StdMutex<HashMap<String, u64>>>,
+);
 
 impl SharedState {
     pub async fn load(config: Config) -> anyhow::Result<Self> {
@@ -80,21 +84,121 @@ impl SharedState {
             .clone()
             .unwrap_or_else(crate::container::default_oci_store);
         let variant = crate::hardware::detect();
-        Ok(Self(Arc::new(Mutex::new(Inner {
-            config,
-            permissions,
-            assignments,
-            profiles,
-            runtimes,
-            containers,
-            sessions: HashMap::new(),
-            installing_profiles: HashMap::new(),
-            runtime_downloads: HashMap::new(),
-            runtime_download_owners: HashMap::new(),
-            runtime_update_checks: HashMap::new(),
-            recent_installs: VecDeque::new(),
-            recent_runtime_downloads: VecDeque::new(),
-            variant,
-        }))))
+        Ok(Self(
+            Arc::new(Mutex::new(Inner {
+                config,
+                permissions,
+                assignments,
+                profiles,
+                runtimes,
+                containers,
+                sessions: HashMap::new(),
+                installing_profiles: HashMap::new(),
+                runtime_downloads: HashMap::new(),
+                runtime_download_owners: HashMap::new(),
+                runtime_update_checks: HashMap::new(),
+                recent_installs: VecDeque::new(),
+                recent_runtime_downloads: VecDeque::new(),
+                variant,
+            })),
+            Arc::new(StdMutex::new(HashMap::new())),
+        ))
+    }
+
+    pub fn begin_predict_next(&self, session_id: &str) -> u64 {
+        let mut generations = self.1.lock().expect("prediction generation mutex poisoned");
+        let generation = generations
+            .get(session_id)
+            .copied()
+            .unwrap_or_default()
+            .saturating_add(1);
+        generations.insert(session_id.to_string(), generation);
+        generation
+    }
+
+    pub fn is_current_predict_next(&self, session_id: &str, generation: u64) -> bool {
+        self.1
+            .lock()
+            .expect("prediction generation mutex poisoned")
+            .get(session_id)
+            .is_some_and(|current| *current == generation)
+    }
+
+    pub fn clear_predict_next(&self, session_id: &str) {
+        self.1
+            .lock()
+            .expect("prediction generation mutex poisoned")
+            .remove(session_id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::assignments::Assignments;
+    use crate::config::Config;
+    use crate::hardware::Variant;
+    use crate::manifests::RuntimeManifestStore;
+    use crate::permissions::PermissionStore;
+    use crate::profiles::ProfileStore;
+
+    fn shared_state() -> SharedState {
+        SharedState(
+            Arc::new(Mutex::new(Inner {
+                config: Config {
+                    allow_all: false,
+                    auto_grant: false,
+                    idle_timeout_secs: 300,
+                    container_memory: "8g".to_string(),
+                    oci_store: None,
+                },
+                permissions: PermissionStore::default(),
+                assignments: Assignments::default(),
+                profiles: ProfileStore::default(),
+                runtimes: RuntimeManifestStore::default(),
+                containers: ContainerPool::new(),
+                sessions: HashMap::new(),
+                installing_profiles: HashMap::new(),
+                runtime_downloads: HashMap::new(),
+                runtime_download_owners: HashMap::new(),
+                runtime_update_checks: HashMap::new(),
+                recent_installs: VecDeque::new(),
+                recent_runtime_downloads: VecDeque::new(),
+                variant: Variant::Cpu,
+            })),
+            Arc::new(StdMutex::new(HashMap::new())),
+        )
+    }
+
+    #[test]
+    fn newer_predict_next_generation_supersedes_older_generation() {
+        let state = shared_state();
+
+        let first = state.begin_predict_next("session-a");
+        let second = state.begin_predict_next("session-a");
+
+        assert!(!state.is_current_predict_next("session-a", first));
+        assert!(state.is_current_predict_next("session-a", second));
+    }
+
+    #[test]
+    fn predict_next_generations_are_scoped_to_session() {
+        let state = shared_state();
+
+        let first = state.begin_predict_next("session-a");
+        let other = state.begin_predict_next("session-b");
+
+        assert!(state.is_current_predict_next("session-a", first));
+        assert!(state.is_current_predict_next("session-b", other));
+    }
+
+    #[test]
+    fn predict_next_generation_can_be_cleared() {
+        let state = shared_state();
+
+        let generation = state.begin_predict_next("session-a");
+        state.clear_predict_next("session-a");
+
+        assert!(!state.is_current_predict_next("session-a", generation));
     }
 }

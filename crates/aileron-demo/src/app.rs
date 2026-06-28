@@ -1034,6 +1034,8 @@ enum GuidedStreamEvent {
     ToolCalls(Vec<ToolCallDbus>, bool),
 }
 
+type SnapshotHandler<'a> = &'a mut dyn FnMut(&str) -> anyhow::Result<()>;
+
 fn stream_guided_response(
     session_handle: &OwnedObjectPath,
     prompt: &str,
@@ -1112,7 +1114,7 @@ fn stream_guided_call(
     fields: Vec<(String, String, String, bool)>,
     tools: Vec<ToolDefinitionDbus>,
     options: PortalOptions,
-    mut snapshot_handler: Option<&mut dyn FnMut(&str) -> anyhow::Result<()>>,
+    mut snapshot_handler: Option<SnapshotHandler<'_>>,
 ) -> anyhow::Result<(String, Vec<ToolCallDbus>)> {
     let call_conn = portal_connection()?;
     let signal_conn = zbus::blocking::Connection::session()?;
@@ -1629,7 +1631,7 @@ fn end_prediction_session(session_id: &str) -> anyhow::Result<()> {
 
 fn clean_prediction(input: &str, raw: &str) -> String {
     let mut suggestion = raw
-        .trim()
+        .trim_end()
         .trim_matches(['"', '\'', '`'])
         .replace(['\r', '\n'], " ");
     while suggestion.contains("  ") {
@@ -1646,10 +1648,12 @@ fn clean_prediction(input: &str, raw: &str) -> String {
         suggestion = suggestion["completion:".len()..].trim_start().to_string();
     }
 
-    let suffix_mode = input
-        .chars()
-        .last()
-        .is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-');
+    let starts_with_boundary = suggestion.chars().next().is_some_and(char::is_whitespace);
+    let suffix_mode = !starts_with_boundary
+        && input
+            .chars()
+            .last()
+            .is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-');
     suggestion = one_prediction_unit(&suggestion, suffix_mode);
 
     let mut out = String::new();
@@ -2250,7 +2254,7 @@ fn base64_encode(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        DemoMode, base64_encode, clear_failed_prediction_session, concise_error,
+        DemoMode, base64_encode, clean_prediction, clear_failed_prediction_session, concise_error,
         guided_chat_answer_draft, is_session_not_found_message,
     };
     use hegel::TestCase;
@@ -2307,6 +2311,17 @@ mod tests {
         assert!(!is_session_not_found_message(
             "aileron.Inference.GenerationFailed"
         ));
+    }
+
+    #[test]
+    fn clean_prediction_preserves_next_word_boundary() {
+        assert_eq!(clean_prediction("hey, das ist", " eine"), " eine");
+        assert_eq!(clean_prediction("hey, my", " 10-year"), " 10-year");
+    }
+
+    #[test]
+    fn clean_prediction_keeps_current_word_suffixes_attached() {
+        assert_eq!(clean_prediction("runn", "ing"), "ing");
     }
 
     #[test]

@@ -35,6 +35,7 @@ impl VarlinkInterface for SessionsHandler {
             if !kill_session(&mut guard, &session_id) {
                 return call.reply_session_not_found(session_id);
             }
+            self.state.clear_predict_next(&session_id);
             call.reply()
         })
     }
