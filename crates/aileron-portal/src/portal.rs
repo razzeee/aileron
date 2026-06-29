@@ -299,6 +299,7 @@ impl LanguagePortalBackend {
         let result = async {
             let record = ensure_known_session(&self.state, session_id, PortalInterface::Language)?;
             ensure_language_generation_session(&record)?;
+            ensure_request_active(&self.state, request_id)?;
             self.emit_loading(request_id, session_id, &emitter).await?;
             ensure_request_active(&self.state, request_id)?;
             let session_id = session_id.to_string();
@@ -381,6 +382,7 @@ impl LanguagePortalBackend {
         let result = async {
             let record = ensure_known_session(&self.state, session_id, PortalInterface::Language)?;
             ensure_exact_session_use_case(&record, "language.complete", "StreamPredictNext")?;
+            ensure_request_active(&self.state, request_id)?;
             self.emit_loading(request_id, session_id, &emitter).await?;
             ensure_request_active(&self.state, request_id)?;
             let session_id = session_id.to_string();
@@ -465,6 +467,7 @@ impl LanguagePortalBackend {
         let result = async {
             let record = ensure_known_session(&self.state, session_id, PortalInterface::Language)?;
             ensure_language_generation_session(&record)?;
+            ensure_request_active(&self.state, request_id)?;
             self.emit_loading(request_id, session_id, &emitter).await?;
             ensure_request_active(&self.state, request_id)?;
             let session_id = session_id.to_string();
@@ -587,6 +590,7 @@ impl LanguagePortalBackend {
         let result = async {
             let record = ensure_known_session(&self.state, session_id, PortalInterface::Language)?;
             ensure_language_generation_session(&record)?;
+            ensure_request_active(&self.state, request_id)?;
             self.emit_loading(request_id, session_id, &emitter).await?;
             ensure_request_active(&self.state, request_id)?;
             let session_id = session_id.to_string();
@@ -690,6 +694,7 @@ impl LanguagePortalBackend {
         let result = async {
             let record = ensure_known_session(&self.state, session_id, PortalInterface::Language)?;
             ensure_exact_session_use_case(&record, "language.embed", "StreamEmbed")?;
+            ensure_request_active(&self.state, request_id)?;
             self.emit_loading(request_id, session_id, &emitter).await?;
             ensure_request_active(&self.state, request_id)?;
             let session_id = session_id.to_string();
@@ -742,7 +747,7 @@ impl LanguagePortalBackend {
         #[zbus(header)] header: Header<'_>,
     ) -> zbus::fdo::Result<()> {
         ensure_portal_frontend(conn, &header).await?;
-        end_session_impl(&self.state, session_id, PortalInterface::Language)
+        end_session_impl(&self.state, session_id, PortalInterface::Language).await
     }
 }
 
@@ -848,6 +853,7 @@ impl SpeechPortalBackend {
         begin_request(conn, &self.state, request_id, Some(session_id)).await?;
         let result = async {
             ensure_known_session(&self.state, session_id, PortalInterface::Speech)?;
+            ensure_request_active(&self.state, request_id)?;
             self.emit_loading(request_id, session_id, &emitter).await?;
             ensure_request_active(&self.state, request_id)?;
             let session_id = session_id.to_string();
@@ -917,7 +923,7 @@ impl SpeechPortalBackend {
         #[zbus(header)] header: Header<'_>,
     ) -> zbus::fdo::Result<()> {
         ensure_portal_frontend(conn, &header).await?;
-        end_session_impl(&self.state, session_id, PortalInterface::Speech)
+        end_session_impl(&self.state, session_id, PortalInterface::Speech).await
     }
 }
 
@@ -1022,6 +1028,7 @@ impl VisionPortalBackend {
         let result = async {
             let record = ensure_known_session(&self.state, session_id, PortalInterface::Vision)?;
             ensure_exact_session_use_case(&record, "vision.describe", "StreamDescribe")?;
+            ensure_request_active(&self.state, request_id)?;
             self.emit_loading(request_id, session_id, &emitter).await?;
             ensure_request_active(&self.state, request_id)?;
             let session_id = session_id.to_string();
@@ -1089,6 +1096,7 @@ impl VisionPortalBackend {
         let result = async {
             let record = ensure_known_session(&self.state, session_id, PortalInterface::Vision)?;
             ensure_exact_session_use_case(&record, "vision.ocr", "StreamOcr")?;
+            ensure_request_active(&self.state, request_id)?;
             self.emit_loading(request_id, session_id, &emitter).await?;
             ensure_request_active(&self.state, request_id)?;
             let session_id = session_id.to_string();
@@ -1156,6 +1164,7 @@ impl VisionPortalBackend {
         let result = async {
             let record = ensure_known_session(&self.state, session_id, PortalInterface::Vision)?;
             ensure_exact_session_use_case(&record, "vision.segment", "StreamSegment")?;
+            ensure_request_active(&self.state, request_id)?;
             self.emit_loading(request_id, session_id, &emitter).await?;
             ensure_request_active(&self.state, request_id)?;
             let session_id = session_id.to_string();
@@ -1227,7 +1236,7 @@ impl VisionPortalBackend {
         #[zbus(header)] header: Header<'_>,
     ) -> zbus::fdo::Result<()> {
         ensure_portal_frontend(conn, &header).await?;
-        end_session_impl(&self.state, session_id, PortalInterface::Vision)
+        end_session_impl(&self.state, session_id, PortalInterface::Vision).await
     }
 }
 
@@ -1275,13 +1284,22 @@ async fn begin_request(
     request_id: &str,
     session_id: Option<&str>,
 ) -> zbus::fdo::Result<()> {
-    state.requests.lock().unwrap().insert(
-        request_id.to_string(),
-        RequestRecord {
-            session_id: session_id.map(str::to_string),
-            cancelled: false,
-        },
-    );
+    {
+        let mut requests = state.requests.lock().unwrap();
+        if requests.contains_key(request_id) {
+            return Err(zbus::fdo::Error::Failed(format!(
+                "request object {request_id} already exists"
+            )));
+        }
+
+        requests.insert(
+            request_id.to_string(),
+            RequestRecord {
+                session_id: session_id.map(str::to_string),
+                cancelled: false,
+            },
+        );
+    }
 
     let added = conn
         .object_server()
@@ -1568,16 +1586,33 @@ fn prewarm_impl_blocking(
     }
 }
 
-fn end_session_impl(
+async fn end_session_impl(
     state: &PortalState,
     session_id: &str,
     interface: PortalInterface,
 ) -> zbus::fdo::Result<()> {
     ensure_known_session(state, session_id, interface)?;
     cancel_session_requests(state, session_id);
+    end_daemon_session(session_id.to_string()).await?;
     state.sessions.lock().unwrap().remove(session_id);
-    end_daemon_session_async(session_id.to_string());
     Ok(())
+}
+
+async fn end_daemon_session(session_id: String) -> zbus::fdo::Result<()> {
+    tokio::task::spawn_blocking(move || {
+        use aileron_varlink::aileron_Inference::VarlinkClientInterface;
+
+        let conn =
+            aileron_ipc::client::connect().map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn);
+        client
+            .end_session(session_id)
+            .call()
+            .map(|_| ())
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))
+    })
+    .await
+    .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?
 }
 
 fn end_daemon_session_async(session_id: String) {
