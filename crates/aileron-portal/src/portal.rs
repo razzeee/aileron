@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
-use tracing::info;
+use std::thread;
+use std::time::Duration;
+use tracing::{info, warn};
 use zbus::zvariant::Type;
 use zbus::{connection, interface, message::Header, object_server::SignalEmitter};
 
@@ -33,6 +35,13 @@ pub async fn run() -> Result<()> {
 struct PortalState {
     warm_profiles: Mutex<HashSet<String>>,
     sessions: Mutex<HashMap<String, SessionRecord>>,
+    requests: Mutex<HashMap<String, RequestRecord>>,
+}
+
+#[derive(Debug, Clone)]
+struct RequestRecord {
+    session_id: Option<String>,
+    cancelled: bool,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -70,6 +79,11 @@ struct VisionPortalBackend {
     state: Arc<PortalState>,
 }
 
+struct RequestPortalBackend {
+    state: Arc<PortalState>,
+    request_id: String,
+}
+
 impl LanguagePortalBackend {
     fn new(state: Arc<PortalState>) -> Self {
         Self { state }
@@ -85,6 +99,15 @@ impl SpeechPortalBackend {
 impl VisionPortalBackend {
     fn new(state: Arc<PortalState>) -> Self {
         Self { state }
+    }
+}
+
+impl RequestPortalBackend {
+    fn new(state: Arc<PortalState>, request_id: &str) -> Self {
+        Self {
+            state,
+            request_id: request_id.to_string(),
+        }
     }
 }
 
@@ -143,6 +166,19 @@ struct VisionSegmentDbus {
     height: f64,
 }
 
+#[interface(name = "org.freedesktop.impl.portal.Request")]
+impl RequestPortalBackend {
+    async fn close(
+        &self,
+        #[zbus(connection)] conn: &zbus::Connection,
+        #[zbus(header)] header: Header<'_>,
+    ) -> zbus::fdo::Result<()> {
+        ensure_portal_frontend(conn, &header).await?;
+        cancel_request(&self.state, &self.request_id);
+        Ok(())
+    }
+}
+
 #[interface(name = "org.freedesktop.impl.portal.Language")]
 impl LanguagePortalBackend {
     #[zbus(property, name = "version")]
@@ -167,6 +203,7 @@ impl LanguagePortalBackend {
         &self,
         #[zbus(connection)] conn: &zbus::Connection,
         #[zbus(header)] header: Header<'_>,
+        request_id: &str,
         app_id: &str,
         parent_window: &str,
         use_case: &str,
@@ -174,14 +211,18 @@ impl LanguagePortalBackend {
     ) -> zbus::fdo::Result<String> {
         ensure_portal_frontend(conn, &header).await?;
         ensure_use_case_prefix(use_case, "language.", "Language")?;
-        create_session_impl(
+        begin_request(conn, &self.state, request_id, None).await?;
+        let result = create_session_impl(
             &self.state,
+            request_id,
             app_id,
             parent_window,
             use_case,
             instructions,
             PortalInterface::Language,
-        )
+        );
+        finish_request(conn, &self.state, request_id).await;
+        result
     }
 
     async fn prewarm(
@@ -193,11 +234,24 @@ impl LanguagePortalBackend {
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) -> zbus::fdo::Result<()> {
         ensure_portal_frontend(conn, &header).await?;
-        ensure_known_session(&self.state, session_id, PortalInterface::Language)?;
-        LanguagePortalBackend::model_loading(&emitter, request_id, session_id, "preparing model")
+        begin_request(conn, &self.state, request_id, Some(session_id)).await?;
+        let result = async {
+            ensure_known_session(&self.state, session_id, PortalInterface::Language)?;
+            ensure_request_active(&self.state, request_id)?;
+            LanguagePortalBackend::model_loading(
+                &emitter,
+                request_id,
+                session_id,
+                "preparing model",
+            )
             .await
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-        prewarm_impl(&self.state, session_id, PortalInterface::Language)
+            ensure_request_active(&self.state, request_id)?;
+            prewarm_impl(&self.state, session_id, PortalInterface::Language)
+        }
+        .await;
+        finish_request(conn, &self.state, request_id).await;
+        result
     }
 
     #[zbus(signal)]
@@ -222,48 +276,63 @@ impl LanguagePortalBackend {
         use aileron_varlink::aileron_Inference::VarlinkClientInterface;
 
         ensure_portal_frontend(conn, &header).await?;
-        self.emit_loading_if_cold(request_id, session_id, &emitter)
-            .await?;
-        let session_id = session_id.to_string();
-        let conn =
-            aileron_ipc::client::connect().map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-        let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn);
-        let mut call = client.stream_response(
-            session_id.clone(),
-            prompt.to_string(),
-            options.into_varlink(),
-        );
-        let iter = call
-            .more()
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        begin_request(conn, &self.state, request_id, Some(session_id)).await?;
+        let result = async {
+            self.emit_loading_if_cold(request_id, session_id, &emitter)
+                .await?;
+            ensure_request_active(&self.state, request_id)?;
+            let session_id = session_id.to_string();
+            let ipc_conn = aileron_ipc::client::connect()
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(ipc_conn);
+            let mut call = client.stream_response(
+                session_id.clone(),
+                prompt.to_string(),
+                options.into_varlink(),
+            );
+            let iter = call
+                .more()
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
 
-        let mut pending_token: Option<String> = None;
-        for reply in iter {
-            let token = reply
-                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?
-                .token;
+            let mut pending_token: Option<String> = None;
+            for reply in iter {
+                ensure_request_active(&self.state, request_id)?;
+                let token = reply
+                    .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?
+                    .token;
 
-            if let Some(previous) = pending_token.replace(token) {
+                if let Some(previous) = pending_token.replace(token) {
+                    LanguagePortalBackend::token_received(
+                        &emitter,
+                        request_id,
+                        &session_id,
+                        &previous,
+                        false,
+                    )
+                    .await
+                    .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+                }
+            }
+
+            ensure_request_active(&self.state, request_id)?;
+            if let Some(token) = pending_token {
                 LanguagePortalBackend::token_received(
                     &emitter,
                     request_id,
                     &session_id,
-                    &previous,
-                    false,
+                    &token,
+                    true,
                 )
                 .await
                 .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
             }
-        }
 
-        if let Some(token) = pending_token {
-            LanguagePortalBackend::token_received(&emitter, request_id, &session_id, &token, true)
-                .await
-                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            self.mark_warm(&session_id);
+            Ok(())
         }
-
-        self.mark_warm(&session_id);
-        Ok(())
+        .await;
+        finish_request(conn, &self.state, request_id).await;
+        result
     }
 
     #[zbus(signal)]
@@ -289,48 +358,63 @@ impl LanguagePortalBackend {
         use aileron_varlink::aileron_Inference::VarlinkClientInterface;
 
         ensure_portal_frontend(conn, &header).await?;
-        self.emit_loading_if_cold(request_id, session_id, &emitter)
-            .await?;
-        let session_id = session_id.to_string();
-        let conn =
-            aileron_ipc::client::connect().map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-        let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn);
-        let mut call = client.stream_predict_next(
-            session_id.clone(),
-            prefix.to_string(),
-            options.into_varlink(),
-        );
-        let iter = call
-            .more()
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-
-        let mut completions = Vec::new();
-        for reply in iter {
-            completions = reply
-                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?
-                .completions;
-        }
-
-        if completions.is_empty() {
-            LanguagePortalBackend::prediction_received(&emitter, request_id, &session_id, "", true)
-                .await
+        begin_request(conn, &self.state, request_id, Some(session_id)).await?;
+        let result = async {
+            self.emit_loading_if_cold(request_id, session_id, &emitter)
+                .await?;
+            ensure_request_active(&self.state, request_id)?;
+            let session_id = session_id.to_string();
+            let ipc_conn = aileron_ipc::client::connect()
                 .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-        } else {
-            let last_index = completions.len() - 1;
-            for (index, completion) in completions.iter().enumerate() {
+            let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(ipc_conn);
+            let mut call = client.stream_predict_next(
+                session_id.clone(),
+                prefix.to_string(),
+                options.into_varlink(),
+            );
+            let iter = call
+                .more()
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+
+            let mut completions = Vec::new();
+            for reply in iter {
+                ensure_request_active(&self.state, request_id)?;
+                completions = reply
+                    .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?
+                    .completions;
+            }
+
+            ensure_request_active(&self.state, request_id)?;
+            if completions.is_empty() {
                 LanguagePortalBackend::prediction_received(
                     &emitter,
                     request_id,
                     &session_id,
-                    completion,
-                    index == last_index,
+                    "",
+                    true,
                 )
                 .await
                 .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            } else {
+                let last_index = completions.len() - 1;
+                for (index, completion) in completions.iter().enumerate() {
+                    LanguagePortalBackend::prediction_received(
+                        &emitter,
+                        request_id,
+                        &session_id,
+                        completion,
+                        index == last_index,
+                    )
+                    .await
+                    .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+                }
             }
+            self.mark_warm(&session_id);
+            Ok(())
         }
-        self.mark_warm(&session_id);
-        Ok(())
+        .await;
+        finish_request(conn, &self.state, request_id).await;
+        result
     }
 
     #[zbus(signal)]
@@ -358,82 +442,91 @@ impl LanguagePortalBackend {
         use aileron_varlink::aileron_Inference::VarlinkClientInterface;
 
         ensure_portal_frontend(conn, &header).await?;
-        self.emit_loading_if_cold(request_id, session_id, &emitter)
-            .await?;
-        let session_id = session_id.to_string();
-        let conn =
-            aileron_ipc::client::connect().map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-        let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn);
-        let mut call = client.stream_respond_guided(
-            session_id.clone(),
-            prompt.to_string(),
-            fields
-                .into_iter()
-                .map(GuidedFieldDbus::into_varlink)
-                .collect(),
-            tools
-                .into_iter()
-                .map(ToolDefinitionDbus::into_varlink)
-                .collect(),
-            options.into_varlink(),
-        );
-        let iter = call
-            .more()
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-
-        let mut pending_snapshot: Option<String> = None;
-        let mut emitted_terminal_tool_calls = false;
-        for reply in iter {
-            let reply = reply.map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-            let snapshot = reply.snapshot_json;
-            let tool_calls = reply
-                .tool_calls
-                .into_iter()
-                .map(ToolCallDbus::from_varlink)
-                .collect::<Vec<_>>();
-
-            if !tool_calls.is_empty() {
-                pending_snapshot = None;
-                emitted_terminal_tool_calls = true;
-                LanguagePortalBackend::guided_tool_calls_received(
-                    &emitter,
-                    request_id,
-                    &session_id,
-                    &tool_calls,
-                    true,
-                )
-                .await
+        begin_request(conn, &self.state, request_id, Some(session_id)).await?;
+        let result = async {
+            self.emit_loading_if_cold(request_id, session_id, &emitter)
+                .await?;
+            ensure_request_active(&self.state, request_id)?;
+            let session_id = session_id.to_string();
+            let ipc_conn = aileron_ipc::client::connect()
                 .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-                continue;
+            let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(ipc_conn);
+            let mut call = client.stream_respond_guided(
+                session_id.clone(),
+                prompt.to_string(),
+                fields
+                    .into_iter()
+                    .map(GuidedFieldDbus::into_varlink)
+                    .collect(),
+                tools
+                    .into_iter()
+                    .map(ToolDefinitionDbus::into_varlink)
+                    .collect(),
+                options.into_varlink(),
+            );
+            let iter = call
+                .more()
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+
+            let mut pending_snapshot: Option<String> = None;
+            let mut emitted_terminal_tool_calls = false;
+            for reply in iter {
+                ensure_request_active(&self.state, request_id)?;
+                let reply = reply.map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+                let snapshot = reply.snapshot_json;
+                let tool_calls = reply
+                    .tool_calls
+                    .into_iter()
+                    .map(ToolCallDbus::from_varlink)
+                    .collect::<Vec<_>>();
+
+                if !tool_calls.is_empty() {
+                    pending_snapshot = None;
+                    emitted_terminal_tool_calls = true;
+                    LanguagePortalBackend::guided_tool_calls_received(
+                        &emitter,
+                        request_id,
+                        &session_id,
+                        &tool_calls,
+                        true,
+                    )
+                    .await
+                    .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+                    continue;
+                }
+
+                if let Some(previous) = pending_snapshot.replace(snapshot) {
+                    LanguagePortalBackend::guided_snapshot_received(
+                        &emitter,
+                        request_id,
+                        &session_id,
+                        &previous,
+                        false,
+                    )
+                    .await
+                    .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+                }
             }
 
-            if let Some(previous) = pending_snapshot.replace(snapshot) {
+            ensure_request_active(&self.state, request_id)?;
+            if !emitted_terminal_tool_calls && let Some(snapshot) = pending_snapshot {
                 LanguagePortalBackend::guided_snapshot_received(
                     &emitter,
                     request_id,
                     &session_id,
-                    &previous,
-                    false,
+                    &snapshot,
+                    true,
                 )
                 .await
                 .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
             }
-        }
 
-        if !emitted_terminal_tool_calls && let Some(snapshot) = pending_snapshot {
-            LanguagePortalBackend::guided_snapshot_received(
-                &emitter,
-                request_id,
-                &session_id,
-                &snapshot,
-                true,
-            )
-            .await
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            self.mark_warm(&session_id);
+            Ok(())
         }
-
-        self.mark_warm(&session_id);
-        Ok(())
+        .await;
+        finish_request(conn, &self.state, request_id).await;
+        result
     }
 
     #[zbus(signal)]
@@ -471,86 +564,95 @@ impl LanguagePortalBackend {
         use aileron_varlink::aileron_Inference::VarlinkClientInterface;
 
         ensure_portal_frontend(conn, &header).await?;
-        self.emit_loading_if_cold(request_id, session_id, &emitter)
-            .await?;
-        let session_id = session_id.to_string();
-        let conn =
-            aileron_ipc::client::connect().map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-        let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn);
-        let mut call = client.stream_submit_tool_results_guided(
-            session_id.clone(),
-            prompt.to_string(),
-            results
-                .into_iter()
-                .map(ToolResultDbus::into_varlink)
-                .collect(),
-            fields
-                .into_iter()
-                .map(GuidedFieldDbus::into_varlink)
-                .collect(),
-            tools
-                .into_iter()
-                .map(ToolDefinitionDbus::into_varlink)
-                .collect(),
-            options.into_varlink(),
-        );
-        let iter = call
-            .more()
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-
-        let mut pending_snapshot: Option<String> = None;
-        let mut emitted_terminal_tool_calls = false;
-        for reply in iter {
-            let reply = reply.map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-            let snapshot = reply.snapshot_json;
-            let tool_calls = reply
-                .tool_calls
-                .into_iter()
-                .map(ToolCallDbus::from_varlink)
-                .collect::<Vec<_>>();
-
-            if !tool_calls.is_empty() {
-                pending_snapshot = None;
-                emitted_terminal_tool_calls = true;
-                LanguagePortalBackend::guided_tool_calls_received(
-                    &emitter,
-                    request_id,
-                    &session_id,
-                    &tool_calls,
-                    true,
-                )
-                .await
+        begin_request(conn, &self.state, request_id, Some(session_id)).await?;
+        let result = async {
+            self.emit_loading_if_cold(request_id, session_id, &emitter)
+                .await?;
+            ensure_request_active(&self.state, request_id)?;
+            let session_id = session_id.to_string();
+            let ipc_conn = aileron_ipc::client::connect()
                 .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-                continue;
+            let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(ipc_conn);
+            let mut call = client.stream_submit_tool_results_guided(
+                session_id.clone(),
+                prompt.to_string(),
+                results
+                    .into_iter()
+                    .map(ToolResultDbus::into_varlink)
+                    .collect(),
+                fields
+                    .into_iter()
+                    .map(GuidedFieldDbus::into_varlink)
+                    .collect(),
+                tools
+                    .into_iter()
+                    .map(ToolDefinitionDbus::into_varlink)
+                    .collect(),
+                options.into_varlink(),
+            );
+            let iter = call
+                .more()
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+
+            let mut pending_snapshot: Option<String> = None;
+            let mut emitted_terminal_tool_calls = false;
+            for reply in iter {
+                ensure_request_active(&self.state, request_id)?;
+                let reply = reply.map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+                let snapshot = reply.snapshot_json;
+                let tool_calls = reply
+                    .tool_calls
+                    .into_iter()
+                    .map(ToolCallDbus::from_varlink)
+                    .collect::<Vec<_>>();
+
+                if !tool_calls.is_empty() {
+                    pending_snapshot = None;
+                    emitted_terminal_tool_calls = true;
+                    LanguagePortalBackend::guided_tool_calls_received(
+                        &emitter,
+                        request_id,
+                        &session_id,
+                        &tool_calls,
+                        true,
+                    )
+                    .await
+                    .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+                    continue;
+                }
+
+                if let Some(previous) = pending_snapshot.replace(snapshot) {
+                    LanguagePortalBackend::guided_snapshot_received(
+                        &emitter,
+                        request_id,
+                        &session_id,
+                        &previous,
+                        false,
+                    )
+                    .await
+                    .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+                }
             }
 
-            if let Some(previous) = pending_snapshot.replace(snapshot) {
+            ensure_request_active(&self.state, request_id)?;
+            if !emitted_terminal_tool_calls && let Some(snapshot) = pending_snapshot {
                 LanguagePortalBackend::guided_snapshot_received(
                     &emitter,
                     request_id,
                     &session_id,
-                    &previous,
-                    false,
+                    &snapshot,
+                    true,
                 )
                 .await
                 .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
             }
-        }
 
-        if !emitted_terminal_tool_calls && let Some(snapshot) = pending_snapshot {
-            LanguagePortalBackend::guided_snapshot_received(
-                &emitter,
-                request_id,
-                &session_id,
-                &snapshot,
-                true,
-            )
-            .await
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            self.mark_warm(&session_id);
+            Ok(())
         }
-
-        self.mark_warm(&session_id);
-        Ok(())
+        .await;
+        finish_request(conn, &self.state, request_id).await;
+        result
     }
 
     async fn stream_embed(
@@ -565,35 +667,44 @@ impl LanguagePortalBackend {
         use aileron_varlink::aileron_Inference::VarlinkClientInterface;
 
         ensure_portal_frontend(conn, &header).await?;
-        self.emit_loading_if_cold(request_id, session_id, &emitter)
-            .await?;
-        let session_id = session_id.to_string();
-        let conn =
-            aileron_ipc::client::connect().map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-        let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn);
-        let mut call = client.stream_embed(session_id.clone(), text.to_string());
-        let iter = call
-            .more()
+        begin_request(conn, &self.state, request_id, Some(session_id)).await?;
+        let result = async {
+            self.emit_loading_if_cold(request_id, session_id, &emitter)
+                .await?;
+            ensure_request_active(&self.state, request_id)?;
+            let session_id = session_id.to_string();
+            let ipc_conn = aileron_ipc::client::connect()
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(ipc_conn);
+            let mut call = client.stream_embed(session_id.clone(), text.to_string());
+            let iter = call
+                .more()
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+
+            let mut last_embedding = Vec::new();
+            for reply in iter {
+                ensure_request_active(&self.state, request_id)?;
+                last_embedding = reply
+                    .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?
+                    .embedding;
+            }
+
+            ensure_request_active(&self.state, request_id)?;
+            LanguagePortalBackend::embedding_received(
+                &emitter,
+                request_id,
+                &session_id,
+                &last_embedding,
+                true,
+            )
+            .await
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-
-        let mut last_embedding = Vec::new();
-        for reply in iter {
-            last_embedding = reply
-                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?
-                .embedding;
+            self.mark_warm(&session_id);
+            Ok(())
         }
-
-        LanguagePortalBackend::embedding_received(
-            &emitter,
-            request_id,
-            &session_id,
-            &last_embedding,
-            true,
-        )
-        .await
-        .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-        self.mark_warm(&session_id);
-        Ok(())
+        .await;
+        finish_request(conn, &self.state, request_id).await;
+        result
     }
 
     #[zbus(signal)]
@@ -640,6 +751,7 @@ impl SpeechPortalBackend {
         &self,
         #[zbus(connection)] conn: &zbus::Connection,
         #[zbus(header)] header: Header<'_>,
+        request_id: &str,
         app_id: &str,
         parent_window: &str,
         use_case: &str,
@@ -647,14 +759,18 @@ impl SpeechPortalBackend {
     ) -> zbus::fdo::Result<String> {
         ensure_portal_frontend(conn, &header).await?;
         ensure_use_case_prefix(use_case, "speech.", "Speech")?;
-        create_session_impl(
+        begin_request(conn, &self.state, request_id, None).await?;
+        let result = create_session_impl(
             &self.state,
+            request_id,
             app_id,
             parent_window,
             use_case,
             instructions,
             PortalInterface::Speech,
-        )
+        );
+        finish_request(conn, &self.state, request_id).await;
+        result
     }
 
     async fn prewarm(
@@ -666,11 +782,19 @@ impl SpeechPortalBackend {
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) -> zbus::fdo::Result<()> {
         ensure_portal_frontend(conn, &header).await?;
-        ensure_known_session(&self.state, session_id, PortalInterface::Speech)?;
-        SpeechPortalBackend::model_loading(&emitter, request_id, session_id, "preparing model")
-            .await
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-        prewarm_impl(&self.state, session_id, PortalInterface::Speech)
+        begin_request(conn, &self.state, request_id, Some(session_id)).await?;
+        let result = async {
+            ensure_known_session(&self.state, session_id, PortalInterface::Speech)?;
+            ensure_request_active(&self.state, request_id)?;
+            SpeechPortalBackend::model_loading(&emitter, request_id, session_id, "preparing model")
+                .await
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            ensure_request_active(&self.state, request_id)?;
+            prewarm_impl(&self.state, session_id, PortalInterface::Speech)
+        }
+        .await;
+        finish_request(conn, &self.state, request_id).await;
+        result
     }
 
     #[zbus(signal)]
@@ -695,52 +819,61 @@ impl SpeechPortalBackend {
         use aileron_varlink::aileron_Inference::VarlinkClientInterface;
 
         ensure_portal_frontend(conn, &header).await?;
-        self.emit_loading_if_cold(request_id, session_id, &emitter)
-            .await?;
-        let session_id = session_id.to_string();
-        let conn =
-            aileron_ipc::client::connect().map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-        let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn);
-        let mut call = client.stream_transcribe(
-            session_id.clone(),
-            audio_b64.to_string(),
-            source_language_hint.to_string(),
-        );
-        let iter = call
-            .more()
+        begin_request(conn, &self.state, request_id, Some(session_id)).await?;
+        let result = async {
+            self.emit_loading_if_cold(request_id, session_id, &emitter)
+                .await?;
+            ensure_request_active(&self.state, request_id)?;
+            let session_id = session_id.to_string();
+            let ipc_conn = aileron_ipc::client::connect()
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(ipc_conn);
+            let mut call = client.stream_transcribe(
+                session_id.clone(),
+                audio_b64.to_string(),
+                source_language_hint.to_string(),
+            );
+            let iter = call
+                .more()
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+
+            let mut pending_text: Option<String> = None;
+            for reply in iter {
+                ensure_request_active(&self.state, request_id)?;
+                let text = reply
+                    .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?
+                    .token;
+
+                if let Some(previous) = pending_text.replace(text) {
+                    SpeechPortalBackend::transcription_received(
+                        &emitter,
+                        request_id,
+                        &session_id,
+                        &previous,
+                        false,
+                    )
+                    .await
+                    .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+                }
+            }
+
+            ensure_request_active(&self.state, request_id)?;
+            SpeechPortalBackend::transcription_received(
+                &emitter,
+                request_id,
+                &session_id,
+                pending_text.as_deref().unwrap_or_default(),
+                true,
+            )
+            .await
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
 
-        let mut pending_text: Option<String> = None;
-        for reply in iter {
-            let text = reply
-                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?
-                .token;
-
-            if let Some(previous) = pending_text.replace(text) {
-                SpeechPortalBackend::transcription_received(
-                    &emitter,
-                    request_id,
-                    &session_id,
-                    &previous,
-                    false,
-                )
-                .await
-                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-            }
+            self.mark_warm(&session_id);
+            Ok(())
         }
-
-        SpeechPortalBackend::transcription_received(
-            &emitter,
-            request_id,
-            &session_id,
-            pending_text.as_deref().unwrap_or_default(),
-            true,
-        )
-        .await
-        .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-
-        self.mark_warm(&session_id);
-        Ok(())
+        .await;
+        finish_request(conn, &self.state, request_id).await;
+        result
     }
 
     #[zbus(signal)]
@@ -787,6 +920,7 @@ impl VisionPortalBackend {
         &self,
         #[zbus(connection)] conn: &zbus::Connection,
         #[zbus(header)] header: Header<'_>,
+        request_id: &str,
         app_id: &str,
         parent_window: &str,
         use_case: &str,
@@ -794,14 +928,18 @@ impl VisionPortalBackend {
     ) -> zbus::fdo::Result<String> {
         ensure_portal_frontend(conn, &header).await?;
         ensure_use_case_prefix(use_case, "vision.", "Vision")?;
-        create_session_impl(
+        begin_request(conn, &self.state, request_id, None).await?;
+        let result = create_session_impl(
             &self.state,
+            request_id,
             app_id,
             parent_window,
             use_case,
             instructions,
             PortalInterface::Vision,
-        )
+        );
+        finish_request(conn, &self.state, request_id).await;
+        result
     }
 
     async fn prewarm(
@@ -813,11 +951,19 @@ impl VisionPortalBackend {
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) -> zbus::fdo::Result<()> {
         ensure_portal_frontend(conn, &header).await?;
-        ensure_known_session(&self.state, session_id, PortalInterface::Vision)?;
-        VisionPortalBackend::model_loading(&emitter, request_id, session_id, "preparing model")
-            .await
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-        prewarm_impl(&self.state, session_id, PortalInterface::Vision)
+        begin_request(conn, &self.state, request_id, Some(session_id)).await?;
+        let result = async {
+            ensure_known_session(&self.state, session_id, PortalInterface::Vision)?;
+            ensure_request_active(&self.state, request_id)?;
+            VisionPortalBackend::model_loading(&emitter, request_id, session_id, "preparing model")
+                .await
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            ensure_request_active(&self.state, request_id)?;
+            prewarm_impl(&self.state, session_id, PortalInterface::Vision)
+        }
+        .await;
+        finish_request(conn, &self.state, request_id).await;
+        result
     }
 
     #[zbus(signal)]
@@ -840,50 +986,59 @@ impl VisionPortalBackend {
         use aileron_varlink::aileron_Inference::VarlinkClientInterface;
 
         ensure_portal_frontend(conn, &header).await?;
-        self.emit_loading_if_cold(request_id, session_id, &emitter)
-            .await?;
-        let session_id = session_id.to_string();
-        let conn =
-            aileron_ipc::client::connect().map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-        let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn);
-        let mut call = client.stream_describe(session_id.clone(), image_b64.to_string());
-        let iter = call
-            .more()
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        begin_request(conn, &self.state, request_id, Some(session_id)).await?;
+        let result = async {
+            self.emit_loading_if_cold(request_id, session_id, &emitter)
+                .await?;
+            ensure_request_active(&self.state, request_id)?;
+            let session_id = session_id.to_string();
+            let ipc_conn = aileron_ipc::client::connect()
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(ipc_conn);
+            let mut call = client.stream_describe(session_id.clone(), image_b64.to_string());
+            let iter = call
+                .more()
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
 
-        let mut pending_text: Option<String> = None;
-        for reply in iter {
-            let text = reply
-                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?
-                .token;
+            let mut pending_text: Option<String> = None;
+            for reply in iter {
+                ensure_request_active(&self.state, request_id)?;
+                let text = reply
+                    .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?
+                    .token;
 
-            if let Some(previous) = pending_text.replace(text) {
+                if let Some(previous) = pending_text.replace(text) {
+                    VisionPortalBackend::vision_text_received(
+                        &emitter,
+                        request_id,
+                        &session_id,
+                        &previous,
+                        false,
+                    )
+                    .await
+                    .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+                }
+            }
+
+            ensure_request_active(&self.state, request_id)?;
+            if let Some(text) = pending_text {
                 VisionPortalBackend::vision_text_received(
                     &emitter,
                     request_id,
                     &session_id,
-                    &previous,
-                    false,
+                    &text,
+                    true,
                 )
                 .await
                 .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
             }
-        }
 
-        if let Some(text) = pending_text {
-            VisionPortalBackend::vision_text_received(
-                &emitter,
-                request_id,
-                &session_id,
-                &text,
-                true,
-            )
-            .await
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            self.mark_warm(&session_id);
+            Ok(())
         }
-
-        self.mark_warm(&session_id);
-        Ok(())
+        .await;
+        finish_request(conn, &self.state, request_id).await;
+        result
     }
 
     async fn stream_ocr(
@@ -898,50 +1053,59 @@ impl VisionPortalBackend {
         use aileron_varlink::aileron_Inference::VarlinkClientInterface;
 
         ensure_portal_frontend(conn, &header).await?;
-        self.emit_loading_if_cold(request_id, session_id, &emitter)
-            .await?;
-        let session_id = session_id.to_string();
-        let conn =
-            aileron_ipc::client::connect().map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-        let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn);
-        let mut call = client.stream_ocr(session_id.clone(), image_b64.to_string());
-        let iter = call
-            .more()
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        begin_request(conn, &self.state, request_id, Some(session_id)).await?;
+        let result = async {
+            self.emit_loading_if_cold(request_id, session_id, &emitter)
+                .await?;
+            ensure_request_active(&self.state, request_id)?;
+            let session_id = session_id.to_string();
+            let ipc_conn = aileron_ipc::client::connect()
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(ipc_conn);
+            let mut call = client.stream_ocr(session_id.clone(), image_b64.to_string());
+            let iter = call
+                .more()
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
 
-        let mut pending_text: Option<String> = None;
-        for reply in iter {
-            let text = reply
-                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?
-                .token;
+            let mut pending_text: Option<String> = None;
+            for reply in iter {
+                ensure_request_active(&self.state, request_id)?;
+                let text = reply
+                    .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?
+                    .token;
 
-            if let Some(previous) = pending_text.replace(text) {
+                if let Some(previous) = pending_text.replace(text) {
+                    VisionPortalBackend::vision_text_received(
+                        &emitter,
+                        request_id,
+                        &session_id,
+                        &previous,
+                        false,
+                    )
+                    .await
+                    .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+                }
+            }
+
+            ensure_request_active(&self.state, request_id)?;
+            if let Some(text) = pending_text {
                 VisionPortalBackend::vision_text_received(
                     &emitter,
                     request_id,
                     &session_id,
-                    &previous,
-                    false,
+                    &text,
+                    true,
                 )
                 .await
                 .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
             }
-        }
 
-        if let Some(text) = pending_text {
-            VisionPortalBackend::vision_text_received(
-                &emitter,
-                request_id,
-                &session_id,
-                &text,
-                true,
-            )
-            .await
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            self.mark_warm(&session_id);
+            Ok(())
         }
-
-        self.mark_warm(&session_id);
-        Ok(())
+        .await;
+        finish_request(conn, &self.state, request_id).await;
+        result
     }
 
     async fn stream_segment(
@@ -956,45 +1120,54 @@ impl VisionPortalBackend {
         use aileron_varlink::aileron_Inference::VarlinkClientInterface;
 
         ensure_portal_frontend(conn, &header).await?;
-        self.emit_loading_if_cold(request_id, session_id, &emitter)
-            .await?;
-        let session_id = session_id.to_string();
-        let conn =
-            aileron_ipc::client::connect().map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-        let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn);
-        let mut call = client.stream_segment(session_id.clone(), image_b64.to_string());
-        let iter = call
-            .more()
+        begin_request(conn, &self.state, request_id, Some(session_id)).await?;
+        let result = async {
+            self.emit_loading_if_cold(request_id, session_id, &emitter)
+                .await?;
+            ensure_request_active(&self.state, request_id)?;
+            let session_id = session_id.to_string();
+            let ipc_conn = aileron_ipc::client::connect()
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(ipc_conn);
+            let mut call = client.stream_segment(session_id.clone(), image_b64.to_string());
+            let iter = call
+                .more()
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+
+            let mut last_segments = Vec::new();
+            for reply in iter {
+                ensure_request_active(&self.state, request_id)?;
+                last_segments = reply
+                    .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?
+                    .segments
+                    .into_iter()
+                    .map(|segment| VisionSegmentDbus {
+                        label: segment.label,
+                        confidence: segment.confidence,
+                        x: segment.x,
+                        y: segment.y,
+                        width: segment.width,
+                        height: segment.height,
+                    })
+                    .collect();
+            }
+
+            ensure_request_active(&self.state, request_id)?;
+            VisionPortalBackend::vision_segments_received(
+                &emitter,
+                request_id,
+                &session_id,
+                &last_segments,
+                true,
+            )
+            .await
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-
-        let mut last_segments = Vec::new();
-        for reply in iter {
-            last_segments = reply
-                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?
-                .segments
-                .into_iter()
-                .map(|segment| VisionSegmentDbus {
-                    label: segment.label,
-                    confidence: segment.confidence,
-                    x: segment.x,
-                    y: segment.y,
-                    width: segment.width,
-                    height: segment.height,
-                })
-                .collect();
+            self.mark_warm(&session_id);
+            Ok(())
         }
-
-        VisionPortalBackend::vision_segments_received(
-            &emitter,
-            request_id,
-            &session_id,
-            &last_segments,
-            true,
-        )
-        .await
-        .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-        self.mark_warm(&session_id);
-        Ok(())
+        .await;
+        finish_request(conn, &self.state, request_id).await;
+        result
     }
 
     #[zbus(signal)]
@@ -1064,6 +1237,88 @@ fn ensure_use_case_prefix(use_case: &str, prefix: &str, interface: &str) -> zbus
     )))
 }
 
+async fn begin_request(
+    conn: &zbus::Connection,
+    state: &Arc<PortalState>,
+    request_id: &str,
+    session_id: Option<&str>,
+) -> zbus::fdo::Result<()> {
+    state.requests.lock().unwrap().insert(
+        request_id.to_string(),
+        RequestRecord {
+            session_id: session_id.map(str::to_string),
+            cancelled: false,
+        },
+    );
+
+    let added = conn
+        .object_server()
+        .at(
+            request_id,
+            RequestPortalBackend::new(state.clone(), request_id),
+        )
+        .await
+        .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+    if !added {
+        finish_request_record(state, request_id);
+        return Err(zbus::fdo::Error::Failed(format!(
+            "request object {request_id} already exists"
+        )));
+    }
+
+    Ok(())
+}
+
+async fn finish_request(conn: &zbus::Connection, state: &PortalState, request_id: &str) {
+    finish_request_record(state, request_id);
+    if let Err(e) = conn
+        .object_server()
+        .remove::<RequestPortalBackend, _>(request_id)
+        .await
+    {
+        warn!("failed to remove portal request {request_id}: {e}");
+    }
+}
+
+fn finish_request_record(state: &PortalState, request_id: &str) {
+    state.requests.lock().unwrap().remove(request_id);
+}
+
+fn cancel_request(state: &PortalState, request_id: &str) {
+    if let Some(record) = state.requests.lock().unwrap().get_mut(request_id) {
+        record.cancelled = true;
+    }
+}
+
+fn cancel_session_requests(state: &PortalState, session_id: &str) {
+    for record in state.requests.lock().unwrap().values_mut() {
+        if record.session_id.as_deref() == Some(session_id) {
+            record.cancelled = true;
+        }
+    }
+}
+
+fn ensure_request_active(state: &PortalState, request_id: &str) -> zbus::fdo::Result<()> {
+    if state
+        .requests
+        .lock()
+        .unwrap()
+        .get(request_id)
+        .map(|record| record.cancelled)
+        .unwrap_or(false)
+    {
+        return Err(request_cancelled_error());
+    }
+
+    Ok(())
+}
+
+fn request_cancelled_error() -> zbus::fdo::Error {
+    zbus::fdo::Error::Failed(
+        "aileron.Inference.RequestCancelled: request was cancelled".to_string(),
+    )
+}
+
 fn get_use_case_availability_impl(
     app_id: &str,
     use_case: &str,
@@ -1087,6 +1342,7 @@ fn get_use_case_availability_impl(
 
 fn create_session_impl(
     state: &PortalState,
+    request_id: &str,
     app_id: &str,
     parent_window: &str,
     use_case: &str,
@@ -1095,6 +1351,7 @@ fn create_session_impl(
 ) -> zbus::fdo::Result<String> {
     use aileron_varlink::aileron_Inference::VarlinkClientInterface;
 
+    ensure_request_active(state, request_id)?;
     let conn =
         aileron_ipc::client::connect().map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
     let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn);
@@ -1113,12 +1370,14 @@ fn create_session_impl(
             )));
         }
         Err(e) if is_permission_prompt_required(&e) => {
-            if !prompt_permission(app_id, parent_window, use_case)? {
+            ensure_request_active(state, request_id)?;
+            if !prompt_permission(state, request_id, app_id, parent_window, use_case)? {
                 set_permission(app_id, use_case, false)?;
                 return Err(zbus::fdo::Error::AccessDenied(format!(
                     "Permission denied for {app_id} / {use_case}"
                 )));
             }
+            ensure_request_active(state, request_id)?;
             set_permission(app_id, use_case, true)?;
             client
                 .create_session(
@@ -1131,6 +1390,11 @@ fn create_session_impl(
         }
         Err(e) => return Err(zbus::fdo::Error::Failed(e.to_string())),
     };
+
+    if let Err(e) = ensure_request_active(state, request_id) {
+        end_daemon_session_async(reply.session_id.clone());
+        return Err(e);
+    }
 
     state.sessions.lock().unwrap().insert(
         reply.session_id.clone(),
@@ -1195,18 +1459,26 @@ fn end_session_impl(
     session_id: &str,
     interface: PortalInterface,
 ) -> zbus::fdo::Result<()> {
-    use aileron_varlink::aileron_Inference::VarlinkClientInterface;
-
     ensure_known_session(state, session_id, interface)?;
-    let conn =
-        aileron_ipc::client::connect().map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-    let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn);
-    client
-        .end_session(session_id.to_string())
-        .call()
-        .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+    cancel_session_requests(state, session_id);
     state.sessions.lock().unwrap().remove(session_id);
+    end_daemon_session_async(session_id.to_string());
     Ok(())
+}
+
+fn end_daemon_session_async(session_id: String) {
+    thread::spawn(move || {
+        use aileron_varlink::aileron_Inference::VarlinkClientInterface;
+
+        let Ok(conn) = aileron_ipc::client::connect() else {
+            warn!("failed to connect to daemon while closing session {session_id}");
+            return;
+        };
+        let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn);
+        if let Err(e) = client.end_session(session_id.clone()).call() {
+            warn!("failed to close daemon session {session_id}: {e}");
+        }
+    });
 }
 
 fn is_permission_denied(error: &impl std::fmt::Display) -> bool {
@@ -1230,16 +1502,22 @@ fn set_permission(app_id: &str, use_case: &str, allowed: bool) -> zbus::fdo::Res
     Ok(())
 }
 
-fn prompt_permission(app_id: &str, parent_window: &str, use_case: &str) -> zbus::fdo::Result<bool> {
+fn prompt_permission(
+    state: &PortalState,
+    request_id: &str,
+    app_id: &str,
+    parent_window: &str,
+    use_case: &str,
+) -> zbus::fdo::Result<bool> {
     let text = format!(
         "Allow {app_id} to use the local model capability {use_case}?\n\nAileron will process this request locally using the assigned model."
     );
     let parent_xid = x11_parent_window_id(parent_window);
 
     if parent_xid.is_some()
-        && let Ok(status) = run_kdialog_permission_prompt(&text, parent_xid)
+        && let Ok(result) = run_kdialog_permission_prompt(state, request_id, &text, parent_xid)
     {
-        return Ok(status.success());
+        return result;
     }
 
     let mut zenity = Command::new("zenity");
@@ -1254,14 +1532,14 @@ fn prompt_permission(app_id: &str, parent_window: &str, use_case: &str) -> zbus:
     if let Some(xid) = parent_xid {
         zenity.arg(format!("--attach={xid}"));
     }
-    if let Ok(status) = zenity.status() {
-        return Ok(status.success());
+    if let Ok(result) = run_prompt_command(state, request_id, &mut zenity) {
+        return result;
     }
 
     if parent_xid.is_none()
-        && let Ok(status) = run_kdialog_permission_prompt(&text, None)
+        && let Ok(result) = run_kdialog_permission_prompt(state, request_id, &text, None)
     {
-        return Ok(status.success());
+        return result;
     }
 
     Err(zbus::fdo::Error::Failed(
@@ -1270,16 +1548,39 @@ fn prompt_permission(app_id: &str, parent_window: &str, use_case: &str) -> zbus:
 }
 
 fn run_kdialog_permission_prompt(
+    state: &PortalState,
+    request_id: &str,
     text: &str,
     parent_xid: Option<&str>,
-) -> std::io::Result<std::process::ExitStatus> {
+) -> std::io::Result<zbus::fdo::Result<bool>> {
     let mut kdialog = Command::new("kdialog");
     kdialog.args(["--title", "Aileron Permission Request"]);
     if let Some(xid) = parent_xid {
         kdialog.args(["--attach", xid]);
     }
     kdialog.args(["--yesno", text]);
-    kdialog.status()
+    run_prompt_command(state, request_id, &mut kdialog)
+}
+
+fn run_prompt_command(
+    state: &PortalState,
+    request_id: &str,
+    command: &mut Command,
+) -> std::io::Result<zbus::fdo::Result<bool>> {
+    let mut child = command.spawn()?;
+    loop {
+        if let Err(e) = ensure_request_active(state, request_id) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(Err(e));
+        }
+
+        if let Some(status) = child.try_wait()? {
+            return Ok(Ok(status.success()));
+        }
+
+        thread::sleep(Duration::from_millis(100));
+    }
 }
 
 fn x11_parent_window_id(parent_window: &str) -> Option<&str> {
@@ -1295,7 +1596,17 @@ impl LanguagePortalBackend {
         session_id: &str,
         emitter: &SignalEmitter<'_>,
     ) -> zbus::fdo::Result<()> {
-        ensure_known_session(&self.state, session_id, PortalInterface::Language)?;
+        let record = ensure_known_session(&self.state, session_id, PortalInterface::Language)?;
+        if self
+            .state
+            .warm_profiles
+            .lock()
+            .unwrap()
+            .contains(&record.profile_id)
+        {
+            return Ok(());
+        }
+
         LanguagePortalBackend::model_loading(emitter, request_id, session_id, "preparing model")
             .await
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
@@ -1323,7 +1634,17 @@ impl SpeechPortalBackend {
         session_id: &str,
         emitter: &SignalEmitter<'_>,
     ) -> zbus::fdo::Result<()> {
-        ensure_known_session(&self.state, session_id, PortalInterface::Speech)?;
+        let record = ensure_known_session(&self.state, session_id, PortalInterface::Speech)?;
+        if self
+            .state
+            .warm_profiles
+            .lock()
+            .unwrap()
+            .contains(&record.profile_id)
+        {
+            return Ok(());
+        }
+
         SpeechPortalBackend::model_loading(emitter, request_id, session_id, "preparing model")
             .await
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
@@ -1351,7 +1672,17 @@ impl VisionPortalBackend {
         session_id: &str,
         emitter: &SignalEmitter<'_>,
     ) -> zbus::fdo::Result<()> {
-        ensure_known_session(&self.state, session_id, PortalInterface::Vision)?;
+        let record = ensure_known_session(&self.state, session_id, PortalInterface::Vision)?;
+        if self
+            .state
+            .warm_profiles
+            .lock()
+            .unwrap()
+            .contains(&record.profile_id)
+        {
+            return Ok(());
+        }
+
         VisionPortalBackend::model_loading(emitter, request_id, session_id, "preparing model")
             .await
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
@@ -1582,5 +1913,51 @@ mod tests {
 
         assert!(err.to_string().contains("Language portal"));
         assert!(err.to_string().contains("Speech"));
+    }
+
+    #[test]
+    fn request_cancellation_rejects_active_request() {
+        let state = PortalState::default();
+        state.requests.lock().unwrap().insert(
+            "request-1".to_string(),
+            RequestRecord {
+                session_id: None,
+                cancelled: false,
+            },
+        );
+
+        assert!(ensure_request_active(&state, "request-1").is_ok());
+        cancel_request(&state, "request-1");
+
+        let err =
+            ensure_request_active(&state, "request-1").expect_err("cancelled request should fail");
+        assert!(
+            err.to_string()
+                .contains("aileron.Inference.RequestCancelled")
+        );
+    }
+
+    #[test]
+    fn session_cancellation_marks_only_matching_requests() {
+        let state = PortalState::default();
+        state.requests.lock().unwrap().insert(
+            "request-1".to_string(),
+            RequestRecord {
+                session_id: Some("session-1".to_string()),
+                cancelled: false,
+            },
+        );
+        state.requests.lock().unwrap().insert(
+            "request-2".to_string(),
+            RequestRecord {
+                session_id: Some("session-2".to_string()),
+                cancelled: false,
+            },
+        );
+
+        cancel_session_requests(&state, "session-1");
+
+        assert!(ensure_request_active(&state, "request-1").is_err());
+        assert!(ensure_request_active(&state, "request-2").is_ok());
     }
 }
