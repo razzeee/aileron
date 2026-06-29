@@ -199,6 +199,7 @@ impl LanguagePortalBackend {
         Ok((get_use_case_availability_impl(app_id, use_case)?,))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn create_session(
         &self,
         #[zbus(connection)] conn: &zbus::Connection,
@@ -747,6 +748,7 @@ impl SpeechPortalBackend {
         Ok((get_use_case_availability_impl(app_id, use_case)?,))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn create_session(
         &self,
         #[zbus(connection)] conn: &zbus::Connection,
@@ -916,6 +918,7 @@ impl VisionPortalBackend {
         Ok((get_use_case_availability_impl(app_id, use_case)?,))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn create_session(
         &self,
         #[zbus(connection)] conn: &zbus::Connection,
