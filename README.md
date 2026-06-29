@@ -407,7 +407,7 @@ method EndSession(session_id: string) -> ()
 
 Tool calls are app-mediated and per request: `StreamRespondGuided` may stream `ToolCall` objects when the app supplies tool definitions, the app executes or rejects them under its own policy, and `StreamSubmitToolResultsGuided` continues generation with the same guided schema. The daemon and runtime do not execute tools. Aileron does not retain daemon-side transcripts; apps own conversation history and pass relevant context explicitly.
 
-`ModelAvailability.code` is stable and machine-readable. Known values are `available`, `permission_denied`, `no_profile_assigned`, `profile_not_installed`, `artifact_missing`, `runtime_unsupported`, and `runtime_missing`. `reason` is human-readable detail.
+`ModelAvailability.code` is stable and machine-readable. Known values are `available`, `unsupported_use_case`, `permission_denied`, `no_profile_assigned`, `profile_not_installed`, `artifact_missing`, `runtime_unsupported`, and `runtime_missing`. `reason` is human-readable detail.
 
 Inference errors are represented as Varlink errors: `PermissionPromptRequired`, `PermissionDenied`, `SessionNotFound`, `ModelUnavailable`, `InvalidGenerationOptions`, `GuidedGenerationFailed`, `GenerationFailed`, `ContextWindowExceeded`, `UnsupportedLanguage`, `SafetyRefusal`, `RequestCancelled`, and `InvalidInput`.
 
@@ -478,7 +478,7 @@ Apps call the public interfaces on `org.freedesktop.portal.Desktop`. The public 
 |---|---|---|---|
 | `GetUseCaseAvailability` | `use_case: s, options: a{sv}` | `(is_available: b, code: s, reason: s)` | Checks whether an assigned profile has local artifacts and a runtime image |
 | `CreateSession` | `parent_window: s, use_case: s, instructions: s, options: a{sv}` | `handle: o` | Creates a session bound to the assigned profile; the request response contains `session_handle: o` |
-| `Prewarm` | `session_handle: o, options: a{sv}` | `handle: o` | Starts the backing container before the first user-visible operation; close the request to cancel |
+| `Prewarm` | `session_handle: o, options: a{sv}` | `handle: o` | Starts the backing container before the first user-visible operation; close the request to stop waiting for completion |
 
 ### Language Methods
 
@@ -496,7 +496,7 @@ Apps call the public interfaces on `org.freedesktop.portal.Desktop`. The public 
 |---|---|---|---|
 | `StreamTranscribe` | `session_handle: o, audio: s, source_language_hint: s, options: a{sv}` | `handle: o` | 16 kHz mono f32le PCM, base64; empty hint means auto-detect/no hint; emits `TranscriptionReceived` signals; final segment has `done=true` |
 
-Streaming D-Bus methods return an `org.freedesktop.portal.Request` handle immediately. Callers should subscribe to both the stream signal and the request's `Response` signal before invoking a stream method when using caller-chosen `handle_token` values. Stream payload signals are correlated by `request_handle`; the request response indicates success, cancellation, or failure.
+Streaming D-Bus methods return an `org.freedesktop.portal.Request` handle immediately. Callers should subscribe to both the stream signal and the request's `Response` signal before invoking a stream method when using caller-chosen `handle_token` values. Stream payload signals are correlated by `request_handle`; the request response indicates success, portal/backend cancellation, or failure. If the app calls `Close` on the request, the request is unexported and the app should not wait for a later `Response` on that handle.
 
 ### Vision Methods
 
@@ -514,11 +514,11 @@ Audio and image payloads are base64 strings in the current prototype and must fi
 
 | Signal | Parameters | Fired when |
 |---|---|---|
-| `ModelLoading` | `request_handle: o, session_handle: o, message: s` | The portal is preparing the backing model/runtime for a request; available on each interface |
+| `ModelLoading` | `request_handle: o, session_handle: o, message: s` | The portal is about to use or prepare the backing model/runtime for a request; available on each interface |
 | `TokenReceived` | `request_handle: o, session_handle: o, token: s, done: b` | Each token during `StreamResponse` on `Language` |
 | `PredictionReceived` | `request_handle: o, session_handle: o, completion: s, done: b` | Each completion during `StreamPredictNext` on `Language` |
 | `GuidedSnapshotReceived` | `request_handle: o, session_handle: o, snapshot_json: s, done: b` | Each validated JSON snapshot during `StreamRespondGuided` on `Language` |
-| `GuidedToolCallsReceived` | `request_handle: o, session_handle: o, tool_calls: a(sss), done: b` | Tool calls requested during `StreamRespondGuided` on `Language` |
+| `GuidedToolCallsReceived` | `request_handle: o, session_handle: o, tool_calls: a(sss), done: b` | Tool calls requested during `StreamRespondGuided` or `StreamSubmitToolResultsGuided` on `Language` |
 | `EmbeddingReceived` | `request_handle: o, session_handle: o, embedding: ad, done: b` | Embedding vector during `StreamEmbed` on `Language` |
 | `TranscriptionReceived` | `request_handle: o, session_handle: o, text: s, done: b` | Each segment during `StreamTranscribe` on `Speech` |
 | `VisionTextReceived` | `request_handle: o, session_handle: o, text: s, done: b` | Each text token during `StreamDescribe` or `StreamOcr` on `Vision` |
@@ -526,7 +526,7 @@ Audio and image payloads are base64 strings in the current prototype and must fi
 
 The implementation backend exposes the same task methods with implementation-oriented identifiers: `CreateSession` receives `request_id: s`, `app_id: s`, and `parent_window: s`, streaming methods receive `request_id: s` and `session_id: s`, and `EndSession(session_id: s)` supports the frontend's session-close path. Public apps should not call the implementation interfaces directly.
 
-The current prototype returns stream failures through the request `Response` signal with response code `2`, an `error` string, and when available an `error_name` string such as `aileron.Inference.RequestCancelled` or `aileron.Inference.InvalidInput`. Apps should still branch on availability `code` values before creating sessions.
+The current prototype returns portal/backend cancellations through the request `Response` signal with response code `1`, and stream failures with response code `2`, an `error` string, and when available an `error_name` string such as `aileron.Inference.RequestCancelled` or `aileron.Inference.InvalidInput`. Apps should still branch on availability `code` values before creating sessions.
 
 ## Portal-to-container API boundary
 

@@ -50,7 +50,7 @@ Avoid treating model names as application requirements. A user may satisfy `lang
 4. Send task input through the appropriate method and correlate stream signals by `request_handle`.
 5. Close the returned `org.freedesktop.portal.Session` handle when the user-visible task is complete.
 
-Operations that may prompt, load a model, or stream output return `org.freedesktop.portal.Request` handles. Use `handle_token` and `session_handle_token` option values when you need race-free signal subscription. Closing the request cancels the in-flight operation; closing the session releases the model session.
+Operations that may prompt, load a model, or stream output return `org.freedesktop.portal.Request` handles. Use `handle_token` and `session_handle_token` option values when you need race-free signal subscription. Closing a request asks the portal to stop waiting and unexports that request handle, so do not wait for a later `Response` after closing it yourself. Any already-started runtime preparation may finish in the background. Closing the session releases the model session.
 
 For conversational features, keep stable instructions in the session and send the relevant local history as part of the prompt with `StreamResponse` or `StreamRespondGuided`. The app owns conversation history and can trim it to fit its UI or context policy. For one-shot features such as "summarize this article", a short-lived session with `StreamResponse` is usually enough.
 
@@ -129,7 +129,7 @@ Recommended behavior:
 - Offer a non-AI fallback when possible.
 - Avoid model-specific instructions in the app UI.
 
-Handle specific inference errors when useful. In the current prototype, stream failures are returned through the request `Response` signal with response code `2`, an `error` string, and when available an `error_name` string. `ContextWindowExceeded` can prompt the user to shorten input, `UnsupportedLanguage` can ask for another language, `SafetyRefusal` should be shown as a refusal rather than a crash, `RequestCancelled` should leave UI state clean, and `InvalidInput` means the app should fix or reject the submitted payload.
+Handle specific inference errors when useful. In the current prototype, portal/backend cancellations are returned through the request `Response` signal with response code `1`; stream failures use response code `2`, an `error` string, and when available an `error_name` string. `ContextWindowExceeded` can prompt the user to shorten input, `UnsupportedLanguage` can ask for another language, `SafetyRefusal` should be shown as a refusal rather than a crash, `RequestCancelled` should leave UI state clean, and `InvalidInput` means the app should fix or reject the submitted payload.
 
 ## Development And Testing
 
