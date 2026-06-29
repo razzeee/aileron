@@ -46,6 +46,13 @@ impl VarlinkInterface for InferenceHandler {
         self.rt.block_on(async {
             let (candidates, artifact_path, oci_store, system_oci_store) = {
                 let guard = self.state.0.lock().await;
+                if !is_supported_use_case(&use_case) {
+                    return call.reply(ModelAvailability {
+                        is_available: false,
+                        code: "unsupported_use_case".to_string(),
+                        reason: format!("unsupported use-case: {use_case}"),
+                    });
+                }
                 if !guard.config.allow_all
                     && matches!(guard.permissions.check(&app_id, &use_case), Some(false))
                 {
@@ -438,6 +445,21 @@ async fn create_session_record(
         ));
     }
 
+    if !is_supported_use_case(&use_case) {
+        return Err(CreateSessionError::InvalidInput(format!(
+            "unsupported use-case: {use_case}"
+        )));
+    }
+
+    let profile_id = assigned_profile_id_for_use_case(&guard, &use_case).ok_or_else(|| {
+        CreateSessionError::ModelUnavailable(format!("no profile assigned for {use_case}"))
+    })?;
+    if guard.profiles.get(&profile_id).is_none() {
+        return Err(CreateSessionError::ModelUnavailable(format!(
+            "assigned profile {profile_id} is not installed"
+        )));
+    }
+
     if !guard.config.allow_all {
         match guard.permissions.check(&app_id, &use_case) {
             Some(true) => {}
@@ -460,15 +482,6 @@ async fn create_session_record(
         }
     }
 
-    let profile_id = assigned_profile_id_for_use_case(&guard, &use_case).ok_or_else(|| {
-        CreateSessionError::ModelUnavailable(format!("no profile assigned for {use_case}"))
-    })?;
-    if guard.profiles.get(&profile_id).is_none() {
-        return Err(CreateSessionError::ModelUnavailable(format!(
-            "assigned profile {profile_id} is not installed"
-        )));
-    }
-
     let session_id = Uuid::new_v4().to_string();
     let session = crate::state::Session {
         session_id: session_id.clone(),
@@ -480,6 +493,10 @@ async fn create_session_record(
     };
     guard.sessions.insert(session_id.clone(), session);
     Ok((session_id, profile_id))
+}
+
+fn is_supported_use_case(use_case: &str) -> bool {
+    crate::manifests::SUPPORTED_USE_CASES.contains(&use_case)
 }
 
 fn assigned_profile_id_for_use_case(guard: &crate::state::Inner, use_case: &str) -> Option<String> {
@@ -1686,6 +1703,20 @@ mod tests {
             validate_options(&options),
             Err("sampling_mode must not be empty".to_string())
         );
+    }
+
+    #[test]
+    fn supported_use_case_catalog_accepts_public_tokens() {
+        assert!(is_supported_use_case("language.summarize"));
+        assert!(is_supported_use_case("speech.translate"));
+        assert!(is_supported_use_case("vision.segment"));
+    }
+
+    #[test]
+    fn supported_use_case_catalog_rejects_unknown_same_prefix_tokens() {
+        assert!(!is_supported_use_case("language.typo"));
+        assert!(!is_supported_use_case("speech.listen"));
+        assert!(!is_supported_use_case("vision.caption"));
     }
 
     #[test]
