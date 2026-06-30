@@ -493,33 +493,60 @@ impl VarlinkInterface for ModelsHandler {
         force: bool,
     ) -> varlink::Result<()> {
         self.rt.block_on(async {
-            let mut guard = self.state.0.lock().await;
-            if guard.profiles.get(&profile_id).is_none() {
-                return call.reply_profile_not_found(profile_id);
-            }
+            let cancelled_sessions = {
+                let mut guard = self.state.0.lock().await;
+                if guard.profiles.get(&profile_id).is_none() {
+                    return call.reply_profile_not_found(profile_id);
+                }
 
-            let assigned = guard
-                .assignments
-                .all()
-                .values()
-                .any(|assigned| assigned == &profile_id);
-            let active_sessions: Vec<String> = guard
-                .sessions
+                let assigned = guard
+                    .assignments
+                    .all()
+                    .values()
+                    .any(|assigned| assigned == &profile_id);
+                let active_sessions: Vec<String> = guard
+                    .sessions
+                    .iter()
+                    .filter(|(_, session)| session.profile_id == profile_id)
+                    .map(|(session_id, _)| session_id.clone())
+                    .collect();
+
+                if !force && (assigned || !active_sessions.is_empty()) {
+                    return call.reply_profile_in_use(profile_id);
+                }
+
+                for session_id in &active_sessions {
+                    self.state.cancel_session_requests(session_id);
+                    guard.sessions.remove(session_id.as_str());
+                }
+                let epoch = guard.profile_epochs.entry(profile_id.clone()).or_default();
+                *epoch = epoch.saturating_add(1);
+                self.state.set_profile_epoch(&profile_id, *epoch);
+                let _ = guard.assignments.remove_profile(&profile_id);
+                guard.profiles.remove(&profile_id).map_err(io_err)?;
+                active_sessions
+            };
+            for session_id in &cancelled_sessions {
+                self.state.clear_predict_next(&session_id);
+            }
+            let active_containers = cancelled_sessions
                 .iter()
-                .filter(|(_, session)| session.profile_id == profile_id)
-                .map(|(session_id, _)| session_id.clone())
-                .collect();
-
-            if !force && (assigned || !active_sessions.is_empty()) {
-                return call.reply_profile_in_use(profile_id);
+                .flat_map(|session_id| {
+                    self.state
+                        .terminate_active_container_handles(&profile_id, session_id)
+                })
+                .collect::<Vec<_>>();
+            let mut containers = self.state.2.lock().await;
+            for container in active_containers {
+                containers.kill_handle(&profile_id, &container);
             }
-
-            for session_id in active_sessions {
-                guard.sessions.remove(&session_id);
+            let profile_still_missing = {
+                let guard = self.state.0.lock().await;
+                guard.profiles.get(&profile_id).is_none()
+            };
+            if profile_still_missing {
+                containers.kill(&profile_id);
             }
-            guard.containers.kill(&profile_id);
-            let _ = guard.assignments.remove_profile(&profile_id);
-            guard.profiles.remove(&profile_id).map_err(io_err)?;
             call.reply()
         })
     }
@@ -801,8 +828,8 @@ async fn runtime_image_usage(state: &SharedState) -> RuntimeImageUsage {
 }
 
 async fn oci_store_for_state(state: &SharedState) -> PathBuf {
-    let guard = state.0.lock().await;
-    guard.containers.oci_store.clone()
+    let containers = state.2.lock().await;
+    containers.oci_store.clone()
 }
 
 async fn list_runtime_images_for_state(
@@ -2468,6 +2495,9 @@ async fn register_profile(
     let mut guard = state.0.lock().await;
     let profile_id = profile.profile_id.clone();
     let suggested = profile.effective_use_cases();
+    let epoch = guard.profile_epochs.entry(profile_id.clone()).or_default();
+    *epoch = epoch.saturating_add(1);
+    state.set_profile_epoch(&profile_id, *epoch);
     guard.profiles.insert(profile)?;
 
     let mut auto_assigned = Vec::new();

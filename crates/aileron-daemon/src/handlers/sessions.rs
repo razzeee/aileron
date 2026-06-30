@@ -31,14 +31,37 @@ impl VarlinkInterface for SessionsHandler {
         session_id: String,
     ) -> varlink::Result<()> {
         self.rt.block_on(async {
-            let mut guard = self.state.0.lock().await;
-            if !kill_session(&mut guard, &session_id) {
-                return call.reply_session_not_found(session_id);
-            }
+            let (profile_id, unused_profile_id) = {
+                let mut guard = self.state.0.lock().await;
+                match kill_session(&mut guard, &session_id) {
+                    KillSessionResult::NotFound => return call.reply_session_not_found(session_id),
+                    KillSessionResult::Removed {
+                        profile_id,
+                        unused_profile_id,
+                    } => {
+                        self.state.cancel_session_requests(&session_id);
+                        (profile_id, unused_profile_id)
+                    }
+                }
+            };
             self.state.clear_predict_next(&session_id);
+            kill_profile_if_session_active(&self.state, &profile_id, &session_id).await;
+            if let Some(unused_profile_id) = unused_profile_id {
+                let mut containers = self.state.2.lock().await;
+                containers.kill(&unused_profile_id);
+            }
             call.reply()
         })
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum KillSessionResult {
+    NotFound,
+    Removed {
+        profile_id: String,
+        unused_profile_id: Option<String>,
+    },
 }
 
 fn active_sessions(guard: &crate::state::Inner) -> Vec<SessionInfo> {
@@ -55,19 +78,30 @@ fn active_sessions(guard: &crate::state::Inner) -> Vec<SessionInfo> {
         .collect()
 }
 
-fn kill_session(guard: &mut crate::state::Inner, session_id: &str) -> bool {
+fn kill_session(guard: &mut crate::state::Inner, session_id: &str) -> KillSessionResult {
     let session = match guard.sessions.remove(session_id) {
         Some(s) => s,
-        None => return false,
+        None => return KillSessionResult::NotFound,
     };
     let profile_still_used = guard
         .sessions
         .values()
         .any(|s| s.profile_id == session.profile_id);
-    if !profile_still_used {
-        guard.containers.kill(&session.profile_id);
+    KillSessionResult::Removed {
+        profile_id: session.profile_id.clone(),
+        unused_profile_id: (!profile_still_used).then_some(session.profile_id),
     }
-    true
+}
+
+async fn kill_profile_if_session_active(state: &SharedState, profile_id: &str, session_id: &str) {
+    let handles = state.terminate_active_container_handles(profile_id, session_id);
+    if handles.is_empty() {
+        return;
+    }
+    let mut containers = state.2.lock().await;
+    for handle in handles {
+        containers.kill_handle(profile_id, &handle);
+    }
 }
 
 #[cfg(test)]
@@ -75,7 +109,6 @@ mod tests {
     use super::*;
     use crate::assignments::Assignments;
     use crate::config::Config;
-    use crate::container::ContainerPool;
     use crate::hardware::Variant;
     use crate::manifests::RuntimeManifestStore;
     use crate::permissions::PermissionStore;
@@ -97,8 +130,8 @@ mod tests {
             permissions: PermissionStore::default(),
             assignments: Assignments::default(),
             profiles: ProfileStore::default(),
+            profile_epochs: HashMap::new(),
             runtimes: RuntimeManifestStore::default(),
-            containers: ContainerPool::new(),
             sessions: HashMap::new(),
             installing_profiles: HashMap::<String, InstallRecord>::new(),
             runtime_downloads: HashMap::<String, InstallRecord>::new(),
@@ -178,7 +211,10 @@ mod tests {
             .sessions
             .insert("session-b".to_string(), session("session-b", "profile-a"));
 
-        assert!(kill_session(&mut inner, "session-a"));
+        assert!(matches!(
+            kill_session(&mut inner, "session-a"),
+            KillSessionResult::Removed { .. }
+        ));
 
         assert!(!inner.sessions.contains_key("session-a"));
         assert!(inner.sessions.contains_key("session-b"));
@@ -198,7 +234,10 @@ mod tests {
             .sessions
             .insert("session-b".to_string(), session("session-b", "profile-a"));
 
-        assert!(kill_session(&mut inner, &target));
+        assert!(matches!(
+            kill_session(&mut inner, &target),
+            KillSessionResult::Removed { .. }
+        ));
 
         assert!(!inner.sessions.contains_key(&target));
         assert_eq!(inner.sessions.len(), 1);
@@ -208,6 +247,9 @@ mod tests {
     fn kill_session_reports_missing_session() {
         let mut inner = test_inner();
 
-        assert!(!kill_session(&mut inner, "missing"));
+        assert_eq!(
+            kill_session(&mut inner, "missing"),
+            KillSessionResult::NotFound
+        );
     }
 }

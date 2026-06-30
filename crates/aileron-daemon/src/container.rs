@@ -57,6 +57,8 @@ use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LockResult, Mutex, MutexGuard, TryLockError, TryLockResult};
 use std::thread;
 
 use anyhow::{Context, Result, bail};
@@ -110,6 +112,10 @@ pub struct Container {
     #[allow(dead_code)]
     pub variant: Variant,
     #[allow(dead_code)]
+    runtime_id: String,
+    #[allow(dead_code)]
+    profile_epoch: u64,
+    #[allow(dead_code)]
     pub image_ref: String,
     #[allow(dead_code)]
     pub artifact_path: PathBuf,
@@ -117,10 +123,19 @@ pub struct Container {
     runtime_options: HashMap<String, String>,
     /// Kept alive to prevent the container process from being killed on drop.
     #[allow(dead_code)]
-    child: Child,
+    child: Arc<Mutex<Child>>,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     pub last_used: std::time::Instant,
+}
+
+impl Drop for Container {
+    fn drop(&mut self) {
+        if let Ok(mut child) = self.child.lock() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -168,6 +183,26 @@ pub struct GuidedToolResponse {
 }
 
 impl Container {
+    pub fn matches_any_runtime(
+        &self,
+        runtime_id: &str,
+        profile_epoch: u64,
+        candidates: &[RuntimeCandidate],
+        artifact_path: &Path,
+        runtime_options: &HashMap<String, String>,
+    ) -> bool {
+        self.runtime_id == runtime_id
+            && self.profile_epoch == profile_epoch
+            && self.artifact_path == artifact_path
+            && runtime_spawn_attempts(runtime_id, candidates, runtime_options)
+                .iter()
+                .any(|attempt| {
+                    attempt.image_ref == self.image_ref
+                        && attempt.variant == self.variant
+                        && attempt.runtime_options == self.runtime_options
+                })
+    }
+
     /// Spawn a hardened OCI runtime bundle for the given image and block until the
     /// entrypoint signals it is ready by writing `ready` to stderr.
     ///
@@ -179,6 +214,8 @@ impl Container {
     /// namespace, read-only rootfs, tmpfs `/tmp`, no capabilities, no new
     /// privileges, PID limit, memory limit, and `/model` mounted read-only.
     pub fn spawn(
+        runtime_id: &str,
+        profile_epoch: u64,
         candidate: &RuntimeCandidate,
         artifact_path: &Path,
         runtime_options: &HashMap<String, String>,
@@ -186,6 +223,7 @@ impl Container {
         oci_store: &Path,
         system_oci_store: &Path,
         mut on_status: impl FnMut(String) + Send + 'static,
+        mut should_continue: impl FnMut() -> Result<(), String>,
     ) -> Result<Self> {
         let image_ref = candidate.image_ref.as_str();
         info!("spawning OCI runtime for {}", image_ref);
@@ -254,19 +292,46 @@ impl Container {
             }
         });
 
-        // Block until the container is ready or fails.
-        match ready_rx.recv() {
-            Ok(Ok(())) => info!("container ready: {}", image_ref),
-            Ok(Err(e)) => bail!("container failed to start: {}", e),
-            Err(_) => bail!("container stderr thread dropped before ready"),
+        // Block until the container is ready or fails, but poll cancellation so
+        // session close/kill can abort a cold start before the ready sentinel.
+        loop {
+            if let Err(reason) = should_continue() {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!(reason);
+            }
+            match ready_rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                Ok(Ok(())) => {
+                    if let Err(reason) = should_continue() {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        bail!(reason);
+                    }
+                    info!("container ready: {}", image_ref);
+                    break;
+                }
+                Ok(Err(e)) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    bail!("container failed to start: {}", e);
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    bail!("container stderr thread dropped before ready");
+                }
+            }
         }
 
         Ok(Self {
             variant: candidate.variant,
+            runtime_id: runtime_id.to_string(),
+            profile_epoch,
             image_ref: image_ref.to_string(),
             artifact_path: artifact_path.to_path_buf(),
             runtime_options: runtime_options.clone(),
-            child,
+            child: Arc::new(Mutex::new(child)),
             stdin,
             stdout,
             last_used: std::time::Instant::now(),
@@ -1556,9 +1621,95 @@ fn base64_encode(data: &[u8]) -> String {
 
 // ── Pool ──────────────────────────────────────────────────────────────────────
 
-/// Pool of running containers, keyed by profile ID.
+/// Pool handle for a running container.
+#[derive(Clone)]
+pub struct ContainerHandle {
+    inner: Arc<Mutex<Container>>,
+    child: Arc<Mutex<Child>>,
+    terminating: Arc<AtomicBool>,
+    published: Arc<AtomicBool>,
+}
+
+impl ContainerHandle {
+    fn new(container: Container) -> Self {
+        Self::new_with_published(container, true)
+    }
+
+    fn new_pending(container: Container) -> Self {
+        Self::new_with_published(container, false)
+    }
+
+    fn new_with_published(container: Container, published: bool) -> Self {
+        let child = container.child.clone();
+        Self {
+            inner: Arc::new(Mutex::new(container)),
+            child,
+            terminating: Arc::new(AtomicBool::new(false)),
+            published: Arc::new(AtomicBool::new(published)),
+        }
+    }
+
+    pub fn lock(&self) -> LockResult<MutexGuard<'_, Container>> {
+        self.inner.lock()
+    }
+
+    pub(crate) fn try_lock(&self) -> TryLockResult<MutexGuard<'_, Container>> {
+        self.inner.try_lock()
+    }
+
+    fn strong_count(&self) -> usize {
+        Arc::strong_count(&self.inner)
+    }
+
+    pub(crate) fn publish(&self) {
+        self.published.store(true, Ordering::SeqCst);
+    }
+
+    fn is_published(&self) -> bool {
+        self.published.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn terminate(&self) {
+        self.terminating.store(true, Ordering::SeqCst);
+        if let Ok(mut child) = self.child.lock() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
+    pub(crate) fn is_terminating(&self) -> bool {
+        if self.terminating.load(Ordering::SeqCst) {
+            return true;
+        }
+
+        match self.child.try_lock() {
+            Ok(mut child) => match child.try_wait() {
+                Ok(Some(_)) => {
+                    self.terminating.store(true, Ordering::SeqCst);
+                    true
+                }
+                Ok(None) => false,
+                Err(e) => {
+                    warn!("failed to inspect container child status: {e}");
+                    self.terminating.store(true, Ordering::SeqCst);
+                    true
+                }
+            },
+            Err(TryLockError::WouldBlock) => false,
+            Err(TryLockError::Poisoned(_)) => {
+                self.terminating.store(true, Ordering::SeqCst);
+                true
+            }
+        }
+    }
+
+    pub(crate) fn ptr_eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+}
+
 pub struct ContainerPool {
-    containers: HashMap<String, Container>,
+    containers: HashMap<String, ContainerHandle>,
     /// Idle timeout in seconds (default 300 = 5 min).
     pub idle_timeout_secs: u64,
     /// OCI memory limit applied to each model runtime.
@@ -1597,18 +1748,27 @@ impl ContainerPool {
         artifact_path: &Path,
         runtime_options: &HashMap<String, String>,
         on_status: impl FnMut(String) + Send + 'static,
-    ) -> Result<&mut Container> {
-        if self.containers.get(profile_id).is_some_and(|container| {
+    ) -> Result<ContainerHandle> {
+        let should_replace = self.containers.get(profile_id).is_some_and(|container| {
+            if container.is_terminating() {
+                return true;
+            }
+            let Ok(container) = container.try_lock() else {
+                return false;
+            };
             container.variant != variant
                 || container.image_ref != image_ref
                 || container.artifact_path != artifact_path
                 || container.runtime_options != *runtime_options
-        }) {
+        });
+        if should_replace {
             info!(
                 "replacing container for profile {} with runtime image {}",
                 profile_id, image_ref
             );
-            self.containers.remove(profile_id);
+            if let Some(container) = self.containers.remove(profile_id) {
+                container.terminate();
+            }
         }
 
         if !self.containers.contains_key(profile_id) {
@@ -1617,6 +1777,8 @@ impl ContainerPool {
                 image_ref: image_ref.to_string(),
             };
             let c = Container::spawn(
+                "",
+                0,
                 &candidate,
                 artifact_path,
                 runtime_options,
@@ -1624,10 +1786,16 @@ impl ContainerPool {
                 &self.oci_store,
                 &self.system_oci_store,
                 on_status,
+                || Ok(()),
             )?;
-            self.containers.insert(profile_id.to_string(), c);
+            self.containers
+                .insert(profile_id.to_string(), ContainerHandle::new(c));
+        } else if let Some(container) = self.containers.get(profile_id)
+            && let Ok(mut container) = container.try_lock()
+        {
+            container.last_used = std::time::Instant::now();
         }
-        Ok(self.containers.get_mut(profile_id).unwrap())
+        Ok(self.containers.get(profile_id).unwrap().clone())
     }
 
     /// Get or spawn a container using the first runtime image that starts.
@@ -1641,31 +1809,88 @@ impl ContainerPool {
         artifact_path: &Path,
         runtime_options: &HashMap<String, String>,
         on_status: impl FnMut(String) + Send + 'static,
-    ) -> Result<&mut Container> {
+    ) -> Result<ContainerHandle> {
+        self.get_or_spawn_any_checked(
+            profile_id,
+            0,
+            runtime_id,
+            candidates,
+            artifact_path,
+            runtime_options,
+            on_status,
+            || Ok(()),
+        )
+        .map(|(handle, _)| {
+            handle.publish();
+            handle
+        })
+    }
+
+    /// Like `get_or_spawn_any`, but checks cancellation before cold starts.
+    pub fn get_or_spawn_any_checked(
+        &mut self,
+        profile_id: &str,
+        profile_epoch: u64,
+        runtime_id: &str,
+        candidates: &[RuntimeCandidate],
+        artifact_path: &Path,
+        runtime_options: &HashMap<String, String>,
+        on_status: impl FnMut(String) + Send + 'static,
+        mut should_continue: impl FnMut() -> Result<(), String>,
+    ) -> Result<(ContainerHandle, bool)> {
         if candidates.is_empty() {
             bail!("no runtime images resolved for profile {profile_id}");
         }
+        if let Err(reason) = should_continue() {
+            bail!(reason);
+        }
         let attempts = runtime_spawn_attempts(runtime_id, candidates, runtime_options);
 
-        let can_reuse = self.containers.get(profile_id).is_some_and(|container| {
-            attempts.iter().any(|attempt| {
-                attempt.image_ref == container.image_ref
-                    && attempt.variant == container.variant
-                    && attempt.runtime_options == container.runtime_options
-                    && container.artifact_path == artifact_path
-            })
-        });
-        if can_reuse {
-            return Ok(self.containers.get_mut(profile_id).unwrap());
+        let mut replace_existing = false;
+        if let Some(handle) = self.containers.get(profile_id) {
+            if handle.is_terminating() {
+                replace_existing = true;
+            } else if !handle.is_published() {
+                bail!(
+                    "container startup is being finalized for profile {profile_id}; retry request"
+                );
+            } else {
+                match handle.try_lock() {
+                    Ok(mut container) => {
+                        let matches = attempts.iter().any(|attempt| {
+                            attempt.image_ref == container.image_ref
+                                && attempt.variant == container.variant
+                                && container.runtime_id == runtime_id
+                                && container.profile_epoch == profile_epoch
+                                && attempt.runtime_options == container.runtime_options
+                                && container.artifact_path == artifact_path
+                        });
+                        if matches {
+                            container.last_used = std::time::Instant::now();
+                            return Ok((handle.clone(), false));
+                        }
+                        replace_existing = true;
+                    }
+                    Err(TryLockError::WouldBlock) => {
+                        return Ok((handle.clone(), false));
+                    }
+                    Err(TryLockError::Poisoned(_)) => bail!("container mutex poisoned"),
+                }
+            }
         }
 
-        if self.containers.contains_key(profile_id) {
+        if replace_existing {
+            if let Err(reason) = should_continue() {
+                bail!(reason);
+            }
             info!(
                 "replacing container for profile {} with one of {} candidate runtime images",
                 profile_id,
                 candidates.len()
             );
-            self.containers.remove(profile_id);
+            if let Some(container) = self.containers.remove(profile_id) {
+                container.terminate();
+            }
         }
 
         let on_status = std::sync::Arc::new(std::sync::Mutex::new(on_status));
@@ -1697,12 +1922,17 @@ impl ContainerPool {
                 continue;
             }
             attempted = true;
+            if let Err(reason) = should_continue() {
+                bail!(reason);
+            }
             let status_callback = on_status.clone();
             let candidate = RuntimeCandidate {
                 variant: attempt.variant,
                 image_ref: attempt.image_ref.clone(),
             };
             match Container::spawn(
+                runtime_id,
+                profile_epoch,
                 &candidate,
                 artifact_path,
                 &attempt.runtime_options,
@@ -1714,12 +1944,21 @@ impl ContainerPool {
                         (*callback)(line);
                     }
                 },
+                &mut should_continue,
             ) {
                 Ok(container) => {
-                    self.containers.insert(profile_id.to_string(), container);
-                    return Ok(self.containers.get_mut(profile_id).unwrap());
+                    let handle = ContainerHandle::new_pending(container);
+                    self.containers
+                        .insert(profile_id.to_string(), handle.clone());
+                    return Ok((handle, true));
                 }
                 Err(error) => {
+                    let error_text = error.to_string();
+                    if error_text.starts_with("container returned error request_cancelled:")
+                        || error_text.ends_with("; retry request")
+                    {
+                        return Err(error);
+                    }
                     warn!(
                         "failed to start runtime image {} for profile {}: {:#}",
                         describe_spawn_attempt(&attempt),
@@ -1732,7 +1971,7 @@ impl ContainerPool {
                         "fallback"
                     };
                     errors.push(format!(
-                        "{role} runtime image {} failed to start: {error:#}",
+                        "{role} runtime image {} failed to start: {error_text}",
                         describe_spawn_attempt(&attempt)
                     ));
                 }
@@ -1754,8 +1993,21 @@ impl ContainerPool {
 
     /// Kill and remove the container for a profile.
     pub fn kill(&mut self, profile_id: &str) {
-        if self.containers.remove(profile_id).is_some() {
+        if let Some(container) = self.containers.remove(profile_id) {
+            container.terminate();
             info!("terminated container for profile {}", profile_id);
+        }
+    }
+
+    pub fn kill_handle(&mut self, profile_id: &str, handle: &ContainerHandle) {
+        let should_remove = self
+            .containers
+            .get(profile_id)
+            .is_some_and(|current| current.ptr_eq(handle));
+        if should_remove {
+            self.kill(profile_id);
+        } else {
+            handle.terminate();
         }
     }
 
@@ -1775,7 +2027,15 @@ impl ContainerPool {
         let idle: Vec<_> = self
             .containers
             .iter()
-            .filter(|(_, c)| now.duration_since(c.last_used) > timeout)
+            .filter(|(_, c)| {
+                if c.strong_count() > 1 {
+                    return false;
+                }
+                let Ok(c) = c.try_lock() else {
+                    return false;
+                };
+                now.duration_since(c.last_used) > timeout
+            })
             .map(|(k, _)| k.clone())
             .collect();
         for k in idle {
@@ -2334,11 +2594,11 @@ mod tests {
         let mut pool = ContainerPool {
             containers: HashMap::from([(
                 "profile".to_string(),
-                test_container(
+                ContainerHandle::new(test_container(
                     Variant::Cpu,
                     "registry.example/runtime@sha256:abcdef",
                     &artifact_path,
-                ),
+                )),
             )]),
             idle_timeout_secs: 300,
             memory_limit: "512m".to_string(),
@@ -2828,10 +3088,12 @@ mod tests {
         let stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
         Container {
             variant,
+            runtime_id: ML_RUNTIME_ID.to_string(),
+            profile_epoch: 0,
             image_ref: image_ref.to_string(),
             artifact_path: artifact_path.to_path_buf(),
             runtime_options: HashMap::new(),
-            child,
+            child: Arc::new(Mutex::new(child)),
             stdin,
             stdout,
             last_used: std::time::Instant::now(),
@@ -3071,6 +3333,8 @@ mod tests {
         };
 
         let mut container = Container::spawn(
+            ML_RUNTIME_ID,
+            0,
             &candidate,
             &artifact_path,
             &HashMap::new(),
@@ -3078,6 +3342,7 @@ mod tests {
             &oci_store,
             &default_system_oci_store(),
             |_| {},
+            || Ok(()),
         )
         .expect("spawn stub runtime");
 

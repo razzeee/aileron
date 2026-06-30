@@ -1,12 +1,12 @@
 /// Shared mutable daemon state.
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use tokio::sync::Mutex;
 
 use crate::assignments::Assignments;
 use crate::config::Config;
-use crate::container::ContainerPool;
+use crate::container::{ContainerHandle, ContainerPool};
 use crate::hardware::Variant;
 use crate::manifests::RuntimeManifestStore;
 use crate::permissions::PermissionStore;
@@ -51,8 +51,8 @@ pub struct Inner {
     pub permissions: PermissionStore,
     pub assignments: Assignments,
     pub profiles: ProfileStore,
+    pub profile_epochs: HashMap<String, u64>,
     pub runtimes: RuntimeManifestStore,
-    pub containers: ContainerPool,
     pub sessions: HashMap<String, Session>,
     pub installing_profiles: HashMap<String, InstallRecord>,
     pub runtime_downloads: HashMap<String, InstallRecord>,
@@ -67,6 +67,10 @@ pub struct Inner {
 #[derive(Clone)]
 pub struct SharedState(
     pub Arc<Mutex<Inner>>,
+    pub Arc<StdMutex<HashMap<String, u64>>>,
+    pub Arc<Mutex<ContainerPool>>,
+    pub Arc<StdMutex<HashSet<String>>>,
+    pub Arc<StdMutex<HashMap<String, Vec<(String, ContainerHandle)>>>>,
     pub Arc<StdMutex<HashMap<String, u64>>>,
 );
 
@@ -90,8 +94,8 @@ impl SharedState {
                 permissions,
                 assignments,
                 profiles,
+                profile_epochs: HashMap::new(),
                 runtimes,
-                containers,
                 sessions: HashMap::new(),
                 installing_profiles: HashMap::new(),
                 runtime_downloads: HashMap::new(),
@@ -101,6 +105,10 @@ impl SharedState {
                 recent_runtime_downloads: VecDeque::new(),
                 variant,
             })),
+            Arc::new(StdMutex::new(HashMap::new())),
+            Arc::new(Mutex::new(containers)),
+            Arc::new(StdMutex::new(HashSet::new())),
+            Arc::new(StdMutex::new(HashMap::new())),
             Arc::new(StdMutex::new(HashMap::new())),
         ))
     }
@@ -130,6 +138,116 @@ impl SharedState {
             .expect("prediction generation mutex poisoned")
             .remove(session_id);
     }
+
+    pub fn cancel_session_requests(&self, session_id: &str) {
+        self.3
+            .lock()
+            .expect("session cancellation mutex poisoned")
+            .insert(session_id.to_string());
+    }
+
+    pub fn is_session_cancelled(&self, session_id: &str) -> bool {
+        self.3
+            .lock()
+            .expect("session cancellation mutex poisoned")
+            .contains(session_id)
+    }
+
+    pub fn clear_session_cancelled(&self, session_id: &str) {
+        self.3
+            .lock()
+            .expect("session cancellation mutex poisoned")
+            .remove(session_id);
+    }
+
+    pub fn set_profile_epoch(&self, profile_id: &str, epoch: u64) {
+        self.5
+            .lock()
+            .expect("profile epoch mutex poisoned")
+            .insert(profile_id.to_string(), epoch);
+    }
+
+    pub fn current_profile_epoch(&self, profile_id: &str) -> u64 {
+        self.5
+            .lock()
+            .expect("profile epoch mutex poisoned")
+            .get(profile_id)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    pub fn begin_container_request(
+        &self,
+        profile_id: &str,
+        session_id: &str,
+        handle: ContainerHandle,
+    ) {
+        self.4
+            .lock()
+            .expect("active request mutex poisoned")
+            .entry(session_id.to_string())
+            .or_default()
+            .push((profile_id.to_string(), handle));
+    }
+
+    pub fn end_container_request(
+        &self,
+        profile_id: &str,
+        session_id: &str,
+        handle: &ContainerHandle,
+    ) {
+        let mut active = self.4.lock().expect("active request mutex poisoned");
+        let Some(handles) = active.get_mut(session_id) else {
+            return;
+        };
+        handles.retain(|(active_profile, active_handle)| {
+            active_profile != profile_id || !active_handle.ptr_eq(handle)
+        });
+        if handles.is_empty() {
+            active.remove(session_id);
+        }
+    }
+
+    pub fn active_container_handles(
+        &self,
+        profile_id: &str,
+        session_id: &str,
+    ) -> Vec<ContainerHandle> {
+        self.4
+            .lock()
+            .expect("active request mutex poisoned")
+            .get(session_id)
+            .map(|handles| {
+                handles
+                    .iter()
+                    .filter(|(active_profile, _)| active_profile == profile_id)
+                    .map(|(_, handle)| handle.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn terminate_active_container_handles(
+        &self,
+        profile_id: &str,
+        session_id: &str,
+    ) -> Vec<ContainerHandle> {
+        let active = self.4.lock().expect("active request mutex poisoned");
+        let handles: Vec<ContainerHandle> = active
+            .get(session_id)
+            .map(|handles| {
+                handles
+                    .iter()
+                    .filter(|(active_profile, _)| active_profile == profile_id)
+                    .map(|(_, handle)| handle.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for handle in &handles {
+            handle.terminate();
+        }
+        handles
+    }
 }
 
 #[cfg(test)]
@@ -155,8 +273,8 @@ mod tests {
                 permissions: PermissionStore::default(),
                 assignments: Assignments::default(),
                 profiles: ProfileStore::default(),
+                profile_epochs: HashMap::new(),
                 runtimes: RuntimeManifestStore::default(),
-                containers: ContainerPool::new(),
                 sessions: HashMap::new(),
                 installing_profiles: HashMap::new(),
                 runtime_downloads: HashMap::new(),
@@ -166,6 +284,10 @@ mod tests {
                 recent_runtime_downloads: VecDeque::new(),
                 variant: Variant::Cpu,
             })),
+            Arc::new(StdMutex::new(HashMap::new())),
+            Arc::new(Mutex::new(ContainerPool::new())),
+            Arc::new(StdMutex::new(HashSet::new())),
+            Arc::new(StdMutex::new(HashMap::new())),
             Arc::new(StdMutex::new(HashMap::new())),
         )
     }

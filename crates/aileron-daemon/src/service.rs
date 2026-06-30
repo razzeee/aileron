@@ -16,8 +16,8 @@ pub async fn run(state: SharedState) -> Result<()> {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
             loop {
                 interval.tick().await;
-                let mut guard = state.0.lock().await;
-                guard.containers.evict_idle();
+                let mut containers = state.2.lock().await;
+                containers.evict_idle();
             }
         });
     }

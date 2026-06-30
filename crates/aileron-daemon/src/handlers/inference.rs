@@ -2,8 +2,11 @@
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{MutexGuard, TryLockError};
+use std::time::Duration;
 use uuid::Uuid;
 
+use crate::container::{Container, ContainerHandle};
 use crate::profiles::RuntimeCandidate;
 use crate::state::SharedState;
 #[allow(unused_imports)]
@@ -24,11 +27,63 @@ pub struct InferenceHandler {
 
 type ProfileRuntime = (
     String,
+    u64,
     String,
     Vec<RuntimeCandidate>,
     PathBuf,
     HashMap<String, String>,
 );
+
+#[derive(Debug, Clone)]
+struct ResolvedSessionRuntime {
+    app_id: String,
+    use_case: String,
+    profile_id: String,
+    profile_epoch: u64,
+    runtime_id: String,
+    image_refs: Vec<RuntimeCandidate>,
+    artifact_path: PathBuf,
+    runtime_options: HashMap<String, String>,
+    instructions: String,
+}
+
+struct ActiveContainerRequest<'a> {
+    state: &'a SharedState,
+    profile_id: &'a str,
+    session_id: &'a str,
+    handle: ContainerHandle,
+}
+
+impl<'a> ActiveContainerRequest<'a> {
+    fn new(
+        state: &'a SharedState,
+        profile_id: &'a str,
+        session_id: &'a str,
+        handle: ContainerHandle,
+    ) -> Self {
+        state.begin_container_request(profile_id, session_id, handle.clone());
+        Self {
+            state,
+            profile_id,
+            session_id,
+            handle,
+        }
+    }
+}
+
+impl Drop for ActiveContainerRequest<'_> {
+    fn drop(&mut self) {
+        self.state
+            .end_container_request(self.profile_id, self.session_id, &self.handle);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ResolveSessionError {
+    SessionNotFound(String),
+    ModelUnavailable(String),
+    InvalidInput(String),
+}
 
 impl InferenceHandler {
     pub fn new(state: SharedState, rt: tokio::runtime::Handle) -> Self {
@@ -44,7 +99,7 @@ impl VarlinkInterface for InferenceHandler {
         use_case: String,
     ) -> varlink::Result<()> {
         self.rt.block_on(async {
-            let (candidates, artifact_path, oci_store, system_oci_store) = {
+            let (candidates, artifact_path) = {
                 let guard = self.state.0.lock().await;
                 if !is_supported_use_case(&use_case) {
                     return call.reply(ModelAvailability {
@@ -94,11 +149,13 @@ impl VarlinkInterface for InferenceHandler {
                         ),
                     });
                 }
+                (candidates, profile.artifact_path.clone())
+            };
+            let (oci_store, system_oci_store) = {
+                let containers = self.state.2.lock().await;
                 (
-                    candidates,
-                    profile.artifact_path.clone(),
-                    guard.containers.oci_store.clone(),
-                    guard.containers.system_oci_store.clone(),
+                    containers.oci_store.clone(),
+                    containers.system_oci_store.clone(),
                 )
             };
 
@@ -161,26 +218,30 @@ impl VarlinkInterface for InferenceHandler {
 
     fn prewarm(&self, call: &mut dyn Call_Prewarm, session_id: String) -> varlink::Result<()> {
         self.rt.block_on(async {
-            let mut guard = self.state.0.lock().await;
-            let (profile_id, runtime_id, image_refs, artifact_path, runtime_options) =
-                match guard.sessions.get(&session_id) {
-                    Some(s) => match profile_runtime(&guard, &s.profile_id) {
-                        Ok(resolved) => resolved,
-                        Err(reason) => return call.reply_model_unavailable(reason),
-                    },
-                    None => return call.reply_session_not_found(session_id),
-                };
+            let resolved = match resolve_session_runtime(&self.state, &session_id, |_| Ok(())).await
+            {
+                Ok(resolved) => resolved,
+                Err(ResolveSessionError::SessionNotFound(id)) => {
+                    return call.reply_session_not_found(id);
+                }
+                Err(ResolveSessionError::ModelUnavailable(reason)) => {
+                    return call.reply_model_unavailable(reason);
+                }
+                Err(ResolveSessionError::InvalidInput(reason)) => {
+                    return call.reply_invalid_input(reason);
+                }
+            };
 
-            match guard.containers.get_or_spawn_any(
-                &profile_id,
-                &runtime_id,
-                &image_refs,
-                &artifact_path,
-                &runtime_options,
-                |_| {},
-            ) {
-                Ok(_) => {}
-                Err(e) => return call.reply_generation_failed(e.to_string()),
+            if let Err(e) = with_locked_container(
+                &self.state,
+                &session_id,
+                resolved.clone(),
+                std::convert::identity,
+                |_container, _handle, _spawned| Ok(()),
+            )
+            .await
+            {
+                return reply_generation_failure(call, e);
             }
 
             call.reply()
@@ -250,7 +311,7 @@ impl VarlinkInterface for InferenceHandler {
                 Err(SpeechError::SessionNotFound(id)) => call.reply_session_not_found(id),
                 Err(SpeechError::ModelUnavailable(reason)) => call.reply_model_unavailable(reason),
                 Err(SpeechError::InvalidInput(reason)) => call.reply_invalid_input(reason),
-                Err(SpeechError::Failed(reason)) => call.reply_generation_failed(reason),
+                Err(SpeechError::Failed(reason)) => reply_generation_failure(call, reason),
                 Err(SpeechError::Reply(e)) => Err(e),
             }
         })
@@ -269,7 +330,7 @@ impl VarlinkInterface for InferenceHandler {
                 Err(VisionError::SessionNotFound(id)) => call.reply_session_not_found(id),
                 Err(VisionError::ModelUnavailable(reason)) => call.reply_model_unavailable(reason),
                 Err(VisionError::InvalidInput(reason)) => call.reply_invalid_input(reason),
-                Err(VisionError::Failed(reason)) => call.reply_generation_failed(reason),
+                Err(VisionError::Failed(reason)) => reply_generation_failure(call, reason),
                 Err(VisionError::Reply(e)) => Err(e),
             }
         })
@@ -287,7 +348,7 @@ impl VarlinkInterface for InferenceHandler {
                 Err(VisionError::SessionNotFound(id)) => call.reply_session_not_found(id),
                 Err(VisionError::ModelUnavailable(reason)) => call.reply_model_unavailable(reason),
                 Err(VisionError::InvalidInput(reason)) => call.reply_invalid_input(reason),
-                Err(VisionError::Failed(reason)) => call.reply_generation_failed(reason),
+                Err(VisionError::Failed(reason)) => reply_generation_failure(call, reason),
                 Err(VisionError::Reply(e)) => Err(e),
             }
         })
@@ -305,7 +366,7 @@ impl VarlinkInterface for InferenceHandler {
                 Err(VisionError::SessionNotFound(id)) => call.reply_session_not_found(id),
                 Err(VisionError::ModelUnavailable(reason)) => call.reply_model_unavailable(reason),
                 Err(VisionError::InvalidInput(reason)) => call.reply_invalid_input(reason),
-                Err(VisionError::Failed(reason)) => call.reply_generation_failed(reason),
+                Err(VisionError::Failed(reason)) => reply_generation_failure(call, reason),
                 Err(VisionError::Reply(e)) => Err(e),
             }
         })
@@ -328,7 +389,7 @@ impl VarlinkInterface for InferenceHandler {
                     call.reply_invalid_generation_options(reason)
                 }
                 Err(GenerationError::InvalidInput(reason)) => call.reply_invalid_input(reason),
-                Err(GenerationError::Failed(reason)) => call.reply_generation_failed(reason),
+                Err(GenerationError::Failed(reason)) => reply_generation_failure(call, reason),
                 Err(GenerationError::Reply(e)) => Err(e),
             }
         })
@@ -364,7 +425,7 @@ impl VarlinkInterface for InferenceHandler {
                     call.reply_invalid_generation_options(reason)
                 }
                 Err(GenerationError::InvalidInput(reason)) => call.reply_invalid_input(reason),
-                Err(GenerationError::Failed(reason)) => call.reply_guided_generation_failed(reason),
+                Err(GenerationError::Failed(reason)) => reply_guided_failure(call, reason),
                 Err(GenerationError::Reply(e)) => Err(e),
             }
         })
@@ -402,7 +463,7 @@ impl VarlinkInterface for InferenceHandler {
                     call.reply_invalid_generation_options(reason)
                 }
                 Err(GenerationError::InvalidInput(reason)) => call.reply_invalid_input(reason),
-                Err(GenerationError::Failed(reason)) => call.reply_guided_generation_failed(reason),
+                Err(GenerationError::Failed(reason)) => reply_guided_failure(call, reason),
                 Err(GenerationError::Reply(e)) => Err(e),
             }
         })
@@ -414,11 +475,16 @@ impl VarlinkInterface for InferenceHandler {
         session_id: String,
     ) -> varlink::Result<()> {
         self.rt.block_on(async {
-            let mut guard = self.state.0.lock().await;
-            if guard.sessions.remove(&session_id).is_none() {
-                return call.reply_session_not_found(session_id);
-            }
+            let profile_id = {
+                let mut guard = self.state.0.lock().await;
+                let Some(session) = guard.sessions.remove(&session_id) else {
+                    return call.reply_session_not_found(session_id);
+                };
+                self.state.cancel_session_requests(&session_id);
+                session.profile_id
+            };
             self.state.clear_predict_next(&session_id);
+            kill_profile_if_session_active(&self.state, &profile_id, &session_id).await;
             call.reply()
         })
     }
@@ -492,6 +558,7 @@ async fn create_session_record(
         started_at: chrono::Utc::now(),
     };
     guard.sessions.insert(session_id.clone(), session);
+    state.clear_session_cancelled(&session_id);
     Ok((session_id, profile_id))
 }
 
@@ -522,89 +589,77 @@ async fn stream_transcription(
     audio: String,
     source_language_hint: String,
 ) -> Result<(), SpeechError> {
-    let mut guard = state.0.lock().await;
-
-    let (
-        app_id,
-        use_case,
-        task,
-        profile_id,
-        runtime_id,
-        image_refs,
-        artifact_path,
-        runtime_options,
-    ) = match guard.sessions.get(&session_id) {
-        Some(s) => {
-            let task = ensure_speech_use_case(&s.use_case).map_err(SpeechError::InvalidInput)?;
-            let (profile_id, runtime_id, image_refs, artifact_path, runtime_options) =
-                profile_runtime(&guard, &s.profile_id).map_err(SpeechError::ModelUnavailable)?;
-            (
-                s.app_id.clone(),
-                s.use_case.clone(),
-                task,
-                profile_id,
-                runtime_id,
-                image_refs,
-                artifact_path,
-                runtime_options,
-            )
-        }
-        None => return Err(SpeechError::SessionNotFound(session_id)),
-    };
-
-    let _ = guard.permissions.touch(&app_id, &use_case);
+    let resolved = resolve_session_runtime(state, &session_id, |use_case| {
+        ensure_speech_use_case(use_case).map(|_| ())
+    })
+    .await
+    .map_err(SpeechError::from)?;
+    let task = ensure_speech_use_case(&resolved.use_case).map_err(SpeechError::InvalidInput)?;
     let audio_bytes = base64_decode(&audio).map_err(SpeechError::InvalidInput)?;
-    let container = guard
-        .containers
-        .get_or_spawn_any(
-            &profile_id,
-            &runtime_id,
-            &image_refs,
-            &artifact_path,
-            &runtime_options,
-            |_| {},
-        )
-        .map_err(|e| SpeechError::Failed(e.to_string()))?;
+    with_locked_container(
+        state,
+        &session_id,
+        resolved.clone(),
+        SpeechError::Failed,
+        |container, _handle, _spawned| {
+            let wants_more = call.wants_more();
+            let mut pending_token: Option<String> = None;
+            let mut reply_error: Option<varlink::Error> = None;
+            let mut cancelled = false;
 
-    let wants_more = call.wants_more();
-    let mut pending_token: Option<String> = None;
-    let mut reply_error: Option<varlink::Error> = None;
+            let result = container.stream_transcribe(
+                audio_bytes,
+                Some(&source_language_hint),
+                task,
+                |token| {
+                    if cancelled || state.is_session_cancelled(&session_id) {
+                        cancelled = true;
+                        return;
+                    }
 
-    let result =
-        container.stream_transcribe(audio_bytes, Some(&source_language_hint), task, |token| {
-            if !wants_more {
-                pending_token = Some(token);
-                return;
+                    if !wants_more {
+                        pending_token = Some(token);
+                        return;
+                    }
+
+                    if reply_error.is_some() {
+                        return;
+                    }
+
+                    if let Some(previous) = pending_token.replace(token) {
+                        call.set_continues(true);
+                        if let Err(e) = call.reply(previous) {
+                            reply_error = Some(e);
+                        }
+                    }
+                },
+            );
+
+            if let Some(e) = reply_error {
+                return Err(SpeechError::Reply(e));
             }
-
-            if reply_error.is_some() {
-                return;
-            }
-
-            if let Some(previous) = pending_token.replace(token) {
-                call.set_continues(true);
-                if let Err(e) = call.reply(previous) {
-                    reply_error = Some(e);
+            if cancelled || state.is_session_cancelled(&session_id) {
+                if wants_more {
+                    call.set_continues(false);
                 }
+                return Err(SpeechError::Failed(request_cancelled_reason()));
             }
-        });
 
-    if let Some(e) = reply_error {
-        return Err(SpeechError::Reply(e));
-    }
+            if let Err(e) = result {
+                if wants_more {
+                    call.set_continues(false);
+                }
+                return Err(SpeechError::Failed(e.to_string()));
+            }
 
-    if let Err(e) = result {
-        if wants_more {
-            call.set_continues(false);
-        }
-        return Err(SpeechError::Failed(e.to_string()));
-    }
-
-    if wants_more {
-        call.set_continues(false);
-    }
-    call.reply(pending_token.unwrap_or_default())
-        .map_err(SpeechError::Reply)
+            if wants_more {
+                call.set_continues(false);
+            }
+            call.reply(pending_token.unwrap_or_default())
+                .map_err(SpeechError::Reply)
+        },
+    )
+    .await
 }
 
 async fn stream_vision_text<C: TextStreamCall + ?Sized>(
@@ -614,95 +669,88 @@ async fn stream_vision_text<C: TextStreamCall + ?Sized>(
     image: String,
     expected_use_case: &str,
 ) -> Result<(), VisionError> {
-    let mut guard = state.0.lock().await;
-
-    let (app_id, use_case, profile_id, runtime_id, image_refs, artifact_path, runtime_options) =
-        match guard.sessions.get(&session_id) {
-            Some(s) => {
-                let method = if expected_use_case == "vision.describe" {
-                    "StreamDescribe"
-                } else {
-                    "StreamOcr"
-                };
-                ensure_exact_use_case(&s.use_case, expected_use_case, method)
-                    .map_err(VisionError::InvalidInput)?;
-                let (profile_id, runtime_id, image_refs, artifact_path, runtime_options) =
-                    profile_runtime(&guard, &s.profile_id)
-                        .map_err(VisionError::ModelUnavailable)?;
-                (
-                    s.app_id.clone(),
-                    s.use_case.clone(),
-                    profile_id,
-                    runtime_id,
-                    image_refs,
-                    artifact_path,
-                    runtime_options,
-                )
-            }
-            None => return Err(VisionError::SessionNotFound(session_id)),
-        };
-
-    let _ = guard.permissions.touch(&app_id, &use_case);
-    let image_bytes = base64_decode(&image).map_err(VisionError::InvalidInput)?;
-    let container = guard
-        .containers
-        .get_or_spawn_any(
-            &profile_id,
-            &runtime_id,
-            &image_refs,
-            &artifact_path,
-            &runtime_options,
-            |_| {},
-        )
-        .map_err(|e| VisionError::Failed(e.to_string()))?;
-
-    let wants_more = call.wants_more();
-    let mut pending_token: Option<String> = None;
-    let mut reply_error: Option<varlink::Error> = None;
-    let mut saw_token = false;
-
-    let result = if expected_use_case == "vision.describe" {
-        container.stream_describe(image_bytes, |token| {
-            forward_text_stream_token(
-                call,
-                wants_more,
-                token,
-                &mut pending_token,
-                &mut saw_token,
-                &mut reply_error,
-            );
-        })
+    let method = if expected_use_case == "vision.describe" {
+        "StreamDescribe"
     } else {
-        container.stream_ocr(image_bytes, |token| {
-            forward_text_stream_token(
-                call,
-                wants_more,
-                token,
-                &mut pending_token,
-                &mut saw_token,
-                &mut reply_error,
-            );
-        })
+        "StreamOcr"
     };
+    let resolved = resolve_session_runtime(state, &session_id, |use_case| {
+        ensure_exact_use_case(use_case, expected_use_case, method)
+    })
+    .await
+    .map_err(VisionError::from)?;
+    let image_bytes = base64_decode(&image).map_err(VisionError::InvalidInput)?;
+    with_locked_container(
+        state,
+        &session_id,
+        resolved.clone(),
+        VisionError::Failed,
+        |container, _handle, _spawned| {
+            let wants_more = call.wants_more();
+            let mut pending_token: Option<String> = None;
+            let mut reply_error: Option<varlink::Error> = None;
+            let mut saw_token = false;
+            let mut cancelled = false;
 
-    if let Some(e) = reply_error {
-        return Err(VisionError::Reply(e));
-    }
-    if let Err(e) = result {
-        if wants_more {
-            call.set_continues(false);
-        }
-        return Err(VisionError::Failed(e.to_string()));
-    }
-    if !saw_token && !vision_text_allows_empty_output(expected_use_case) {
-        return Err(VisionError::Failed("model returned no output".to_string()));
-    }
+            let result = if expected_use_case == "vision.describe" {
+                container.stream_describe(image_bytes, |token| {
+                    if cancelled || state.is_session_cancelled(&session_id) {
+                        cancelled = true;
+                        return;
+                    }
+                    forward_text_stream_token(
+                        call,
+                        wants_more,
+                        token,
+                        &mut pending_token,
+                        &mut saw_token,
+                        &mut reply_error,
+                    );
+                })
+            } else {
+                container.stream_ocr(image_bytes, |token| {
+                    if cancelled || state.is_session_cancelled(&session_id) {
+                        cancelled = true;
+                        return;
+                    }
+                    forward_text_stream_token(
+                        call,
+                        wants_more,
+                        token,
+                        &mut pending_token,
+                        &mut saw_token,
+                        &mut reply_error,
+                    );
+                })
+            };
 
-    if wants_more {
-        call.set_continues(false);
-    }
-    call.reply_token(pending_token.unwrap_or_default())
-        .map_err(VisionError::Reply)
+            if let Some(e) = reply_error {
+                return Err(VisionError::Reply(e));
+            }
+            if cancelled || state.is_session_cancelled(&session_id) {
+                if wants_more {
+                    call.set_continues(false);
+                }
+                return Err(VisionError::Failed(request_cancelled_reason()));
+            }
+            if let Err(e) = result {
+                if wants_more {
+                    call.set_continues(false);
+                }
+                return Err(VisionError::Failed(e.to_string()));
+            }
+            if !saw_token && !vision_text_allows_empty_output(expected_use_case) {
+                return Err(VisionError::Failed("model returned no output".to_string()));
+            }
+
+            if wants_more {
+                call.set_continues(false);
+            }
+            call.reply_token(pending_token.unwrap_or_default())
+                .map_err(VisionError::Reply)
+        },
+    )
+    .await
 }
 
 fn forward_text_stream_token<C: TextStreamCall + ?Sized>(
@@ -742,59 +790,40 @@ async fn vision_segments(
     session_id: String,
     image: String,
 ) -> Result<Vec<VisionSegment>, VisionError> {
-    let mut guard = state.0.lock().await;
-
-    let (app_id, use_case, profile_id, runtime_id, image_refs, artifact_path, runtime_options) =
-        match guard.sessions.get(&session_id) {
-            Some(s) => {
-                ensure_exact_use_case(&s.use_case, "vision.segment", "StreamSegment")
-                    .map_err(VisionError::InvalidInput)?;
-                let (profile_id, runtime_id, image_refs, artifact_path, runtime_options) =
-                    profile_runtime(&guard, &s.profile_id)
-                        .map_err(VisionError::ModelUnavailable)?;
-                (
-                    s.app_id.clone(),
-                    s.use_case.clone(),
-                    profile_id,
-                    runtime_id,
-                    image_refs,
-                    artifact_path,
-                    runtime_options,
-                )
-            }
-            None => return Err(VisionError::SessionNotFound(session_id)),
-        };
-
-    let _ = guard.permissions.touch(&app_id, &use_case);
+    let resolved = resolve_session_runtime(state, &session_id, |use_case| {
+        ensure_exact_use_case(use_case, "vision.segment", "StreamSegment")
+    })
+    .await
+    .map_err(VisionError::from)?;
     let image_bytes = base64_decode(&image).map_err(VisionError::InvalidInput)?;
-    let container = guard
-        .containers
-        .get_or_spawn_any(
-            &profile_id,
-            &runtime_id,
-            &image_refs,
-            &artifact_path,
-            &runtime_options,
-            |_| {},
-        )
-        .map_err(|e| VisionError::Failed(e.to_string()))?;
-
-    container
-        .segment(image_bytes)
-        .map(|segments| {
-            segments
-                .into_iter()
-                .map(|segment| VisionSegment {
-                    label: segment.label,
-                    confidence: segment.confidence,
-                    x: segment.x,
-                    y: segment.y,
-                    width: segment.width,
-                    height: segment.height,
+    with_locked_container(
+        state,
+        &session_id,
+        resolved.clone(),
+        VisionError::Failed,
+        |container, handle, spawned| {
+            let result = container
+                .segment(image_bytes)
+                .map(|segments| {
+                    segments
+                        .into_iter()
+                        .map(|segment| VisionSegment {
+                            label: segment.label,
+                            confidence: segment.confidence,
+                            x: segment.x,
+                            y: segment.y,
+                            width: segment.width,
+                            height: segment.height,
+                        })
+                        .collect()
                 })
-                .collect()
-        })
-        .map_err(|e| VisionError::Failed(e.to_string()))
+                .map_err(|e| VisionError::Failed(e.to_string()));
+            ensure_session_not_cancelled_or_terminate_spawned(state, &session_id, handle, spawned)
+                .map_err(VisionError::Failed)?;
+            result
+        },
+    )
+    .await
 }
 
 async fn embedding_vector(
@@ -802,46 +831,27 @@ async fn embedding_vector(
     session_id: String,
     text: String,
 ) -> Result<Vec<f64>, GenerationError> {
-    let mut guard = state.0.lock().await;
-
-    let (app_id, use_case, profile_id, runtime_id, image_refs, artifact_path, runtime_options) =
-        match guard.sessions.get(&session_id) {
-            Some(s) => {
-                ensure_exact_use_case(&s.use_case, "language.embed", "StreamEmbed")
-                    .map_err(GenerationError::InvalidInput)?;
-                let (profile_id, runtime_id, image_refs, artifact_path, runtime_options) =
-                    profile_runtime(&guard, &s.profile_id)
-                        .map_err(GenerationError::ModelUnavailable)?;
-                (
-                    s.app_id.clone(),
-                    s.use_case.clone(),
-                    profile_id,
-                    runtime_id,
-                    image_refs,
-                    artifact_path,
-                    runtime_options,
-                )
-            }
-            None => return Err(GenerationError::SessionNotFound(session_id)),
-        };
-
-    let _ = guard.permissions.touch(&app_id, &use_case);
-    let container = guard
-        .containers
-        .get_or_spawn_any(
-            &profile_id,
-            &runtime_id,
-            &image_refs,
-            &artifact_path,
-            &runtime_options,
-            |_| {},
-        )
-        .map_err(|e| GenerationError::Failed(e.to_string()))?;
-
-    container
-        .embed(&text)
-        .map(|embedding| embedding.into_iter().map(f64::from).collect())
-        .map_err(|e| GenerationError::Failed(e.to_string()))
+    let resolved = resolve_session_runtime(state, &session_id, |use_case| {
+        ensure_exact_use_case(use_case, "language.embed", "StreamEmbed")
+    })
+    .await
+    .map_err(GenerationError::from)?;
+    with_locked_container(
+        state,
+        &session_id,
+        resolved.clone(),
+        GenerationError::Failed,
+        |container, handle, spawned| {
+            let result = container
+                .embed(&text)
+                .map(|embedding| embedding.into_iter().map(f64::from).collect())
+                .map_err(|e| GenerationError::Failed(e.to_string()));
+            ensure_session_not_cancelled_or_terminate_spawned(state, &session_id, handle, spawned)
+                .map_err(GenerationError::Failed)?;
+            result
+        },
+    )
+    .await
 }
 
 async fn stream_tokens(
@@ -852,99 +862,78 @@ async fn stream_tokens(
     options: GenerationOptions,
 ) -> Result<(), GenerationError> {
     let max_tokens = validate_options(&options).map_err(GenerationError::InvalidOptions)?;
-    let mut guard = state.0.lock().await;
+    let resolved = resolve_session_runtime(state, &session_id, ensure_language_generation_use_case)
+        .await
+        .map_err(GenerationError::from)?;
+    let instructions =
+        apply_translation_hints(&resolved.use_case, resolved.instructions.clone(), &options);
+    with_locked_container(
+        state,
+        &session_id,
+        resolved.clone(),
+        GenerationError::Failed,
+        |container, _handle, _spawned| {
+            let wants_more = call.wants_more();
+            let mut pending_token: Option<String> = None;
+            let mut reply_error: Option<varlink::Error> = None;
+            let mut saw_token = false;
+            let mut cancelled = false;
 
-    let (
-        app_id,
-        use_case,
-        profile_id,
-        runtime_id,
-        image_refs,
-        artifact_path,
-        runtime_options,
-        instructions,
-    ) = match guard.sessions.get(&session_id) {
-        Some(s) => {
-            ensure_language_generation_use_case(&s.use_case)
-                .map_err(GenerationError::InvalidInput)?;
-            let (profile_id, runtime_id, image_refs, artifact_path, runtime_options) =
-                profile_runtime(&guard, &s.profile_id)
-                    .map_err(GenerationError::ModelUnavailable)?;
-            (
-                s.app_id.clone(),
-                s.use_case.clone(),
-                profile_id,
-                runtime_id,
-                image_refs,
-                artifact_path,
-                runtime_options,
-                s.instructions.clone(),
-            )
-        }
-        None => return Err(GenerationError::SessionNotFound(session_id)),
-    };
+            let result = container.generate(Some(&instructions), &prompt, max_tokens, |token| {
+                if cancelled || state.is_session_cancelled(&session_id) {
+                    cancelled = true;
+                    return;
+                }
+                if !token.is_empty() {
+                    saw_token = true;
+                }
+                if !wants_more {
+                    pending_token = Some(token);
+                    return;
+                }
 
-    let _ = guard.permissions.touch(&app_id, &use_case);
-    let container = guard
-        .containers
-        .get_or_spawn_any(
-            &profile_id,
-            &runtime_id,
-            &image_refs,
-            &artifact_path,
-            &runtime_options,
-            |_| {},
-        )
-        .map_err(|e| GenerationError::Failed(e.to_string()))?;
+                if reply_error.is_some() {
+                    return;
+                }
 
-    let wants_more = call.wants_more();
-    let mut pending_token: Option<String> = None;
-    let mut reply_error: Option<varlink::Error> = None;
-    let mut saw_token = false;
+                if let Some(previous) = pending_token.replace(token) {
+                    call.set_continues(true);
+                    if let Err(e) = call.reply(previous) {
+                        reply_error = Some(e);
+                    }
+                }
+            });
 
-    let instructions = apply_translation_hints(&use_case, instructions, &options);
-    let result = container.generate(Some(&instructions), &prompt, max_tokens, |token| {
-        if !token.is_empty() {
-            saw_token = true;
-        }
-        if !wants_more {
-            pending_token = Some(token);
-            return;
-        }
-
-        if reply_error.is_some() {
-            return;
-        }
-
-        if let Some(previous) = pending_token.replace(token) {
-            call.set_continues(true);
-            if let Err(e) = call.reply(previous) {
-                reply_error = Some(e);
+            if let Some(e) = reply_error {
+                return Err(GenerationError::Reply(e));
             }
-        }
-    });
+            if cancelled || state.is_session_cancelled(&session_id) {
+                if wants_more {
+                    call.set_continues(false);
+                }
+                return Err(GenerationError::Failed(request_cancelled_reason()));
+            }
 
-    if let Some(e) = reply_error {
-        return Err(GenerationError::Reply(e));
-    }
+            if let Err(e) = result {
+                if wants_more {
+                    call.set_continues(false);
+                }
+                return Err(GenerationError::Failed(e.to_string()));
+            }
+            if !saw_token {
+                return Err(GenerationError::Failed(
+                    "model returned no output".to_string(),
+                ));
+            }
 
-    if let Err(e) = result {
-        if wants_more {
-            call.set_continues(false);
-        }
-        return Err(GenerationError::Failed(e.to_string()));
-    }
-    if !saw_token {
-        return Err(GenerationError::Failed(
-            "model returned no output".to_string(),
-        ));
-    }
-
-    if wants_more {
-        call.set_continues(false);
-    }
-    call.reply(pending_token.unwrap_or_default())
-        .map_err(GenerationError::Reply)
+            if wants_more {
+                call.set_continues(false);
+            }
+            call.reply(pending_token.unwrap_or_default())
+                .map_err(GenerationError::Reply)
+        },
+    )
+    .await
 }
 
 enum GenerationError {
@@ -970,6 +959,357 @@ enum VisionError {
     InvalidInput(String),
     Failed(String),
     Reply(varlink::Error),
+}
+
+impl From<ResolveSessionError> for GenerationError {
+    fn from(error: ResolveSessionError) -> Self {
+        match error {
+            ResolveSessionError::SessionNotFound(id) => Self::SessionNotFound(id),
+            ResolveSessionError::ModelUnavailable(reason) => Self::ModelUnavailable(reason),
+            ResolveSessionError::InvalidInput(reason) => Self::InvalidInput(reason),
+        }
+    }
+}
+
+impl From<ResolveSessionError> for SpeechError {
+    fn from(error: ResolveSessionError) -> Self {
+        match error {
+            ResolveSessionError::SessionNotFound(id) => Self::SessionNotFound(id),
+            ResolveSessionError::ModelUnavailable(reason) => Self::ModelUnavailable(reason),
+            ResolveSessionError::InvalidInput(reason) => Self::InvalidInput(reason),
+        }
+    }
+}
+
+impl From<ResolveSessionError> for VisionError {
+    fn from(error: ResolveSessionError) -> Self {
+        match error {
+            ResolveSessionError::SessionNotFound(id) => Self::SessionNotFound(id),
+            ResolveSessionError::ModelUnavailable(reason) => Self::ModelUnavailable(reason),
+            ResolveSessionError::InvalidInput(reason) => Self::InvalidInput(reason),
+        }
+    }
+}
+
+enum LockContainerError {
+    Retry,
+    Failed(String),
+}
+
+async fn resolve_session_runtime(
+    state: &SharedState,
+    session_id: &str,
+    validate_use_case: impl FnOnce(&str) -> Result<(), String>,
+) -> Result<ResolvedSessionRuntime, ResolveSessionError> {
+    let mut guard = state.0.lock().await;
+    let resolved = match guard.sessions.get(session_id) {
+        Some(session) => {
+            validate_use_case(&session.use_case).map_err(ResolveSessionError::InvalidInput)?;
+            let (profile_id, profile_epoch, runtime_id, image_refs, artifact_path, runtime_options) =
+                profile_runtime(&guard, &session.profile_id)
+                    .map_err(ResolveSessionError::ModelUnavailable)?;
+            ResolvedSessionRuntime {
+                app_id: session.app_id.clone(),
+                use_case: session.use_case.clone(),
+                profile_id,
+                profile_epoch,
+                runtime_id,
+                image_refs,
+                artifact_path,
+                runtime_options,
+                instructions: session.instructions.clone(),
+            }
+        }
+        None => return Err(ResolveSessionError::SessionNotFound(session_id.to_string())),
+    };
+    let _ = guard
+        .permissions
+        .touch(&resolved.app_id, &resolved.use_case);
+    Ok(resolved)
+}
+
+async fn model_container(
+    state: &SharedState,
+    session_id: &str,
+    resolved: &ResolvedSessionRuntime,
+) -> Result<(ContainerHandle, bool), String> {
+    ensure_resolved_session_active(state, session_id, resolved).await?;
+    let (container, spawned) = state
+        .2
+        .lock()
+        .await
+        .get_or_spawn_any_checked(
+            &resolved.profile_id,
+            resolved.profile_epoch,
+            &resolved.runtime_id,
+            &resolved.image_refs,
+            &resolved.artifact_path,
+            &resolved.runtime_options,
+            |_| {},
+            || {
+                ensure_session_not_cancelled(state, session_id)
+                    .and_then(|_| ensure_profile_epoch_current(state, resolved))
+            },
+        )
+        .map_err(|e| e.to_string())?;
+    if let Err(e) = ensure_resolved_session_active(state, session_id, resolved).await {
+        if spawned || profile_is_missing(state, &resolved.profile_id).await {
+            let mut containers = state.2.lock().await;
+            containers.kill_handle(&resolved.profile_id, &container);
+        }
+        return Err(e);
+    }
+    Ok((container, spawned))
+}
+
+fn lock_container_for_session<'a>(
+    state: &SharedState,
+    session_id: &str,
+    handle: &'a ContainerHandle,
+    spawned: bool,
+) -> Result<MutexGuard<'a, Container>, LockContainerError> {
+    loop {
+        ensure_session_not_cancelled_or_terminate_spawned(state, session_id, handle, spawned)
+            .map_err(LockContainerError::Failed)?;
+        ensure_handle_ready_for_request(handle, spawned)?;
+        match handle.try_lock() {
+            Ok(container) => return Ok(container),
+            Err(TryLockError::WouldBlock) => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(LockContainerError::Failed(
+                    "container mutex poisoned".to_string(),
+                ));
+            }
+        }
+    }
+}
+
+async fn with_locked_container<T, E>(
+    state: &SharedState,
+    session_id: &str,
+    mut resolved: ResolvedSessionRuntime,
+    map_failed: impl Fn(String) -> E,
+    op: impl FnOnce(&mut Container, &ContainerHandle, bool) -> Result<T, E>,
+) -> Result<T, E> {
+    let mut op = Some(op);
+    let expected_use_case = resolved.use_case.clone();
+    loop {
+        let (handle, spawned) = match model_container(state, session_id, &resolved).await {
+            Ok(container) => container,
+            Err(reason) if is_startup_finalizing_retry(&reason) => {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                continue;
+            }
+            Err(reason) if is_wait_retry(&reason) => {
+                resolved = refresh_resolved_session_runtime(state, session_id, &expected_use_case)
+                    .await
+                    .map_err(&map_failed)?;
+                continue;
+            }
+            Err(reason) => return Err(map_failed(reason)),
+        };
+        let mut container = match lock_container_for_session(state, session_id, &handle, spawned) {
+            Ok(container) => container,
+            Err(LockContainerError::Retry) => continue,
+            Err(LockContainerError::Failed(reason)) => return Err(map_failed(reason)),
+        };
+
+        ensure_session_not_cancelled_or_terminate_spawned(state, session_id, &handle, spawned)
+            .map_err(&map_failed)?;
+        match ensure_handle_ready_for_request(&handle, spawned) {
+            Ok(()) => {}
+            Err(LockContainerError::Retry) => continue,
+            Err(LockContainerError::Failed(reason)) => return Err(map_failed(reason)),
+        }
+        if let Err(reason) = ensure_profile_epoch_current(state, &resolved) {
+            if !is_wait_retry(&reason) {
+                return Err(map_failed(reason));
+            }
+            drop(container);
+            terminate_stale_handle(state, &resolved.profile_id, &handle).await;
+            resolved = refresh_resolved_session_runtime(state, session_id, &expected_use_case)
+                .await
+                .map_err(&map_failed)?;
+            continue;
+        }
+        if let Err(reason) = ensure_container_matches_resolved(&container, &resolved) {
+            if !is_wait_retry(&reason) {
+                return Err(map_failed(reason));
+            }
+            drop(container);
+            terminate_stale_handle(state, &resolved.profile_id, &handle).await;
+            resolved = refresh_resolved_session_runtime(state, session_id, &expected_use_case)
+                .await
+                .map_err(&map_failed)?;
+            continue;
+        }
+        let _active =
+            ActiveContainerRequest::new(state, &resolved.profile_id, session_id, handle.clone());
+        ensure_session_not_cancelled_or_terminate_spawned(state, session_id, &handle, spawned)
+            .map_err(&map_failed)?;
+        if spawned {
+            handle.publish();
+        }
+
+        let op = op.take().expect("container operation called once");
+        return op(&mut container, &handle, spawned);
+    }
+}
+
+fn is_startup_finalizing_retry(reason: &str) -> bool {
+    reason.starts_with("container startup is being finalized for profile ")
+        && reason.ends_with("; retry request")
+}
+
+fn is_wait_retry(reason: &str) -> bool {
+    reason.ends_with("; retry request")
+}
+
+async fn terminate_stale_handle(state: &SharedState, profile_id: &str, handle: &ContainerHandle) {
+    handle.terminate();
+    let mut containers = state.2.lock().await;
+    containers.kill_handle(profile_id, handle);
+}
+
+async fn refresh_resolved_session_runtime(
+    state: &SharedState,
+    session_id: &str,
+    expected_use_case: &str,
+) -> Result<ResolvedSessionRuntime, String> {
+    resolve_session_runtime(state, session_id, |use_case| {
+        if use_case == expected_use_case {
+            Ok(())
+        } else {
+            Err("session use-case changed while request was waiting; retry request".to_string())
+        }
+    })
+    .await
+    .map_err(resolve_session_wait_error)
+}
+
+fn resolve_session_wait_error(error: ResolveSessionError) -> String {
+    match error {
+        ResolveSessionError::SessionNotFound(_) => request_cancelled_reason(),
+        ResolveSessionError::ModelUnavailable(reason)
+        | ResolveSessionError::InvalidInput(reason) => reason,
+    }
+}
+
+fn ensure_container_matches_resolved(
+    container: &Container,
+    resolved: &ResolvedSessionRuntime,
+) -> Result<(), String> {
+    if container.matches_any_runtime(
+        &resolved.runtime_id,
+        resolved.profile_epoch,
+        &resolved.image_refs,
+        &resolved.artifact_path,
+        &resolved.runtime_options,
+    ) {
+        Ok(())
+    } else {
+        Err("container runtime changed while request was waiting; retry request".to_string())
+    }
+}
+
+fn ensure_profile_epoch_current(
+    state: &SharedState,
+    resolved: &ResolvedSessionRuntime,
+) -> Result<(), String> {
+    if state.current_profile_epoch(&resolved.profile_id) == resolved.profile_epoch {
+        Ok(())
+    } else {
+        Err("container profile changed while request was waiting; retry request".to_string())
+    }
+}
+
+fn ensure_handle_ready_for_request(
+    handle: &ContainerHandle,
+    spawned: bool,
+) -> Result<(), LockContainerError> {
+    if !handle.is_terminating() {
+        return Ok(());
+    }
+    if spawned {
+        Err(LockContainerError::Failed(
+            "container was terminated before request started".to_string(),
+        ))
+    } else {
+        Err(LockContainerError::Retry)
+    }
+}
+
+async fn ensure_resolved_session_active(
+    state: &SharedState,
+    session_id: &str,
+    resolved: &ResolvedSessionRuntime,
+) -> Result<(), String> {
+    ensure_session_not_cancelled(state, session_id)?;
+    let guard = state.0.lock().await;
+    match guard.sessions.get(session_id) {
+        Some(session) if session.profile_id == resolved.profile_id => {
+            let current_epoch = guard
+                .profile_epochs
+                .get(&resolved.profile_id)
+                .copied()
+                .unwrap_or_default();
+            if current_epoch == resolved.profile_epoch {
+                Ok(())
+            } else {
+                Err(
+                    "container profile changed while request was waiting; retry request"
+                        .to_string(),
+                )
+            }
+        }
+        _ => Err(request_cancelled_reason()),
+    }
+}
+
+async fn profile_is_missing(state: &SharedState, profile_id: &str) -> bool {
+    let guard = state.0.lock().await;
+    guard.profiles.get(profile_id).is_none()
+}
+
+fn ensure_session_not_cancelled(state: &SharedState, session_id: &str) -> Result<(), String> {
+    if state.is_session_cancelled(session_id) {
+        Err(request_cancelled_reason())
+    } else {
+        Ok(())
+    }
+}
+
+fn ensure_session_not_cancelled_or_terminate_spawned(
+    state: &SharedState,
+    session_id: &str,
+    handle: &ContainerHandle,
+    spawned: bool,
+) -> Result<(), String> {
+    if let Err(reason) = ensure_session_not_cancelled(state, session_id) {
+        if spawned {
+            handle.terminate();
+        }
+        Err(reason)
+    } else {
+        Ok(())
+    }
+}
+
+async fn kill_profile_if_session_active(state: &SharedState, profile_id: &str, session_id: &str) {
+    let handles = state.terminate_active_container_handles(profile_id, session_id);
+    if handles.is_empty() {
+        return;
+    }
+    let mut containers = state.2.lock().await;
+    for handle in handles {
+        containers.kill_handle(profile_id, &handle);
+    }
+}
+
+fn request_cancelled_reason() -> String {
+    "container returned error request_cancelled: session was closed".to_string()
 }
 
 trait TextStreamCall {
@@ -1024,6 +1364,13 @@ fn reply_generation_failure(
     }
 }
 
+fn reply_guided_failure(call: &mut dyn VarlinkCallError, reason: String) -> varlink::Result<()> {
+    match runtime_error_code(&reason) {
+        Some("request_cancelled") => call.reply_request_cancelled(reason),
+        _ => call.reply_guided_generation_failed(reason),
+    }
+}
+
 fn runtime_error_code(reason: &str) -> Option<&str> {
     reason
         .strip_prefix("container returned error ")
@@ -1039,46 +1386,35 @@ async fn predict_next_completions(
 ) -> Result<Vec<String>, GenerationError> {
     let max_tokens = validate_options(&options).map_err(GenerationError::InvalidOptions)?;
     let generation = state.begin_predict_next(&session_id);
-    let mut guard = state.0.lock().await;
+    let resolved = match resolve_session_runtime(state, &session_id, |use_case| {
+        ensure_exact_use_case(use_case, "language.complete", "StreamPredictNext")
+    })
+    .await
+    {
+        Ok(resolved) => resolved,
+        Err(ResolveSessionError::SessionNotFound(id)) => {
+            state.clear_predict_next(&session_id);
+            return Err(GenerationError::SessionNotFound(id));
+        }
+        Err(error) => return Err(GenerationError::from(error)),
+    };
 
-    let (app_id, use_case, profile_id, runtime_id, image_refs, artifact_path, runtime_options) =
-        match guard.sessions.get(&session_id) {
-            Some(s) => {
-                ensure_exact_use_case(&s.use_case, "language.complete", "StreamPredictNext")
-                    .map_err(GenerationError::InvalidInput)?;
-                let (profile_id, runtime_id, image_refs, artifact_path, runtime_options) =
-                    profile_runtime(&guard, &s.profile_id)
-                        .map_err(GenerationError::ModelUnavailable)?;
-                (
-                    s.app_id.clone(),
-                    s.use_case.clone(),
-                    profile_id,
-                    runtime_id,
-                    image_refs,
-                    artifact_path,
-                    runtime_options,
-                )
-            }
-            None => {
-                state.clear_predict_next(&session_id);
-                return Err(GenerationError::SessionNotFound(session_id));
-            }
-        };
+    let result = with_locked_container(
+        state,
+        &session_id,
+        resolved.clone(),
+        GenerationError::Failed,
+        |container, _handle, _spawned| {
+            container
+                .predict_next(&prefix, max_tokens, options.temperature)
+                .map_err(|e| GenerationError::Failed(e.to_string()))
+        },
+    )
+    .await;
 
-    let _ = guard.permissions.touch(&app_id, &use_case);
-    let result = guard
-        .containers
-        .get_or_spawn_any(
-            &profile_id,
-            &runtime_id,
-            &image_refs,
-            &artifact_path,
-            &runtime_options,
-            |_| {},
-        )
-        .and_then(|container| container.predict_next(&prefix, max_tokens, options.temperature))
-        .map_err(|e| e.to_string());
-
+    if state.is_session_cancelled(&session_id) {
+        return Err(GenerationError::Failed(request_cancelled_reason()));
+    }
     if !state.is_current_predict_next(&session_id, generation) {
         return Err(GenerationError::Failed(
             "container returned error request_cancelled: superseded by newer StreamPredictNext request"
@@ -1086,7 +1422,7 @@ async fn predict_next_completions(
         ));
     }
 
-    result.map_err(GenerationError::Failed)
+    result
 }
 
 async fn stream_guided_snapshots(
@@ -1100,126 +1436,104 @@ async fn stream_guided_snapshots(
 ) -> Result<(), GenerationError> {
     let max_tokens = validate_options(&options).map_err(GenerationError::InvalidOptions)?;
     let schema = guided_fields_schema(&fields).map_err(GenerationError::Failed)?;
-    let mut guard = state.0.lock().await;
+    let resolved = resolve_session_runtime(state, &session_id, ensure_language_generation_use_case)
+        .await
+        .map_err(GenerationError::from)?;
+    with_locked_container(
+        state,
+        &session_id,
+        resolved.clone(),
+        GenerationError::Failed,
+        |container, _handle, _spawned| {
+            let wants_more = call.wants_more();
+            let mut pending_snapshot: Option<String> = None;
+            let mut pending_tool_calls: Option<Vec<ToolCall>> = None;
+            let mut final_snapshot = String::new();
+            let mut emitted_tool_calls = false;
+            let mut reply_error: Option<varlink::Error> = None;
+            let mut cancelled = false;
+            let tools = tools.into_iter().map(varlink_tool_definition).collect();
+            let result = container.stream_structured(
+                Some(&resolved.instructions),
+                &prompt,
+                max_tokens,
+                &schema,
+                tools,
+                Vec::new(),
+                |snapshot, tool_calls, done| {
+                    if cancelled || state.is_session_cancelled(&session_id) {
+                        cancelled = true;
+                        return;
+                    }
+                    if !snapshot.is_empty() {
+                        final_snapshot = snapshot.clone();
+                    }
+                    if !wants_more {
+                        if tool_calls.is_empty() {
+                            pending_snapshot = Some(snapshot);
+                        } else {
+                            pending_tool_calls = Some(varlink_tool_calls(tool_calls));
+                        }
+                        return;
+                    }
+                    if reply_error.is_some() {
+                        return;
+                    }
+                    if !tool_calls.is_empty() {
+                        call.set_continues(false);
+                        emitted_tool_calls = true;
+                        if let Err(e) = call.reply(String::new(), varlink_tool_calls(tool_calls)) {
+                            reply_error = Some(e);
+                        }
+                        return;
+                    }
+                    if let Some(previous) = pending_snapshot.replace(snapshot) {
+                        call.set_continues(true);
+                        if let Err(e) = call.reply(previous, Vec::new()) {
+                            reply_error = Some(e);
+                        }
+                    }
+                    if done {
+                        call.set_continues(false);
+                    }
+                },
+            );
 
-    let (
-        app_id,
-        use_case,
-        profile_id,
-        runtime_id,
-        image_refs,
-        artifact_path,
-        runtime_options,
-        instructions,
-    ) = match guard.sessions.get(&session_id) {
-        Some(s) => {
-            ensure_language_generation_use_case(&s.use_case)
-                .map_err(GenerationError::InvalidInput)?;
-            let (profile_id, runtime_id, image_refs, artifact_path, runtime_options) =
-                profile_runtime(&guard, &s.profile_id)
-                    .map_err(GenerationError::ModelUnavailable)?;
-            (
-                s.app_id.clone(),
-                s.use_case.clone(),
-                profile_id,
-                runtime_id,
-                image_refs,
-                artifact_path,
-                runtime_options,
-                s.instructions.clone(),
-            )
-        }
-        None => return Err(GenerationError::SessionNotFound(session_id)),
-    };
-
-    let _ = guard.permissions.touch(&app_id, &use_case);
-    let container = guard
-        .containers
-        .get_or_spawn_any(
-            &profile_id,
-            &runtime_id,
-            &image_refs,
-            &artifact_path,
-            &runtime_options,
-            |_| {},
-        )
-        .map_err(|e| GenerationError::Failed(e.to_string()))?;
-
-    let wants_more = call.wants_more();
-    let mut pending_snapshot: Option<String> = None;
-    let mut pending_tool_calls: Option<Vec<ToolCall>> = None;
-    let mut final_snapshot = String::new();
-    let mut emitted_tool_calls = false;
-    let mut reply_error: Option<varlink::Error> = None;
-    let tools = tools.into_iter().map(varlink_tool_definition).collect();
-    let result = container.stream_structured(
-        Some(&instructions),
-        &prompt,
-        max_tokens,
-        &schema,
-        tools,
-        Vec::new(),
-        |snapshot, tool_calls, done| {
-            if !snapshot.is_empty() {
-                final_snapshot = snapshot.clone();
+            if let Some(e) = reply_error {
+                return Err(GenerationError::Reply(e));
             }
-            if !wants_more {
-                if tool_calls.is_empty() {
-                    pending_snapshot = Some(snapshot);
-                } else {
-                    pending_tool_calls = Some(varlink_tool_calls(tool_calls));
+            if cancelled || state.is_session_cancelled(&session_id) {
+                if wants_more {
+                    call.set_continues(false);
                 }
-                return;
+                return Err(GenerationError::Failed(request_cancelled_reason()));
             }
-            if reply_error.is_some() {
-                return;
+            if let Err(e) = result {
+                if wants_more {
+                    call.set_continues(false);
+                }
+                return Err(GenerationError::Failed(e.to_string()));
             }
-            if !tool_calls.is_empty() {
+            if final_snapshot.is_empty() && !emitted_tool_calls && pending_tool_calls.is_none() {
+                return Err(GenerationError::Failed(
+                    "model returned no guided snapshots".to_string(),
+                ));
+            }
+            if wants_more {
                 call.set_continues(false);
-                emitted_tool_calls = true;
-                if let Err(e) = call.reply(String::new(), varlink_tool_calls(tool_calls)) {
-                    reply_error = Some(e);
-                }
-                return;
             }
-            if let Some(previous) = pending_snapshot.replace(snapshot) {
-                call.set_continues(true);
-                if let Err(e) = call.reply(previous, Vec::new()) {
-                    reply_error = Some(e);
-                }
-            }
-            if done {
-                call.set_continues(false);
+            if let Some(tool_calls) = pending_tool_calls {
+                call.reply(String::new(), tool_calls)
+                    .map_err(GenerationError::Reply)
+            } else if emitted_tool_calls {
+                Ok(())
+            } else {
+                call.reply(pending_snapshot.unwrap_or(final_snapshot), Vec::new())
+                    .map_err(GenerationError::Reply)
             }
         },
-    );
-
-    if let Some(e) = reply_error {
-        return Err(GenerationError::Reply(e));
-    }
-    if let Err(e) = result {
-        if wants_more {
-            call.set_continues(false);
-        }
-        return Err(GenerationError::Failed(e.to_string()));
-    }
-    if final_snapshot.is_empty() && !emitted_tool_calls && pending_tool_calls.is_none() {
-        return Err(GenerationError::Failed(
-            "model returned no guided snapshots".to_string(),
-        ));
-    }
-    if wants_more {
-        call.set_continues(false);
-    }
-    if let Some(tool_calls) = pending_tool_calls {
-        call.reply(String::new(), tool_calls)
-            .map_err(GenerationError::Reply)
-    } else if emitted_tool_calls {
-        Ok(())
-    } else {
-        call.reply(pending_snapshot.unwrap_or(final_snapshot), Vec::new())
-            .map_err(GenerationError::Reply)
-    }
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1235,127 +1549,105 @@ async fn stream_guided_tool_results(
 ) -> Result<(), GenerationError> {
     let max_tokens = validate_options(&options).map_err(GenerationError::InvalidOptions)?;
     let schema = guided_fields_schema(&fields).map_err(GenerationError::Failed)?;
-    let mut guard = state.0.lock().await;
+    let resolved = resolve_session_runtime(state, &session_id, ensure_language_generation_use_case)
+        .await
+        .map_err(GenerationError::from)?;
+    with_locked_container(
+        state,
+        &session_id,
+        resolved.clone(),
+        GenerationError::Failed,
+        |container, _handle, _spawned| {
+            let wants_more = call.wants_more();
+            let mut pending_snapshot: Option<String> = None;
+            let mut pending_tool_calls: Option<Vec<ToolCall>> = None;
+            let mut final_snapshot = String::new();
+            let mut emitted_tool_calls = false;
+            let mut reply_error: Option<varlink::Error> = None;
+            let mut cancelled = false;
+            let tools = tools.into_iter().map(varlink_tool_definition).collect();
+            let tool_results = results.into_iter().map(varlink_tool_result).collect();
+            let result = container.stream_structured(
+                Some(&resolved.instructions),
+                &prompt,
+                max_tokens,
+                &schema,
+                tools,
+                tool_results,
+                |snapshot, tool_calls, done| {
+                    if cancelled || state.is_session_cancelled(&session_id) {
+                        cancelled = true;
+                        return;
+                    }
+                    if !snapshot.is_empty() {
+                        final_snapshot = snapshot.clone();
+                    }
+                    if !wants_more {
+                        if tool_calls.is_empty() {
+                            pending_snapshot = Some(snapshot);
+                        } else {
+                            pending_tool_calls = Some(varlink_tool_calls(tool_calls));
+                        }
+                        return;
+                    }
+                    if reply_error.is_some() {
+                        return;
+                    }
+                    if !tool_calls.is_empty() {
+                        call.set_continues(false);
+                        emitted_tool_calls = true;
+                        if let Err(e) = call.reply(String::new(), varlink_tool_calls(tool_calls)) {
+                            reply_error = Some(e);
+                        }
+                        return;
+                    }
+                    if let Some(previous) = pending_snapshot.replace(snapshot) {
+                        call.set_continues(true);
+                        if let Err(e) = call.reply(previous, Vec::new()) {
+                            reply_error = Some(e);
+                        }
+                    }
+                    if done {
+                        call.set_continues(false);
+                    }
+                },
+            );
 
-    let (
-        app_id,
-        use_case,
-        profile_id,
-        runtime_id,
-        image_refs,
-        artifact_path,
-        runtime_options,
-        instructions,
-    ) = match guard.sessions.get(&session_id) {
-        Some(s) => {
-            ensure_language_generation_use_case(&s.use_case)
-                .map_err(GenerationError::InvalidInput)?;
-            let (profile_id, runtime_id, image_refs, artifact_path, runtime_options) =
-                profile_runtime(&guard, &s.profile_id)
-                    .map_err(GenerationError::ModelUnavailable)?;
-            (
-                s.app_id.clone(),
-                s.use_case.clone(),
-                profile_id,
-                runtime_id,
-                image_refs,
-                artifact_path,
-                runtime_options,
-                s.instructions.clone(),
-            )
-        }
-        None => return Err(GenerationError::SessionNotFound(session_id)),
-    };
-
-    let _ = guard.permissions.touch(&app_id, &use_case);
-    let container = guard
-        .containers
-        .get_or_spawn_any(
-            &profile_id,
-            &runtime_id,
-            &image_refs,
-            &artifact_path,
-            &runtime_options,
-            |_| {},
-        )
-        .map_err(|e| GenerationError::Failed(e.to_string()))?;
-
-    let wants_more = call.wants_more();
-    let mut pending_snapshot: Option<String> = None;
-    let mut pending_tool_calls: Option<Vec<ToolCall>> = None;
-    let mut final_snapshot = String::new();
-    let mut emitted_tool_calls = false;
-    let mut reply_error: Option<varlink::Error> = None;
-    let tools = tools.into_iter().map(varlink_tool_definition).collect();
-    let tool_results = results.into_iter().map(varlink_tool_result).collect();
-    let result = container.stream_structured(
-        Some(&instructions),
-        &prompt,
-        max_tokens,
-        &schema,
-        tools,
-        tool_results,
-        |snapshot, tool_calls, done| {
-            if !snapshot.is_empty() {
-                final_snapshot = snapshot.clone();
+            if let Some(e) = reply_error {
+                return Err(GenerationError::Reply(e));
             }
-            if !wants_more {
-                if tool_calls.is_empty() {
-                    pending_snapshot = Some(snapshot);
-                } else {
-                    pending_tool_calls = Some(varlink_tool_calls(tool_calls));
+            if cancelled || state.is_session_cancelled(&session_id) {
+                if wants_more {
+                    call.set_continues(false);
                 }
-                return;
+                return Err(GenerationError::Failed(request_cancelled_reason()));
             }
-            if reply_error.is_some() {
-                return;
+            if let Err(e) = result {
+                if wants_more {
+                    call.set_continues(false);
+                }
+                return Err(GenerationError::Failed(e.to_string()));
             }
-            if !tool_calls.is_empty() {
+            if final_snapshot.is_empty() && !emitted_tool_calls && pending_tool_calls.is_none() {
+                return Err(GenerationError::Failed(
+                    "model returned no guided snapshots".to_string(),
+                ));
+            }
+            if wants_more {
                 call.set_continues(false);
-                emitted_tool_calls = true;
-                if let Err(e) = call.reply(String::new(), varlink_tool_calls(tool_calls)) {
-                    reply_error = Some(e);
-                }
-                return;
             }
-            if let Some(previous) = pending_snapshot.replace(snapshot) {
-                call.set_continues(true);
-                if let Err(e) = call.reply(previous, Vec::new()) {
-                    reply_error = Some(e);
-                }
-            }
-            if done {
-                call.set_continues(false);
+            if let Some(tool_calls) = pending_tool_calls {
+                call.reply(String::new(), tool_calls)
+                    .map_err(GenerationError::Reply)
+            } else if emitted_tool_calls {
+                Ok(())
+            } else {
+                call.reply(pending_snapshot.unwrap_or(final_snapshot), Vec::new())
+                    .map_err(GenerationError::Reply)
             }
         },
-    );
-
-    if let Some(e) = reply_error {
-        return Err(GenerationError::Reply(e));
-    }
-    if let Err(e) = result {
-        if wants_more {
-            call.set_continues(false);
-        }
-        return Err(GenerationError::Failed(e.to_string()));
-    }
-    if final_snapshot.is_empty() && !emitted_tool_calls && pending_tool_calls.is_none() {
-        return Err(GenerationError::Failed(
-            "model returned no guided snapshots".to_string(),
-        ));
-    }
-    if wants_more {
-        call.set_continues(false);
-    }
-    if let Some(tool_calls) = pending_tool_calls {
-        call.reply(String::new(), tool_calls)
-            .map_err(GenerationError::Reply)
-    } else if emitted_tool_calls {
-        Ok(())
-    } else {
-        call.reply(pending_snapshot.unwrap_or(final_snapshot), Vec::new())
-            .map_err(GenerationError::Reply)
-    }
+    )
+    .await
 }
 
 fn varlink_tool_definition(tool: ToolDefinition) -> crate::container::ToolDefinition {
@@ -1431,6 +1723,11 @@ fn profile_runtime(
     let runtime_options = profile_runtime_options(profile);
     Ok((
         profile.profile_id.clone(),
+        guard
+            .profile_epochs
+            .get(profile_id)
+            .copied()
+            .unwrap_or_default(),
         profile.runtime_id.clone(),
         candidates,
         profile.artifact_path.clone(),
