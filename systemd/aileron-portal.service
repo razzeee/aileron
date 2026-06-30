@@ -7,7 +7,7 @@ BindsTo=aileron-daemon.service
 [Service]
 Type=dbus
 BusName=org.freedesktop.impl.portal.desktop.aileron
-ExecStart=%h/.local/bin/aileron-portal
+ExecStart=/usr/bin/aileron-portal
 Restart=on-failure
 RestartSec=3
 

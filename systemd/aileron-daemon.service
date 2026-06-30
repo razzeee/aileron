@@ -6,7 +6,7 @@ PartOf=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/aileron-daemon
+ExecStart=/usr/bin/aileron-daemon
 Restart=on-failure
 RestartSec=3
 

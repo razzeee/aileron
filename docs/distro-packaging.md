@@ -157,6 +157,8 @@ Enable these user services according to distro policy:
 
 The daemon listens on `$XDG_RUNTIME_DIR/aileron.socket`. The portal service connects to that socket and exposes the portal backend over D-Bus.
 
+The checked-in D-Bus and systemd user service files assume the packaged binaries are installed as `/usr/bin/aileron-daemon` and `/usr/bin/aileron-portal`. If a distribution uses another prefix, patch both the D-Bus `Exec=` line and the systemd `ExecStart=` lines consistently.
+
 Do not run `aileron-daemon` as a system service. It manages per-user permissions, per-user model artifacts, per-user runtime images, and per-user application sessions.
 
 ## OCI Runtime Execution

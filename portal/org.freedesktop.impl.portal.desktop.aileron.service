@@ -1,4 +1,4 @@
 [D-BUS Service]
 Name=org.freedesktop.impl.portal.desktop.aileron
-Exec=%h/.local/bin/aileron-portal
+Exec=/usr/bin/aileron-portal
 SystemdService=aileron-portal.service
