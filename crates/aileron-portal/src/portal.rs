@@ -243,7 +243,6 @@ impl LanguagePortalBackend {
         use_case: &str,
     ) -> zbus::fdo::Result<(ModelAvailabilityDbus,)> {
         ensure_portal_frontend(conn, &header).await?;
-        ensure_use_case_prefix(use_case, "language.", "Language")?;
         Ok((get_use_case_availability_impl(app_id, use_case)?,))
     }
 
@@ -829,7 +828,6 @@ impl SpeechPortalBackend {
         use_case: &str,
     ) -> zbus::fdo::Result<(ModelAvailabilityDbus,)> {
         ensure_portal_frontend(conn, &header).await?;
-        ensure_use_case_prefix(use_case, "speech.", "Speech")?;
         Ok((get_use_case_availability_impl(app_id, use_case)?,))
     }
 
@@ -948,6 +946,7 @@ impl SpeechPortalBackend {
         begin_request(conn, &self.state, request_id, Some(session_id)).await?;
         let result = async {
             let record = ensure_known_session(&self.state, session_id, PortalInterface::Speech)?;
+            ensure_speech_session_use_case(&record, "StreamTranscribe")?;
             ensure_request_active(&self.state, request_id)?;
             self.emit_loading(&request_handle, &session_handle, &emitter)
                 .await?;
@@ -1028,7 +1027,6 @@ impl VisionPortalBackend {
         use_case: &str,
     ) -> zbus::fdo::Result<(ModelAvailabilityDbus,)> {
         ensure_portal_frontend(conn, &header).await?;
-        ensure_use_case_prefix(use_case, "vision.", "Vision")?;
         Ok((get_use_case_availability_impl(app_id, use_case)?,))
     }
 
@@ -1813,6 +1811,15 @@ fn ensure_language_generation_session(record: &SessionRecord) -> zbus::fdo::Resu
         | "language.extract" | "language.analyze" => Ok(()),
         use_case => Err(zbus::fdo::Error::Failed(format!(
             "aileron.Inference.InvalidInput: full text generation requires a language generation use-case, got {use_case}"
+        ))),
+    }
+}
+
+fn ensure_speech_session_use_case(record: &SessionRecord, method: &str) -> zbus::fdo::Result<()> {
+    match record.use_case.as_str() {
+        "speech.transcribe" | "speech.translate" => Ok(()),
+        use_case => Err(zbus::fdo::Error::Failed(format!(
+            "aileron.Inference.InvalidInput: {method} requires use-case speech.transcribe or speech.translate, got {use_case}"
         ))),
     }
 }
