@@ -468,7 +468,7 @@ The portal does not talk to containers directly. It translates D-Bus calls into 
 | `org.freedesktop.portal.Speech` | `speech.*` | `GetUseCaseAvailability`, `CreateSession`, `Prewarm`, `StreamTranscribe` |
 | `org.freedesktop.portal.Vision` | `vision.*` | `GetUseCaseAvailability`, `CreateSession`, `Prewarm`, `StreamDescribe`, `StreamOcr`, `StreamSegment` |
 
-Apps call the public interfaces on `org.freedesktop.portal.Desktop`. The public frontend derives the app identity, returns request handles for operations that may prompt, load, or stream, and closes backend sessions when the app calls `Close` on the corresponding `org.freedesktop.portal.Session` object. The implementation backend uses internal `app_id: s`, `request_id: s`, and `session_id: s` strings and is only called by xdg-desktop-portal.
+Apps call the public interfaces on `org.freedesktop.portal.Desktop`. The public frontend derives the app identity, returns request handles for operations that may prompt, load, or stream, and closes backend sessions when the app calls `Close` on the corresponding `org.freedesktop.portal.Session` object. The implementation backend receives the standard `handle: o` and `session_handle: o` object paths plus internal `app_id: s` strings and is only called by xdg-desktop-portal.
 
 `GetUseCaseAvailability`, `CreateSession`, and `Prewarm` have the same public signatures on each interface. `CreateSession` takes a `parent_window` string so permission prompts can be associated with the triggering app window where the platform supports it. Each interface validates that the requested use-case token matches its prefix.
 
@@ -524,7 +524,7 @@ Audio and image payloads are base64 strings in the current prototype and must fi
 | `VisionTextReceived` | `request_handle: o, session_handle: o, text: s, done: b` | Each text token during `StreamDescribe` or `StreamOcr` on `Vision` |
 | `VisionSegmentsReceived` | `request_handle: o, session_handle: o, segments: a(sddddd), done: b` | Segmentation result during `StreamSegment` on `Vision` |
 
-The implementation backend exposes the same task methods with implementation-oriented identifiers: `CreateSession` receives `request_id: s`, `app_id: s`, and `parent_window: s`, streaming methods receive `request_id: s` and `session_id: s`, and `EndSession(session_id: s)` supports the frontend's session-close path. Public apps should not call the implementation interfaces directly.
+The implementation backend exposes the same task methods with implementation-oriented identifiers: `CreateSession` receives `handle: o`, `session_handle: o`, `app_id: s`, and `parent_window: s`; streaming methods receive `handle: o` and `session_handle: o`; and session close uses the shared `org.freedesktop.impl.portal.Session.Close` path. Public apps should not call the implementation interfaces directly.
 
 The current prototype returns portal/backend cancellations through the request `Response` signal with response code `1`, and stream failures with response code `2`, an `error` string, and when available an `error_name` string such as `aileron.Inference.RequestCancelled` or `aileron.Inference.InvalidInput`. Apps should still branch on availability `code` values before creating sessions.
 
