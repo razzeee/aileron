@@ -1133,6 +1133,7 @@ impl VisionPortalBackend {
         request_handle: OwnedObjectPath,
         session_handle: OwnedObjectPath,
         image_fd: OwnedFd,
+        instructions: &str,
         #[zbus(connection)] conn: &zbus::Connection,
         #[zbus(header)] header: Header<'_>,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
@@ -1154,7 +1155,8 @@ impl VisionPortalBackend {
             let image_path = fd_proc_path(&image_fd);
             let ipc_conn = connect_request_daemon(&self.state, request_id)?;
             let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(ipc_conn);
-            let mut call = client.stream_describe(daemon_session_id, image_path);
+            let mut call =
+                client.stream_describe(daemon_session_id, image_path, instructions.to_string());
             let iter = call
                 .more()
                 .map_err(|e| map_request_error(&self.state, request_id, e))?;
@@ -1204,6 +1206,7 @@ impl VisionPortalBackend {
         request_handle: OwnedObjectPath,
         session_handle: OwnedObjectPath,
         image_fd: OwnedFd,
+        instructions: &str,
         #[zbus(connection)] conn: &zbus::Connection,
         #[zbus(header)] header: Header<'_>,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
@@ -1225,7 +1228,8 @@ impl VisionPortalBackend {
             let image_path = fd_proc_path(&image_fd);
             let ipc_conn = connect_request_daemon(&self.state, request_id)?;
             let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(ipc_conn);
-            let mut call = client.stream_ocr(daemon_session_id, image_path);
+            let mut call =
+                client.stream_ocr(daemon_session_id, image_path, instructions.to_string());
             let iter = call
                 .more()
                 .map_err(|e| map_request_error(&self.state, request_id, e))?;
@@ -1275,6 +1279,7 @@ impl VisionPortalBackend {
         request_handle: OwnedObjectPath,
         session_handle: OwnedObjectPath,
         image_fd: OwnedFd,
+        instructions: &str,
         #[zbus(connection)] conn: &zbus::Connection,
         #[zbus(header)] header: Header<'_>,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
@@ -1296,7 +1301,8 @@ impl VisionPortalBackend {
             let image_path = fd_proc_path(&image_fd);
             let ipc_conn = connect_request_daemon(&self.state, request_id)?;
             let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(ipc_conn);
-            let mut call = client.stream_segment(daemon_session_id, image_path);
+            let mut call =
+                client.stream_segment(daemon_session_id, image_path, instructions.to_string());
             let iter = call
                 .more()
                 .map_err(|e| map_request_error(&self.state, request_id, e))?;

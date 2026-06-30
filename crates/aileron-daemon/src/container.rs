@@ -37,19 +37,19 @@
 ///
 /// ### Image description
 /// Request:
-///   {"id":"<uuid>","type":"describe","image":"<base64 PNG/JPEG>"}
+///   {"id":"<uuid>","type":"describe","image":"<base64 PNG/JPEG>","prompt":"optional instructions"}
 /// Response (same as generate):
 ///   {"id":"<uuid>","token":"A cat sitting...","done":true}
 ///
 /// ### Image OCR (text extraction)
 /// Request:
-///   {"id":"<uuid>","type":"ocr","image":"<base64 PNG/JPEG>"}
+///   {"id":"<uuid>","type":"ocr","image":"<base64 PNG/JPEG>","prompt":"optional instructions"}
 /// Response (same as generate):
 ///   {"id":"<uuid>","token":"extracted text...","done":true}
 ///
 /// ### Image segmentation
 /// Request:
-///   {"id":"<uuid>","type":"segment","image":"<base64 PNG/JPEG>"}
+///   {"id":"<uuid>","type":"segment","image":"<base64 PNG/JPEG>","prompt":"optional instructions"}
 /// Response (single line, no streaming):
 ///   {"id":"<uuid>","result":"{\"segments\":[...]}","done":true}
 use std::collections::HashMap;
@@ -631,35 +631,44 @@ impl Container {
     }
 
     /// Send a vision describe request and return the full description.
-    pub fn describe(&mut self, image: Vec<u8>) -> Result<String> {
+    pub fn describe(&mut self, image: Vec<u8>, instructions: &str) -> Result<String> {
         let mut result = String::new();
-        self.stream_describe(image, |token| result.push_str(&token))?;
+        self.stream_describe(image, instructions, |token| result.push_str(&token))?;
         Ok(result)
     }
 
     /// Send a vision describe request and call `on_token` for each returned token.
-    pub fn stream_describe(&mut self, image: Vec<u8>, on_token: impl FnMut(String)) -> Result<()> {
-        self.stream_vision_text("describe", image, on_token)
+    pub fn stream_describe(
+        &mut self,
+        image: Vec<u8>,
+        instructions: &str,
+        on_token: impl FnMut(String),
+    ) -> Result<()> {
+        self.stream_vision_text("describe", image, instructions, on_token)
     }
 
     /// Send a vision OCR request and return the extracted text.
-    pub fn ocr(&mut self, image: Vec<u8>) -> Result<String> {
+    pub fn ocr(&mut self, image: Vec<u8>, instructions: &str) -> Result<String> {
         let mut result = String::new();
-        self.stream_ocr(image, |token| result.push_str(&token))?;
+        self.stream_ocr(image, instructions, |token| result.push_str(&token))?;
         Ok(result)
     }
 
     /// Send a vision OCR request and call `on_token` for each returned token.
-    pub fn stream_ocr(&mut self, image: Vec<u8>, on_token: impl FnMut(String)) -> Result<()> {
-        self.stream_vision_text("ocr", image, on_token)
+    pub fn stream_ocr(
+        &mut self,
+        image: Vec<u8>,
+        instructions: &str,
+        on_token: impl FnMut(String),
+    ) -> Result<()> {
+        self.stream_vision_text("ocr", image, instructions, on_token)
     }
 
     /// Send a vision segment request and return normalized object boxes.
-    pub fn segment(&mut self, image: Vec<u8>) -> Result<Vec<VisionSegment>> {
+    pub fn segment(&mut self, image: Vec<u8>, instructions: &str) -> Result<Vec<VisionSegment>> {
         let id = Uuid::new_v4().to_string();
         let schema = vision_segment_schema();
-        let mut req = ContainerRequest::new(id.clone(), "segment");
-        req.image = Some(base64_encode(&image));
+        let req = vision_request(id.clone(), "segment", &image, instructions);
         let line = serde_json::to_string(&req)? + "\n";
         self.stdin.write_all(line.as_bytes())?;
         self.stdin.flush()?;
@@ -719,17 +728,31 @@ impl Container {
         &mut self,
         request_type: &str,
         image: Vec<u8>,
+        instructions: &str,
         on_token: impl FnMut(String),
     ) -> Result<()> {
         let id = Uuid::new_v4().to_string();
-        let mut req = ContainerRequest::new(id.clone(), request_type);
-        req.image = Some(base64_encode(&image));
+        let req = vision_request(id.clone(), request_type, &image, instructions);
         let line = serde_json::to_string(&req)? + "\n";
         self.stdin.write_all(line.as_bytes())?;
         self.stdin.flush()?;
         self.last_used = std::time::Instant::now();
         read_text_stream_response(&mut self.stdout, &id, on_token)
     }
+}
+
+fn vision_request(
+    id: String,
+    request_type: &str,
+    image: &[u8],
+    instructions: &str,
+) -> ContainerRequest {
+    let mut req = ContainerRequest::new(id, request_type);
+    req.image = Some(base64_encode(image));
+    if !instructions.trim().is_empty() {
+        req.prompt = Some(instructions.to_string());
+    }
+    req
 }
 
 fn write_transcribe_request(
@@ -2960,6 +2983,30 @@ mod tests {
         }
     }
 
+    #[test]
+    fn vision_request_includes_nonempty_instructions_as_prompt() {
+        let request = vision_request(
+            "request-id".to_string(),
+            "describe",
+            b"image bytes",
+            "focus on text labels",
+        );
+        let value = serde_json::to_value(request).expect("request should serialize");
+
+        assert_eq!(value["type"], "describe");
+        assert_eq!(value["prompt"], "focus on text labels");
+        assert!(value.get("image").and_then(Value::as_str).is_some());
+    }
+
+    #[test]
+    fn vision_request_omits_empty_instructions_prompt() {
+        let request = vision_request("request-id".to_string(), "ocr", b"image bytes", "  ");
+        let value = serde_json::to_value(request).expect("request should serialize");
+
+        assert_eq!(value["type"], "ocr");
+        assert!(value.get("prompt").is_none());
+    }
+
     fn env(config: &Value) -> Vec<&str> {
         config["process"]["env"]
             .as_array()
@@ -3390,17 +3437,17 @@ mod tests {
         assert!(!embedding.is_empty());
 
         let description = container
-            .describe(Vec::new())
+            .describe(Vec::new(), "")
             .expect("describe through container wrapper");
         assert!(!description.is_empty());
 
         let extracted = container
-            .ocr(Vec::new())
+            .ocr(Vec::new(), "")
             .expect("ocr through container wrapper");
         assert!(!extracted.is_empty());
 
         let segments = container
-            .segment(Vec::new())
+            .segment(Vec::new(), "")
             .expect("segment through container wrapper");
         assert!(!segments.is_empty());
 

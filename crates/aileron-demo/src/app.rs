@@ -1365,6 +1365,7 @@ fn stream_embedding(session_handle: &OwnedObjectPath, text: &str) -> anyhow::Res
 fn stream_vision_text(
     session_handle: &OwnedObjectPath,
     image: &[u8],
+    instructions: &str,
     method: &str,
     text_tx: Option<(std::sync::mpsc::Sender<VisionEvent>, VisionTextKind)>,
 ) -> anyhow::Result<String> {
@@ -1409,8 +1410,10 @@ fn stream_vision_text(
         let _ = stream_done_tx.send(result);
     });
 
-    let stream_result: zbus::Result<OwnedObjectPath> =
-        proxy.call(method, &(session_handle, image_fd, empty_options()));
+    let stream_result: zbus::Result<OwnedObjectPath> = proxy.call(
+        method,
+        &(session_handle, image_fd, instructions, empty_options()),
+    );
     let request_handle = stream_result?;
     let content = stream_done_rx
         .recv_timeout(Duration::from_secs(2))
@@ -1424,6 +1427,7 @@ fn stream_vision_text(
 fn stream_vision_segments(
     session_handle: &OwnedObjectPath,
     image: &[u8],
+    instructions: &str,
 ) -> anyhow::Result<Vec<VisionSegmentDbus>> {
     let image_file = media_file_from_bytes(image)?;
     let image_fd = Fd::from(&image_file);
@@ -1459,7 +1463,7 @@ fn stream_vision_segments(
 
     let stream_result: zbus::Result<OwnedObjectPath> = proxy.call(
         "StreamSegment",
-        &(session_handle, image_fd, empty_options()),
+        &(session_handle, image_fd, instructions, empty_options()),
     );
     let request_handle = stream_result?;
     let segments = stream_done_rx
@@ -2162,7 +2166,11 @@ fn end_speech_session(session_handle: &OwnedObjectPath) {
     let _ = close_public_session(session_handle);
 }
 
-fn describe_image(image: &[u8], tx: std::sync::mpsc::Sender<VisionEvent>) -> anyhow::Result<()> {
+fn describe_image(
+    image: &[u8],
+    instructions: &str,
+    tx: std::sync::mpsc::Sender<VisionEvent>,
+) -> anyhow::Result<()> {
     let conn = portal_connection()?;
     let proxy = zbus::blocking::Proxy::new(&conn, PORTAL_BUS, PORTAL_PATH, VISION_IFACE)?;
 
@@ -2178,6 +2186,7 @@ fn describe_image(image: &[u8], tx: std::sync::mpsc::Sender<VisionEvent>) -> any
     let description = stream_vision_text(
         &session_handle,
         image,
+        instructions,
         "StreamDescribe",
         Some((tx.clone(), VisionTextKind::Description)),
     )?;
@@ -2188,7 +2197,11 @@ fn describe_image(image: &[u8], tx: std::sync::mpsc::Sender<VisionEvent>) -> any
     Ok(())
 }
 
-fn ocr_image(image: &[u8], tx: std::sync::mpsc::Sender<VisionEvent>) -> anyhow::Result<()> {
+fn ocr_image(
+    image: &[u8],
+    instructions: &str,
+    tx: std::sync::mpsc::Sender<VisionEvent>,
+) -> anyhow::Result<()> {
     let conn = portal_connection()?;
     let proxy = zbus::blocking::Proxy::new(&conn, PORTAL_BUS, PORTAL_PATH, VISION_IFACE)?;
 
@@ -2204,6 +2217,7 @@ fn ocr_image(image: &[u8], tx: std::sync::mpsc::Sender<VisionEvent>) -> anyhow::
     let text = stream_vision_text(
         &session_handle,
         image,
+        instructions,
         "StreamOcr",
         Some((tx.clone(), VisionTextKind::Ocr)),
     )?;
@@ -2214,7 +2228,11 @@ fn ocr_image(image: &[u8], tx: std::sync::mpsc::Sender<VisionEvent>) -> anyhow::
     Ok(())
 }
 
-fn segment_image(image: &[u8], tx: std::sync::mpsc::Sender<VisionEvent>) -> anyhow::Result<()> {
+fn segment_image(
+    image: &[u8],
+    instructions: &str,
+    tx: std::sync::mpsc::Sender<VisionEvent>,
+) -> anyhow::Result<()> {
     let conn = portal_connection()?;
     let proxy = zbus::blocking::Proxy::new(&conn, PORTAL_BUS, PORTAL_PATH, VISION_IFACE)?;
 
@@ -2227,7 +2245,7 @@ fn segment_image(image: &[u8], tx: std::sync::mpsc::Sender<VisionEvent>) -> anyh
 
     tx.send(VisionEvent::Phase(VisionPhase::LoadingModel))?;
     tx.send(VisionEvent::Phase(VisionPhase::Segmenting))?;
-    let segments = stream_vision_segments(&session_handle, image)?;
+    let segments = stream_vision_segments(&session_handle, image, instructions)?;
     tx.send(VisionEvent::Segments(segments))?;
 
     close_public_session(&session_handle)?;

@@ -259,9 +259,12 @@ Request:
 {
   "id": "request-id",
   "type": "describe",
-  "image": "base64-encoded-png-or-jpeg"
+  "image": "base64-encoded-png-or-jpeg",
+  "prompt": "optional per-image instructions"
 }
 ```
+
+`prompt` is omitted when the caller leaves per-image instructions empty.
 
 Response uses the same token stream shape as text generation:
 
@@ -277,9 +280,12 @@ Request:
 {
   "id": "request-id",
   "type": "ocr",
-  "image": "base64-encoded-png-or-jpeg"
+  "image": "base64-encoded-png-or-jpeg",
+  "prompt": "optional per-image instructions"
 }
 ```
+
+`prompt` is omitted when the caller leaves per-image instructions empty.
 
 Response uses the same token stream shape as text generation:
 
@@ -295,9 +301,12 @@ Request:
 {
   "id": "request-id",
   "type": "segment",
-  "image": "base64-encoded-png-or-jpeg"
+  "image": "base64-encoded-png-or-jpeg",
+  "prompt": "optional per-image instructions"
 }
 ```
+
+`prompt` is omitted when the caller leaves per-image instructions empty.
 
 Response is a single line containing a JSON string of normalized object boxes:
 

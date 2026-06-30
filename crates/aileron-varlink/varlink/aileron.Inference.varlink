@@ -84,16 +84,19 @@ method StreamTranscribe(session_id: string, audio_path: string, source_language_
 
 # Stream image description tokens. Session must have been created with vision.describe
 # image_path: readable path for PNG or JPEG bytes
-method StreamDescribe(session_id: string, image_path: string) -> (token: string)
+# instructions: optional per-image instructions
+method StreamDescribe(session_id: string, image_path: string, instructions: string) -> (token: string)
 
 # Stream OCR text tokens. Session must have been created with vision.ocr
 # image_path: readable path for PNG or JPEG bytes
-method StreamOcr(session_id: string, image_path: string) -> (token: string)
+# instructions: optional per-image instructions
+method StreamOcr(session_id: string, image_path: string, instructions: string) -> (token: string)
 
 # Stream identified objects in an image. Session must have been created with vision.segment
 # Coordinates are normalized to 0.0..1.0, relative to the image dimensions.
 # image_path: readable path for PNG or JPEG bytes
-method StreamSegment(session_id: string, image_path: string) -> (segments: []VisionSegment)
+# instructions: optional per-image instructions
+method StreamSegment(session_id: string, image_path: string, instructions: string) -> (segments: []VisionSegment)
 
 # End a session. The per-profile container remains pooled until idle timeout.
 method EndSession(session_id: string) -> ()

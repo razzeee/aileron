@@ -70,6 +70,27 @@ pub(crate) fn build_page() -> gtk4::Widget {
             .build(),
     );
 
+    let instructions_buffer = TextBuffer::new(None);
+    let instructions_view = TextView::builder()
+        .buffer(&instructions_buffer)
+        .editable(true)
+        .wrap_mode(gtk4::WrapMode::WordChar)
+        .hexpand(true)
+        .vexpand(false)
+        .build();
+    vbox.append(
+        &Label::builder()
+            .label("Per-image instructions (optional)")
+            .xalign(0.0)
+            .build(),
+    );
+    vbox.append(
+        &ScrolledWindow::builder()
+            .child(&instructions_view)
+            .min_content_height(80)
+            .build(),
+    );
+
     let status_row = Box::new(Orientation::Horizontal, 12);
     status_row.add_css_class("card");
     status_row.set_margin_bottom(8);
@@ -198,6 +219,7 @@ pub(crate) fn build_page() -> gtk4::Widget {
     {
         let selected_image = selected_image.clone();
         let paste_buffer = paste_buffer.clone();
+        let instructions_buffer = instructions_buffer.clone();
         let description_buffer = description_buffer.clone();
         let describe_button_for_click = describe_button.clone();
         let ocr_button_for_click = ocr_button.clone();
@@ -214,6 +236,7 @@ pub(crate) fn build_page() -> gtk4::Widget {
                     return;
                 }
             };
+            let instructions = buffer_text(&instructions_buffer);
 
             description_buffer.set_text("");
             describe_button_for_click.set_sensitive(false);
@@ -281,7 +304,7 @@ pub(crate) fn build_page() -> gtk4::Widget {
 
             let error_tx = tx.clone();
             std::thread::spawn(move || {
-                if let Err(e) = describe_image(&image, tx) {
+                if let Err(e) = describe_image(&image, &instructions, tx) {
                     eprintln!("[aileron-demo] describe error: {e}");
                     let _ = error_tx.send(VisionEvent::Error(friendly_error(&e)));
                 }
@@ -292,6 +315,7 @@ pub(crate) fn build_page() -> gtk4::Widget {
     {
         let selected_image = selected_image.clone();
         let paste_buffer = paste_buffer.clone();
+        let instructions_buffer = instructions_buffer.clone();
         let ocr_buffer = ocr_buffer.clone();
         let describe_button_for_click = describe_button.clone();
         let ocr_button_for_click = ocr_button.clone();
@@ -308,6 +332,7 @@ pub(crate) fn build_page() -> gtk4::Widget {
                     return;
                 }
             };
+            let instructions = buffer_text(&instructions_buffer);
 
             ocr_buffer.set_text("");
             describe_button_for_click.set_sensitive(false);
@@ -375,7 +400,7 @@ pub(crate) fn build_page() -> gtk4::Widget {
 
             let error_tx = tx.clone();
             std::thread::spawn(move || {
-                if let Err(e) = ocr_image(&image, tx) {
+                if let Err(e) = ocr_image(&image, &instructions, tx) {
                     eprintln!("[aileron-demo] ocr error: {e}");
                     let _ = error_tx.send(VisionEvent::Error(friendly_error(&e)));
                 }
@@ -386,6 +411,7 @@ pub(crate) fn build_page() -> gtk4::Widget {
     {
         let selected_image = selected_image.clone();
         let paste_buffer = paste_buffer.clone();
+        let instructions_buffer = instructions_buffer.clone();
         let segments_buffer = segments_buffer.clone();
         let describe_button_for_click = describe_button.clone();
         let ocr_button_for_click = ocr_button.clone();
@@ -402,6 +428,7 @@ pub(crate) fn build_page() -> gtk4::Widget {
                     return;
                 }
             };
+            let instructions = buffer_text(&instructions_buffer);
 
             segments_buffer.set_text("");
             describe_button_for_click.set_sensitive(false);
@@ -468,7 +495,7 @@ pub(crate) fn build_page() -> gtk4::Widget {
 
             let error_tx = tx.clone();
             std::thread::spawn(move || {
-                if let Err(e) = segment_image(&image, tx) {
+                if let Err(e) = segment_image(&image, &instructions, tx) {
                     eprintln!("[aileron-demo] segment error: {e}");
                     let _ = error_tx.send(VisionEvent::Error(friendly_error(&e)));
                 }
@@ -477,6 +504,11 @@ pub(crate) fn build_page() -> gtk4::Widget {
     }
 
     scrollable_page(&vbox)
+}
+
+fn buffer_text(buffer: &TextBuffer) -> String {
+    let (start, end) = buffer.bounds();
+    buffer.text(&start, &end, false).trim().to_string()
 }
 
 fn image_bytes_from_inputs(

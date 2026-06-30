@@ -102,7 +102,7 @@ Use `speech.transcribe` for verbatim speech-to-text and `speech.translate` to tr
 
 Live microphone chunking is app behavior in the current API. Apps that want interim text can keep recording locally, periodically send sufficiently large aligned PCM chunks through `StreamTranscribe`, and run one final `StreamTranscribe` pass over the complete recording when capture stops.
 
-Use `vision.describe` with `StreamDescribe`, `vision.ocr` with `StreamOcr`, and `vision.segment` with `StreamSegment`. Description and OCR stream text; segmentation emits one segment-list event with normalized rectangular boxes. Images are passed to the portal as readable Unix fds containing PNG or JPEG bytes.
+Use `vision.describe` with `StreamDescribe`, `vision.ocr` with `StreamOcr`, and `vision.segment` with `StreamSegment`. Description and OCR stream text; segmentation emits one segment-list event with normalized rectangular boxes. Images are passed to the portal as readable Unix fds containing PNG or JPEG bytes. Each Vision stream method also accepts an `instructions` string for per-image guidance; pass an empty string when unspecified.
 
 Large media inputs can be expensive even when transported by fd. Prefer user-initiated actions, visible progress, resized images, app-side audio chunking, and cancellation-friendly UI.
 

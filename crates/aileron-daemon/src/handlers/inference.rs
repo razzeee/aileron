@@ -328,10 +328,18 @@ impl VarlinkInterface for InferenceHandler {
         call: &mut dyn Call_StreamDescribe,
         session_id: String,
         image_path: String,
+        instructions: String,
     ) -> varlink::Result<()> {
         self.rt.block_on(async {
-            match stream_vision_text(&self.state, call, session_id, image_path, "vision.describe")
-                .await
+            match stream_vision_text(
+                &self.state,
+                call,
+                session_id,
+                image_path,
+                instructions,
+                "vision.describe",
+            )
+            .await
             {
                 Ok(()) => Ok(()),
                 Err(VisionError::SessionNotFound(id)) => call.reply_session_not_found(id),
@@ -348,9 +356,18 @@ impl VarlinkInterface for InferenceHandler {
         call: &mut dyn Call_StreamOcr,
         session_id: String,
         image_path: String,
+        instructions: String,
     ) -> varlink::Result<()> {
         self.rt.block_on(async {
-            match stream_vision_text(&self.state, call, session_id, image_path, "vision.ocr").await
+            match stream_vision_text(
+                &self.state,
+                call,
+                session_id,
+                image_path,
+                instructions,
+                "vision.ocr",
+            )
+            .await
             {
                 Ok(()) => Ok(()),
                 Err(VisionError::SessionNotFound(id)) => call.reply_session_not_found(id),
@@ -367,9 +384,10 @@ impl VarlinkInterface for InferenceHandler {
         call: &mut dyn Call_StreamSegment,
         session_id: String,
         image_path: String,
+        instructions: String,
     ) -> varlink::Result<()> {
         self.rt.block_on(async {
-            match vision_segments(&self.state, session_id, image_path).await {
+            match vision_segments(&self.state, session_id, image_path, instructions).await {
                 Ok(segments) => call.reply(segments),
                 Err(VisionError::SessionNotFound(id)) => call.reply_session_not_found(id),
                 Err(VisionError::ModelUnavailable(reason)) => call.reply_model_unavailable(reason),
@@ -675,6 +693,7 @@ async fn stream_vision_text<C: TextStreamCall + ?Sized>(
     call: &mut C,
     session_id: String,
     image_path: String,
+    instructions: String,
     expected_use_case: &str,
 ) -> Result<(), VisionError> {
     let method = if expected_use_case == "vision.describe" {
@@ -701,7 +720,7 @@ async fn stream_vision_text<C: TextStreamCall + ?Sized>(
             let mut cancelled = false;
 
             let result = if expected_use_case == "vision.describe" {
-                container.stream_describe(image_bytes, |token| {
+                container.stream_describe(image_bytes, &instructions, |token| {
                     if cancelled || state.is_session_cancelled(&session_id) {
                         cancelled = true;
                         return;
@@ -716,7 +735,7 @@ async fn stream_vision_text<C: TextStreamCall + ?Sized>(
                     );
                 })
             } else {
-                container.stream_ocr(image_bytes, |token| {
+                container.stream_ocr(image_bytes, &instructions, |token| {
                     if cancelled || state.is_session_cancelled(&session_id) {
                         cancelled = true;
                         return;
@@ -797,6 +816,7 @@ async fn vision_segments(
     state: &SharedState,
     session_id: String,
     image_path: String,
+    instructions: String,
 ) -> Result<Vec<VisionSegment>, VisionError> {
     let resolved = resolve_session_runtime(state, &session_id, |use_case| {
         ensure_exact_use_case(use_case, "vision.segment", "StreamSegment")
@@ -811,7 +831,7 @@ async fn vision_segments(
         VisionError::Failed,
         |container, handle, spawned| {
             let result = container
-                .segment(image_bytes)
+                .segment(image_bytes, &instructions)
                 .map(|segments| {
                     segments
                         .into_iter()
