@@ -2,12 +2,13 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::os::fd::AsRawFd;
 use std::process::Command;
 use std::sync::{Arc, Mutex, RwLock, mpsc};
 use std::thread;
 use std::time::Duration;
 use tracing::{info, warn};
-use zbus::zvariant::{OwnedObjectPath, Type};
+use zbus::zvariant::{OwnedFd, OwnedObjectPath, Type};
 use zbus::{connection, interface, message::Header, object_server::SignalEmitter};
 
 const BUS_NAME: &str = "org.freedesktop.impl.portal.desktop.aileron";
@@ -932,7 +933,7 @@ impl SpeechPortalBackend {
         &self,
         request_handle: OwnedObjectPath,
         session_handle: OwnedObjectPath,
-        audio_b64: &str,
+        audio_fd: OwnedFd,
         source_language_hint: &str,
         #[zbus(connection)] conn: &zbus::Connection,
         #[zbus(header)] header: Header<'_>,
@@ -952,11 +953,12 @@ impl SpeechPortalBackend {
                 .await?;
             ensure_request_active(&self.state, request_id)?;
             let daemon_session_id = record.daemon_session_id;
+            let audio_path = fd_proc_path(&audio_fd);
             let ipc_conn = connect_request_daemon(&self.state, request_id)?;
             let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(ipc_conn);
             let mut call = client.stream_transcribe(
                 daemon_session_id,
-                audio_b64.to_string(),
+                audio_path,
                 source_language_hint.to_string(),
             );
             let iter = call
@@ -1130,7 +1132,7 @@ impl VisionPortalBackend {
         &self,
         request_handle: OwnedObjectPath,
         session_handle: OwnedObjectPath,
-        image_b64: &str,
+        image_fd: OwnedFd,
         #[zbus(connection)] conn: &zbus::Connection,
         #[zbus(header)] header: Header<'_>,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
@@ -1149,9 +1151,10 @@ impl VisionPortalBackend {
                 .await?;
             ensure_request_active(&self.state, request_id)?;
             let daemon_session_id = record.daemon_session_id;
+            let image_path = fd_proc_path(&image_fd);
             let ipc_conn = connect_request_daemon(&self.state, request_id)?;
             let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(ipc_conn);
-            let mut call = client.stream_describe(daemon_session_id, image_b64.to_string());
+            let mut call = client.stream_describe(daemon_session_id, image_path);
             let iter = call
                 .more()
                 .map_err(|e| map_request_error(&self.state, request_id, e))?;
@@ -1200,7 +1203,7 @@ impl VisionPortalBackend {
         &self,
         request_handle: OwnedObjectPath,
         session_handle: OwnedObjectPath,
-        image_b64: &str,
+        image_fd: OwnedFd,
         #[zbus(connection)] conn: &zbus::Connection,
         #[zbus(header)] header: Header<'_>,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
@@ -1219,9 +1222,10 @@ impl VisionPortalBackend {
                 .await?;
             ensure_request_active(&self.state, request_id)?;
             let daemon_session_id = record.daemon_session_id;
+            let image_path = fd_proc_path(&image_fd);
             let ipc_conn = connect_request_daemon(&self.state, request_id)?;
             let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(ipc_conn);
-            let mut call = client.stream_ocr(daemon_session_id, image_b64.to_string());
+            let mut call = client.stream_ocr(daemon_session_id, image_path);
             let iter = call
                 .more()
                 .map_err(|e| map_request_error(&self.state, request_id, e))?;
@@ -1270,7 +1274,7 @@ impl VisionPortalBackend {
         &self,
         request_handle: OwnedObjectPath,
         session_handle: OwnedObjectPath,
-        image_b64: &str,
+        image_fd: OwnedFd,
         #[zbus(connection)] conn: &zbus::Connection,
         #[zbus(header)] header: Header<'_>,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
@@ -1289,9 +1293,10 @@ impl VisionPortalBackend {
                 .await?;
             ensure_request_active(&self.state, request_id)?;
             let daemon_session_id = record.daemon_session_id;
+            let image_path = fd_proc_path(&image_fd);
             let ipc_conn = connect_request_daemon(&self.state, request_id)?;
             let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(ipc_conn);
-            let mut call = client.stream_segment(daemon_session_id, image_b64.to_string());
+            let mut call = client.stream_segment(daemon_session_id, image_path);
             let iter = call
                 .more()
                 .map_err(|e| map_request_error(&self.state, request_id, e))?;
@@ -1574,6 +1579,10 @@ fn request_cancelled_error() -> zbus::fdo::Error {
     zbus::fdo::Error::Failed(
         "aileron.Inference.RequestCancelled: request was cancelled".to_string(),
     )
+}
+
+fn fd_proc_path(fd: &OwnedFd) -> String {
+    format!("/proc/{}/fd/{}", std::process::id(), fd.as_raw_fd())
 }
 
 fn get_use_case_availability_impl(

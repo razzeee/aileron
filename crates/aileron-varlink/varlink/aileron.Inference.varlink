@@ -78,21 +78,22 @@ method StreamEmbed(session_id: string, text: string) -> (embedding: []float)
 
 # Stream transcript or translation segments. Session must have been created with
 # use_case: speech.transcribe (verbatim, source language) or speech.translate (translated to English).
+# audio_path: readable path for 16 kHz mono f32le PCM bytes
 # The final reply has continues=false.
-method StreamTranscribe(session_id: string, audio: string, source_language_hint: string) -> (token: string)
+method StreamTranscribe(session_id: string, audio_path: string, source_language_hint: string) -> (token: string)
 
 # Stream image description tokens. Session must have been created with vision.describe
-# image: PNG or JPEG bytes encoded as base64
-method StreamDescribe(session_id: string, image: string) -> (token: string)
+# image_path: readable path for PNG or JPEG bytes
+method StreamDescribe(session_id: string, image_path: string) -> (token: string)
 
 # Stream OCR text tokens. Session must have been created with vision.ocr
-# image: PNG or JPEG bytes encoded as base64
-method StreamOcr(session_id: string, image: string) -> (token: string)
+# image_path: readable path for PNG or JPEG bytes
+method StreamOcr(session_id: string, image_path: string) -> (token: string)
 
 # Stream identified objects in an image. Session must have been created with vision.segment
 # Coordinates are normalized to 0.0..1.0, relative to the image dimensions.
-# image: PNG or JPEG bytes encoded as base64
-method StreamSegment(session_id: string, image: string) -> (segments: []VisionSegment)
+# image_path: readable path for PNG or JPEG bytes
+method StreamSegment(session_id: string, image_path: string) -> (segments: []VisionSegment)
 
 # End a session. The per-profile container remains pooled until idle timeout.
 method EndSession(session_id: string) -> ()

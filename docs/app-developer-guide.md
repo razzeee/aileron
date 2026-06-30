@@ -98,13 +98,13 @@ Use `language.embed` with `StreamEmbed` to turn text into a fixed-length vector 
 
 ## Speech And Vision
 
-Use `speech.transcribe` for verbatim speech-to-text and `speech.translate` to translate spoken audio into English text. Both use `StreamTranscribe`; the daemon selects the whisper transcribe or translate task from the session use-case. Audio is passed as base64-encoded raw PCM bytes through the portal-facing API. The method accepts an optional `source_language_hint` string; pass an empty string to let the runtime auto-detect or use its default behavior. This hint describes the spoken input language only; it does not select translation or the output language.
+Use `speech.transcribe` for verbatim speech-to-text and `speech.translate` to translate spoken audio into English text. Both use `StreamTranscribe`; the daemon selects the whisper transcribe or translate task from the session use-case. Audio is passed to the portal as a readable Unix fd containing raw PCM bytes. The method accepts an optional `source_language_hint` string; pass an empty string to let the runtime auto-detect or use its default behavior. This hint describes the spoken input language only; it does not select translation or the output language.
 
 Live microphone chunking is app behavior in the current API. Apps that want interim text can keep recording locally, periodically send sufficiently large aligned PCM chunks through `StreamTranscribe`, and run one final `StreamTranscribe` pass over the complete recording when capture stops.
 
-Use `vision.describe` with `StreamDescribe`, `vision.ocr` with `StreamOcr`, and `vision.segment` with `StreamSegment`. Description and OCR stream text; segmentation emits one segment-list event with normalized rectangular boxes. Images are passed as base64-encoded PNG or JPEG bytes.
+Use `vision.describe` with `StreamDescribe`, `vision.ocr` with `StreamOcr`, and `vision.segment` with `StreamSegment`. Description and OCR stream text; segmentation emits one segment-list event with normalized rectangular boxes. Images are passed to the portal as readable Unix fds containing PNG or JPEG bytes.
 
-Large media inputs can be expensive and must fit within the session bus message limit in the current base64-string prototype. Prefer user-initiated actions, visible progress, resized images, app-side audio chunking, and cancellation-friendly UI.
+Large media inputs can be expensive even when transported by fd. Prefer user-initiated actions, visible progress, resized images, app-side audio chunking, and cancellation-friendly UI.
 
 ## Privacy And Permissions
 

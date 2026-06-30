@@ -300,12 +300,18 @@ impl VarlinkInterface for InferenceHandler {
         &self,
         call: &mut dyn Call_StreamTranscribe,
         session_id: String,
-        audio: String,
+        audio_path: String,
         source_language_hint: String,
     ) -> varlink::Result<()> {
         self.rt.block_on(async {
-            match stream_transcription(&self.state, call, session_id, audio, source_language_hint)
-                .await
+            match stream_transcription(
+                &self.state,
+                call,
+                session_id,
+                audio_path,
+                source_language_hint,
+            )
+            .await
             {
                 Ok(()) => Ok(()),
                 Err(SpeechError::SessionNotFound(id)) => call.reply_session_not_found(id),
@@ -321,10 +327,11 @@ impl VarlinkInterface for InferenceHandler {
         &self,
         call: &mut dyn Call_StreamDescribe,
         session_id: String,
-        image: String,
+        image_path: String,
     ) -> varlink::Result<()> {
         self.rt.block_on(async {
-            match stream_vision_text(&self.state, call, session_id, image, "vision.describe").await
+            match stream_vision_text(&self.state, call, session_id, image_path, "vision.describe")
+                .await
             {
                 Ok(()) => Ok(()),
                 Err(VisionError::SessionNotFound(id)) => call.reply_session_not_found(id),
@@ -340,10 +347,11 @@ impl VarlinkInterface for InferenceHandler {
         &self,
         call: &mut dyn Call_StreamOcr,
         session_id: String,
-        image: String,
+        image_path: String,
     ) -> varlink::Result<()> {
         self.rt.block_on(async {
-            match stream_vision_text(&self.state, call, session_id, image, "vision.ocr").await {
+            match stream_vision_text(&self.state, call, session_id, image_path, "vision.ocr").await
+            {
                 Ok(()) => Ok(()),
                 Err(VisionError::SessionNotFound(id)) => call.reply_session_not_found(id),
                 Err(VisionError::ModelUnavailable(reason)) => call.reply_model_unavailable(reason),
@@ -358,10 +366,10 @@ impl VarlinkInterface for InferenceHandler {
         &self,
         call: &mut dyn Call_StreamSegment,
         session_id: String,
-        image: String,
+        image_path: String,
     ) -> varlink::Result<()> {
         self.rt.block_on(async {
-            match vision_segments(&self.state, session_id, image).await {
+            match vision_segments(&self.state, session_id, image_path).await {
                 Ok(segments) => call.reply(segments),
                 Err(VisionError::SessionNotFound(id)) => call.reply_session_not_found(id),
                 Err(VisionError::ModelUnavailable(reason)) => call.reply_model_unavailable(reason),
@@ -586,7 +594,7 @@ async fn stream_transcription(
     state: &SharedState,
     call: &mut dyn Call_StreamTranscribe,
     session_id: String,
-    audio: String,
+    audio_path: String,
     source_language_hint: String,
 ) -> Result<(), SpeechError> {
     let resolved = resolve_session_runtime(state, &session_id, |use_case| {
@@ -595,7 +603,7 @@ async fn stream_transcription(
     .await
     .map_err(SpeechError::from)?;
     let task = ensure_speech_use_case(&resolved.use_case).map_err(SpeechError::InvalidInput)?;
-    let audio_bytes = base64_decode(&audio).map_err(SpeechError::InvalidInput)?;
+    let audio_bytes = read_media_path(&audio_path).map_err(SpeechError::InvalidInput)?;
     with_locked_container(
         state,
         &session_id,
@@ -666,7 +674,7 @@ async fn stream_vision_text<C: TextStreamCall + ?Sized>(
     state: &SharedState,
     call: &mut C,
     session_id: String,
-    image: String,
+    image_path: String,
     expected_use_case: &str,
 ) -> Result<(), VisionError> {
     let method = if expected_use_case == "vision.describe" {
@@ -679,7 +687,7 @@ async fn stream_vision_text<C: TextStreamCall + ?Sized>(
     })
     .await
     .map_err(VisionError::from)?;
-    let image_bytes = base64_decode(&image).map_err(VisionError::InvalidInput)?;
+    let image_bytes = read_media_path(&image_path).map_err(VisionError::InvalidInput)?;
     with_locked_container(
         state,
         &session_id,
@@ -788,14 +796,14 @@ fn vision_text_allows_empty_output(expected_use_case: &str) -> bool {
 async fn vision_segments(
     state: &SharedState,
     session_id: String,
-    image: String,
+    image_path: String,
 ) -> Result<Vec<VisionSegment>, VisionError> {
     let resolved = resolve_session_runtime(state, &session_id, |use_case| {
         ensure_exact_use_case(use_case, "vision.segment", "StreamSegment")
     })
     .await
     .map_err(VisionError::from)?;
-    let image_bytes = base64_decode(&image).map_err(VisionError::InvalidInput)?;
+    let image_bytes = read_media_path(&image_path).map_err(VisionError::InvalidInput)?;
     with_locked_container(
         state,
         &session_id,
@@ -1897,32 +1905,12 @@ fn guided_fields_schema(fields: &[GuidedField]) -> Result<Value, String> {
     }))
 }
 
-fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
-    let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut table = [255u8; 256];
-    for (i, &b) in alphabet.iter().enumerate() {
-        table[b as usize] = i as u8;
+fn read_media_path(path: &str) -> Result<Vec<u8>, String> {
+    if path.trim().is_empty() {
+        return Err("media path must not be empty".to_string());
     }
 
-    let clean: Vec<u8> = s.bytes().filter(|&b| b != b'=').collect();
-    let mut out = Vec::with_capacity(clean.len() * 3 / 4);
-    let mut buf = 0u32;
-    let mut bits = 0u32;
-
-    for b in clean {
-        let v = table[b as usize];
-        if v == 255 {
-            return Err(format!("invalid base64 char: {}", b as char));
-        }
-        buf = (buf << 6) | v as u32;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((buf >> bits) as u8);
-            buf &= (1 << bits) - 1;
-        }
-    }
-    Ok(out)
+    std::fs::read(path).map_err(|e| format!("failed to read media path {path}: {e}"))
 }
 
 #[cfg(test)]
@@ -2187,25 +2175,21 @@ mod tests {
     }
 
     #[test]
-    fn base64_decode_rejects_invalid_input() {
+    fn read_media_path_reads_file_bytes() {
+        let file = tempfile::NamedTempFile::new().expect("temp file should be created");
+        std::fs::write(file.path(), b"media").expect("temp media should be written");
+
         assert_eq!(
-            base64_decode("not base64!"),
-            Err("invalid base64 char:  ".to_string())
+            read_media_path(file.path().to_str().expect("path should be utf-8")),
+            Ok(b"media".to_vec())
         );
     }
 
-    #[hegel::test]
-    fn base64_decode_accepts_generated_valid_alphabet(tc: TestCase) {
-        let chars = tc.draw(
-            gs::vecs(gs::sampled_from(
-                "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-                    .chars()
-                    .collect::<Vec<_>>(),
-            ))
-            .max_size(64),
+    #[test]
+    fn read_media_path_rejects_empty_path() {
+        assert_eq!(
+            read_media_path("  "),
+            Err("media path must not be empty".to_string())
         );
-        let encoded = chars.into_iter().collect::<String>();
-
-        assert!(base64_decode(&encoded).is_ok());
     }
 }

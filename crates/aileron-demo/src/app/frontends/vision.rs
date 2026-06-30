@@ -1,5 +1,5 @@
 use super::super::{
-    VisionEvent, base64_encode, describe_image, format_segments, friendly_error, ocr_image,
+    VisionEvent, decode_base64, describe_image, format_segments, friendly_error, ocr_image,
     segment_image,
 };
 use super::scrollable_page;
@@ -206,21 +206,14 @@ pub(crate) fn build_page() -> gtk4::Widget {
         let status_title = status_title.clone();
         let status_detail = status_detail.clone();
         describe_button.connect_clicked(move |_| {
-            let image_b64 = if let Some(bytes) = selected_image.borrow().clone() {
-                base64_encode(&bytes)
-            } else {
-                let (start, end) = paste_buffer.bounds();
-                paste_buffer
-                    .text(&start, &end, false)
-                    .trim()
-                    .replace(['\n', '\r', ' ', '\t'], "")
+            let image = match image_bytes_from_inputs(&selected_image, &paste_buffer) {
+                Ok(bytes) => bytes,
+                Err(message) => {
+                    status_title.set_text("No image input");
+                    status_detail.set_text(&message);
+                    return;
+                }
             };
-
-            if image_b64.is_empty() {
-                status_title.set_text("No image input");
-                status_detail.set_text("Choose an image file or paste base64 image bytes first.");
-                return;
-            }
 
             description_buffer.set_text("");
             describe_button_for_click.set_sensitive(false);
@@ -288,7 +281,7 @@ pub(crate) fn build_page() -> gtk4::Widget {
 
             let error_tx = tx.clone();
             std::thread::spawn(move || {
-                if let Err(e) = describe_image(&image_b64, tx) {
+                if let Err(e) = describe_image(&image, tx) {
                     eprintln!("[aileron-demo] describe error: {e}");
                     let _ = error_tx.send(VisionEvent::Error(friendly_error(&e)));
                 }
@@ -307,21 +300,14 @@ pub(crate) fn build_page() -> gtk4::Widget {
         let status_title = status_title.clone();
         let status_detail = status_detail.clone();
         ocr_button.connect_clicked(move |_| {
-            let image_b64 = if let Some(bytes) = selected_image.borrow().clone() {
-                base64_encode(&bytes)
-            } else {
-                let (start, end) = paste_buffer.bounds();
-                paste_buffer
-                    .text(&start, &end, false)
-                    .trim()
-                    .replace(['\n', '\r', ' ', '\t'], "")
+            let image = match image_bytes_from_inputs(&selected_image, &paste_buffer) {
+                Ok(bytes) => bytes,
+                Err(message) => {
+                    status_title.set_text("No image input");
+                    status_detail.set_text(&message);
+                    return;
+                }
             };
-
-            if image_b64.is_empty() {
-                status_title.set_text("No image input");
-                status_detail.set_text("Choose an image file or paste base64 image bytes first.");
-                return;
-            }
 
             ocr_buffer.set_text("");
             describe_button_for_click.set_sensitive(false);
@@ -389,7 +375,7 @@ pub(crate) fn build_page() -> gtk4::Widget {
 
             let error_tx = tx.clone();
             std::thread::spawn(move || {
-                if let Err(e) = ocr_image(&image_b64, tx) {
+                if let Err(e) = ocr_image(&image, tx) {
                     eprintln!("[aileron-demo] ocr error: {e}");
                     let _ = error_tx.send(VisionEvent::Error(friendly_error(&e)));
                 }
@@ -408,21 +394,14 @@ pub(crate) fn build_page() -> gtk4::Widget {
         let status_title = status_title.clone();
         let status_detail = status_detail.clone();
         segment_button.connect_clicked(move |_| {
-            let image_b64 = if let Some(bytes) = selected_image.borrow().clone() {
-                base64_encode(&bytes)
-            } else {
-                let (start, end) = paste_buffer.bounds();
-                paste_buffer
-                    .text(&start, &end, false)
-                    .trim()
-                    .replace(['\n', '\r', ' ', '\t'], "")
+            let image = match image_bytes_from_inputs(&selected_image, &paste_buffer) {
+                Ok(bytes) => bytes,
+                Err(message) => {
+                    status_title.set_text("No image input");
+                    status_detail.set_text(&message);
+                    return;
+                }
             };
-
-            if image_b64.is_empty() {
-                status_title.set_text("No image input");
-                status_detail.set_text("Choose an image file or paste base64 image bytes first.");
-                return;
-            }
 
             segments_buffer.set_text("");
             describe_button_for_click.set_sensitive(false);
@@ -489,7 +468,7 @@ pub(crate) fn build_page() -> gtk4::Widget {
 
             let error_tx = tx.clone();
             std::thread::spawn(move || {
-                if let Err(e) = segment_image(&image_b64, tx) {
+                if let Err(e) = segment_image(&image, tx) {
                     eprintln!("[aileron-demo] segment error: {e}");
                     let _ = error_tx.send(VisionEvent::Error(friendly_error(&e)));
                 }
@@ -498,4 +477,30 @@ pub(crate) fn build_page() -> gtk4::Widget {
     }
 
     scrollable_page(&vbox)
+}
+
+fn image_bytes_from_inputs(
+    selected_image: &Rc<RefCell<Option<Vec<u8>>>>,
+    paste_buffer: &TextBuffer,
+) -> Result<Vec<u8>, String> {
+    if let Some(bytes) = selected_image.borrow().clone() {
+        if bytes.is_empty() {
+            return Err("Selected image is empty.".to_string());
+        }
+        return Ok(bytes);
+    }
+
+    let (start, end) = paste_buffer.bounds();
+    let pasted = paste_buffer.text(&start, &end, false);
+    let pasted = pasted.trim();
+    if pasted.is_empty() {
+        return Err("Choose an image file or paste base64 image bytes first.".to_string());
+    }
+
+    let bytes =
+        decode_base64(pasted).map_err(|e| format!("Pasted image is not valid base64: {e}"))?;
+    if bytes.is_empty() {
+        return Err("Pasted image decoded to empty bytes.".to_string());
+    }
+    Ok(bytes)
 }

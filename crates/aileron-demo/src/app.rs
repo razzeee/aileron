@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use zbus::zvariant::{OwnedObjectPath, OwnedValue, Type, Value};
+use zbus::zvariant::{Fd, OwnedObjectPath, OwnedValue, Type, Value};
 
 const PORTAL_BUS: &str = "org.freedesktop.portal.Desktop";
 const PORTAL_PATH: &str = "/org/freedesktop/portal/desktop";
@@ -1364,10 +1364,12 @@ fn stream_embedding(session_handle: &OwnedObjectPath, text: &str) -> anyhow::Res
 
 fn stream_vision_text(
     session_handle: &OwnedObjectPath,
-    image_b64: &str,
+    image: &[u8],
     method: &str,
     text_tx: Option<(std::sync::mpsc::Sender<VisionEvent>, VisionTextKind)>,
 ) -> anyhow::Result<String> {
+    let image_file = media_file_from_bytes(image)?;
+    let image_fd = Fd::from(&image_file);
     let call_conn = portal_connection()?;
     let signal_conn = zbus::blocking::Connection::session()?;
     let proxy = zbus::blocking::Proxy::new(&call_conn, PORTAL_BUS, PORTAL_PATH, VISION_IFACE)?;
@@ -1408,7 +1410,7 @@ fn stream_vision_text(
     });
 
     let stream_result: zbus::Result<OwnedObjectPath> =
-        proxy.call(method, &(session_handle, image_b64, empty_options()));
+        proxy.call(method, &(session_handle, image_fd, empty_options()));
     let request_handle = stream_result?;
     let content = stream_done_rx
         .recv_timeout(Duration::from_secs(2))
@@ -1421,8 +1423,10 @@ fn stream_vision_text(
 
 fn stream_vision_segments(
     session_handle: &OwnedObjectPath,
-    image_b64: &str,
+    image: &[u8],
 ) -> anyhow::Result<Vec<VisionSegmentDbus>> {
+    let image_file = media_file_from_bytes(image)?;
+    let image_fd = Fd::from(&image_file);
     let call_conn = portal_connection()?;
     let signal_conn = zbus::blocking::Connection::session()?;
     let proxy = zbus::blocking::Proxy::new(&call_conn, PORTAL_BUS, PORTAL_PATH, VISION_IFACE)?;
@@ -1455,7 +1459,7 @@ fn stream_vision_segments(
 
     let stream_result: zbus::Result<OwnedObjectPath> = proxy.call(
         "StreamSegment",
-        &(session_handle, image_b64, empty_options()),
+        &(session_handle, image_fd, empty_options()),
     );
     let request_handle = stream_result?;
     let segments = stream_done_rx
@@ -2085,7 +2089,8 @@ fn stream_speech_audio(
     tx: &std::sync::mpsc::Sender<SpeechEvent>,
     mode: SpeechTranscriptMode,
 ) -> anyhow::Result<String> {
-    let audio_b64 = base64_encode(audio);
+    let audio_file = media_file_from_bytes(audio)?;
+    let audio_fd = Fd::from(&audio_file);
     let mut transcription_iter = sig_proxy.receive_signal("TranscriptionReceived")?;
     let transcript_session_handle = session_handle.clone();
     let tx_transcript = tx.clone();
@@ -2127,7 +2132,7 @@ fn stream_speech_audio(
         "StreamTranscribe",
         &(
             session_handle,
-            &audio_b64,
+            audio_fd,
             source_language_hint,
             empty_options(),
         ),
@@ -2157,7 +2162,7 @@ fn end_speech_session(session_handle: &OwnedObjectPath) {
     let _ = close_public_session(session_handle);
 }
 
-fn describe_image(image_b64: &str, tx: std::sync::mpsc::Sender<VisionEvent>) -> anyhow::Result<()> {
+fn describe_image(image: &[u8], tx: std::sync::mpsc::Sender<VisionEvent>) -> anyhow::Result<()> {
     let conn = portal_connection()?;
     let proxy = zbus::blocking::Proxy::new(&conn, PORTAL_BUS, PORTAL_PATH, VISION_IFACE)?;
 
@@ -2172,7 +2177,7 @@ fn describe_image(image_b64: &str, tx: std::sync::mpsc::Sender<VisionEvent>) -> 
     tx.send(VisionEvent::Phase(VisionPhase::Describing))?;
     let description = stream_vision_text(
         &session_handle,
-        image_b64,
+        image,
         "StreamDescribe",
         Some((tx.clone(), VisionTextKind::Description)),
     )?;
@@ -2183,7 +2188,7 @@ fn describe_image(image_b64: &str, tx: std::sync::mpsc::Sender<VisionEvent>) -> 
     Ok(())
 }
 
-fn ocr_image(image_b64: &str, tx: std::sync::mpsc::Sender<VisionEvent>) -> anyhow::Result<()> {
+fn ocr_image(image: &[u8], tx: std::sync::mpsc::Sender<VisionEvent>) -> anyhow::Result<()> {
     let conn = portal_connection()?;
     let proxy = zbus::blocking::Proxy::new(&conn, PORTAL_BUS, PORTAL_PATH, VISION_IFACE)?;
 
@@ -2198,7 +2203,7 @@ fn ocr_image(image_b64: &str, tx: std::sync::mpsc::Sender<VisionEvent>) -> anyho
     tx.send(VisionEvent::Phase(VisionPhase::Ocr))?;
     let text = stream_vision_text(
         &session_handle,
-        image_b64,
+        image,
         "StreamOcr",
         Some((tx.clone(), VisionTextKind::Ocr)),
     )?;
@@ -2209,7 +2214,7 @@ fn ocr_image(image_b64: &str, tx: std::sync::mpsc::Sender<VisionEvent>) -> anyho
     Ok(())
 }
 
-fn segment_image(image_b64: &str, tx: std::sync::mpsc::Sender<VisionEvent>) -> anyhow::Result<()> {
+fn segment_image(image: &[u8], tx: std::sync::mpsc::Sender<VisionEvent>) -> anyhow::Result<()> {
     let conn = portal_connection()?;
     let proxy = zbus::blocking::Proxy::new(&conn, PORTAL_BUS, PORTAL_PATH, VISION_IFACE)?;
 
@@ -2222,7 +2227,7 @@ fn segment_image(image_b64: &str, tx: std::sync::mpsc::Sender<VisionEvent>) -> a
 
     tx.send(VisionEvent::Phase(VisionPhase::LoadingModel))?;
     tx.send(VisionEvent::Phase(VisionPhase::Segmenting))?;
-    let segments = stream_vision_segments(&session_handle, image_b64)?;
+    let segments = stream_vision_segments(&session_handle, image)?;
     tx.send(VisionEvent::Segments(segments))?;
 
     close_public_session(&session_handle)?;
@@ -2300,6 +2305,62 @@ fn format_embedding(vector: &[f64]) -> String {
         preview,
         ellipsis
     )
+}
+
+fn media_file_from_bytes(bytes: &[u8]) -> anyhow::Result<std::fs::File> {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let suffix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "aileron-demo-media-{}-{suffix}",
+        std::process::id()
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
+    if let Err(e) = std::fs::remove_file(&path) {
+        tracing::warn!(
+            "failed to unlink temporary media file {}: {e}",
+            path.display()
+        );
+    }
+    file.write_all(bytes)?;
+    file.seek(SeekFrom::Start(0))?;
+    Ok(file)
+}
+
+pub(crate) fn decode_base64(input: &str) -> Result<Vec<u8>, String> {
+    let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut table = [255u8; 256];
+    for (i, &b) in alphabet.iter().enumerate() {
+        table[b as usize] = i as u8;
+    }
+
+    let clean = input
+        .bytes()
+        .filter(|b| !matches!(b, b'=' | b'\n' | b'\r' | b' ' | b'\t'))
+        .collect::<Vec<_>>();
+    let mut out = Vec::with_capacity(clean.len() * 3 / 4);
+    let mut buf = 0u32;
+    let mut bits = 0u32;
+
+    for b in clean {
+        let v = table[b as usize];
+        if v == 255 {
+            return Err(format!("invalid base64 char: {}", b as char));
+        }
+        buf = (buf << 6) | v as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+            buf &= (1 << bits) - 1;
+        }
+    }
+
+    Ok(out)
 }
 
 fn base64_encode(data: &[u8]) -> String {

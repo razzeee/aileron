@@ -366,10 +366,10 @@ Use-cases describe the task intent and modality; methods describe the operation 
 | `language.extract` | Extract structured data | llama.cpp |
 | `language.analyze` | Derive mixed structured insights from text | llama.cpp |
 | `language.embed` | Compute text embedding vectors | llama.cpp |
-| `speech.transcribe` | Transcribe audio (16 kHz mono f32le, prototype base64 payload) | whisper.cpp |
+| `speech.transcribe` | Transcribe audio (16 kHz mono f32le) | whisper.cpp |
 | `speech.translate` | Translate spoken audio to English text | whisper.cpp |
-| `vision.describe` | Describe image contents (prototype PNG/JPEG base64 payload) | llava / llama.cpp |
-| `vision.ocr` | Extract text from an image (prototype PNG/JPEG base64 payload) | llama.cpp multimodal |
+| `vision.describe` | Describe image contents (PNG/JPEG) | llava / llama.cpp |
+| `vision.ocr` | Extract text from an image (PNG/JPEG) | llama.cpp multimodal |
 | `vision.segment` | Identify objects in image | llama.cpp multimodal |
 
 ## Varlink interfaces
@@ -397,14 +397,14 @@ method StreamPredictNext(session_id: string, prefix: string, options: Generation
 method StreamRespondGuided(session_id: string, prompt: string, fields: []GuidedField, tools: []ToolDefinition, options: GenerationOptions) -> (snapshot_json: string, tool_calls: []ToolCall)
 method StreamSubmitToolResultsGuided(session_id: string, prompt: string, results: []ToolResult, fields: []GuidedField, tools: []ToolDefinition, options: GenerationOptions) -> (snapshot_json: string, tool_calls: []ToolCall)
 method StreamEmbed(session_id: string, text: string) -> (embedding: []float)
-method StreamTranscribe(session_id: string, audio: string, source_language_hint: string) -> (token: string)
-method StreamDescribe(session_id: string, image: string) -> (token: string)
-method StreamOcr(session_id: string, image: string) -> (token: string)
-method StreamSegment(session_id: string, image: string) -> (segments: []VisionSegment)
+method StreamTranscribe(session_id: string, audio_path: string, source_language_hint: string) -> (token: string)
+method StreamDescribe(session_id: string, image_path: string) -> (token: string)
+method StreamOcr(session_id: string, image_path: string) -> (token: string)
+method StreamSegment(session_id: string, image_path: string) -> (segments: []VisionSegment)
 method EndSession(session_id: string) -> ()
 ```
 
-`CreateSession` returns the backend session id and selected profile id; the portal frontend exposes only an opaque public session handle to apps. Missing app permissions fail with `PermissionPromptRequired` so the portal backend can prompt once and persist the decision; explicit denials fail with `PermissionDenied` and are not re-prompted. `instructions` are stored on the session and forwarded to text containers as the container `system` prompt. `StreamPredictNext` is for inline typing assistance on `language.complete` sessions: the daemon forwards the raw prefix to the runtime and streams one completions event with up to three short completions, typically word suffixes or next words. Newer `StreamPredictNext` calls for the same session supersede older in-flight prediction calls; superseded calls fail with `RequestCancelled` and do not emit completions. In the current prototype, `audio` is raw 16 kHz mono f32le PCM bytes encoded as base64 and `image` is PNG or JPEG bytes encoded as base64; these strings are size-bounded transport placeholders, not the intended stable large-media API. `StreamTranscribe` streams a verbatim transcript for `speech.transcribe` sessions or an English translation for `speech.translate` sessions. `StreamEmbed` streams one embedding vector event for `text`. `VisionSegment` coordinates are normalized `0.0..1.0` rectangles relative to image dimensions.
+`CreateSession` returns the backend session id and selected profile id; the portal frontend exposes only an opaque public session handle to apps. Missing app permissions fail with `PermissionPromptRequired` so the portal backend can prompt once and persist the decision; explicit denials fail with `PermissionDenied` and are not re-prompted. `instructions` are stored on the session and forwarded to text containers as the container `system` prompt. `StreamPredictNext` is for inline typing assistance on `language.complete` sessions: the daemon forwards the raw prefix to the runtime and streams one completions event with up to three short completions, typically word suffixes or next words. Newer `StreamPredictNext` calls for the same session supersede older in-flight prediction calls; superseded calls fail with `RequestCancelled` and do not emit completions. `StreamTranscribe` reads raw 16 kHz mono f32le PCM from `audio_path` and streams a verbatim transcript for `speech.transcribe` sessions or an English translation for `speech.translate` sessions. Vision methods read PNG or JPEG bytes from `image_path`. `StreamEmbed` streams one embedding vector event for `text`. `VisionSegment` coordinates are normalized `0.0..1.0` rectangles relative to image dimensions.
 
 `GenerationOptions.maximum_response_tokens` must be greater than zero and fit in `u32`. `temperature` must be finite and non-negative. `sampling_mode` must be non-empty. `source_language_hint` and `target_language_hint` are optional strings for `language.translate`; pass empty strings when unspecified. Today the daemon validates sampling fields, forwards `maximum_response_tokens` to containers as `max_tokens`, and folds translation hints into the session instructions for `language.translate`.
 
@@ -499,7 +499,7 @@ Apps call the public interfaces on `org.freedesktop.portal.Desktop`. The public 
 
 | Method | Parameters | Returns | Notes |
 |---|---|---|---|
-| `StreamTranscribe` | `session_handle: o, audio: s, source_language_hint: s, options: a{sv}` | `handle: o` | 16 kHz mono f32le PCM, base64; empty hint means auto-detect/no hint; emits `TranscriptionReceived` signals; final segment has `done=true` |
+| `StreamTranscribe` | `session_handle: o, audio_fd: h, source_language_hint: s, options: a{sv}` | `handle: o` | 16 kHz mono f32le PCM readable from the fd; empty hint means auto-detect/no hint; emits `TranscriptionReceived` signals; final segment has `done=true` |
 
 Streaming D-Bus methods return an `org.freedesktop.portal.Request` handle immediately. Callers should subscribe to both the stream signal and the request's `Response` signal before invoking a stream method when using caller-chosen `handle_token` values. Stream payload signals are correlated by `request_handle`; the request response indicates success, portal/backend cancellation, or failure. If the app calls `Close` on the request, the request is unexported and the app should not wait for a later `Response` on that handle.
 
@@ -507,13 +507,13 @@ Streaming D-Bus methods return an `org.freedesktop.portal.Request` handle immedi
 
 | Method | Parameters | Returns | Notes |
 |---|---|---|---|
-| `StreamDescribe` | `session_handle: o, image: s, options: a{sv}` | `handle: o` | `vision.describe` sessions only; emits `VisionTextReceived` signals |
-| `StreamOcr` | `session_handle: o, image: s, options: a{sv}` | `handle: o` | `vision.ocr` sessions only; emits `VisionTextReceived` signals |
-| `StreamSegment` | `session_handle: o, image: s, options: a{sv}` | `handle: o` | `vision.segment` sessions only; emits one `VisionSegmentsReceived` signal with normalized boxes |
+| `StreamDescribe` | `session_handle: o, image_fd: h, options: a{sv}` | `handle: o` | `vision.describe` sessions only; reads PNG/JPEG bytes from the fd; emits `VisionTextReceived` signals |
+| `StreamOcr` | `session_handle: o, image_fd: h, options: a{sv}` | `handle: o` | `vision.ocr` sessions only; reads PNG/JPEG bytes from the fd; emits `VisionTextReceived` signals |
+| `StreamSegment` | `session_handle: o, image_fd: h, options: a{sv}` | `handle: o` | `vision.segment` sessions only; reads PNG/JPEG bytes from the fd; emits one `VisionSegmentsReceived` signal with normalized boxes |
 
-These are D-Bus signatures: parentheses define a struct, `a(...)` means an array of structs, and `a{sv}` is an options vardict. `parent_window` follows xdg-desktop-portal window identifier rules such as `x11:<XID>` or `wayland:<HANDLE>`; pass an empty string when no suitable handle exists. Aileron's fallback `zenity`/`kdialog` prompt currently attaches only X11 parent windows. Public language generation methods accept these option keys: `maximum_response_tokens` as int64, `temperature` as float64, `sampling_mode` as string, `source_language_hint` as string, and `target_language_hint` as string. Empty language hints mean unspecified. The generation option language hints only affect `language.translate`; `StreamEmbed`, Speech stream options, and Vision stream options are reserved except for standard request options such as `handle_token`. Speech methods use their `source_language_hint` argument only to identify the spoken input language; the session use-case selects whether speech output is a transcript or English translation. `fields: a(sssb)` is an array of `GuidedField` structs: name, kind, description, required. Tool structs are `a(sss)`: definitions are name, description, schema JSON; calls are id, name, arguments JSON; results are id, content, content JSON.
+These are D-Bus signatures: parentheses define a struct, `a(...)` means an array of structs, `a{sv}` is an options vardict, and `h` is a Unix fd handle. `parent_window` follows xdg-desktop-portal window identifier rules such as `x11:<XID>` or `wayland:<HANDLE>`; pass an empty string when no suitable handle exists. Aileron's fallback `zenity`/`kdialog` prompt currently attaches only X11 parent windows. Public language generation methods accept these option keys: `maximum_response_tokens` as int64, `temperature` as float64, `sampling_mode` as string, `source_language_hint` as string, and `target_language_hint` as string. Empty language hints mean unspecified. The generation option language hints only affect `language.translate`; `StreamEmbed`, Speech stream options, and Vision stream options are reserved except for standard request options such as `handle_token`. Speech methods use their `source_language_hint` argument only to identify the spoken input language; the session use-case selects whether speech output is a transcript or English translation. `fields: a(sssb)` is an array of `GuidedField` structs: name, kind, description, required. Tool structs are `a(sss)`: definitions are name, description, schema JSON; calls are id, name, arguments JSON; results are id, content, content JSON.
 
-Audio and image payloads are base64 strings in the current prototype and must fit within the session bus message limit after encoding. This is a compatibility placeholder for small, user-initiated media requests; apps should resize images and chunk live audio before calling the portal. A production fd/document-handle transport should be a separate API revision rather than an implicit behavior change to these string arguments.
+Audio and image payloads are passed to the public portal as readable Unix fd handles, avoiding D-Bus string payload limits for media bytes. Apps should still use user-initiated actions, visible progress, resized images, app-side audio chunking, and cancellation-friendly UI. The daemon's container runtime protocol remains JSON over stdio and base64-encodes these bytes internally for runtime compatibility.
 
 ### Signals
 
