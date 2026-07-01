@@ -56,8 +56,6 @@ fn string_option_value(value: &str) -> OwnedValue {
 
 fn generation_options(
     maximum_response_tokens: i64,
-    temperature: f64,
-    sampling_mode: &str,
     source_language_hint: &str,
     target_language_hint: &str,
 ) -> PortalOptions {
@@ -65,11 +63,6 @@ fn generation_options(
     options.insert(
         "maximum_response_tokens".to_string(),
         OwnedValue::from(maximum_response_tokens),
-    );
-    options.insert("temperature".to_string(), OwnedValue::from(temperature));
-    options.insert(
-        "sampling_mode".to_string(),
-        string_option_value(sampling_mode),
     );
     options.insert(
         "source_language_hint".to_string(),
@@ -1007,7 +1000,7 @@ fn summarize_streaming(text: &str, tx: std::sync::mpsc::Sender<DemoEvent>) -> an
         let _ = stream_done_tx.send(result);
     });
 
-    let options = generation_options(512, 0.7, "default", "", "");
+    let options = generation_options(512, "", "");
     tx.send(DemoEvent::Phase(DemoPhase::RequestingStream))?;
     let stream_result: zbus::Result<OwnedObjectPath> =
         proxy.call("StreamResponse", &(&session_handle, &prompt, options));
@@ -1507,7 +1500,7 @@ fn extract_guided(text: &str, tx: std::sync::mpsc::Sender<DemoEvent>) -> anyhow:
             true,
         ),
     ];
-    let options = generation_options(128, 0.2, "default", "", "");
+    let options = generation_options(128, "", "");
 
     tx.send(DemoEvent::Phase(DemoPhase::WaitingForModel))?;
     tx.send(DemoEvent::Phase(DemoPhase::RequestingGuided))?;
@@ -1567,7 +1560,7 @@ fn classify_guided(text: &str, tx: std::sync::mpsc::Sender<DemoEvent>) -> anyhow
             true,
         ),
     ];
-    let options = generation_options(512, 0.2, "default", "", "");
+    let options = generation_options(512, "", "");
 
     tx.send(DemoEvent::Phase(DemoPhase::WaitingForModel))?;
     tx.send(DemoEvent::Phase(DemoPhase::RequestingGuided))?;
@@ -1604,8 +1597,8 @@ fn respond_text_task(
     tx.send(DemoEvent::Phase(DemoPhase::WaitingForModel))?;
     tx.send(DemoEvent::Phase(DemoPhase::RequestingResponse))?;
     let options = match mode {
-        DemoMode::Translate => generation_options(512, 0.3, "default", "", "Spanish"),
-        _ => generation_options(512, 0.5, "default", "", ""),
+        DemoMode::Translate => generation_options(512, "", "Spanish"),
+        _ => generation_options(512, "", ""),
     };
     let content = stream_language_text(
         &session_handle,
@@ -1654,7 +1647,7 @@ fn predict_inline_completion(
     } else {
         input.to_string()
     };
-    let options = generation_options(4, 0.0, "greedy", "", "");
+    let options = generation_options(4, "", "");
     let completions_result = stream_prediction(&session_handle, &prompt_input, options);
     let completions = match completions_result {
         Ok(completions) => completions,
@@ -1663,7 +1656,7 @@ fn predict_inline_completion(
             match stream_prediction(
                 &session_handle,
                 &prompt_input,
-                generation_options(4, 0.0, "greedy", "", ""),
+                generation_options(4, "", ""),
             ) {
                 Ok(completions) => completions,
                 Err(e) => {
@@ -1825,7 +1818,7 @@ fn guided_chat_turn(
             true,
         ),
     ];
-    let options = generation_options(512, 0.2, "default", "", "");
+    let options = generation_options(512, "", "");
     let prompt = guided_chat_prompt(memory, &messages);
     let mut send_draft = |snapshot: &str| {
         if let Some(answer) = guided_chat_answer_draft(snapshot) {
@@ -1850,7 +1843,7 @@ fn guided_chat_turn(
                 &prompt,
                 fields,
                 Vec::<ToolDefinitionDbus>::new(),
-                generation_options(512, 0.2, "default", "", ""),
+                generation_options(512, "", ""),
                 &mut send_draft,
             ) {
                 Ok(response) => response,

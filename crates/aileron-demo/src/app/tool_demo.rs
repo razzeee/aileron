@@ -190,7 +190,7 @@ fn run_character_tool_demo(
 
     let fields = guided_tool_loop_fields();
     let tools = count_tool_definitions()?;
-    let options = generation_options(128, 0.2, "default", "", "");
+    let options = generation_options(128, "", "");
     let mut loop_prompt = format!(
         "Available app tool:\n- count_character_occurrences(word: string, character: string): exact deterministic count.\n\nUser request: {prompt}\n\nReturn action=call_tool with tool_name=count_character_occurrences, word, and character if this needs exact counting. Return action=final only if no tool is needed."
     );
@@ -354,7 +354,7 @@ fn run_linux_diagnostics_tool_demo(
 
     let fields = guided_linux_pc_diagnostics_loop_fields();
     let tools = linux_pc_diagnostics_tool_definitions()?;
-    let options = generation_options(384, 0.2, "default", "", "");
+    let options = generation_options(384, "", "");
     let loop_prompt = format!(
         "Available app tool:\n- collect_linux_pc_diagnostics(scope?: all|user|system, unit?: systemd unit, lines?: number): collect bounded read-only Linux PC status, resource usage, failed units, kernel messages, and journal excerpts from the local machine.\n\nPolicy:\n- The app may read local status and logs only.\n- Analyze the whole PC unless the user asks for a specific unit or subsystem.\n- Do not run repair commands automatically.\n- Final answers should include likely cause, evidence from logs/status, and safe commands the user can review.\n\nUser request: {prompt}\n\nReturn action=call_tool with tool_name=collect_linux_pc_diagnostics before answering. Put arguments in scope, unit, and lines. If you use tool_input for compatibility, it must be a JSON string, not an object."
     );

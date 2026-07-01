@@ -232,7 +232,7 @@ impl SessionPortalBackend {
 impl LanguagePortalBackend {
     #[zbus(property, name = "version")]
     fn version(&self) -> u32 {
-        4
+        1
     }
 
     #[zbus(out_args("availability"))]
@@ -817,7 +817,7 @@ impl LanguagePortalBackend {
 impl SpeechPortalBackend {
     #[zbus(property, name = "version")]
     fn version(&self) -> u32 {
-        4
+        1
     }
 
     #[zbus(out_args("availability"))]
@@ -1017,7 +1017,7 @@ impl SpeechPortalBackend {
 impl VisionPortalBackend {
     #[zbus(property, name = "version")]
     fn version(&self) -> u32 {
-        4
+        1
     }
 
     #[zbus(out_args("availability"))]
