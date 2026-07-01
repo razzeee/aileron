@@ -400,17 +400,15 @@ impl LanguagePortalBackend {
             }
 
             ensure_request_active(&self.state, request_id)?;
-            if let Some(token) = pending_token {
-                LanguagePortalBackend::token_received(
-                    &emitter,
-                    &request_handle,
-                    &session_handle,
-                    &token,
-                    true,
-                )
-                .await
-                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-            }
+            LanguagePortalBackend::token_received(
+                &emitter,
+                &request_handle,
+                &session_handle,
+                pending_token.as_deref().unwrap_or_default(),
+                true,
+            )
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
 
             Ok(())
         }
@@ -600,12 +598,12 @@ impl LanguagePortalBackend {
             }
 
             ensure_request_active(&self.state, request_id)?;
-            if !emitted_terminal_tool_calls && let Some(snapshot) = pending_snapshot {
+            if !emitted_terminal_tool_calls {
                 LanguagePortalBackend::guided_snapshot_received(
                     &emitter,
                     &request_handle,
                     &session_handle,
-                    &snapshot,
+                    pending_snapshot.as_deref().unwrap_or_default(),
                     true,
                 )
                 .await
@@ -729,12 +727,12 @@ impl LanguagePortalBackend {
             }
 
             ensure_request_active(&self.state, request_id)?;
-            if !emitted_terminal_tool_calls && let Some(snapshot) = pending_snapshot {
+            if !emitted_terminal_tool_calls {
                 LanguagePortalBackend::guided_snapshot_received(
                     &emitter,
                     &request_handle,
                     &session_handle,
-                    &snapshot,
+                    pending_snapshot.as_deref().unwrap_or_default(),
                     true,
                 )
                 .await
@@ -1182,17 +1180,15 @@ impl VisionPortalBackend {
             }
 
             ensure_request_active(&self.state, request_id)?;
-            if let Some(text) = pending_text {
-                VisionPortalBackend::vision_text_received(
-                    &emitter,
-                    &request_handle,
-                    &session_handle,
-                    &text,
-                    true,
-                )
-                .await
-                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-            }
+            VisionPortalBackend::vision_text_received(
+                &emitter,
+                &request_handle,
+                &session_handle,
+                pending_text.as_deref().unwrap_or_default(),
+                true,
+            )
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
 
             Ok(())
         }
@@ -1255,17 +1251,15 @@ impl VisionPortalBackend {
             }
 
             ensure_request_active(&self.state, request_id)?;
-            if let Some(text) = pending_text {
-                VisionPortalBackend::vision_text_received(
-                    &emitter,
-                    &request_handle,
-                    &session_handle,
-                    &text,
-                    true,
-                )
-                .await
-                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-            }
+            VisionPortalBackend::vision_text_received(
+                &emitter,
+                &request_handle,
+                &session_handle,
+                pending_text.as_deref().unwrap_or_default(),
+                true,
+            )
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
 
             Ok(())
         }
