@@ -2320,25 +2320,35 @@ fn format_embedding(vector: &[f64]) -> String {
 
 fn media_file_from_bytes(bytes: &[u8]) -> anyhow::Result<std::fs::File> {
     use std::io::{Seek, SeekFrom, Write};
+    use std::os::fd::FromRawFd;
+    use std::os::raw::{c_char, c_int, c_uint};
 
-    let suffix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-    let path = std::env::temp_dir().join(format!(
-        "aileron-demo-media-{}-{suffix}",
-        std::process::id()
-    ));
-    let mut file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .open(&path)?;
-    if let Err(e) = std::fs::remove_file(&path) {
-        tracing::warn!(
-            "failed to unlink temporary media file {}: {e}",
-            path.display()
-        );
+    const MFD_ALLOW_SEALING: c_uint = 0x0002;
+    const F_ADD_SEALS: c_int = 1033;
+    const F_SEAL_SHRINK: c_int = 0x0002;
+    const F_SEAL_GROW: c_int = 0x0004;
+    const F_SEAL_WRITE: c_int = 0x0008;
+
+    unsafe extern "C" {
+        fn memfd_create(name: *const c_char, flags: c_uint) -> c_int;
+        fn fcntl(fd: c_int, cmd: c_int, arg: c_int) -> c_int;
     }
+
+    let name = std::ffi::CString::new("aileron-demo-media")?;
+    let fd = unsafe { memfd_create(name.as_ptr(), MFD_ALLOW_SEALING) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
     file.write_all(bytes)?;
     file.seek(SeekFrom::Start(0))?;
+
+    let seals = F_SEAL_GROW | F_SEAL_WRITE | F_SEAL_SHRINK;
+    if unsafe { fcntl(fd, F_ADD_SEALS, seals) } < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+
     Ok(file)
 }
 
@@ -2374,36 +2384,10 @@ pub(crate) fn decode_base64(input: &str) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-fn base64_encode(data: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-
-    for chunk in data.chunks(3) {
-        let b0 = chunk[0];
-        let b1 = *chunk.get(1).unwrap_or(&0);
-        let b2 = *chunk.get(2).unwrap_or(&0);
-
-        out.push(TABLE[(b0 >> 2) as usize] as char);
-        out.push(TABLE[(((b0 & 0b0000_0011) << 4) | (b1 >> 4)) as usize] as char);
-        if chunk.len() > 1 {
-            out.push(TABLE[(((b1 & 0b0000_1111) << 2) | (b2 >> 6)) as usize] as char);
-        } else {
-            out.push('=');
-        }
-        if chunk.len() > 2 {
-            out.push(TABLE[(b2 & 0b0011_1111) as usize] as char);
-        } else {
-            out.push('=');
-        }
-    }
-
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        DemoMode, base64_encode, clean_prediction, clear_failed_prediction_session, concise_error,
+        DemoMode, clean_prediction, clear_failed_prediction_session, concise_error,
         guided_chat_answer_draft, is_session_not_found_message,
     };
     use hegel::TestCase;
@@ -2488,25 +2472,6 @@ mod tests {
             guided_chat_answer_draft(r#"{"answer":"Streaming in fl"#).as_deref(),
             Some("Streaming in fl")
         );
-    }
-
-    #[hegel::test]
-    fn base64_encoding_uses_expected_length_alphabet_and_padding(tc: TestCase) {
-        let data = tc.draw(gs::binary().max_size(128));
-        let encoded = base64_encode(&data);
-
-        assert_eq!(encoded.len(), data.len().div_ceil(3) * 4);
-        assert!(
-            encoded
-                .chars()
-                .all(|ch| ch.is_ascii_alphanumeric() || ch == '+' || ch == '/' || ch == '=')
-        );
-        match data.len() % 3 {
-            0 => assert!(!encoded.ends_with('=')),
-            1 => assert!(encoded.ends_with("==")),
-            2 => assert!(encoded.ends_with('=')),
-            _ => unreachable!(),
-        }
     }
 
     #[hegel::test]

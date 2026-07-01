@@ -499,7 +499,7 @@ Apps call the public interfaces on `org.freedesktop.portal.Desktop`. The public 
 
 | Method | Parameters | Returns | Notes |
 |---|---|---|---|
-| `StreamTranscribe` | `session_handle: o, audio_fd: h, source_language_hint: s, options: a{sv}` | `handle: o` | 16 kHz mono f32le PCM readable from the fd; empty hint means auto-detect/no hint; emits `TranscriptionReceived` signals; final segment has `done=true` |
+| `StreamTranscribe` | `session_handle: o, audio_fd: h, source_language_hint: s, options: a{sv}` | `handle: o` | 16 kHz mono f32le PCM readable from a sealable memfd; empty hint means auto-detect/no hint; emits `TranscriptionReceived` signals; final segment has `done=true` |
 
 Streaming D-Bus methods return an `org.freedesktop.portal.Request` handle immediately. Callers should subscribe to both the stream signal and the request's `Response` signal before invoking a stream method when using caller-chosen `handle_token` values. Stream payload signals are correlated by `request_handle`; the request response indicates success, portal/backend cancellation, or failure. If the app calls `Close` on the request, the request is unexported and the app should not wait for a later `Response` on that handle.
 
@@ -507,13 +507,13 @@ Streaming D-Bus methods return an `org.freedesktop.portal.Request` handle immedi
 
 | Method | Parameters | Returns | Notes |
 |---|---|---|---|
-| `StreamDescribe` | `session_handle: o, image_fd: h, instructions: s, options: a{sv}` | `handle: o` | `vision.describe` sessions only; reads PNG/JPEG bytes from the fd; optional per-image instructions; emits `VisionTextReceived` signals |
-| `StreamOcr` | `session_handle: o, image_fd: h, instructions: s, options: a{sv}` | `handle: o` | `vision.ocr` sessions only; reads PNG/JPEG bytes from the fd; optional per-image instructions; emits `VisionTextReceived` signals |
-| `StreamSegment` | `session_handle: o, image_fd: h, instructions: s, options: a{sv}` | `handle: o` | `vision.segment` sessions only; reads PNG/JPEG bytes from the fd; optional per-image instructions; emits one `VisionSegmentsReceived` signal with normalized boxes |
+| `StreamDescribe` | `session_handle: o, image_fd: h, instructions: s, options: a{sv}` | `handle: o` | `vision.describe` sessions only; reads PNG/JPEG bytes from a sealable memfd; optional per-image instructions; emits `VisionTextReceived` signals |
+| `StreamOcr` | `session_handle: o, image_fd: h, instructions: s, options: a{sv}` | `handle: o` | `vision.ocr` sessions only; reads PNG/JPEG bytes from a sealable memfd; optional per-image instructions; emits `VisionTextReceived` signals |
+| `StreamSegment` | `session_handle: o, image_fd: h, instructions: s, options: a{sv}` | `handle: o` | `vision.segment` sessions only; reads PNG/JPEG bytes from a sealable memfd; optional per-image instructions; emits one `VisionSegmentsReceived` signal with normalized boxes |
 
 These are D-Bus signatures: parentheses define a struct, `a(...)` means an array of structs, `a{sv}` is an options vardict, and `h` is a Unix fd handle. `parent_window` follows xdg-desktop-portal window identifier rules such as `x11:<XID>` or `wayland:<HANDLE>`; pass an empty string when no suitable handle exists. Aileron's fallback `zenity`/`kdialog` prompt currently attaches only X11 parent windows. Public language generation methods accept these option keys: `maximum_response_tokens` as int64, `source_language_hint` as string, and `target_language_hint` as string. `temperature` and `sampling_mode` are reserved for future public portal sampling controls. Empty language hints and empty Vision `instructions` mean unspecified. The generation option language hints only affect `language.translate`; `StreamEmbed`, Speech stream options, and Vision stream options are reserved except for standard request options such as `handle_token`. Speech methods use their `source_language_hint` argument only to identify the spoken input language; the session use-case selects whether speech output is a transcript or English translation. `fields: a(sssb)` is an array of `GuidedField` structs: name, kind, description, required. Tool structs are `a(sss)`: definitions are name, description, schema JSON; calls are id, name, arguments JSON; results are id, content, content JSON.
 
-Audio and image payloads are passed to the public portal as readable Unix fd handles, avoiding D-Bus string payload limits for media bytes. Apps should still use user-initiated actions, visible progress, resized images, app-side audio chunking, and cancellation-friendly UI. The daemon's container runtime protocol remains JSON over stdio and base64-encodes these bytes internally for runtime compatibility.
+Audio and image payloads are passed to the public portal as readable, sealable memfd handles, avoiding D-Bus string payload limits for media bytes while preventing mutation after the portal accepts the handle. Apps should still use user-initiated actions, visible progress, resized images, app-side audio chunking, and cancellation-friendly UI. The daemon's container runtime protocol remains JSON over stdio and base64-encodes these bytes internally for runtime compatibility.
 
 ### Signals
 
