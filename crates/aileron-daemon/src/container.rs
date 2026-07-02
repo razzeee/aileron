@@ -68,6 +68,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::hardware::Variant;
+use crate::observability;
 use crate::profiles::RuntimeCandidate;
 
 const NVIDIA_LIBRARY_DIR: &str = "/usr/local/nvidia/lib64";
@@ -213,6 +214,7 @@ impl Container {
     /// Isolation is encoded in the generated OCI `config.json`: no network
     /// namespace, read-only rootfs, tmpfs `/tmp`, no capabilities, no new
     /// privileges, PID limit, memory limit, and `/model` mounted read-only.
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         runtime_id: &str,
         profile_epoch: u64,
@@ -226,7 +228,12 @@ impl Container {
         mut should_continue: impl FnMut() -> Result<(), String>,
     ) -> Result<Self> {
         let image_ref = candidate.image_ref.as_str();
-        info!("spawning OCI runtime for {}", image_ref);
+        let started_at = observability::log_runtime_starting(
+            runtime_id,
+            image_ref,
+            candidate.variant.as_tag(),
+            runtime_options.len(),
+        );
         let bundle = OciRuntimeManager::new(oci_store, system_oci_store).prepare_bundle(
             candidate.variant,
             image_ref,
@@ -252,13 +259,21 @@ impl Container {
         // Read stderr lines in a background thread, forwarding them to
         // `on_status` and watching for the "ready" sentinel.
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        let status_runtime_id = runtime_id.to_string();
+        let status_image_ref = image_ref.to_string();
+        let status_variant = candidate.variant.as_tag().to_string();
         thread::spawn(move || {
             let mut signalled = false;
             let mut recent = std::collections::VecDeque::with_capacity(8);
             for line in stderr.lines() {
                 match line {
                     Ok(l) => {
-                        info!("[container stderr] {}", l);
+                        observability::log_runtime_status(
+                            &status_runtime_id,
+                            &status_image_ref,
+                            &status_variant,
+                            &l,
+                        );
                         if recent.len() == 8 {
                             recent.pop_front();
                         }
@@ -307,7 +322,12 @@ impl Container {
                         let _ = child.wait();
                         bail!(reason);
                     }
-                    info!("container ready: {}", image_ref);
+                    observability::log_runtime_ready(
+                        runtime_id,
+                        image_ref,
+                        candidate.variant.as_tag(),
+                        started_at,
+                    );
                     break;
                 }
                 Ok(Err(e)) => {
@@ -1785,10 +1805,7 @@ impl ContainerPool {
                 || container.runtime_options != *runtime_options
         });
         if should_replace {
-            info!(
-                "replacing container for profile {} with runtime image {}",
-                profile_id, image_ref
-            );
+            observability::log_runtime_replacing_image(profile_id, image_ref, variant.as_tag());
             if let Some(container) = self.containers.remove(profile_id) {
                 container.terminate();
             }
@@ -1850,6 +1867,7 @@ impl ContainerPool {
     }
 
     /// Like `get_or_spawn_any`, but checks cancellation before cold starts.
+    #[allow(clippy::too_many_arguments)]
     pub fn get_or_spawn_any_checked(
         &mut self,
         profile_id: &str,
@@ -1906,10 +1924,10 @@ impl ContainerPool {
             if let Err(reason) = should_continue() {
                 bail!(reason);
             }
-            info!(
-                "replacing container for profile {} with one of {} candidate runtime images",
+            observability::log_runtime_replacing_candidates(
                 profile_id,
-                candidates.len()
+                runtime_id,
+                candidates.len(),
             );
             if let Some(container) = self.containers.remove(profile_id) {
                 container.terminate();
@@ -1982,11 +2000,16 @@ impl ContainerPool {
                     {
                         return Err(error);
                     }
-                    warn!(
-                        "failed to start runtime image {} for profile {}: {:#}",
-                        describe_spawn_attempt(&attempt),
+                    observability::log_runtime_start_failed(
                         profile_id,
-                        error
+                        runtime_id,
+                        &attempt.image_ref,
+                        attempt.variant.as_tag(),
+                        attempt
+                            .runtime_options
+                            .get("N_GPU_LAYERS")
+                            .map(String::as_str),
+                        &error_text,
                     );
                     let role = if attempt.image_ref == candidates[0].image_ref {
                         "preferred"
@@ -2062,7 +2085,7 @@ impl ContainerPool {
             .map(|(k, _)| k.clone())
             .collect();
         for k in idle {
-            warn!("evicting idle container for profile {}", k);
+            observability::log_runtime_evicted_idle(&k, self.idle_timeout_secs);
             self.containers.remove(&k);
         }
     }

@@ -12,6 +12,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::manifests::{self, ManifestArtifact, ModelManifest};
+use crate::observability;
 use crate::profiles::Profile;
 use crate::state::{
     InstallRecord, InstallSample, RuntimeUpdateCheck as CachedRuntimeUpdateCheck, SharedState,
@@ -515,25 +516,36 @@ impl VarlinkInterface for ModelsHandler {
                     return call.reply_profile_in_use(profile_id);
                 }
 
+                let mut cancelled_sessions = Vec::new();
                 for session_id in &active_sessions {
                     self.state.cancel_session_requests(session_id);
-                    guard.sessions.remove(session_id.as_str());
+                    if let Some(session) = guard.sessions.remove(session_id.as_str()) {
+                        cancelled_sessions.push(session);
+                    }
                 }
                 let epoch = guard.profile_epochs.entry(profile_id.clone()).or_default();
                 *epoch = epoch.saturating_add(1);
                 self.state.set_profile_epoch(&profile_id, *epoch);
                 let _ = guard.assignments.remove_profile(&profile_id);
                 guard.profiles.remove(&profile_id).map_err(io_err)?;
-                active_sessions
+                cancelled_sessions
             };
-            for session_id in &cancelled_sessions {
-                self.state.clear_predict_next(&session_id);
+            for session in &cancelled_sessions {
+                self.state.clear_predict_next(session.session_id.as_str());
+                observability::log_session_ended(observability::SessionFields {
+                    session_id: &session.session_id,
+                    app_id: &session.app_id,
+                    use_case: &session.use_case,
+                    profile_id: &session.profile_id,
+                });
             }
             let active_containers = cancelled_sessions
                 .iter()
-                .flat_map(|session_id| {
-                    self.state
-                        .terminate_active_container_handles(&profile_id, session_id)
+                .flat_map(|session| {
+                    self.state.terminate_active_container_handles(
+                        &profile_id,
+                        session.session_id.as_str(),
+                    )
                 })
                 .collect::<Vec<_>>();
             let mut containers = self.state.2.lock().await;

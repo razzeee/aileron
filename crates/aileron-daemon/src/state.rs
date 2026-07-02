@@ -12,6 +12,10 @@ use crate::manifests::RuntimeManifestStore;
 use crate::permissions::PermissionStore;
 use crate::profiles::ProfileStore;
 
+pub type ActiveContainerEntry = (String, ContainerHandle);
+pub type ActiveContainerRequests = HashMap<String, Vec<ActiveContainerEntry>>;
+pub type SharedActiveContainerRequests = Arc<StdMutex<ActiveContainerRequests>>;
+
 #[derive(Debug, Clone)]
 pub struct InstallRecord {
     pub bytes_pulled: u64,
@@ -70,7 +74,7 @@ pub struct SharedState(
     pub Arc<StdMutex<HashMap<String, u64>>>,
     pub Arc<Mutex<ContainerPool>>,
     pub Arc<StdMutex<HashSet<String>>>,
-    pub Arc<StdMutex<HashMap<String, Vec<(String, ContainerHandle)>>>>,
+    pub SharedActiveContainerRequests,
     pub Arc<StdMutex<HashMap<String, u64>>>,
 );
 

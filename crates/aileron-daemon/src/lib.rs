@@ -5,6 +5,7 @@ pub mod handlers;
 pub mod hardware;
 pub mod llmfit_metadata;
 pub mod manifests;
+mod observability;
 pub mod permissions;
 pub mod profiles;
 pub mod service;
