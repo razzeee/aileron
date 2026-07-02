@@ -7,6 +7,7 @@ use std::time::Duration;
 use uuid::Uuid;
 
 use crate::container::{Container, ContainerHandle};
+use crate::observability::{self, ObservabilityFailure};
 use crate::profiles::RuntimeCandidate;
 use crate::state::SharedState;
 #[allow(unused_imports)]
@@ -233,6 +234,7 @@ impl VarlinkInterface for InferenceHandler {
             };
 
             if let Err(e) = with_locked_container(
+                "Prewarm",
                 &self.state,
                 &session_id,
                 resolved.clone(),
@@ -501,16 +503,22 @@ impl VarlinkInterface for InferenceHandler {
         session_id: String,
     ) -> varlink::Result<()> {
         self.rt.block_on(async {
-            let profile_id = {
+            let (profile_id, app_id, use_case) = {
                 let mut guard = self.state.0.lock().await;
                 let Some(session) = guard.sessions.remove(&session_id) else {
                     return call.reply_session_not_found(session_id);
                 };
                 self.state.cancel_session_requests(&session_id);
-                session.profile_id
+                (session.profile_id, session.app_id, session.use_case)
             };
             self.state.clear_predict_next(&session_id);
             kill_profile_if_session_active(&self.state, &profile_id, &session_id).await;
+            observability::log_session_ended(observability::SessionFields {
+                session_id: &session_id,
+                app_id: &app_id,
+                use_case: &use_case,
+                profile_id: &profile_id,
+            });
             call.reply()
         })
     }
@@ -583,6 +591,12 @@ async fn create_session_record(
         instructions,
         started_at: chrono::Utc::now(),
     };
+    observability::log_session_created(observability::SessionFields {
+        session_id: &session.session_id,
+        app_id: &session.app_id,
+        use_case: &session.use_case,
+        profile_id: &session.profile_id,
+    });
     guard.sessions.insert(session_id.clone(), session);
     state.clear_session_cancelled(&session_id);
     Ok((session_id, profile_id))
@@ -623,6 +637,7 @@ async fn stream_transcription(
     let task = ensure_speech_use_case(&resolved.use_case).map_err(SpeechError::InvalidInput)?;
     let audio_bytes = read_media_path(&audio_path).map_err(SpeechError::InvalidInput)?;
     with_locked_container(
+        "StreamTranscribe",
         state,
         &session_id,
         resolved.clone(),
@@ -708,6 +723,7 @@ async fn stream_vision_text<C: TextStreamCall + ?Sized>(
     .map_err(VisionError::from)?;
     let image_bytes = read_media_path(&image_path).map_err(VisionError::InvalidInput)?;
     with_locked_container(
+        method,
         state,
         &session_id,
         resolved.clone(),
@@ -825,6 +841,7 @@ async fn vision_segments(
     .map_err(VisionError::from)?;
     let image_bytes = read_media_path(&image_path).map_err(VisionError::InvalidInput)?;
     with_locked_container(
+        "StreamSegment",
         state,
         &session_id,
         resolved.clone(),
@@ -865,6 +882,7 @@ async fn embedding_vector(
     .await
     .map_err(GenerationError::from)?;
     with_locked_container(
+        "StreamEmbed",
         state,
         &session_id,
         resolved.clone(),
@@ -896,6 +914,7 @@ async fn stream_tokens(
     let instructions =
         apply_translation_hints(&resolved.use_case, resolved.instructions.clone(), &options);
     with_locked_container(
+        "StreamResponse",
         state,
         &session_id,
         resolved.clone(),
@@ -1024,6 +1043,116 @@ enum LockContainerError {
     Failed(String),
 }
 
+impl ObservabilityFailure for String {
+    fn observability_summary(&self) -> observability::FailureSummary {
+        observability::FailureSummary {
+            code: observability::inference_failure_code(self),
+            reason_len: self.len(),
+        }
+    }
+}
+
+impl ObservabilityFailure for GenerationError {
+    fn observability_summary(&self) -> observability::FailureSummary {
+        let code = match self {
+            Self::SessionNotFound(_) => "session_not_found",
+            Self::ModelUnavailable(_) => "model_unavailable",
+            Self::InvalidOptions(_) => "invalid_generation_options",
+            Self::InvalidInput(_) => "invalid_input",
+            Self::Failed(reason) => observability::inference_failure_code(reason),
+            Self::Reply(_) => "reply_failed",
+        };
+        let reason_len = match self {
+            Self::SessionNotFound(reason)
+            | Self::ModelUnavailable(reason)
+            | Self::InvalidOptions(reason)
+            | Self::InvalidInput(reason)
+            | Self::Failed(reason) => reason.len(),
+            Self::Reply(_) => 0,
+        };
+        observability::FailureSummary { code, reason_len }
+    }
+}
+
+impl ObservabilityFailure for SpeechError {
+    fn observability_summary(&self) -> observability::FailureSummary {
+        let code = match self {
+            Self::SessionNotFound(_) => "session_not_found",
+            Self::ModelUnavailable(_) => "model_unavailable",
+            Self::InvalidInput(_) => "invalid_input",
+            Self::Failed(reason) => observability::inference_failure_code(reason),
+            Self::Reply(_) => "reply_failed",
+        };
+        let reason_len = match self {
+            Self::SessionNotFound(reason)
+            | Self::ModelUnavailable(reason)
+            | Self::InvalidInput(reason)
+            | Self::Failed(reason) => reason.len(),
+            Self::Reply(_) => 0,
+        };
+        observability::FailureSummary { code, reason_len }
+    }
+}
+
+impl ObservabilityFailure for VisionError {
+    fn observability_summary(&self) -> observability::FailureSummary {
+        let code = match self {
+            Self::SessionNotFound(_) => "session_not_found",
+            Self::ModelUnavailable(_) => "model_unavailable",
+            Self::InvalidInput(_) => "invalid_input",
+            Self::Failed(reason) => observability::inference_failure_code(reason),
+            Self::Reply(_) => "reply_failed",
+        };
+        let reason_len = match self {
+            Self::SessionNotFound(reason)
+            | Self::ModelUnavailable(reason)
+            | Self::InvalidInput(reason)
+            | Self::Failed(reason) => reason.len(),
+            Self::Reply(_) => 0,
+        };
+        observability::FailureSummary { code, reason_len }
+    }
+}
+
+fn inference_request_fields<'a>(
+    method: &'static str,
+    session_id: &'a str,
+    resolved: &'a ResolvedSessionRuntime,
+) -> observability::InferenceRequestFields<'a> {
+    observability::InferenceRequestFields {
+        method,
+        session_id,
+        app_id: &resolved.app_id,
+        use_case: &resolved.use_case,
+        profile_id: &resolved.profile_id,
+        runtime_id: &resolved.runtime_id,
+        candidate_count: resolved.image_refs.len(),
+    }
+}
+
+fn map_observed_failure<E, F>(
+    method: &'static str,
+    session_id: &str,
+    resolved: &ResolvedSessionRuntime,
+    started_at: std::time::Instant,
+    container_source: &'static str,
+    map_failed: &F,
+    reason: String,
+) -> E
+where
+    E: ObservabilityFailure,
+    F: Fn(String) -> E,
+{
+    let error = map_failed(reason);
+    observability::log_inference_request_failed(
+        inference_request_fields(method, session_id, resolved),
+        started_at,
+        container_source,
+        error.observability_summary(),
+    );
+    error
+}
+
 async fn resolve_session_runtime(
     state: &SharedState,
     session_id: &str,
@@ -1114,7 +1243,8 @@ fn lock_container_for_session<'a>(
     }
 }
 
-async fn with_locked_container<T, E>(
+async fn with_locked_container<T, E: ObservabilityFailure>(
+    method: &'static str,
     state: &SharedState,
     session_id: &str,
     mut resolved: ResolvedSessionRuntime,
@@ -1123,6 +1253,9 @@ async fn with_locked_container<T, E>(
 ) -> Result<T, E> {
     let mut op = Some(op);
     let expected_use_case = resolved.use_case.clone();
+    let started_at = observability::log_inference_request_started(inference_request_fields(
+        method, session_id, &resolved,
+    ));
     loop {
         let (handle, spawned) = match model_container(state, session_id, &resolved).await {
             Ok(container) => container,
@@ -1131,58 +1264,167 @@ async fn with_locked_container<T, E>(
                 continue;
             }
             Err(reason) if is_wait_retry(&reason) => {
-                resolved = refresh_resolved_session_runtime(state, session_id, &expected_use_case)
-                    .await
-                    .map_err(&map_failed)?;
+                resolved =
+                    match refresh_resolved_session_runtime(state, session_id, &expected_use_case)
+                        .await
+                    {
+                        Ok(resolved) => resolved,
+                        Err(reason) => {
+                            return Err(map_observed_failure(
+                                method,
+                                session_id,
+                                &resolved,
+                                started_at,
+                                "unavailable",
+                                &map_failed,
+                                reason,
+                            ));
+                        }
+                    };
                 continue;
             }
-            Err(reason) => return Err(map_failed(reason)),
-        };
-        let mut container = match lock_container_for_session(state, session_id, &handle, spawned) {
-            Ok(container) => container,
-            Err(LockContainerError::Retry) => continue,
-            Err(LockContainerError::Failed(reason)) => return Err(map_failed(reason)),
-        };
-
-        ensure_session_not_cancelled_or_terminate_spawned(state, session_id, &handle, spawned)
-            .map_err(&map_failed)?;
-        match ensure_handle_ready_for_request(&handle, spawned) {
-            Ok(()) => {}
-            Err(LockContainerError::Retry) => continue,
-            Err(LockContainerError::Failed(reason)) => return Err(map_failed(reason)),
-        }
-        if let Err(reason) = ensure_profile_epoch_current(state, &resolved) {
-            if !is_wait_retry(&reason) {
-                return Err(map_failed(reason));
+            Err(reason) => {
+                return Err(map_observed_failure(
+                    method,
+                    session_id,
+                    &resolved,
+                    started_at,
+                    "unavailable",
+                    &map_failed,
+                    reason,
+                ));
             }
-            drop(container);
-            terminate_stale_handle(state, &resolved.profile_id, &handle).await;
-            resolved = refresh_resolved_session_runtime(state, session_id, &expected_use_case)
-                .await
-                .map_err(&map_failed)?;
-            continue;
-        }
-        if let Err(reason) = ensure_container_matches_resolved(&container, &resolved) {
-            if !is_wait_retry(&reason) {
-                return Err(map_failed(reason));
+        };
+        {
+            let mut container =
+                match lock_container_for_session(state, session_id, &handle, spawned) {
+                    Ok(container) => container,
+                    Err(LockContainerError::Retry) => continue,
+                    Err(LockContainerError::Failed(reason)) => {
+                        return Err(map_observed_failure(
+                            method,
+                            session_id,
+                            &resolved,
+                            started_at,
+                            observability::container_source(spawned),
+                            &map_failed,
+                            reason,
+                        ));
+                    }
+                };
+
+            ensure_session_not_cancelled_or_terminate_spawned(state, session_id, &handle, spawned)
+                .map_err(|reason| {
+                    map_observed_failure(
+                        method,
+                        session_id,
+                        &resolved,
+                        started_at,
+                        observability::container_source(spawned),
+                        &map_failed,
+                        reason,
+                    )
+                })?;
+            match ensure_handle_ready_for_request(&handle, spawned) {
+                Ok(()) => {}
+                Err(LockContainerError::Retry) => continue,
+                Err(LockContainerError::Failed(reason)) => {
+                    return Err(map_observed_failure(
+                        method,
+                        session_id,
+                        &resolved,
+                        started_at,
+                        observability::container_source(spawned),
+                        &map_failed,
+                        reason,
+                    ));
+                }
             }
-            drop(container);
-            terminate_stale_handle(state, &resolved.profile_id, &handle).await;
-            resolved = refresh_resolved_session_runtime(state, session_id, &expected_use_case)
-                .await
-                .map_err(&map_failed)?;
-            continue;
-        }
-        let _active =
-            ActiveContainerRequest::new(state, &resolved.profile_id, session_id, handle.clone());
-        ensure_session_not_cancelled_or_terminate_spawned(state, session_id, &handle, spawned)
-            .map_err(&map_failed)?;
-        if spawned {
-            handle.publish();
+            if let Err(reason) = ensure_profile_epoch_current(state, &resolved) {
+                if !is_wait_retry(&reason) {
+                    return Err(map_observed_failure(
+                        method,
+                        session_id,
+                        &resolved,
+                        started_at,
+                        observability::container_source(spawned),
+                        &map_failed,
+                        reason,
+                    ));
+                }
+            } else if let Err(reason) = ensure_container_matches_resolved(&container, &resolved) {
+                if !is_wait_retry(&reason) {
+                    return Err(map_observed_failure(
+                        method,
+                        session_id,
+                        &resolved,
+                        started_at,
+                        observability::container_source(spawned),
+                        &map_failed,
+                        reason,
+                    ));
+                }
+            } else {
+                let _active = ActiveContainerRequest::new(
+                    state,
+                    &resolved.profile_id,
+                    session_id,
+                    handle.clone(),
+                );
+                ensure_session_not_cancelled_or_terminate_spawned(
+                    state, session_id, &handle, spawned,
+                )
+                .map_err(|reason| {
+                    map_observed_failure(
+                        method,
+                        session_id,
+                        &resolved,
+                        started_at,
+                        observability::container_source(spawned),
+                        &map_failed,
+                        reason,
+                    )
+                })?;
+                if spawned {
+                    handle.publish();
+                }
+
+                let op = op.take().expect("container operation called once");
+                let result = op(&mut container, &handle, spawned);
+                match &result {
+                    Ok(_) => observability::log_inference_request_succeeded(
+                        inference_request_fields(method, session_id, &resolved),
+                        started_at,
+                        observability::container_source(spawned),
+                    ),
+                    Err(error) => observability::log_inference_request_failed(
+                        inference_request_fields(method, session_id, &resolved),
+                        started_at,
+                        observability::container_source(spawned),
+                        error.observability_summary(),
+                    ),
+                }
+                return result;
+            }
         }
 
-        let op = op.take().expect("container operation called once");
-        return op(&mut container, &handle, spawned);
+        terminate_stale_handle(state, &resolved.profile_id, &handle).await;
+        resolved =
+            match refresh_resolved_session_runtime(state, session_id, &expected_use_case).await {
+                Ok(resolved) => resolved,
+                Err(reason) => {
+                    return Err(map_observed_failure(
+                        method,
+                        session_id,
+                        &resolved,
+                        started_at,
+                        observability::container_source(spawned),
+                        &map_failed,
+                        reason,
+                    ));
+                }
+            };
+        continue;
     }
 }
 
@@ -1382,7 +1624,7 @@ fn reply_generation_failure(
     call: &mut dyn VarlinkCallError,
     reason: String,
 ) -> varlink::Result<()> {
-    match runtime_error_code(&reason) {
+    match observability::runtime_error_code(&reason) {
         Some("context_window_exceeded") => call.reply_context_window_exceeded(reason),
         Some("unsupported_language") => call.reply_unsupported_language(reason),
         Some("safety_refusal") => call.reply_safety_refusal(reason),
@@ -1393,17 +1635,10 @@ fn reply_generation_failure(
 }
 
 fn reply_guided_failure(call: &mut dyn VarlinkCallError, reason: String) -> varlink::Result<()> {
-    match runtime_error_code(&reason) {
+    match observability::runtime_error_code(&reason) {
         Some("request_cancelled") => call.reply_request_cancelled(reason),
         _ => call.reply_guided_generation_failed(reason),
     }
-}
-
-fn runtime_error_code(reason: &str) -> Option<&str> {
-    reason
-        .strip_prefix("container returned error ")
-        .and_then(|rest| rest.split_once(':'))
-        .map(|(code, _)| code.trim())
 }
 
 async fn predict_next_completions(
@@ -1427,30 +1662,29 @@ async fn predict_next_completions(
         Err(error) => return Err(GenerationError::from(error)),
     };
 
-    let result = with_locked_container(
+    with_locked_container(
+        "StreamPredictNext",
         state,
         &session_id,
         resolved.clone(),
         GenerationError::Failed,
         |container, _handle, _spawned| {
-            container
+            let result = container
                 .predict_next(&prefix, max_tokens, options.temperature)
-                .map_err(|e| GenerationError::Failed(e.to_string()))
+                .map_err(|e| GenerationError::Failed(e.to_string()));
+            if state.is_session_cancelled(&session_id) {
+                return Err(GenerationError::Failed(request_cancelled_reason()));
+            }
+            if !state.is_current_predict_next(&session_id, generation) {
+                return Err(GenerationError::Failed(
+                    "container returned error request_cancelled: superseded by newer StreamPredictNext request"
+                        .to_string(),
+                ));
+            }
+            result
         },
     )
-    .await;
-
-    if state.is_session_cancelled(&session_id) {
-        return Err(GenerationError::Failed(request_cancelled_reason()));
-    }
-    if !state.is_current_predict_next(&session_id, generation) {
-        return Err(GenerationError::Failed(
-            "container returned error request_cancelled: superseded by newer StreamPredictNext request"
-                .to_string(),
-        ));
-    }
-
-    result
+    .await
 }
 
 async fn stream_guided_snapshots(
@@ -1468,6 +1702,7 @@ async fn stream_guided_snapshots(
         .await
         .map_err(GenerationError::from)?;
     with_locked_container(
+        "StreamRespondGuided",
         state,
         &session_id,
         resolved.clone(),
@@ -1581,6 +1816,7 @@ async fn stream_guided_tool_results(
         .await
         .map_err(GenerationError::from)?;
     with_locked_container(
+        "StreamSubmitToolResultsGuided",
         state,
         &session_id,
         resolved.clone(),

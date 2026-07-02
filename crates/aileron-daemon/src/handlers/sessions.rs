@@ -1,4 +1,5 @@
 /// Varlink handler for `aileron.Sessions`.
+use crate::observability;
 use crate::state::SharedState;
 #[allow(unused_imports)]
 // VarlinkCallError is a supertrait; its methods reach us via Call_* dyn objects
@@ -31,16 +32,18 @@ impl VarlinkInterface for SessionsHandler {
         session_id: String,
     ) -> varlink::Result<()> {
         self.rt.block_on(async {
-            let (profile_id, unused_profile_id) = {
+            let (app_id, use_case, profile_id, unused_profile_id) = {
                 let mut guard = self.state.0.lock().await;
                 match kill_session(&mut guard, &session_id) {
                     KillSessionResult::NotFound => return call.reply_session_not_found(session_id),
                     KillSessionResult::Removed {
+                        app_id,
+                        use_case,
                         profile_id,
                         unused_profile_id,
                     } => {
                         self.state.cancel_session_requests(&session_id);
-                        (profile_id, unused_profile_id)
+                        (app_id, use_case, profile_id, unused_profile_id)
                     }
                 }
             };
@@ -50,6 +53,12 @@ impl VarlinkInterface for SessionsHandler {
                 let mut containers = self.state.2.lock().await;
                 containers.kill(&unused_profile_id);
             }
+            observability::log_session_ended(observability::SessionFields {
+                session_id: &session_id,
+                app_id: &app_id,
+                use_case: &use_case,
+                profile_id: &profile_id,
+            });
             call.reply()
         })
     }
@@ -59,6 +68,8 @@ impl VarlinkInterface for SessionsHandler {
 enum KillSessionResult {
     NotFound,
     Removed {
+        app_id: String,
+        use_case: String,
         profile_id: String,
         unused_profile_id: Option<String>,
     },
@@ -88,6 +99,8 @@ fn kill_session(guard: &mut crate::state::Inner, session_id: &str) -> KillSessio
         .values()
         .any(|s| s.profile_id == session.profile_id);
     KillSessionResult::Removed {
+        app_id: session.app_id,
+        use_case: session.use_case,
         profile_id: session.profile_id.clone(),
         unused_profile_id: (!profile_still_used).then_some(session.profile_id),
     }
@@ -211,10 +224,19 @@ mod tests {
             .sessions
             .insert("session-b".to_string(), session("session-b", "profile-a"));
 
-        assert!(matches!(
-            kill_session(&mut inner, "session-a"),
-            KillSessionResult::Removed { .. }
-        ));
+        match kill_session(&mut inner, "session-a") {
+            KillSessionResult::Removed {
+                app_id,
+                use_case,
+                profile_id,
+                ..
+            } => {
+                assert_eq!(app_id, "org.aileron.Test");
+                assert_eq!(use_case, "language.extract");
+                assert_eq!(profile_id, "profile-a");
+            }
+            KillSessionResult::NotFound => panic!("session-a should be removed"),
+        }
 
         assert!(!inner.sessions.contains_key("session-a"));
         assert!(inner.sessions.contains_key("session-b"));

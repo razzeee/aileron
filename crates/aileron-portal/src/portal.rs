@@ -1126,6 +1126,7 @@ impl VisionPortalBackend {
         message: &str,
     ) -> zbus::Result<()>;
 
+    #[allow(clippy::too_many_arguments)]
     async fn stream_describe(
         &self,
         request_handle: OwnedObjectPath,
@@ -1197,6 +1198,7 @@ impl VisionPortalBackend {
         result
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn stream_ocr(
         &self,
         request_handle: OwnedObjectPath,
@@ -1268,6 +1270,7 @@ impl VisionPortalBackend {
         result
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn stream_segment(
         &self,
         request_handle: OwnedObjectPath,
