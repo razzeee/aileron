@@ -41,11 +41,20 @@ Request:
   "type": "generate",
   "system": "Stable system instructions",
   "prompt": "User prompt",
+  "input": [
+    {
+      "role": "user",
+      "content": [
+        {"type": "input_text", "text": "Describe this image."},
+        {"type": "input_image", "image": "base64-encoded-png", "mime_type": "image/png"}
+      ]
+    }
+  ],
   "max_tokens": 512
 }
 ```
 
-The `system` field is optional. `max_tokens` is a positive integer selected by the caller or daemon defaults.
+The `system` field is optional. `input` is the canonical multimodal message array for `generate` requests. The daemon also sends `prompt` as the text-only rendering of `input` for runtimes that implement text generation. `max_tokens` is a positive integer selected by the caller or daemon defaults.
 
 Streaming response:
 

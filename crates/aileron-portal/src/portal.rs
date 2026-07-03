@@ -348,7 +348,8 @@ impl LanguagePortalBackend {
         &self,
         request_handle: OwnedObjectPath,
         session_handle: OwnedObjectPath,
-        prompt: &str,
+        input_json: &str,
+        media_fds: Vec<OwnedFd>,
         options: GenerationOptionsDbus,
         #[zbus(connection)] conn: &zbus::Connection,
         #[zbus(header)] header: Header<'_>,
@@ -368,11 +369,13 @@ impl LanguagePortalBackend {
                 .await?;
             ensure_request_active(&self.state, request_id)?;
             let daemon_session_id = record.daemon_session_id;
+            let media_paths = media_fds.iter().map(fd_proc_path).collect::<Vec<_>>();
             let ipc_conn = connect_request_daemon(&self.state, request_id)?;
             let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(ipc_conn);
             let mut call = client.stream_response(
                 daemon_session_id,
-                prompt.to_string(),
+                input_json.to_string(),
+                media_paths,
                 options.into_varlink(),
             );
             let iter = call

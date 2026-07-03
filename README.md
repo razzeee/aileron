@@ -306,8 +306,8 @@ varlink call "unix:$XDG_RUNTIME_DIR/aileron.socket/aileron.Inference.CreateSessi
 
 # 7. Generate (replace SESSION_ID)
 varlink call --more "unix:$XDG_RUNTIME_DIR/aileron.socket/aileron.Inference.StreamResponse" \
-    '{"session_id":"SESSION_ID","prompt":"Hello world","options":{"maximum_response_tokens":64,"temperature":0.0,"sampling_mode":"greedy"}}'
-# → {"token": "Hello world"}   stub echoes the prompt
+    '{"session_id":"SESSION_ID","input_json":"[{\"type\":\"input_text\",\"text\":\"Hello world\"}]","media_paths":[],"options":{"maximum_response_tokens":64,"temperature":0.0,"sampling_mode":"greedy"}}'
+# → {"token": "Hello world"}   stub echoes the rendered input
 
 # 8. End the session
 varlink call "unix:$XDG_RUNTIME_DIR/aileron.socket/aileron.Inference.EndSession" \
@@ -392,7 +392,7 @@ type VisionSegment (label: string, confidence: float, x: float, y: float, width:
 method GetUseCaseAvailability(app_id: string, use_case: string) -> (availability: ModelAvailability)
 method CreateSession(app_id: string, use_case: string, instructions: string) -> (session_id: string, profile_id: string)
 method Prewarm(session_id: string) -> ()
-method StreamResponse(session_id: string, prompt: string, options: GenerationOptions) -> (token: string)
+method StreamResponse(session_id: string, input_json: string, media_paths: []string, options: GenerationOptions) -> (token: string)
 method StreamPredictNext(session_id: string, prefix: string, options: GenerationOptions) -> (completions: []string)
 method StreamRespondGuided(session_id: string, prompt: string, fields: []GuidedField, tools: []ToolDefinition, options: GenerationOptions) -> (snapshot_json: string, tool_calls: []ToolCall)
 method StreamSubmitToolResultsGuided(session_id: string, prompt: string, results: []ToolResult, fields: []GuidedField, tools: []ToolDefinition, options: GenerationOptions) -> (snapshot_json: string, tool_calls: []ToolCall)
@@ -489,7 +489,7 @@ Apps call the public interfaces on `org.freedesktop.portal.Desktop`. The public 
 
 | Method | Parameters | Returns | Notes |
 |---|---|---|---|
-| `StreamResponse` | `session_handle: o, prompt: s, options: a{sv}` | `handle: o` | Full language generation sessions only; emits `TokenReceived` signals; final token has `done=true` |
+| `StreamResponse` | `session_handle: o, input_json: s, media_fds: ah, options: a{sv}` | `handle: o` | Full language generation sessions only; emits `TokenReceived` signals; final token has `done=true` |
 | `StreamPredictNext` | `session_handle: o, prefix: s, options: a{sv}` | `handle: o` | `language.complete` sessions only; emits `PredictionReceived` signals for up to three short completions; newer calls for the same session cancel older in-flight prediction calls |
 | `StreamRespondGuided` | `session_handle: o, prompt: s, fields: a(sssb), tools: a(sss), options: a{sv}` | `handle: o` | Full language generation sessions only; emits `GuidedSnapshotReceived` and/or `GuidedToolCallsReceived` signals; final event has `done=true` |
 | `StreamSubmitToolResultsGuided` | `session_handle: o, prompt: s, results: a(sss), fields: a(sssb), tools: a(sss), options: a{sv}` | `handle: o` | Full language generation sessions only; continues after the app executes or rejects tool calls; emits guided signals |

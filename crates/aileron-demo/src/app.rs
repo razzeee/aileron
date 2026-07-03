@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use zbus::zvariant::{Fd, OwnedObjectPath, OwnedValue, Type, Value};
+use zbus::zvariant::{Fd, OwnedFd, OwnedObjectPath, OwnedValue, Type, Value};
 
 const PORTAL_BUS: &str = "org.freedesktop.portal.Desktop";
 const PORTAL_PATH: &str = "/org/freedesktop/portal/desktop";
@@ -32,6 +32,10 @@ type PortalOptions = HashMap<String, OwnedValue>;
 
 fn empty_options() -> PortalOptions {
     HashMap::new()
+}
+
+fn text_shorthand_json(text: &str) -> String {
+    serde_json::json!([{ "type": "input_text", "text": text }]).to_string()
 }
 
 fn portal_connection() -> zbus::Result<zbus::blocking::Connection> {
@@ -969,7 +973,7 @@ fn summarize_streaming(text: &str, tx: std::sync::mpsc::Sender<DemoEvent>) -> an
 
     tx.send(DemoEvent::Phase(DemoPhase::WaitingForModel))?;
 
-    let prompt = DemoMode::Summarize.prompt(text);
+    let input_json = text_shorthand_json(&DemoMode::Summarize.prompt(text));
 
     // Subscribe before generation and consume concurrently. The D-Bus method
     // reply only marks stream completion; tokens are delivered as signals.
@@ -1002,8 +1006,10 @@ fn summarize_streaming(text: &str, tx: std::sync::mpsc::Sender<DemoEvent>) -> an
 
     let options = generation_options(512, "", "");
     tx.send(DemoEvent::Phase(DemoPhase::RequestingStream))?;
-    let stream_result: zbus::Result<OwnedObjectPath> =
-        proxy.call("StreamResponse", &(&session_handle, &prompt, options));
+    let stream_result: zbus::Result<OwnedObjectPath> = proxy.call(
+        "StreamResponse",
+        &(&session_handle, &input_json, Vec::<OwnedFd>::new(), options),
+    );
     let request_handle = match stream_result {
         Ok(handle) => handle,
         Err(error) => {
@@ -1062,8 +1068,11 @@ fn stream_language_text(
         let _ = stream_done_tx.send(result);
     });
 
-    let stream_result: zbus::Result<OwnedObjectPath> =
-        proxy.call("StreamResponse", &(session_handle, prompt, options));
+    let input_json = text_shorthand_json(prompt);
+    let stream_result: zbus::Result<OwnedObjectPath> = proxy.call(
+        "StreamResponse",
+        &(session_handle, &input_json, Vec::<OwnedFd>::new(), options),
+    );
     let request_handle = stream_result?;
     let content = stream_done_rx
         .recv_timeout(Duration::from_secs(2))

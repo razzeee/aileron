@@ -18,6 +18,8 @@ pub struct Request {
     #[serde(default)]
     pub prompt: Option<String>,
     #[serde(default)]
+    pub input: Option<Vec<Message>>,
+    #[serde(default)]
     pub max_tokens: Option<u32>,
     #[serde(default)]
     pub choices: Option<u32>,
@@ -37,6 +39,26 @@ pub struct Request {
     pub tools: Option<Vec<Value>>,
     #[serde(default)]
     pub tool_results: Option<Vec<Value>>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct Message {
+    pub role: String,
+    #[serde(default)]
+    pub content: Vec<ContentPart>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(tag = "type")]
+pub enum ContentPart {
+    #[serde(rename = "input_text")]
+    InputText { text: String },
+    #[serde(rename = "output_text")]
+    OutputText { text: String },
+    #[serde(rename = "input_image")]
+    InputImage { image: String, mime_type: String },
+    #[serde(rename = "input_audio")]
+    InputAudio { audio: String, mime_type: String },
 }
 
 #[derive(Clone, Debug, Deserialize)]

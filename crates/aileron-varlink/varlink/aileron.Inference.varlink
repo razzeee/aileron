@@ -60,7 +60,8 @@ method CreateSession(app_id: string, use_case: string, instructions: string) -> 
 method Prewarm(session_id: string) -> ()
 
 # Stream response tokens. Session must have been created with a language generation use_case.
-method StreamResponse(session_id: string, prompt: string, options: GenerationOptions) -> (token: string)
+# input_json is either content-part shorthand or a role-message array. media_paths contains readable request-scoped media paths referenced by fd_index.
+method StreamResponse(session_id: string, input_json: string, media_paths: []string, options: GenerationOptions) -> (token: string)
 
 # Stream up to three short inline continuations from the raw text prefix. Session must have been created with use_case: language.complete.
 # Newer StreamPredictNext calls for the same session supersede older in-flight calls; superseded calls fail with RequestCancelled.

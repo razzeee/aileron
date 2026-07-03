@@ -1,12 +1,13 @@
 /// Varlink handler for `aileron.Inference`.
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::PathBuf;
 use std::sync::{MutexGuard, TryLockError};
 use std::time::Duration;
 use uuid::Uuid;
 
-use crate::container::{Container, ContainerHandle};
+use crate::container::{Container, ContainerHandle, InputMessage, InputPart};
 use crate::observability::{self, ObservabilityFailure};
 use crate::profiles::RuntimeCandidate;
 use crate::state::SharedState;
@@ -34,6 +35,8 @@ type ProfileRuntime = (
     PathBuf,
     HashMap<String, String>,
 );
+
+const STREAM_RESPONSE_MEDIA_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 struct ResolvedSessionRuntime {
@@ -254,11 +257,21 @@ impl VarlinkInterface for InferenceHandler {
         &self,
         call: &mut dyn Call_StreamResponse,
         session_id: String,
-        prompt: String,
+        input_json: String,
+        media_paths: Vec<String>,
         options: GenerationOptions,
     ) -> varlink::Result<()> {
         self.rt.block_on(async {
-            match stream_tokens(&self.state, call, session_id, prompt, options).await {
+            match stream_tokens(
+                &self.state,
+                call,
+                session_id,
+                input_json,
+                media_paths,
+                options,
+            )
+            .await
+            {
                 Ok(()) => Ok(()),
                 Err(GenerationError::SessionNotFound(id)) => call.reply_session_not_found(id),
                 Err(GenerationError::ModelUnavailable(reason)) => {
@@ -900,17 +913,241 @@ async fn embedding_vector(
     .await
 }
 
+fn normalize_stream_input(
+    input_json: &str,
+    media_paths: &[String],
+) -> Result<Vec<InputMessage>, String> {
+    let value: Value =
+        serde_json::from_str(input_json).map_err(|e| format!("invalid input_json: {e}"))?;
+    let items = value
+        .as_array()
+        .ok_or_else(|| "input_json must be a JSON array".to_string())?;
+    if items.is_empty() {
+        return Err("input_json must not be empty".to_string());
+    }
+
+    let first = items[0]
+        .as_object()
+        .ok_or_else(|| "top-level entries must be objects".to_string())?;
+    let is_message_array = first.contains_key("role") || first.contains_key("content");
+
+    if is_message_array {
+        items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| normalize_message(item, media_paths, index))
+            .collect()
+    } else {
+        Ok(vec![InputMessage {
+            role: "user".to_string(),
+            content: items
+                .iter()
+                .enumerate()
+                .map(|(index, item)| normalize_part(item, media_paths, index))
+                .collect::<Result<Vec<_>, _>>()?,
+        }])
+    }
+}
+
+fn normalize_message(
+    value: &Value,
+    media_paths: &[String],
+    index: usize,
+) -> Result<InputMessage, String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| format!("message {index} must be an object"))?;
+    let role = object
+        .get("role")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("message {index} is missing role"))?;
+    if !matches!(role, "system" | "user" | "assistant" | "tool") {
+        return Err(format!("message {index} has unsupported role {role}"));
+    }
+    let content = object
+        .get("content")
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("message {index} content must be an array"))?;
+    if content.is_empty() {
+        return Err(format!("message {index} content must not be empty"));
+    }
+
+    Ok(InputMessage {
+        role: role.to_string(),
+        content: content
+            .iter()
+            .enumerate()
+            .map(|(part_index, part)| normalize_part(part, media_paths, part_index))
+            .collect::<Result<Vec<_>, _>>()?,
+    })
+}
+
+fn normalize_part(
+    value: &Value,
+    media_paths: &[String],
+    index: usize,
+) -> Result<InputPart, String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| format!("content part {index} must be an object"))?;
+    if object.contains_key("role") || object.contains_key("content") {
+        return Err("top-level input must not mix messages and content parts".to_string());
+    }
+    let part_type = object
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("content part {index} is missing type"))?;
+
+    match part_type {
+        "input_text" => Ok(InputPart::InputText {
+            text: non_empty_string(object, "text", index)?,
+        }),
+        "output_text" => Ok(InputPart::OutputText {
+            text: non_empty_string(object, "text", index)?,
+        }),
+        "input_image" => media_part(object, media_paths, index, "image/", |data, mime_type| {
+            InputPart::InputImage {
+                image: data,
+                mime_type,
+            }
+        }),
+        "input_audio" => media_part(object, media_paths, index, "audio/", |data, mime_type| {
+            InputPart::InputAudio {
+                audio: data,
+                mime_type,
+            }
+        }),
+        other => Err(format!("content part {index} has unsupported type {other}")),
+    }
+}
+
+fn non_empty_string(
+    object: &Map<String, Value>,
+    key: &str,
+    index: usize,
+) -> Result<String, String> {
+    let value = object
+        .get(key)
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("content part {index} is missing {key}"))?;
+    if value.is_empty() {
+        return Err(format!("content part {index} {key} must not be empty"));
+    }
+    Ok(value.to_string())
+}
+
+fn media_part(
+    object: &Map<String, Value>,
+    media_paths: &[String],
+    index: usize,
+    mime_prefix: &str,
+    build: impl FnOnce(String, String) -> InputPart,
+) -> Result<InputPart, String> {
+    let fd_index = object
+        .get("fd_index")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| format!("content part {index} is missing fd_index"))?
+        as usize;
+    let mime_type = non_empty_string(object, "mime_type", index)?;
+    if !mime_type.starts_with(mime_prefix) {
+        return Err(format!(
+            "content part {index} has unsupported MIME type {mime_type}"
+        ));
+    }
+    let path = media_paths
+        .get(fd_index)
+        .ok_or_else(|| format!("content part {index} fd_index {fd_index} is out of range"))?;
+    let data = read_stream_response_media_path(path, fd_index)?;
+    Ok(build(base64_encode(&data), mime_type))
+}
+
+fn read_stream_response_media_path(path: &str, fd_index: usize) -> Result<Vec<u8>, String> {
+    if path.trim().is_empty() {
+        return Err(format!("media fd_index {fd_index} path must not be empty"));
+    }
+
+    let file = std::fs::File::open(path)
+        .map_err(|e| format!("failed to read media fd_index {fd_index}: {e}"))?;
+    let mut reader = file.take(STREAM_RESPONSE_MEDIA_MAX_BYTES + 1);
+    let mut data = Vec::new();
+    reader
+        .read_to_end(&mut data)
+        .map_err(|e| format!("failed to read media fd_index {fd_index}: {e}"))?;
+
+    if data.len() as u64 > STREAM_RESPONSE_MEDIA_MAX_BYTES {
+        return Err(format!(
+            "media fd_index {fd_index} exceeds maximum size of {STREAM_RESPONSE_MEDIA_MAX_BYTES} bytes"
+        ));
+    }
+
+    Ok(data)
+}
+
+fn render_text_prompt(input: &[InputMessage]) -> String {
+    if input.len() == 1 && input[0].role == "user" {
+        return render_text_content(&input[0]);
+    }
+
+    input
+        .iter()
+        .map(|message| {
+            let content = render_text_content(message);
+            format!("{}: {content}", message.role)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn render_text_content(message: &InputMessage) -> String {
+    message
+        .content
+        .iter()
+        .filter_map(|part| match part {
+            InputPart::InputText { text } | InputPart::OutputText { text } => Some(text.as_str()),
+            InputPart::InputImage { .. } | InputPart::InputAudio { .. } => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn base64_encode(data: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = *chunk.get(1).unwrap_or(&0);
+        let b2 = *chunk.get(2).unwrap_or(&0);
+        out.push(TABLE[(b0 >> 2) as usize] as char);
+        out.push(TABLE[(((b0 & 0b0000_0011) << 4) | (b1 >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[(((b1 & 0b0000_1111) << 2) | (b2 >> 6)) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[(b2 & 0b0011_1111) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
 async fn stream_tokens(
     state: &SharedState,
     call: &mut dyn Call_StreamResponse,
     session_id: String,
-    prompt: String,
+    input_json: String,
+    media_paths: Vec<String>,
     options: GenerationOptions,
 ) -> Result<(), GenerationError> {
     let max_tokens = validate_options(&options).map_err(GenerationError::InvalidOptions)?;
     let resolved = resolve_session_runtime(state, &session_id, ensure_language_generation_use_case)
         .await
         .map_err(GenerationError::from)?;
+    let input =
+        normalize_stream_input(&input_json, &media_paths).map_err(GenerationError::InvalidInput)?;
+    let prompt = render_text_prompt(&input);
     let instructions =
         apply_translation_hints(&resolved.use_case, resolved.instructions.clone(), &options);
     with_locked_container(
@@ -926,30 +1163,36 @@ async fn stream_tokens(
             let mut saw_token = false;
             let mut cancelled = false;
 
-            let result = container.generate(Some(&instructions), &prompt, max_tokens, |token| {
-                if cancelled || state.is_session_cancelled(&session_id) {
-                    cancelled = true;
-                    return;
-                }
-                if !token.is_empty() {
-                    saw_token = true;
-                }
-                if !wants_more {
-                    pending_token = Some(token);
-                    return;
-                }
-
-                if reply_error.is_some() {
-                    return;
-                }
-
-                if let Some(previous) = pending_token.replace(token) {
-                    call.set_continues(true);
-                    if let Err(e) = call.reply(previous) {
-                        reply_error = Some(e);
+            let result = container.generate(
+                Some(&instructions),
+                &prompt,
+                Some(&input),
+                max_tokens,
+                |token| {
+                    if cancelled || state.is_session_cancelled(&session_id) {
+                        cancelled = true;
+                        return;
                     }
-                }
-            });
+                    if !token.is_empty() {
+                        saw_token = true;
+                    }
+                    if !wants_more {
+                        pending_token = Some(token);
+                        return;
+                    }
+
+                    if reply_error.is_some() {
+                        return;
+                    }
+
+                    if let Some(previous) = pending_token.replace(token) {
+                        call.set_continues(true);
+                        if let Err(e) = call.reply(previous) {
+                            reply_error = Some(e);
+                        }
+                    }
+                },
+            );
 
             if let Some(e) = reply_error {
                 return Err(GenerationError::Reply(e));
@@ -2188,6 +2431,72 @@ mod tests {
     #[test]
     fn validate_options_accepts_normal_generation_options() {
         assert_eq!(validate_options(&generation_options()), Ok(128));
+    }
+
+    #[test]
+    fn stream_input_normalizes_text_shorthand() {
+        let input =
+            normalize_stream_input(r#"[{"type":"input_text","text":"hello"}]"#, &[]).unwrap();
+
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0].role, "user");
+        assert_eq!(
+            input[0].content,
+            vec![InputPart::InputText {
+                text: "hello".to_string()
+            }]
+        );
+        assert_eq!(render_text_prompt(&input), "hello");
+    }
+
+    #[test]
+    fn stream_input_embeds_media_fd_parts() {
+        let dir = tempfile::tempdir().unwrap();
+        let media_path = dir.path().join("image.png");
+        std::fs::write(&media_path, [1_u8, 2, 3]).unwrap();
+        let media_paths = vec![media_path.display().to_string()];
+
+        let input = normalize_stream_input(
+            r#"[{"role":"user","content":[{"type":"input_image","fd_index":0,"mime_type":"image/png"}]}]"#,
+            &media_paths,
+        )
+        .unwrap();
+
+        assert_eq!(
+            input[0].content,
+            vec![InputPart::InputImage {
+                image: "AQID".to_string(),
+                mime_type: "image/png".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn stream_input_rejects_out_of_range_fd_index() {
+        let error = normalize_stream_input(
+            r#"[{"type":"input_audio","fd_index":1,"mime_type":"audio/wav"}]"#,
+            &[],
+        )
+        .unwrap_err();
+
+        assert!(error.contains("fd_index 1 is out of range"));
+    }
+
+    #[test]
+    fn stream_input_rejects_oversized_media() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        file.as_file()
+            .set_len(STREAM_RESPONSE_MEDIA_MAX_BYTES + 1)
+            .unwrap();
+        let media_paths = vec![file.path().display().to_string()];
+
+        let error = normalize_stream_input(
+            r#"[{"type":"input_image","fd_index":0,"mime_type":"image/png"}]"#,
+            &media_paths,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("exceeds maximum size"));
     }
 
     #[hegel::test]

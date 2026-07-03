@@ -364,6 +364,7 @@ impl Container {
         &mut self,
         system: Option<&str>,
         prompt: &str,
+        input: Option<&[InputMessage]>,
         max_tokens: u32,
         mut on_token: impl FnMut(String),
     ) -> Result<()> {
@@ -371,6 +372,7 @@ impl Container {
         let mut req = ContainerRequest::new(id.clone(), "generate");
         req.system = system.map(str::to_string);
         req.prompt = Some(prompt.to_string());
+        req.input = input.map(|messages| messages.to_vec());
         req.max_tokens = Some(max_tokens);
         let line = serde_json::to_string(&req)? + "\n";
         self.stdin.write_all(line.as_bytes())?;
@@ -2152,6 +2154,8 @@ struct ContainerRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     prompt: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    input: Option<Vec<InputMessage>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     choices: Option<u32>,
@@ -2183,6 +2187,7 @@ impl ContainerRequest {
             r#type: request_type.to_string(),
             system: None,
             prompt: None,
+            input: None,
             max_tokens: None,
             choices: None,
             temperature: None,
@@ -2195,6 +2200,25 @@ impl ContainerRequest {
             tool_results: None,
         }
     }
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct InputMessage {
+    pub role: String,
+    pub content: Vec<InputPart>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
+#[serde(tag = "type")]
+pub enum InputPart {
+    #[serde(rename = "input_text")]
+    InputText { text: String },
+    #[serde(rename = "output_text")]
+    OutputText { text: String },
+    #[serde(rename = "input_image")]
+    InputImage { image: String, mime_type: String },
+    #[serde(rename = "input_audio")]
+    InputAudio { audio: String, mime_type: String },
 }
 
 /// Instructs the container to constrain output to a JSON Schema.
@@ -3418,7 +3442,9 @@ mod tests {
 
         let mut generated = String::new();
         container
-            .generate(None, "hello world", 16, |token| generated.push_str(&token))
+            .generate(None, "hello world", None, 16, |token| {
+                generated.push_str(&token)
+            })
             .expect("generate through container wrapper");
         assert!(!generated.is_empty());
 

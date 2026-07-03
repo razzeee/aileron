@@ -1,6 +1,8 @@
 use std::time::Duration;
 
-use aileron_runtime::{Request, clamp_choices, first_tool_name, send, send_unsupported};
+use aileron_runtime::{
+    ContentPart, Request, clamp_choices, first_tool_name, send, send_unsupported,
+};
 use anyhow::Result;
 use serde_json::json;
 
@@ -36,7 +38,31 @@ fn handle_request(req: Request) -> Result<()> {
 }
 
 fn handle_generate(req: &Request) -> Result<()> {
-    let prompt = req.prompt.as_deref().unwrap_or("(empty prompt)");
+    let rendered_input = req.input.as_ref().map(|messages| {
+        messages
+            .iter()
+            .map(|message| {
+                let content = message
+                    .content
+                    .iter()
+                    .map(|part| match part {
+                        ContentPart::InputText { text } | ContentPart::OutputText { text } => {
+                            text.as_str()
+                        }
+                        ContentPart::InputImage { .. } => "[image]",
+                        ContentPart::InputAudio { .. } => "[audio]",
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                format!("{}: {content}", message.role)
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    });
+    let prompt = rendered_input
+        .as_deref()
+        .or(req.prompt.as_deref())
+        .unwrap_or("(empty prompt)");
     let words = prompt.split_whitespace().collect::<Vec<_>>();
     if words.is_empty() {
         return send(json!({

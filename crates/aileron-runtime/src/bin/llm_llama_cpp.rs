@@ -3,7 +3,9 @@ use aileron_runtime::llama_runtime::{
     generate_completion, initialize_llama, load_model, new_context, new_embedding_context,
     render_tool_results,
 };
-use aileron_runtime::{Request, clamp_choices, first_json_value, send, send_unsupported};
+use aileron_runtime::{
+    ContentPart, Request, clamp_choices, first_json_value, send, send_unsupported,
+};
 use anyhow::Result;
 use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::llama_backend::LlamaBackend;
@@ -46,6 +48,15 @@ fn handle_generate(model: &LlamaModel, ctx: &mut LlamaContext<'_>, req: &Request
     let max_tokens = req.max_tokens.unwrap_or(512);
     let temperature = req.temperature.unwrap_or(0.0);
 
+    if input_contains_media(req) {
+        return send(json!({
+            "id": req.id,
+            "error": "unsupported_modality",
+            "reason": "input_image and input_audio are not supported by this runtime",
+            "done": true,
+        }));
+    }
+
     generate_chat(
         model,
         ctx,
@@ -57,6 +68,19 @@ fn handle_generate(model: &LlamaModel, ctx: &mut LlamaContext<'_>, req: &Request
         |token| send(json!({"id": req.id, "token": token})),
     )?;
     send(json!({"id": req.id, "done": true}))
+}
+
+fn input_contains_media(req: &Request) -> bool {
+    req.input.as_ref().is_some_and(|messages| {
+        messages.iter().any(|message| {
+            message.content.iter().any(|part| {
+                matches!(
+                    part,
+                    ContentPart::InputImage { .. } | ContentPart::InputAudio { .. }
+                )
+            })
+        })
+    })
 }
 
 fn handle_predict_next(

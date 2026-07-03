@@ -3,7 +3,9 @@ use aileron_runtime::llama_runtime::{
     generate_completion, generate_from_evaluated_prompt, initialize_llama, load_model, new_context,
     new_embedding_context, render_chat_prompt, render_tool_results,
 };
-use aileron_runtime::{Request, clamp_choices, first_json_value, send, send_unsupported};
+use aileron_runtime::{
+    ContentPart, Request, clamp_choices, first_json_value, send, send_unsupported,
+};
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use llama_cpp_2::context::LlamaContext;
@@ -81,7 +83,7 @@ fn handle_request<'model>(
     req: Request,
 ) -> Result<()> {
     match req.request_type.as_str() {
-        "generate" => handle_generate(model, ctx, &req),
+        "generate" => handle_generate(model, mtmd, ctx, &req),
         "predict_next" => handle_predict_next(model, ctx, &req),
         "generate_structured" => handle_generate_structured(model, ctx, &req),
         "generate_structured_stream" => handle_generate_structured_stream(model, ctx, &req),
@@ -93,11 +95,44 @@ fn handle_request<'model>(
     }
 }
 
-fn handle_generate(model: &LlamaModel, ctx: &mut LlamaContext<'_>, req: &Request) -> Result<()> {
+fn handle_generate(
+    model: &LlamaModel,
+    mtmd: &MtmdContext,
+    ctx: &mut LlamaContext<'_>,
+    req: &Request,
+) -> Result<()> {
     let system = req.system.as_deref().unwrap_or(DEFAULT_SYSTEM);
     let prompt = req.prompt.as_deref().unwrap_or_default();
     let max_tokens = req.max_tokens.unwrap_or(512);
     let temperature = req.temperature.unwrap_or(0.0);
+
+    if input_contains_audio(req) {
+        return send(json!({
+            "id": req.id,
+            "error": "unsupported_modality",
+            "reason": "input_audio is not supported by this runtime generate path",
+            "done": true,
+        }));
+    }
+
+    if input_image_count(req) > 1 {
+        return send(json!({
+            "id": req.id,
+            "error": "unsupported_modality",
+            "reason": "multiple input_image parts are not supported by this runtime generate path",
+            "done": true,
+        }));
+    }
+
+    if let Some(image) = first_input_image(req) {
+        return match generate_for_image_bytes(
+            model, mtmd, ctx, req, system, prompt, image, max_tokens, None,
+        ) {
+            Ok(text) => send(json!({"id": req.id, "token": text.trim(), "done": true})),
+            Err(ImageRequestError::InvalidImage(reason)) => send_invalid_image(req, reason),
+            Err(ImageRequestError::Runtime(err)) => Err(err),
+        };
+    }
 
     generate_chat(
         model,
@@ -323,6 +358,39 @@ fn prompt_from_request_or_env(req: &Request, env_name: &str, default: &str) -> S
         .unwrap_or_else(|| default.to_string())
 }
 
+fn first_input_image(req: &Request) -> Option<&str> {
+    req.input.as_ref()?.iter().find_map(|message| {
+        message.content.iter().find_map(|part| match part {
+            ContentPart::InputImage { image, .. } => Some(image.as_str()),
+            _ => None,
+        })
+    })
+}
+
+fn input_image_count(req: &Request) -> usize {
+    req.input
+        .as_ref()
+        .map(|messages| {
+            messages
+                .iter()
+                .flat_map(|message| &message.content)
+                .filter(|part| matches!(part, ContentPart::InputImage { .. }))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+fn input_contains_audio(req: &Request) -> bool {
+    req.input.as_ref().is_some_and(|messages| {
+        messages.iter().any(|message| {
+            message
+                .content
+                .iter()
+                .any(|part| matches!(part, ContentPart::InputAudio { .. }))
+        })
+    })
+}
+
 enum ImageRequestError {
     InvalidImage(String),
     Runtime(anyhow::Error),
@@ -344,7 +412,48 @@ fn generate_for_image(
     schema: Option<&Value>,
 ) -> std::result::Result<String, ImageRequestError> {
     let image = image_bytes(req).map_err(ImageRequestError::InvalidImage)?;
-    let bitmap = MtmdBitmap::from_buffer(mtmd, &image, false).context("decode image for mtmd")?;
+    generate_for_image_data(
+        model,
+        mtmd,
+        ctx,
+        req,
+        DEFAULT_SYSTEM,
+        prompt,
+        &image,
+        max_tokens,
+        schema,
+    )
+}
+
+fn generate_for_image_bytes(
+    model: &LlamaModel,
+    mtmd: &MtmdContext,
+    ctx: &mut LlamaContext<'_>,
+    req: &Request,
+    system: &str,
+    prompt: &str,
+    image: &str,
+    max_tokens: u32,
+    schema: Option<&Value>,
+) -> std::result::Result<String, ImageRequestError> {
+    let image = decode_and_validate_image(image).map_err(ImageRequestError::InvalidImage)?;
+    generate_for_image_data(
+        model, mtmd, ctx, req, system, prompt, &image, max_tokens, schema,
+    )
+}
+
+fn generate_for_image_data(
+    model: &LlamaModel,
+    mtmd: &MtmdContext,
+    ctx: &mut LlamaContext<'_>,
+    req: &Request,
+    system: &str,
+    prompt: &str,
+    image: &[u8],
+    max_tokens: u32,
+    schema: Option<&Value>,
+) -> std::result::Result<String, ImageRequestError> {
+    let bitmap = MtmdBitmap::from_buffer(mtmd, image, false).context("decode image for mtmd")?;
     let media_prompt = match schema {
         Some(schema) => format!(
             "{prompt}\n\nReturn only valid JSON matching this schema:\n{}\n{}",
@@ -353,7 +462,7 @@ fn generate_for_image(
         ),
         None => format!("{prompt}\n{}", mtmd_default_marker()),
     };
-    let rendered = render_chat_prompt(model, DEFAULT_SYSTEM, &media_prompt)?;
+    let rendered = render_chat_prompt(model, system, &media_prompt)?;
     let chunks = mtmd
         .tokenize(
             MtmdInputText {
@@ -386,9 +495,7 @@ fn image_bytes(req: &Request) -> std::result::Result<Vec<u8>, String> {
     };
 
     let bytes = if let Some(text) = value.as_str() {
-        base64::engine::general_purpose::STANDARD
-            .decode(text)
-            .map_err(|err| err.to_string())?
+        decode_base64_image(text)?
     } else if let Some(items) = value.as_array() {
         let mut out = Vec::with_capacity(items.len());
         for item in items {
@@ -405,6 +512,20 @@ fn image_bytes(req: &Request) -> std::result::Result<Vec<u8>, String> {
         return Err("image must be a base64 string or byte array".to_string());
     };
 
+    validate_image_bytes(bytes)
+}
+
+fn decode_base64_image(text: &str) -> std::result::Result<Vec<u8>, String> {
+    base64::engine::general_purpose::STANDARD
+        .decode(text)
+        .map_err(|err| err.to_string())
+}
+
+fn decode_and_validate_image(text: &str) -> std::result::Result<Vec<u8>, String> {
+    validate_image_bytes(decode_base64_image(text)?)
+}
+
+fn validate_image_bytes(bytes: Vec<u8>) -> std::result::Result<Vec<u8>, String> {
     if bytes.starts_with(b"\xff\xd8\xff") || bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
         Ok(bytes)
     } else {
