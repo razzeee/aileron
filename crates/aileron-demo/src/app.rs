@@ -1137,16 +1137,16 @@ fn stream_guided_response(
     tools: Vec<ToolDefinitionDbus>,
     options: PortalOptions,
 ) -> anyhow::Result<(String, Vec<ToolCallDbus>)> {
-    stream_guided_call(
-        None,
+    stream_guided_call(GuidedPortalCall {
+        results: None,
         session_handle,
         prompt,
-        Vec::new(),
+        media_files: Vec::new(),
         fields,
         tools,
         options,
-        None,
-    )
+        snapshot_handler: None,
+    })
 }
 
 fn stream_guided_response_with_snapshots(
@@ -1180,16 +1180,16 @@ fn stream_guided_response_with_snapshot_handler(
     options: PortalOptions,
     snapshot_handler: &mut dyn FnMut(&str) -> anyhow::Result<()>,
 ) -> anyhow::Result<(String, Vec<ToolCallDbus>)> {
-    stream_guided_call(
-        None,
+    stream_guided_call(GuidedPortalCall {
+        results: None,
         session_handle,
         prompt,
-        Vec::new(),
+        media_files: Vec::new(),
         fields,
         tools,
         options,
-        Some(snapshot_handler),
-    )
+        snapshot_handler: Some(snapshot_handler),
+    })
 }
 
 fn stream_guided_tool_results(
@@ -1200,16 +1200,16 @@ fn stream_guided_tool_results(
     tools: Vec<ToolDefinitionDbus>,
     options: PortalOptions,
 ) -> anyhow::Result<(String, Vec<ToolCallDbus>)> {
-    stream_guided_call(
-        Some(results),
+    stream_guided_call(GuidedPortalCall {
+        results: Some(results),
         session_handle,
         prompt,
-        Vec::new(),
+        media_files: Vec::new(),
         fields,
         tools,
         options,
-        None,
-    )
+        snapshot_handler: None,
+    })
 }
 
 fn stream_guided_response_with_media_and_snapshot_handler(
@@ -1221,28 +1221,42 @@ fn stream_guided_response_with_media_and_snapshot_handler(
     options: PortalOptions,
     snapshot_handler: &mut dyn FnMut(&str) -> anyhow::Result<()>,
 ) -> anyhow::Result<(String, Vec<ToolCallDbus>)> {
-    stream_guided_call(
-        None,
+    stream_guided_call(GuidedPortalCall {
+        results: None,
         session_handle,
         prompt,
         media_files,
         fields,
         tools,
         options,
-        Some(snapshot_handler),
-    )
+        snapshot_handler: Some(snapshot_handler),
+    })
 }
 
-fn stream_guided_call(
+struct GuidedPortalCall<'a> {
     results: Option<Vec<ToolResultDbus>>,
-    session_handle: &OwnedObjectPath,
-    prompt: &str,
+    session_handle: &'a OwnedObjectPath,
+    prompt: &'a str,
     media_files: Vec<std::fs::File>,
     fields: Vec<(String, String, String, bool)>,
     tools: Vec<ToolDefinitionDbus>,
     options: PortalOptions,
-    mut snapshot_handler: Option<SnapshotHandler<'_>>,
+    snapshot_handler: Option<SnapshotHandler<'a>>,
+}
+
+fn stream_guided_call(
+    request: GuidedPortalCall<'_>,
 ) -> anyhow::Result<(String, Vec<ToolCallDbus>)> {
+    let GuidedPortalCall {
+        results,
+        session_handle,
+        prompt,
+        media_files,
+        fields,
+        tools,
+        options,
+        mut snapshot_handler,
+    } = request;
     let call_conn = portal_connection()?;
     let signal_conn = call_conn.clone();
     let proxy = zbus::blocking::Proxy::new(&call_conn, PORTAL_BUS, PORTAL_PATH, LANGUAGE_IFACE)?;

@@ -454,12 +454,14 @@ impl VarlinkInterface for InferenceHandler {
             match stream_guided_snapshots(
                 &self.state,
                 call,
-                session_id,
-                prompt,
-                media_paths,
-                fields,
-                tools,
-                options,
+                GuidedStreamRequest {
+                    session_id,
+                    prompt,
+                    media_paths,
+                    fields,
+                    tools,
+                    options,
+                },
             )
             .await
             {
@@ -2009,16 +2011,28 @@ async fn predict_next_completions(
     .await
 }
 
-async fn stream_guided_snapshots(
-    state: &SharedState,
-    call: &mut dyn Call_StreamRespondGuided,
+struct GuidedStreamRequest {
     session_id: String,
     prompt: String,
     media_paths: Vec<String>,
     fields: Vec<GuidedField>,
     tools: Vec<ToolDefinition>,
     options: GenerationOptions,
+}
+
+async fn stream_guided_snapshots(
+    state: &SharedState,
+    call: &mut dyn Call_StreamRespondGuided,
+    request: GuidedStreamRequest,
 ) -> Result<(), GenerationError> {
+    let GuidedStreamRequest {
+        session_id,
+        prompt,
+        media_paths,
+        fields,
+        tools,
+        options,
+    } = request;
     let max_tokens = validate_options(&options).map_err(GenerationError::InvalidOptions)?;
     let schema = guided_fields_schema(&fields).map_err(GenerationError::Failed)?;
     let resolved = resolve_session_runtime(state, &session_id, ensure_language_generation_use_case)
