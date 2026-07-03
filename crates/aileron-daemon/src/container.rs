@@ -569,6 +569,7 @@ impl Container {
         &mut self,
         system: Option<&str>,
         prompt: &str,
+        input: Option<&[InputMessage]>,
         max_tokens: u32,
         schema: &Value,
         tools: Vec<ToolDefinition>,
@@ -579,6 +580,7 @@ impl Container {
         let mut req = ContainerRequest::new(id.clone(), "generate_structured_stream");
         req.system = system.map(str::to_string);
         req.prompt = Some(prompt.to_string());
+        req.input = input.map(|messages| messages.to_vec());
         req.max_tokens = Some(max_tokens);
         req.response_format = Some(ResponseFormat {
             r#type: "json_schema".to_string(),

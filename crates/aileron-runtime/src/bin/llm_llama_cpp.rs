@@ -162,6 +162,10 @@ fn structured_result(
     ctx: &mut LlamaContext<'_>,
     req: &Request,
 ) -> std::result::Result<String, String> {
+    if input_contains_media(req) {
+        return Err("input_image and input_audio are not supported by this runtime".to_string());
+    }
+
     let system = req.system.as_deref().unwrap_or(DEFAULT_SYSTEM);
     let mut prompt = req.prompt.as_deref().unwrap_or_default().to_string();
     if let Some(tool_results) = req.tool_results.as_deref() {

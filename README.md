@@ -394,8 +394,8 @@ method CreateSession(app_id: string, use_case: string, instructions: string) -> 
 method Prewarm(session_id: string) -> ()
 method StreamResponse(session_id: string, input_json: string, media_paths: []string, options: GenerationOptions) -> (token: string)
 method StreamPredictNext(session_id: string, prefix: string, options: GenerationOptions) -> (completions: []string)
-method StreamRespondGuided(session_id: string, prompt: string, fields: []GuidedField, tools: []ToolDefinition, options: GenerationOptions) -> (snapshot_json: string, tool_calls: []ToolCall)
-method StreamSubmitToolResultsGuided(session_id: string, prompt: string, results: []ToolResult, fields: []GuidedField, tools: []ToolDefinition, options: GenerationOptions) -> (snapshot_json: string, tool_calls: []ToolCall)
+method StreamRespondGuided(session_id: string, prompt: string, media_paths: []string, fields: []GuidedField, tools: []ToolDefinition, options: GenerationOptions) -> (snapshot_json: string, tool_calls: []ToolCall)
+method StreamSubmitToolResultsGuided(session_id: string, prompt: string, media_paths: []string, results: []ToolResult, fields: []GuidedField, tools: []ToolDefinition, options: GenerationOptions) -> (snapshot_json: string, tool_calls: []ToolCall)
 method StreamEmbed(session_id: string, text: string) -> (embedding: []float)
 method StreamTranscribe(session_id: string, audio_path: string, source_language_hint: string) -> (token: string)
 method StreamDescribe(session_id: string, image_path: string, instructions: string) -> (token: string)
@@ -408,7 +408,7 @@ method EndSession(session_id: string) -> ()
 
 `GenerationOptions.maximum_response_tokens` must be greater than zero and fit in `u32`. `temperature` must be finite and non-negative. `sampling_mode` must be non-empty. `source_language_hint` and `target_language_hint` are optional strings for `language.translate`; pass empty strings when unspecified. Today the daemon validates sampling fields, forwards `maximum_response_tokens` to containers as `max_tokens`, and folds translation hints into the session instructions for `language.translate`.
 
-`GuidedField.kind` supports `string`, `number`, `integer`, `boolean`, and `string_array`. The daemon converts guided fields into a JSON Schema object with `additionalProperties: false`, sends it to the container as `response_format.schema`, then validates the returned JSON before replying. `StreamRespondGuided` returns validated JSON snapshots or app-mediated tool calls rather than token deltas.
+`GuidedField.kind` supports `string`, `number`, `integer`, `boolean`, and `string_array`. The daemon converts guided fields into a JSON Schema object with `additionalProperties: false`, sends it to the container as `response_format.schema`, then validates the returned JSON before replying. `StreamRespondGuided` returns validated JSON snapshots or app-mediated tool calls rather than token deltas. Guided `prompt` may be plain text or the same content-part/role-message JSON accepted by `StreamResponse`; media parts reference `media_paths` by `fd_index`.
 
 Tool calls are app-mediated and per request: `StreamRespondGuided` may stream `ToolCall` objects when the app supplies tool definitions, the app executes or rejects them under its own policy, and `StreamSubmitToolResultsGuided` continues generation with the same guided schema. The daemon and runtime do not execute tools. Aileron does not retain daemon-side transcripts; apps own conversation history and pass relevant context explicitly.
 
@@ -491,8 +491,8 @@ Apps call the public interfaces on `org.freedesktop.portal.Desktop`. The public 
 |---|---|---|---|
 | `StreamResponse` | `session_handle: o, input_json: s, media_fds: ah, options: a{sv}` | `handle: o` | Full language generation sessions only; emits `TokenReceived` signals; final token has `done=true` |
 | `StreamPredictNext` | `session_handle: o, prefix: s, options: a{sv}` | `handle: o` | `language.complete` sessions only; emits `PredictionReceived` signals for up to three short completions; newer calls for the same session cancel older in-flight prediction calls |
-| `StreamRespondGuided` | `session_handle: o, prompt: s, fields: a(sssb), tools: a(sss), options: a{sv}` | `handle: o` | Full language generation sessions only; emits `GuidedSnapshotReceived` and/or `GuidedToolCallsReceived` signals; final event has `done=true` |
-| `StreamSubmitToolResultsGuided` | `session_handle: o, prompt: s, results: a(sss), fields: a(sssb), tools: a(sss), options: a{sv}` | `handle: o` | Full language generation sessions only; continues after the app executes or rejects tool calls; emits guided signals |
+| `StreamRespondGuided` | `session_handle: o, prompt: s, media_fds: ah, fields: a(sssb), tools: a(sss), options: a{sv}` | `handle: o` | Full language generation sessions only; emits `GuidedSnapshotReceived` and/or `GuidedToolCallsReceived` signals; final event has `done=true` |
+| `StreamSubmitToolResultsGuided` | `session_handle: o, prompt: s, media_fds: ah, results: a(sss), fields: a(sssb), tools: a(sss), options: a{sv}` | `handle: o` | Full language generation sessions only; continues after the app executes or rejects tool calls; emits guided signals |
 | `StreamEmbed` | `session_handle: o, text: s, options: a{sv}` | `handle: o` | `language.embed` sessions only; emits one `EmbeddingReceived` signal |
 
 ### Speech Methods

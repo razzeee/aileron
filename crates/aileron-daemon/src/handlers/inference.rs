@@ -3,7 +3,11 @@ use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::PathBuf;
-use std::sync::{MutexGuard, TryLockError};
+use std::sync::{
+    Arc, MutexGuard, TryLockError,
+    atomic::{AtomicBool, Ordering},
+};
+use std::thread;
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -441,6 +445,7 @@ impl VarlinkInterface for InferenceHandler {
         call: &mut dyn Call_StreamRespondGuided,
         session_id: String,
         prompt: String,
+        media_paths: Vec<String>,
         fields: Vec<GuidedField>,
         tools: Vec<ToolDefinition>,
         options: GenerationOptions,
@@ -451,6 +456,7 @@ impl VarlinkInterface for InferenceHandler {
                 call,
                 session_id,
                 prompt,
+                media_paths,
                 fields,
                 tools,
                 options,
@@ -477,6 +483,7 @@ impl VarlinkInterface for InferenceHandler {
         call: &mut dyn Call_StreamSubmitToolResultsGuided,
         session_id: String,
         prompt: String,
+        media_paths: Vec<String>,
         results: Vec<ToolResult>,
         fields: Vec<GuidedField>,
         tools: Vec<ToolDefinition>,
@@ -488,6 +495,7 @@ impl VarlinkInterface for InferenceHandler {
                 call,
                 session_id,
                 prompt,
+                media_paths,
                 results,
                 fields,
                 tools,
@@ -946,6 +954,26 @@ fn normalize_stream_input(
                 .map(|(index, item)| normalize_part(item, media_paths, index))
                 .collect::<Result<Vec<_>, _>>()?,
         }])
+    }
+}
+
+fn normalize_guided_input(
+    prompt: &str,
+    media_paths: &[String],
+) -> Result<Option<Vec<InputMessage>>, String> {
+    if !prompt.trim_start().starts_with('[') {
+        if media_paths.is_empty() {
+            return Ok(None);
+        }
+        return Err(
+            "guided media requires prompt to be content-part or role-message JSON".to_string(),
+        );
+    }
+
+    match normalize_stream_input(prompt, media_paths) {
+        Ok(input) => Ok(Some(input)),
+        Err(_error) if media_paths.is_empty() => Ok(None),
+        Err(error) => Err(error),
     }
 }
 
@@ -1633,7 +1661,9 @@ async fn with_locked_container<T, E: ObservabilityFailure>(
                 }
 
                 let op = op.take().expect("container operation called once");
+                let cancel_watcher = spawn_cancel_watcher(state, session_id, &handle);
                 let result = op(&mut container, &handle, spawned);
+                cancel_watcher.stop();
                 match &result {
                     Ok(_) => observability::log_inference_request_succeeded(
                         inference_request_fields(method, session_id, &resolved),
@@ -1668,6 +1698,55 @@ async fn with_locked_container<T, E: ObservabilityFailure>(
                 }
             };
         continue;
+    }
+}
+
+struct CancelWatcher {
+    stop: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl CancelWatcher {
+    fn stop(mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for CancelWatcher {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn spawn_cancel_watcher(
+    state: &SharedState,
+    session_id: &str,
+    handle: &ContainerHandle,
+) -> CancelWatcher {
+    let state = state.clone();
+    let session_id = session_id.to_string();
+    let handle = handle.clone();
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = stop.clone();
+    let thread = thread::spawn(move || {
+        while !thread_stop.load(Ordering::SeqCst) {
+            if state.is_session_cancelled(&session_id) {
+                handle.terminate();
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    });
+
+    CancelWatcher {
+        stop,
+        thread: Some(thread),
     }
 }
 
@@ -1935,6 +2014,7 @@ async fn stream_guided_snapshots(
     call: &mut dyn Call_StreamRespondGuided,
     session_id: String,
     prompt: String,
+    media_paths: Vec<String>,
     fields: Vec<GuidedField>,
     tools: Vec<ToolDefinition>,
     options: GenerationOptions,
@@ -1944,6 +2024,9 @@ async fn stream_guided_snapshots(
     let resolved = resolve_session_runtime(state, &session_id, ensure_language_generation_use_case)
         .await
         .map_err(GenerationError::from)?;
+    let input =
+        normalize_guided_input(&prompt, &media_paths).map_err(GenerationError::InvalidInput)?;
+    let prompt = input.as_deref().map(render_text_prompt).unwrap_or(prompt);
     with_locked_container(
         "StreamRespondGuided",
         state,
@@ -1962,6 +2045,7 @@ async fn stream_guided_snapshots(
             let result = container.stream_structured(
                 Some(&resolved.instructions),
                 &prompt,
+                input.as_deref(),
                 max_tokens,
                 &schema,
                 tools,
@@ -2048,6 +2132,7 @@ async fn stream_guided_tool_results(
     call: &mut dyn Call_StreamSubmitToolResultsGuided,
     session_id: String,
     prompt: String,
+    media_paths: Vec<String>,
     results: Vec<ToolResult>,
     fields: Vec<GuidedField>,
     tools: Vec<ToolDefinition>,
@@ -2058,6 +2143,9 @@ async fn stream_guided_tool_results(
     let resolved = resolve_session_runtime(state, &session_id, ensure_language_generation_use_case)
         .await
         .map_err(GenerationError::from)?;
+    let input =
+        normalize_guided_input(&prompt, &media_paths).map_err(GenerationError::InvalidInput)?;
+    let prompt = input.as_deref().map(render_text_prompt).unwrap_or(prompt);
     with_locked_container(
         "StreamSubmitToolResultsGuided",
         state,
@@ -2077,6 +2165,7 @@ async fn stream_guided_tool_results(
             let result = container.stream_structured(
                 Some(&resolved.instructions),
                 &prompt,
+                input.as_deref(),
                 max_tokens,
                 &schema,
                 tools,
@@ -2497,6 +2586,35 @@ mod tests {
         .unwrap_err();
 
         assert!(error.contains("exceeds maximum size"));
+    }
+
+    #[test]
+    fn guided_input_keeps_bracketed_text_plain_without_media() {
+        let input = normalize_guided_input("[draft] summarize this", &[]).unwrap();
+
+        assert!(input.is_none());
+    }
+
+    #[test]
+    fn guided_input_parses_valid_json_without_media() {
+        let input = normalize_guided_input(
+            r#"[{"role":"user","content":[{"type":"input_text","text":"hi"}]}]"#,
+            &[],
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0].role, "user");
+        assert_eq!(render_text_prompt(&input), "hi");
+    }
+
+    #[test]
+    fn guided_input_requires_json_when_media_is_attached() {
+        let media_paths = vec!["/tmp/image.png".to_string()];
+        let error = normalize_guided_input("describe this image", &media_paths).unwrap_err();
+
+        assert!(error.contains("guided media requires prompt"));
     }
 
     #[hegel::test]

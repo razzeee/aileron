@@ -520,6 +520,7 @@ impl LanguagePortalBackend {
         request_handle: OwnedObjectPath,
         session_handle: OwnedObjectPath,
         prompt: &str,
+        media_fds: Vec<OwnedFd>,
         fields: Vec<GuidedFieldDbus>,
         tools: Vec<ToolDefinitionDbus>,
         options: GenerationOptionsDbus,
@@ -541,11 +542,13 @@ impl LanguagePortalBackend {
                 .await?;
             ensure_request_active(&self.state, request_id)?;
             let daemon_session_id = record.daemon_session_id;
+            let media_paths = media_fds.iter().map(fd_proc_path).collect::<Vec<_>>();
             let ipc_conn = connect_request_daemon(&self.state, request_id)?;
             let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(ipc_conn);
             let mut call = client.stream_respond_guided(
                 daemon_session_id,
                 prompt.to_string(),
+                media_paths,
                 fields
                     .into_iter()
                     .map(GuidedFieldDbus::into_varlink)
@@ -644,6 +647,7 @@ impl LanguagePortalBackend {
         request_handle: OwnedObjectPath,
         session_handle: OwnedObjectPath,
         prompt: &str,
+        media_fds: Vec<OwnedFd>,
         results: Vec<ToolResultDbus>,
         fields: Vec<GuidedFieldDbus>,
         tools: Vec<ToolDefinitionDbus>,
@@ -666,11 +670,13 @@ impl LanguagePortalBackend {
                 .await?;
             ensure_request_active(&self.state, request_id)?;
             let daemon_session_id = record.daemon_session_id;
+            let media_paths = media_fds.iter().map(fd_proc_path).collect::<Vec<_>>();
             let ipc_conn = connect_request_daemon(&self.state, request_id)?;
             let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(ipc_conn);
             let mut call = client.stream_submit_tool_results_guided(
                 daemon_session_id,
                 prompt.to_string(),
+                media_paths,
                 results
                     .into_iter()
                     .map(ToolResultDbus::into_varlink)

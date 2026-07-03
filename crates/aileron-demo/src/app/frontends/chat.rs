@@ -3,7 +3,9 @@ use super::super::{
 };
 use super::scrollable_page;
 use gtk4::prelude::*;
-use gtk4::{Align, Box, Button, CssProvider, Entry, Label, Orientation, ScrolledWindow, Spinner};
+use gtk4::{
+    Align, Box, Button, CssProvider, Entry, FileDialog, Label, Orientation, ScrolledWindow, Spinner,
+};
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -87,9 +89,69 @@ pub(crate) fn build_page() -> gtk4::Widget {
     input_row.append(&clear_button);
     vbox.append(&input_row);
 
+    let attachment_row = Box::new(Orientation::Horizontal, 8);
+    let choose_image_button = Button::with_label("Choose Image");
+    let clear_image_button = Button::with_label("Clear Image");
+    clear_image_button.set_sensitive(false);
+    let attachment_label = Label::builder()
+        .label("No image attached.")
+        .xalign(0.0)
+        .hexpand(true)
+        .build();
+    attachment_row.append(&choose_image_button);
+    attachment_row.append(&clear_image_button);
+    attachment_row.append(&attachment_label);
+    vbox.append(&attachment_row);
+
     let history = Rc::new(RefCell::new(Vec::<ChatMessage>::new()));
     let memory = Rc::new(RefCell::new(Vec::<String>::new()));
     let session_id = Rc::new(RefCell::new(None::<String>));
+    let selected_image = Rc::new(RefCell::new(None::<Vec<u8>>));
+
+    {
+        let selected_image = selected_image.clone();
+        let attachment_label = attachment_label.clone();
+        let clear_image_button = clear_image_button.clone();
+        choose_image_button.connect_clicked(move |_| {
+            let dialog = FileDialog::builder().title("Choose chat image").build();
+            let selected_image = selected_image.clone();
+            let attachment_label = attachment_label.clone();
+            let clear_image_button = clear_image_button.clone();
+            dialog.open(
+                None::<&gtk4::Window>,
+                None::<&gio::Cancellable>,
+                move |result| {
+                    let Ok(file) = result else {
+                        return;
+                    };
+                    let Some(path) = file.path() else {
+                        attachment_label.set_text("Could not read selected image path.");
+                        return;
+                    };
+                    match std::fs::read(&path) {
+                        Ok(bytes) if !bytes.is_empty() => {
+                            *selected_image.borrow_mut() = Some(bytes);
+                            attachment_label.set_text(&format!("Attached: {}", path.display()));
+                            clear_image_button.set_sensitive(true);
+                        }
+                        Ok(_) => attachment_label.set_text("Selected image is empty."),
+                        Err(e) => attachment_label.set_text(&format!("Could not read image: {e}")),
+                    }
+                },
+            );
+        });
+    }
+
+    {
+        let selected_image = selected_image.clone();
+        let attachment_label = attachment_label.clone();
+        let clear_image_button_for_click = clear_image_button.clone();
+        clear_image_button.connect_clicked(move |_| {
+            *selected_image.borrow_mut() = None;
+            attachment_label.set_text("No image attached.");
+            clear_image_button_for_click.set_sensitive(false);
+        });
+    }
 
     {
         let history = history.clone();
@@ -99,6 +161,10 @@ pub(crate) fn build_page() -> gtk4::Widget {
         let send_button_for_click = send_button.clone();
         let send_button = send_button.clone();
         let clear_button = clear_button.clone();
+        let choose_image_button = choose_image_button.clone();
+        let clear_image_button = clear_image_button.clone();
+        let attachment_label = attachment_label.clone();
+        let selected_image = selected_image.clone();
         let chat_box = chat_box.clone();
         let status_spinner = status_spinner.clone();
         let status_title = status_title.clone();
@@ -112,13 +178,23 @@ pub(crate) fn build_page() -> gtk4::Widget {
             input_entry.set_text("");
             send_button.set_sensitive(false);
             clear_button.set_sensitive(false);
+            choose_image_button.set_sensitive(false);
+            clear_image_button.set_sensitive(false);
             status_spinner.start();
             status_title.set_text("Starting guided chat turn");
             status_detail.set_text("Sending history and memory through StreamRespondGuided...");
 
+            let image = selected_image.borrow_mut().take();
+            if image.is_some() {
+                attachment_label.set_text("Image attached to this turn.");
+            }
             history.borrow_mut().push(ChatMessage {
                 role: "user".to_string(),
-                content: text,
+                content: if image.is_some() {
+                    format!("{text}\n[Attached image]")
+                } else {
+                    text
+                },
             });
             render_chat(&chat_box, &history.borrow(), None);
 
@@ -133,6 +209,9 @@ pub(crate) fn build_page() -> gtk4::Widget {
             let chat_box_for_rx = chat_box.clone();
             let send_button_for_rx = send_button.clone();
             let clear_button_for_rx = clear_button.clone();
+            let choose_image_button_for_rx = choose_image_button.clone();
+            let clear_image_button_for_rx = clear_image_button.clone();
+            let attachment_label_for_rx = attachment_label.clone();
             let status_spinner_for_rx = status_spinner.clone();
             let status_title_for_rx = status_title.clone();
             let status_detail_for_rx = status_detail.clone();
@@ -179,6 +258,9 @@ pub(crate) fn build_page() -> gtk4::Widget {
                             status_detail_for_rx.set_text(&message);
                             send_button_for_rx.set_sensitive(true);
                             clear_button_for_rx.set_sensitive(true);
+                            choose_image_button_for_rx.set_sensitive(true);
+                            clear_image_button_for_rx.set_sensitive(false);
+                            attachment_label_for_rx.set_text("No image attached.");
                             return glib::ControlFlow::Break;
                         }
                         Ok(ChatEvent::Done) => {
@@ -187,6 +269,9 @@ pub(crate) fn build_page() -> gtk4::Widget {
                             status_title_for_rx.set_text("Response complete");
                             send_button_for_rx.set_sensitive(true);
                             clear_button_for_rx.set_sensitive(true);
+                            choose_image_button_for_rx.set_sensitive(true);
+                            clear_image_button_for_rx.set_sensitive(false);
+                            attachment_label_for_rx.set_text("No image attached.");
                             return glib::ControlFlow::Break;
                         }
                         Err(std::sync::mpsc::TryRecvError::Empty) => break,
@@ -197,6 +282,9 @@ pub(crate) fn build_page() -> gtk4::Widget {
                                 .set_text("The chat response channel closed unexpectedly.");
                             send_button_for_rx.set_sensitive(true);
                             clear_button_for_rx.set_sensitive(true);
+                            choose_image_button_for_rx.set_sensitive(true);
+                            clear_image_button_for_rx.set_sensitive(false);
+                            attachment_label_for_rx.set_text("No image attached.");
                             return glib::ControlFlow::Break;
                         }
                     }
@@ -206,7 +294,7 @@ pub(crate) fn build_page() -> gtk4::Widget {
 
             let error_tx = tx.clone();
             std::thread::spawn(move || {
-                if let Err(e) = guided_chat_turn(existing_session, &memories, messages, tx) {
+                if let Err(e) = guided_chat_turn(existing_session, &memories, messages, image, tx) {
                     eprintln!("[aileron-demo] chat error: {e}");
                     let _ = error_tx.send(ChatEvent::Error(friendly_error(&e)));
                 }
@@ -231,6 +319,9 @@ pub(crate) fn build_page() -> gtk4::Widget {
         let status_spinner = status_spinner.clone();
         let status_title = status_title.clone();
         let status_detail = status_detail.clone();
+        let selected_image = selected_image.clone();
+        let attachment_label = attachment_label.clone();
+        let clear_image_button = clear_image_button.clone();
         clear_button.connect_clicked(move |_| {
             if let Some(id) = session_id.borrow_mut().take() {
                 std::thread::spawn(move || {
@@ -239,6 +330,9 @@ pub(crate) fn build_page() -> gtk4::Widget {
             }
             history.borrow_mut().clear();
             memory.borrow_mut().clear();
+            *selected_image.borrow_mut() = None;
+            attachment_label.set_text("No image attached.");
+            clear_image_button.set_sensitive(false);
             render_chat(&chat_box, &history.borrow(), None);
             status_spinner.stop();
             status_title.set_text("Ready");

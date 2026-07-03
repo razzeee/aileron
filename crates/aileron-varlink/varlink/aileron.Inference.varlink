@@ -68,10 +68,11 @@ method StreamResponse(session_id: string, input_json: string, media_paths: []str
 method StreamPredictNext(session_id: string, prefix: string, options: GenerationOptions) -> (completions: []string)
 
 # Stream schema-valid guided output snapshots. The final reply has continues=false.
-method StreamRespondGuided(session_id: string, prompt: string, fields: []GuidedField, tools: []ToolDefinition, options: GenerationOptions) -> (snapshot_json: string, tool_calls: []ToolCall)
+# prompt is plain text or content-part/role-message JSON. media_paths contains readable request-scoped media paths referenced by fd_index.
+method StreamRespondGuided(session_id: string, prompt: string, media_paths: []string, fields: []GuidedField, tools: []ToolDefinition, options: GenerationOptions) -> (snapshot_json: string, tool_calls: []ToolCall)
 
 # Stream guided generation after the app executes or rejects requested tools.
-method StreamSubmitToolResultsGuided(session_id: string, prompt: string, results: []ToolResult, fields: []GuidedField, tools: []ToolDefinition, options: GenerationOptions) -> (snapshot_json: string, tool_calls: []ToolCall)
+method StreamSubmitToolResultsGuided(session_id: string, prompt: string, media_paths: []string, results: []ToolResult, fields: []GuidedField, tools: []ToolDefinition, options: GenerationOptions) -> (snapshot_json: string, tool_calls: []ToolCall)
 
 # Stream embedding vectors for text. Session must have been created with use_case: language.embed
 # embedding: the embedding vector for the supplied text

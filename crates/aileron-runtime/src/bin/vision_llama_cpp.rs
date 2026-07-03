@@ -85,8 +85,8 @@ fn handle_request<'model>(
     match req.request_type.as_str() {
         "generate" => handle_generate(model, mtmd, ctx, &req),
         "predict_next" => handle_predict_next(model, ctx, &req),
-        "generate_structured" => handle_generate_structured(model, ctx, &req),
-        "generate_structured_stream" => handle_generate_structured_stream(model, ctx, &req),
+        "generate_structured" => handle_generate_structured(model, mtmd, ctx, &req),
+        "generate_structured_stream" => handle_generate_structured_stream(model, mtmd, ctx, &req),
         "embed" => handle_embed(backend, model, embed_ctx, config, &req),
         "describe" => handle_describe(model, mtmd, ctx, &req),
         "ocr" => handle_ocr(model, mtmd, ctx, &req),
@@ -188,10 +188,11 @@ fn handle_predict_next(
 
 fn handle_generate_structured(
     model: &LlamaModel,
+    mtmd: &MtmdContext,
     ctx: &mut LlamaContext<'_>,
     req: &Request,
 ) -> Result<()> {
-    match structured_result(model, ctx, req) {
+    match structured_result(model, mtmd, ctx, req) {
         Ok(result) => send(json!({"id": req.id, "result": result, "done": true})),
         Err(reason) => send(json!({
             "id": req.id,
@@ -204,10 +205,11 @@ fn handle_generate_structured(
 
 fn handle_generate_structured_stream(
     model: &LlamaModel,
+    mtmd: &MtmdContext,
     ctx: &mut LlamaContext<'_>,
     req: &Request,
 ) -> Result<()> {
-    match structured_result(model, ctx, req) {
+    match structured_result(model, mtmd, ctx, req) {
         Ok(result) => {
             send(json!({"id": req.id, "snapshot": result}))?;
             send(json!({"id": req.id, "snapshot": result, "done": true}))
@@ -223,6 +225,7 @@ fn handle_generate_structured_stream(
 
 fn structured_result(
     model: &LlamaModel,
+    mtmd: &MtmdContext,
     ctx: &mut LlamaContext<'_>,
     req: &Request,
 ) -> std::result::Result<String, String> {
@@ -238,6 +241,34 @@ fn structured_result(
     }
     let prompt = structured_prompt(&source_prompt, schema);
     let max_tokens = req.max_tokens.unwrap_or(1024);
+    if input_contains_audio(req) {
+        return Err("input_audio is not supported by this runtime structured path".to_string());
+    }
+    if input_image_count(req) > 1 {
+        return Err(
+            "multiple input_image parts are not supported by this runtime structured path"
+                .to_string(),
+        );
+    }
+    if let Some(image) = first_input_image(req) {
+        return generate_for_image_bytes(
+            model,
+            mtmd,
+            ctx,
+            req,
+            system,
+            &prompt,
+            image,
+            max_tokens,
+            Some(schema),
+        )
+        .map(|result| result.trim().to_string())
+        .map_err(|err| match err {
+            ImageRequestError::InvalidImage(reason) => reason,
+            ImageRequestError::Runtime(err) => err.to_string(),
+        })
+        .and_then(|result| first_json_value(&result));
+    }
     let result = generate_chat(
         model,
         ctx,

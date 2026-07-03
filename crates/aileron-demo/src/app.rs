@@ -84,16 +84,52 @@ fn create_public_session(
     use_case: &str,
     instructions: &str,
 ) -> anyhow::Result<OwnedObjectPath> {
-    let request_handle: OwnedObjectPath = proxy.call(
-        "CreateSession",
-        &("", use_case, instructions, empty_options()),
-    )?;
-    let mut results = wait_request_response(&request_handle)?;
+    let conn = portal_connection()?;
+    let token_suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let handle_token = format!("create_{token_suffix}");
+    let session_handle_token = format!("session_{token_suffix}");
+    let request_path = portal_request_path(&conn, &handle_token)?;
+    let request_proxy =
+        zbus::blocking::Proxy::new(&conn, PORTAL_BUS, request_path.as_str(), REQUEST_IFACE)?;
+    let mut response_iter = request_proxy.receive_signal("Response")?;
+    let mut options = empty_options();
+    options.insert(
+        "handle_token".to_string(),
+        string_option_value(&handle_token),
+    );
+    options.insert(
+        "session_handle_token".to_string(),
+        string_option_value(&session_handle_token),
+    );
+
+    let request_handle: OwnedObjectPath =
+        proxy.call("CreateSession", &("", use_case, instructions, options))?;
+    let mut results = wait_request_response_from_iter(&mut response_iter)?;
     let session_handle = results
         .remove("session_handle")
         .ok_or_else(|| anyhow::anyhow!("CreateSession response omitted session_handle"))?;
-    OwnedObjectPath::try_from(session_handle)
-        .map_err(|e| anyhow::anyhow!("CreateSession returned invalid session handle: {e}"))
+    let session_handle = OwnedObjectPath::try_from(session_handle)
+        .map_err(|e| anyhow::anyhow!("CreateSession returned invalid session handle: {e}"))?;
+    if request_handle.as_str() != request_path {
+        anyhow::bail!(
+            "CreateSession returned unexpected request handle: {}",
+            request_handle.as_str()
+        );
+    }
+    Ok(session_handle)
+}
+
+fn portal_request_path(conn: &zbus::blocking::Connection, token: &str) -> anyhow::Result<String> {
+    let unique = conn
+        .unique_name()
+        .ok_or_else(|| anyhow::anyhow!("portal connection has no unique bus name"))?
+        .as_str()
+        .trim_start_matches(':')
+        .replace('.', "_");
+    Ok(format!("{PORTAL_PATH}/request/{unique}/{token}"))
 }
 
 fn wait_request_response(
@@ -103,6 +139,15 @@ fn wait_request_response(
     let proxy =
         zbus::blocking::Proxy::new(&conn, PORTAL_BUS, request_handle.as_str(), REQUEST_IFACE)?;
     let mut response_iter = proxy.receive_signal("Response")?;
+    wait_request_response_from_iter(&mut response_iter)
+}
+
+fn wait_request_response_from_iter<I>(
+    response_iter: &mut I,
+) -> anyhow::Result<HashMap<String, OwnedValue>>
+where
+    I: Iterator<Item = zbus::Message>,
+{
     let msg = response_iter
         .next()
         .ok_or_else(|| anyhow::anyhow!("request closed without a Response signal"))?;
@@ -936,11 +981,8 @@ fn concise_error(message: &str) -> String {
 
 /// Call `StreamResponse` on the portal and forward token signals via `tx`.
 fn summarize_streaming(text: &str, tx: std::sync::mpsc::Sender<DemoEvent>) -> anyhow::Result<()> {
-    // Separate connections for method calls and signal subscriptions —
-    // the blocking zbus connection is single-threaded; mixing signals and
-    // method calls on the same connection causes deadlocks.
     let call_conn = portal_connection()?;
-    let signal_conn = zbus::blocking::Connection::session()?;
+    let signal_conn = call_conn.clone();
 
     let proxy = zbus::blocking::Proxy::new(&call_conn, PORTAL_BUS, PORTAL_PATH, LANGUAGE_IFACE)?;
     let sig_proxy =
@@ -1034,7 +1076,7 @@ fn stream_language_text(
     token_tx: Option<std::sync::mpsc::Sender<DemoEvent>>,
 ) -> anyhow::Result<String> {
     let call_conn = portal_connection()?;
-    let signal_conn = zbus::blocking::Connection::session()?;
+    let signal_conn = call_conn.clone();
     let proxy = zbus::blocking::Proxy::new(&call_conn, PORTAL_BUS, PORTAL_PATH, LANGUAGE_IFACE)?;
     let sig_proxy =
         zbus::blocking::Proxy::new(&signal_conn, PORTAL_BUS, PORTAL_PATH, LANGUAGE_IFACE)?;
@@ -1095,7 +1137,16 @@ fn stream_guided_response(
     tools: Vec<ToolDefinitionDbus>,
     options: PortalOptions,
 ) -> anyhow::Result<(String, Vec<ToolCallDbus>)> {
-    stream_guided_call(None, session_handle, prompt, fields, tools, options, None)
+    stream_guided_call(
+        None,
+        session_handle,
+        prompt,
+        Vec::new(),
+        fields,
+        tools,
+        options,
+        None,
+    )
 }
 
 fn stream_guided_response_with_snapshots(
@@ -1133,6 +1184,7 @@ fn stream_guided_response_with_snapshot_handler(
         None,
         session_handle,
         prompt,
+        Vec::new(),
         fields,
         tools,
         options,
@@ -1152,6 +1204,7 @@ fn stream_guided_tool_results(
         Some(results),
         session_handle,
         prompt,
+        Vec::new(),
         fields,
         tools,
         options,
@@ -1159,23 +1212,46 @@ fn stream_guided_tool_results(
     )
 }
 
+fn stream_guided_response_with_media_and_snapshot_handler(
+    session_handle: &OwnedObjectPath,
+    prompt: &str,
+    media_files: Vec<std::fs::File>,
+    fields: Vec<(String, String, String, bool)>,
+    tools: Vec<ToolDefinitionDbus>,
+    options: PortalOptions,
+    snapshot_handler: &mut dyn FnMut(&str) -> anyhow::Result<()>,
+) -> anyhow::Result<(String, Vec<ToolCallDbus>)> {
+    stream_guided_call(
+        None,
+        session_handle,
+        prompt,
+        media_files,
+        fields,
+        tools,
+        options,
+        Some(snapshot_handler),
+    )
+}
+
 fn stream_guided_call(
     results: Option<Vec<ToolResultDbus>>,
     session_handle: &OwnedObjectPath,
     prompt: &str,
+    media_files: Vec<std::fs::File>,
     fields: Vec<(String, String, String, bool)>,
     tools: Vec<ToolDefinitionDbus>,
     options: PortalOptions,
     mut snapshot_handler: Option<SnapshotHandler<'_>>,
 ) -> anyhow::Result<(String, Vec<ToolCallDbus>)> {
     let call_conn = portal_connection()?;
-    let signal_conn = zbus::blocking::Connection::session()?;
+    let signal_conn = call_conn.clone();
     let proxy = zbus::blocking::Proxy::new(&call_conn, PORTAL_BUS, PORTAL_PATH, LANGUAGE_IFACE)?;
     let signal_proxy =
         zbus::blocking::Proxy::new(&signal_conn, PORTAL_BUS, PORTAL_PATH, LANGUAGE_IFACE)?;
     let mut signal_iter = signal_proxy.receive_all_signals()?;
     let signal_session_handle = session_handle.clone();
     let (event_tx, event_rx) = std::sync::mpsc::channel::<anyhow::Result<GuidedStreamEvent>>();
+    let media_fds = media_files.iter().map(Fd::from).collect::<Vec<_>>();
 
     std::thread::spawn(move || {
         for msg in &mut signal_iter {
@@ -1237,12 +1313,20 @@ fn stream_guided_call(
     let request_handle: OwnedObjectPath = if let Some(results) = results {
         proxy.call(
             "StreamSubmitToolResultsGuided",
-            &(session_handle, prompt, results, fields, tools, options),
+            &(
+                session_handle,
+                prompt,
+                &media_fds,
+                results,
+                fields,
+                tools,
+                options,
+            ),
         )?
     } else {
         proxy.call(
             "StreamRespondGuided",
-            &(session_handle, prompt, fields, tools, options),
+            &(session_handle, prompt, &media_fds, fields, tools, options),
         )?
     };
 
@@ -1276,7 +1360,7 @@ fn stream_prediction(
     options: PortalOptions,
 ) -> anyhow::Result<Vec<String>> {
     let call_conn = portal_connection()?;
-    let signal_conn = zbus::blocking::Connection::session()?;
+    let signal_conn = call_conn.clone();
     let proxy = zbus::blocking::Proxy::new(&call_conn, PORTAL_BUS, PORTAL_PATH, LANGUAGE_IFACE)?;
     let sig_proxy =
         zbus::blocking::Proxy::new(&signal_conn, PORTAL_BUS, PORTAL_PATH, LANGUAGE_IFACE)?;
@@ -1323,7 +1407,7 @@ fn stream_prediction(
 
 fn stream_embedding(session_handle: &OwnedObjectPath, text: &str) -> anyhow::Result<Vec<f64>> {
     let call_conn = portal_connection()?;
-    let signal_conn = zbus::blocking::Connection::session()?;
+    let signal_conn = call_conn.clone();
     let proxy = zbus::blocking::Proxy::new(&call_conn, PORTAL_BUS, PORTAL_PATH, LANGUAGE_IFACE)?;
     let sig_proxy =
         zbus::blocking::Proxy::new(&signal_conn, PORTAL_BUS, PORTAL_PATH, LANGUAGE_IFACE)?;
@@ -1374,7 +1458,7 @@ fn stream_vision_text(
     let image_file = media_file_from_bytes(image)?;
     let image_fd = Fd::from(&image_file);
     let call_conn = portal_connection()?;
-    let signal_conn = zbus::blocking::Connection::session()?;
+    let signal_conn = call_conn.clone();
     let proxy = zbus::blocking::Proxy::new(&call_conn, PORTAL_BUS, PORTAL_PATH, VISION_IFACE)?;
     let sig_proxy =
         zbus::blocking::Proxy::new(&signal_conn, PORTAL_BUS, PORTAL_PATH, VISION_IFACE)?;
@@ -1434,7 +1518,7 @@ fn stream_vision_segments(
     let image_file = media_file_from_bytes(image)?;
     let image_fd = Fd::from(&image_file);
     let call_conn = portal_connection()?;
-    let signal_conn = zbus::blocking::Connection::session()?;
+    let signal_conn = call_conn.clone();
     let proxy = zbus::blocking::Proxy::new(&call_conn, PORTAL_BUS, PORTAL_PATH, VISION_IFACE)?;
     let sig_proxy =
         zbus::blocking::Proxy::new(&signal_conn, PORTAL_BUS, PORTAL_PATH, VISION_IFACE)?;
@@ -1786,6 +1870,7 @@ fn guided_chat_turn(
     existing_session: Option<String>,
     memory: &[String],
     messages: Vec<ChatMessage>,
+    image: Option<Vec<u8>>,
     tx: std::sync::mpsc::Sender<ChatEvent>,
 ) -> anyhow::Result<()> {
     let conn = portal_connection()?;
@@ -1828,16 +1913,32 @@ fn guided_chat_turn(
         ),
     ];
     let options = generation_options(512, "", "");
-    let prompt = guided_chat_prompt(memory, &messages);
+    let text_prompt = guided_chat_prompt(memory, &messages);
+    let image_bytes = image;
+    let image_mime_type = image_bytes
+        .as_deref()
+        .map(image_mime_type)
+        .unwrap_or("image/png");
+    let prompt = if image_bytes.is_some() {
+        serde_json::json!([
+            { "type": "input_text", "text": text_prompt },
+            { "type": "input_image", "fd_index": 0, "mime_type": image_mime_type }
+        ])
+        .to_string()
+    } else {
+        text_prompt
+    };
+    let media_files = chat_media_files(image_bytes.as_deref())?;
     let mut send_draft = |snapshot: &str| {
         if let Some(answer) = guided_chat_answer_draft(snapshot) {
             tx.send(ChatEvent::Draft(answer))?;
         }
         Ok(())
     };
-    let response_result = stream_guided_response_with_snapshot_handler(
+    let response_result = stream_guided_response_with_media_and_snapshot_handler(
         &session_handle,
         &prompt,
+        media_files,
         fields.clone(),
         Vec::<ToolDefinitionDbus>::new(),
         options,
@@ -1847,9 +1948,10 @@ fn guided_chat_turn(
         Ok(response) => response,
         Err(e) if used_existing_session && is_session_not_found_message(&e.to_string()) => {
             session_handle = create_session()?;
-            match stream_guided_response_with_snapshot_handler(
+            match stream_guided_response_with_media_and_snapshot_handler(
                 &session_handle,
                 &prompt,
+                chat_media_files(image_bytes.as_deref())?,
                 fields,
                 Vec::<ToolDefinitionDbus>::new(),
                 generation_options(512, "", ""),
@@ -1869,6 +1971,23 @@ fn guided_chat_turn(
 
     tx.send(ChatEvent::Done)?;
     Ok(())
+}
+
+fn chat_media_files(image: Option<&[u8]>) -> anyhow::Result<Vec<std::fs::File>> {
+    image
+        .map(media_file_from_bytes)
+        .transpose()
+        .map(|file| file.into_iter().collect())
+}
+
+fn image_mime_type(bytes: &[u8]) -> &'static str {
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
+        "image/png"
+    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        "image/jpeg"
+    } else {
+        "image/png"
+    }
 }
 
 fn end_guided_chat_session(session_id: &str) -> anyhow::Result<()> {
@@ -1983,7 +2102,7 @@ fn transcribe_recording(
     }
 
     let call_conn = portal_connection()?;
-    let signal_conn = zbus::blocking::Connection::session()?;
+    let signal_conn = call_conn.clone();
     let proxy = zbus::blocking::Proxy::new(&call_conn, PORTAL_BUS, PORTAL_PATH, SPEECH_IFACE)?;
     let sig_proxy =
         zbus::blocking::Proxy::new(&signal_conn, PORTAL_BUS, PORTAL_PATH, SPEECH_IFACE)?;
@@ -2021,7 +2140,7 @@ fn live_transcribe_recording(
 ) -> anyhow::Result<()> {
     let source_language_hint = source_language_hint.to_string();
     let call_conn = portal_connection()?;
-    let signal_conn = zbus::blocking::Connection::session()?;
+    let signal_conn = call_conn.clone();
     let proxy = zbus::blocking::Proxy::new(&call_conn, PORTAL_BUS, PORTAL_PATH, SPEECH_IFACE)?;
     let sig_proxy =
         zbus::blocking::Proxy::new(&signal_conn, PORTAL_BUS, PORTAL_PATH, SPEECH_IFACE)?;
