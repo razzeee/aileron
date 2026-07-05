@@ -187,13 +187,32 @@ fn schema_type(schema: &Value) -> Option<&str> {
         .and_then(|items| items.iter().find_map(Value::as_str))
 }
 
-pub fn first_tool_name(tools: Option<&[Value]>) -> String {
+pub fn select_tool_name(tools: Option<&[Value]>, prompt: Option<&str>) -> String {
+    let Some(tools) = tools else {
+        return "stub_tool".to_string();
+    };
+    let Some(first_tool) = tools.first() else {
+        return "stub_tool".to_string();
+    };
+
+    let prompt = prompt.unwrap_or_default().to_lowercase();
     tools
-        .and_then(|items| items.first())
-        .and_then(|tool| tool.get("name"))
-        .and_then(Value::as_str)
-        .unwrap_or("stub_tool")
-        .to_string()
+        .iter()
+        .find_map(|tool| {
+            let name = tool.get("name").and_then(Value::as_str)?;
+            if prompt.contains(&name.to_lowercase()) {
+                Some(name.to_string())
+            } else {
+                None
+            }
+        })
+        .or_else(|| {
+            first_tool
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "stub_tool".to_string())
 }
 
 pub fn field_as_string(value: &Value, key: &str) -> Option<String> {
@@ -270,6 +289,33 @@ mod tests {
         assert_eq!(clamp_choices(Some(0)), 1);
         assert_eq!(clamp_choices(Some(2)), 2);
         assert_eq!(clamp_choices(Some(99)), 3);
+    }
+
+    #[test]
+    fn select_tool_name_chooses_named_tool_from_multiple_tools() {
+        let tools = vec![
+            json!({"name": "weather_lookup"}),
+            json!({"name": "calendar_search"}),
+            json!({"name": "file_search"}),
+        ];
+
+        assert_eq!(
+            select_tool_name(Some(&tools), Some("Use calendar_search for tomorrow")),
+            "calendar_search"
+        );
+    }
+
+    #[test]
+    fn select_tool_name_falls_back_to_first_available_tool() {
+        let tools = vec![
+            json!({"name": "weather_lookup"}),
+            json!({"name": "file_search"}),
+        ];
+
+        assert_eq!(
+            select_tool_name(Some(&tools), Some("Pick the best available tool")),
+            "weather_lookup"
+        );
     }
 
     #[test]
