@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 use zbus::zvariant::{Fd, OwnedFd, OwnedObjectPath, OwnedValue, Type, Value};
 
 const PORTAL_BUS: &str = "org.freedesktop.portal.Desktop";
@@ -25,7 +25,6 @@ const REQUEST_IFACE: &str = "org.freedesktop.portal.Request";
 const SESSION_IFACE: &str = "org.freedesktop.portal.Session";
 const SPEECH_IFACE: &str = "org.freedesktop.portal.Speech";
 const VISION_IFACE: &str = "org.freedesktop.portal.Vision";
-
 static PORTAL_CONNECTION: OnceLock<zbus::blocking::Connection> = OnceLock::new();
 
 type PortalOptions = HashMap<String, OwnedValue>;
@@ -233,7 +232,7 @@ fn build_window(window: &ApplicationWindow) {
         Some("overview"),
         "Lab overview",
     );
-    overview_page.set_icon_name(Some("view-dashboard-symbolic"));
+    overview_page.set_icon_name(Some("view-grid-symbolic"));
     let text_page = stack.add_titled(&frontends::text::build_page(), Some("text"), "Text lab");
     text_page.set_icon_name(Some("text-x-generic-symbolic"));
     let prediction_page = stack.add_titled(
@@ -718,7 +717,7 @@ impl DemoMode {
                 "Classify the following text by topic and intent. Choose concise labels and include a short rationale:\n\n{trimmed}"
             ),
             DemoMode::Extract => format!(
-                "Summarize this article as structured data. Keep the summary short, include 3-5 key points, and set confidence from 0 to 100:\n\n{trimmed}"
+                "Return only a valid JSON object with summary, key_points, and confidence. Do not include markdown, commentary, or prose outside the JSON. Summarize this article as structured data. Keep the summary short, include 3-5 key points, and set confidence from 0 to 100:\n\n{trimmed}"
             ),
             DemoMode::Analyze => format!(
                 "Analyze the following text. Identify the main claim, supporting evidence, assumptions, and any risks or open questions. Keep the answer concise:\n\n{trimmed}"
@@ -1022,7 +1021,8 @@ fn summarize_streaming(text: &str, tx: std::sync::mpsc::Sender<DemoEvent>) -> an
     let mut token_iter = sig_proxy.receive_signal("TokenReceived")?;
     let token_session_handle = session_handle.clone();
     let tx_tokens = tx.clone();
-    let (stream_done_tx, stream_done_rx) = std::sync::mpsc::channel();
+    let (stream_event_tx, stream_event_rx) = std::sync::mpsc::channel();
+    let token_event_tx = stream_event_tx.clone();
     std::thread::spawn(move || {
         let result = (|| -> anyhow::Result<()> {
             for msg in &mut token_iter {
@@ -1036,14 +1036,16 @@ fn summarize_streaming(text: &str, tx: std::sync::mpsc::Sender<DemoEvent>) -> an
                 if sig_session.as_str() != token_session_handle.as_str() {
                     continue;
                 }
-                tx_tokens.send(DemoEvent::Token(token))?;
+                token_event_tx.send(Ok(TokenStreamEvent::Token(token, done)))?;
                 if done {
                     break;
                 }
             }
             Ok(())
         })();
-        let _ = stream_done_tx.send(result);
+        if let Err(error) = result {
+            let _ = token_event_tx.send(Err(error));
+        }
     });
 
     let options = generation_options(512, "", "");
@@ -1059,10 +1061,36 @@ fn summarize_streaming(text: &str, tx: std::sync::mpsc::Sender<DemoEvent>) -> an
             return Err(error.into());
         }
     };
-    stream_done_rx
-        .recv_timeout(Duration::from_secs(2))
-        .map_err(|_| anyhow::anyhow!("stream completed without a final TokenReceived signal"))??;
-    wait_request_success(&request_handle)?;
+    let response_request_handle = request_handle.clone();
+    std::thread::spawn(move || {
+        let result = wait_request_success(&response_request_handle);
+        let _ = stream_event_tx.send(Ok(TokenStreamEvent::RequestDone(result)));
+    });
+
+    let mut terminal_seen = false;
+    let mut request_done = false;
+    loop {
+        match stream_event_rx.recv() {
+            Ok(event) => match event? {
+                TokenStreamEvent::Token(token, done) => {
+                    tx_tokens.send(DemoEvent::Token(token))?;
+                    if done {
+                        terminal_seen = true;
+                    }
+                }
+                TokenStreamEvent::RequestDone(result) => {
+                    result?;
+                    request_done = true;
+                }
+            },
+            Err(std::sync::mpsc::RecvError) => {
+                anyhow::bail!("token stream ended before the request completed");
+            }
+        }
+        if terminal_seen && request_done {
+            break;
+        }
+    }
 
     close_public_session(&session_handle)?;
     tx.send(DemoEvent::Done)?;
@@ -1082,11 +1110,11 @@ fn stream_language_text(
         zbus::blocking::Proxy::new(&signal_conn, PORTAL_BUS, PORTAL_PATH, LANGUAGE_IFACE)?;
     let mut token_iter = sig_proxy.receive_signal("TokenReceived")?;
     let token_session_handle = session_handle.clone();
-    let (stream_done_tx, stream_done_rx) = std::sync::mpsc::channel();
+    let (stream_event_tx, stream_event_rx) = std::sync::mpsc::channel();
+    let token_event_tx = stream_event_tx.clone();
 
     std::thread::spawn(move || {
-        let result = (|| -> anyhow::Result<String> {
-            let mut content = String::new();
+        let result = (|| -> anyhow::Result<()> {
             for msg in &mut token_iter {
                 let (_sig_request, sig_session, token, done): (
                     OwnedObjectPath,
@@ -1097,17 +1125,16 @@ fn stream_language_text(
                 if sig_session.as_str() != token_session_handle.as_str() {
                     continue;
                 }
-                content.push_str(&token);
-                if let Some(tx) = &token_tx {
-                    tx.send(DemoEvent::Token(token))?;
-                }
+                token_event_tx.send(Ok(TokenStreamEvent::Token(token, done)))?;
                 if done {
                     break;
                 }
             }
-            Ok(content)
+            Ok(())
         })();
-        let _ = stream_done_tx.send(result);
+        if let Err(error) = result {
+            let _ = token_event_tx.send(Err(error));
+        }
     });
 
     let input_json = text_shorthand_json(prompt);
@@ -1116,16 +1143,51 @@ fn stream_language_text(
         &(session_handle, &input_json, Vec::<OwnedFd>::new(), options),
     );
     let request_handle = stream_result?;
-    let content = stream_done_rx
-        .recv_timeout(Duration::from_secs(2))
-        .map_err(|_| anyhow::anyhow!("stream completed without a final TokenReceived signal"))??;
-    wait_request_success(&request_handle)?;
-    Ok(content)
+    let response_request_handle = request_handle.clone();
+    std::thread::spawn(move || {
+        let result = wait_request_success(&response_request_handle);
+        let _ = stream_event_tx.send(Ok(TokenStreamEvent::RequestDone(result)));
+    });
+
+    let mut content = String::new();
+    let mut terminal_content = None::<String>;
+    let mut request_done = false;
+    loop {
+        match stream_event_rx.recv() {
+            Ok(event) => match event? {
+                TokenStreamEvent::Token(token, done) => {
+                    content.push_str(&token);
+                    if let Some(tx) = &token_tx {
+                        tx.send(DemoEvent::Token(token))?;
+                    }
+                    if done {
+                        terminal_content = Some(content.clone());
+                    }
+                }
+                TokenStreamEvent::RequestDone(result) => {
+                    result?;
+                    request_done = true;
+                }
+            },
+            Err(std::sync::mpsc::RecvError) => {
+                anyhow::bail!("token stream ended before the request completed");
+            }
+        }
+        if request_done && let Some(content) = terminal_content.take() {
+            return Ok(content);
+        }
+    }
+}
+
+enum TokenStreamEvent {
+    Token(String, bool),
+    RequestDone(anyhow::Result<()>),
 }
 
 enum GuidedStreamEvent {
     Snapshot(String, bool),
     ToolCalls(Vec<ToolCallDbus>, bool),
+    RequestDone(anyhow::Result<()>),
 }
 
 type SnapshotHandler<'a> = &'a mut dyn FnMut(&str) -> anyhow::Result<()>;
@@ -1266,6 +1328,7 @@ fn stream_guided_call(
     let signal_session_handle = session_handle.clone();
     let (event_tx, event_rx) = std::sync::mpsc::channel::<anyhow::Result<GuidedStreamEvent>>();
     let media_fds = media_files.iter().map(Fd::from).collect::<Vec<_>>();
+    let signal_tx = event_tx.clone();
 
     std::thread::spawn(move || {
         for msg in &mut signal_iter {
@@ -1310,14 +1373,14 @@ fn stream_guided_call(
                         GuidedStreamEvent::Snapshot(_, true)
                             | GuidedStreamEvent::ToolCalls(_, true)
                     );
-                    let _ = event_tx.send(Ok(event));
+                    let _ = signal_tx.send(Ok(event));
                     if done {
                         break;
                     }
                 }
                 Ok(None) => {}
                 Err(error) => {
-                    let _ = event_tx.send(Err(error));
+                    let _ = signal_tx.send(Err(error));
                     break;
                 }
             }
@@ -1344,26 +1407,42 @@ fn stream_guided_call(
         )?
     };
 
+    let response_tx = event_tx.clone();
+    let response_request_handle = request_handle.clone();
+    std::thread::spawn(move || {
+        let result = wait_request_success(&response_request_handle);
+        let _ = response_tx.send(Ok(GuidedStreamEvent::RequestDone(result)));
+    });
+
+    let mut terminal_response = None::<(String, Vec<ToolCallDbus>)>;
+    let mut request_done = false;
     loop {
-        match event_rx
-            .recv_timeout(Duration::from_secs(2))
-            .map_err(|_| anyhow::anyhow!("stream completed without a final guided signal"))??
-        {
-            GuidedStreamEvent::Snapshot(snapshot, done) => {
-                if let Some(handler) = snapshot_handler.as_mut() {
-                    handler(&snapshot)?;
+        match event_rx.recv() {
+            Ok(event) => match event? {
+                GuidedStreamEvent::Snapshot(snapshot, done) => {
+                    if let Some(handler) = snapshot_handler.as_mut() {
+                        handler(&snapshot)?;
+                    }
+                    if done {
+                        terminal_response = Some((snapshot, Vec::new()));
+                    }
                 }
-                if done {
-                    wait_request_success(&request_handle)?;
-                    return Ok((snapshot, Vec::new()));
+                GuidedStreamEvent::ToolCalls(tool_calls, done) => {
+                    if done {
+                        terminal_response = Some((String::new(), tool_calls));
+                    }
                 }
+                GuidedStreamEvent::RequestDone(result) => {
+                    result?;
+                    request_done = true;
+                }
+            },
+            Err(std::sync::mpsc::RecvError) => {
+                anyhow::bail!("guided stream ended before a final guided signal");
             }
-            GuidedStreamEvent::ToolCalls(tool_calls, done) => {
-                if done {
-                    wait_request_success(&request_handle)?;
-                    return Ok((String::new(), tool_calls));
-                }
-            }
+        }
+        if request_done && let Some(response) = terminal_response.take() {
+            return Ok(response);
         }
     }
 }
@@ -1380,11 +1459,11 @@ fn stream_prediction(
         zbus::blocking::Proxy::new(&signal_conn, PORTAL_BUS, PORTAL_PATH, LANGUAGE_IFACE)?;
     let mut prediction_iter = sig_proxy.receive_signal("PredictionReceived")?;
     let prediction_session_handle = session_handle.clone();
-    let (stream_done_tx, stream_done_rx) = std::sync::mpsc::channel();
+    let (stream_event_tx, stream_event_rx) = std::sync::mpsc::channel();
+    let prediction_event_tx = stream_event_tx.clone();
 
     std::thread::spawn(move || {
-        let result = (|| -> anyhow::Result<Vec<String>> {
-            let mut completions = Vec::new();
+        let result = (|| -> anyhow::Result<()> {
             for msg in &mut prediction_iter {
                 let (_sig_request, sig_session, completion, done): (
                     OwnedObjectPath,
@@ -1395,28 +1474,60 @@ fn stream_prediction(
                 if sig_session.as_str() != prediction_session_handle.as_str() {
                     continue;
                 }
-                if !completion.is_empty() {
-                    completions.push(completion);
-                }
+                prediction_event_tx
+                    .send(Ok(PredictionStreamEvent::Completion(completion, done)))?;
                 if done {
-                    return Ok(completions);
+                    break;
                 }
             }
-            Ok(Vec::new())
+            Ok(())
         })();
-        let _ = stream_done_tx.send(result);
+        if let Err(error) = result {
+            let _ = prediction_event_tx.send(Err(error));
+        }
     });
 
     let stream_result: zbus::Result<OwnedObjectPath> =
         proxy.call("StreamPredictNext", &(session_handle, prefix, options));
     let request_handle = stream_result?;
-    let completions = stream_done_rx
-        .recv_timeout(Duration::from_secs(2))
-        .map_err(|_| {
-            anyhow::anyhow!("stream completed without a final PredictionReceived signal")
-        })??;
-    wait_request_success(&request_handle)?;
-    Ok(completions)
+    let response_request_handle = request_handle.clone();
+    std::thread::spawn(move || {
+        let result = wait_request_success(&response_request_handle);
+        let _ = stream_event_tx.send(Ok(PredictionStreamEvent::RequestDone(result)));
+    });
+
+    let mut completions = Vec::new();
+    let mut terminal_completions = None::<Vec<String>>;
+    let mut request_done = false;
+    loop {
+        match stream_event_rx.recv() {
+            Ok(event) => match event? {
+                PredictionStreamEvent::Completion(completion, done) => {
+                    if !completion.is_empty() {
+                        completions.push(completion);
+                    }
+                    if done {
+                        terminal_completions = Some(completions.clone());
+                    }
+                }
+                PredictionStreamEvent::RequestDone(result) => {
+                    result?;
+                    request_done = true;
+                }
+            },
+            Err(std::sync::mpsc::RecvError) => {
+                anyhow::bail!("prediction stream ended before the request completed");
+            }
+        }
+        if request_done && let Some(completions) = terminal_completions.take() {
+            return Ok(completions);
+        }
+    }
+}
+
+enum PredictionStreamEvent {
+    Completion(String, bool),
+    RequestDone(anyhow::Result<()>),
 }
 
 fn stream_embedding(session_handle: &OwnedObjectPath, text: &str) -> anyhow::Result<Vec<f64>> {
@@ -1427,10 +1538,11 @@ fn stream_embedding(session_handle: &OwnedObjectPath, text: &str) -> anyhow::Res
         zbus::blocking::Proxy::new(&signal_conn, PORTAL_BUS, PORTAL_PATH, LANGUAGE_IFACE)?;
     let mut embedding_iter = sig_proxy.receive_signal("EmbeddingReceived")?;
     let embedding_session_handle = session_handle.clone();
-    let (stream_done_tx, stream_done_rx) = std::sync::mpsc::channel();
+    let (stream_event_tx, stream_event_rx) = std::sync::mpsc::channel();
+    let embedding_event_tx = stream_event_tx.clone();
 
     std::thread::spawn(move || {
-        let result = (|| -> anyhow::Result<Vec<f64>> {
+        let result = (|| -> anyhow::Result<()> {
             for msg in &mut embedding_iter {
                 let (_sig_request, sig_session, embedding, done): (
                     OwnedObjectPath,
@@ -1441,25 +1553,55 @@ fn stream_embedding(session_handle: &OwnedObjectPath, text: &str) -> anyhow::Res
                 if sig_session.as_str() != embedding_session_handle.as_str() {
                     continue;
                 }
+                embedding_event_tx.send(Ok(EmbeddingStreamEvent::Embedding(embedding, done)))?;
                 if done {
-                    return Ok(embedding);
+                    break;
                 }
             }
-            Ok(Vec::new())
+            Ok(())
         })();
-        let _ = stream_done_tx.send(result);
+        if let Err(error) = result {
+            let _ = embedding_event_tx.send(Err(error));
+        }
     });
 
     let stream_result: zbus::Result<OwnedObjectPath> =
         proxy.call("StreamEmbed", &(session_handle, text, empty_options()));
     let request_handle = stream_result?;
-    let embedding = stream_done_rx
-        .recv_timeout(Duration::from_secs(2))
-        .map_err(|_| {
-            anyhow::anyhow!("stream completed without a final EmbeddingReceived signal")
-        })??;
-    wait_request_success(&request_handle)?;
-    Ok(embedding)
+    let response_request_handle = request_handle.clone();
+    std::thread::spawn(move || {
+        let result = wait_request_success(&response_request_handle);
+        let _ = stream_event_tx.send(Ok(EmbeddingStreamEvent::RequestDone(result)));
+    });
+
+    let mut terminal_embedding = None::<Vec<f64>>;
+    let mut request_done = false;
+    loop {
+        match stream_event_rx.recv() {
+            Ok(event) => match event? {
+                EmbeddingStreamEvent::Embedding(value, done) => {
+                    if done {
+                        terminal_embedding = Some(value);
+                    }
+                }
+                EmbeddingStreamEvent::RequestDone(result) => {
+                    result?;
+                    request_done = true;
+                }
+            },
+            Err(std::sync::mpsc::RecvError) => {
+                anyhow::bail!("embedding stream ended before the request completed");
+            }
+        }
+        if request_done && let Some(embedding) = terminal_embedding.take() {
+            return Ok(embedding);
+        }
+    }
+}
+
+enum EmbeddingStreamEvent {
+    Embedding(Vec<f64>, bool),
+    RequestDone(anyhow::Result<()>),
 }
 
 fn stream_vision_text(
@@ -1478,11 +1620,11 @@ fn stream_vision_text(
         zbus::blocking::Proxy::new(&signal_conn, PORTAL_BUS, PORTAL_PATH, VISION_IFACE)?;
     let mut text_iter = sig_proxy.receive_signal("VisionTextReceived")?;
     let text_session_handle = session_handle.clone();
-    let (stream_done_tx, stream_done_rx) = std::sync::mpsc::channel();
+    let (stream_event_tx, stream_event_rx) = std::sync::mpsc::channel();
+    let text_event_tx = stream_event_tx.clone();
 
     std::thread::spawn(move || {
-        let result = (|| -> anyhow::Result<String> {
-            let mut content = String::new();
+        let result = (|| -> anyhow::Result<()> {
             for msg in &mut text_iter {
                 let (_sig_request, sig_session, text, done): (
                     OwnedObjectPath,
@@ -1493,21 +1635,16 @@ fn stream_vision_text(
                 if sig_session.as_str() != text_session_handle.as_str() {
                     continue;
                 }
-                content.push_str(&text);
-                if let Some((tx, kind)) = &text_tx {
-                    let event = match kind {
-                        VisionTextKind::Description => VisionEvent::Description(content.clone()),
-                        VisionTextKind::Ocr => VisionEvent::Ocr(content.clone()),
-                    };
-                    tx.send(event)?;
-                }
+                text_event_tx.send(Ok(VisionTextStreamEvent::Text(text, done)))?;
                 if done {
                     break;
                 }
             }
-            Ok(content)
+            Ok(())
         })();
-        let _ = stream_done_tx.send(result);
+        if let Err(error) = result {
+            let _ = text_event_tx.send(Err(error));
+        }
     });
 
     let stream_result: zbus::Result<OwnedObjectPath> = proxy.call(
@@ -1515,13 +1652,51 @@ fn stream_vision_text(
         &(session_handle, image_fd, instructions, empty_options()),
     );
     let request_handle = stream_result?;
-    let content = stream_done_rx
-        .recv_timeout(Duration::from_secs(2))
-        .map_err(|_| {
-            anyhow::anyhow!("stream completed without a final VisionTextReceived signal")
-        })??;
-    wait_request_success(&request_handle)?;
-    Ok(content)
+    let response_request_handle = request_handle.clone();
+    std::thread::spawn(move || {
+        let result = wait_request_success(&response_request_handle);
+        let _ = stream_event_tx.send(Ok(VisionTextStreamEvent::RequestDone(result)));
+    });
+
+    let mut content = String::new();
+    let mut terminal_content = None::<String>;
+    let mut request_done = false;
+    loop {
+        match stream_event_rx.recv() {
+            Ok(event) => match event? {
+                VisionTextStreamEvent::Text(text, done) => {
+                    content.push_str(&text);
+                    if let Some((tx, kind)) = &text_tx {
+                        let event = match kind {
+                            VisionTextKind::Description => {
+                                VisionEvent::Description(content.clone())
+                            }
+                            VisionTextKind::Ocr => VisionEvent::Ocr(content.clone()),
+                        };
+                        tx.send(event)?;
+                    }
+                    if done {
+                        terminal_content = Some(content.clone());
+                    }
+                }
+                VisionTextStreamEvent::RequestDone(result) => {
+                    result?;
+                    request_done = true;
+                }
+            },
+            Err(std::sync::mpsc::RecvError) => {
+                anyhow::bail!("vision text stream ended before the request completed");
+            }
+        }
+        if request_done && let Some(content) = terminal_content.take() {
+            return Ok(content);
+        }
+    }
+}
+
+enum VisionTextStreamEvent {
+    Text(String, bool),
+    RequestDone(anyhow::Result<()>),
 }
 
 fn stream_vision_segments(
@@ -1538,10 +1713,11 @@ fn stream_vision_segments(
         zbus::blocking::Proxy::new(&signal_conn, PORTAL_BUS, PORTAL_PATH, VISION_IFACE)?;
     let mut segment_iter = sig_proxy.receive_signal("VisionSegmentsReceived")?;
     let segment_session_handle = session_handle.clone();
-    let (stream_done_tx, stream_done_rx) = std::sync::mpsc::channel();
+    let (stream_event_tx, stream_event_rx) = std::sync::mpsc::channel();
+    let segment_event_tx = stream_event_tx.clone();
 
     std::thread::spawn(move || {
-        let result = (|| -> anyhow::Result<Vec<VisionSegmentDbus>> {
+        let result = (|| -> anyhow::Result<()> {
             for msg in &mut segment_iter {
                 let (_sig_request, sig_session, segments, done): (
                     OwnedObjectPath,
@@ -1552,13 +1728,16 @@ fn stream_vision_segments(
                 if sig_session.as_str() != segment_session_handle.as_str() {
                     continue;
                 }
+                segment_event_tx.send(Ok(VisionSegmentStreamEvent::Segments(segments, done)))?;
                 if done {
-                    return Ok(segments);
+                    break;
                 }
             }
-            Ok(Vec::new())
+            Ok(())
         })();
-        let _ = stream_done_tx.send(result);
+        if let Err(error) = result {
+            let _ = segment_event_tx.send(Err(error));
+        }
     });
 
     let stream_result: zbus::Result<OwnedObjectPath> = proxy.call(
@@ -1566,13 +1745,40 @@ fn stream_vision_segments(
         &(session_handle, image_fd, instructions, empty_options()),
     );
     let request_handle = stream_result?;
-    let segments = stream_done_rx
-        .recv_timeout(Duration::from_secs(2))
-        .map_err(|_| {
-            anyhow::anyhow!("stream completed without a final VisionSegmentsReceived signal")
-        })??;
-    wait_request_success(&request_handle)?;
-    Ok(segments)
+    let response_request_handle = request_handle.clone();
+    std::thread::spawn(move || {
+        let result = wait_request_success(&response_request_handle);
+        let _ = stream_event_tx.send(Ok(VisionSegmentStreamEvent::RequestDone(result)));
+    });
+
+    let mut terminal_segments = None::<Vec<VisionSegmentDbus>>;
+    let mut request_done = false;
+    loop {
+        match stream_event_rx.recv() {
+            Ok(event) => match event? {
+                VisionSegmentStreamEvent::Segments(value, done) => {
+                    if done {
+                        terminal_segments = Some(value);
+                    }
+                }
+                VisionSegmentStreamEvent::RequestDone(result) => {
+                    result?;
+                    request_done = true;
+                }
+            },
+            Err(std::sync::mpsc::RecvError) => {
+                anyhow::bail!("vision segment stream ended before the request completed");
+            }
+        }
+        if request_done && let Some(segments) = terminal_segments.take() {
+            return Ok(segments);
+        }
+    }
+}
+
+enum VisionSegmentStreamEvent {
+    Segments(Vec<VisionSegmentDbus>, bool),
+    RequestDone(anyhow::Result<()>),
 }
 
 fn extract_guided(text: &str, tx: std::sync::mpsc::Sender<DemoEvent>) -> anyhow::Result<()> {
@@ -1607,7 +1813,7 @@ fn extract_guided(text: &str, tx: std::sync::mpsc::Sender<DemoEvent>) -> anyhow:
             true,
         ),
     ];
-    let options = generation_options(128, "", "");
+    let options = generation_options(512, "", "");
 
     tx.send(DemoEvent::Phase(DemoPhase::WaitingForModel))?;
     tx.send(DemoEvent::Phase(DemoPhase::RequestingGuided))?;
@@ -2233,10 +2439,10 @@ fn stream_speech_audio(
     let mut transcription_iter = sig_proxy.receive_signal("TranscriptionReceived")?;
     let transcript_session_handle = session_handle.clone();
     let tx_transcript = tx.clone();
-    let (stream_done_tx, stream_done_rx) = std::sync::mpsc::channel();
+    let (stream_event_tx, stream_event_rx) = std::sync::mpsc::channel();
+    let transcript_event_tx = stream_event_tx.clone();
     std::thread::spawn(move || {
-        let result = (|| -> anyhow::Result<String> {
-            let mut transcript = String::new();
+        let result = (|| -> anyhow::Result<()> {
             for msg in &mut transcription_iter {
                 let (_sig_request, sig_session, text, done): (
                     OwnedObjectPath,
@@ -2247,24 +2453,16 @@ fn stream_speech_audio(
                 if sig_session.as_str() != transcript_session_handle.as_str() {
                     continue;
                 }
-                transcript.push_str(&text);
-                match mode {
-                    SpeechTranscriptMode::Replace => {
-                        tx_transcript.send(SpeechEvent::Transcript(transcript.clone()))?;
-                    }
-                    SpeechTranscriptMode::Append => {
-                        if !text.is_empty() {
-                            tx_transcript.send(SpeechEvent::AppendTranscript(text))?;
-                        }
-                    }
-                }
+                transcript_event_tx.send(Ok(SpeechStreamEvent::Text(text, done)))?;
                 if done {
                     break;
                 }
             }
-            Ok(transcript)
+            Ok(())
         })();
-        let _ = stream_done_tx.send(result);
+        if let Err(error) = result {
+            let _ = transcript_event_tx.send(Err(error));
+        }
     });
 
     let stream_result: zbus::Result<OwnedObjectPath> = proxy.call(
@@ -2277,13 +2475,52 @@ fn stream_speech_audio(
         ),
     );
     let request_handle = stream_result?;
-    let transcript = stream_done_rx
-        .recv_timeout(Duration::from_secs(2))
-        .map_err(|_| {
-            anyhow::anyhow!("stream completed without a final TranscriptionReceived signal")
-        })??;
-    wait_request_success(&request_handle)?;
-    Ok(transcript)
+    let response_request_handle = request_handle.clone();
+    std::thread::spawn(move || {
+        let result = wait_request_success(&response_request_handle);
+        let _ = stream_event_tx.send(Ok(SpeechStreamEvent::RequestDone(result)));
+    });
+
+    let mut transcript = String::new();
+    let mut terminal_transcript = None::<String>;
+    let mut request_done = false;
+    loop {
+        match stream_event_rx.recv() {
+            Ok(event) => match event? {
+                SpeechStreamEvent::Text(text, done) => {
+                    transcript.push_str(&text);
+                    match mode {
+                        SpeechTranscriptMode::Replace => {
+                            tx_transcript.send(SpeechEvent::Transcript(transcript.clone()))?;
+                        }
+                        SpeechTranscriptMode::Append => {
+                            if !text.is_empty() {
+                                tx_transcript.send(SpeechEvent::AppendTranscript(text))?;
+                            }
+                        }
+                    }
+                    if done {
+                        terminal_transcript = Some(transcript.clone());
+                    }
+                }
+                SpeechStreamEvent::RequestDone(result) => {
+                    result?;
+                    request_done = true;
+                }
+            },
+            Err(std::sync::mpsc::RecvError) => {
+                anyhow::bail!("speech stream ended before the request completed");
+            }
+        }
+        if request_done && let Some(transcript) = terminal_transcript.take() {
+            return Ok(transcript);
+        }
+    }
+}
+
+enum SpeechStreamEvent {
+    Text(String, bool),
+    RequestDone(anyhow::Result<()>),
 }
 
 fn read_audio_range(path: &Path, start: u64, end: u64) -> anyhow::Result<Vec<u8>> {
@@ -2492,38 +2729,6 @@ fn media_file_from_bytes(bytes: &[u8]) -> anyhow::Result<std::fs::File> {
     }
 
     Ok(file)
-}
-
-pub(crate) fn decode_base64(input: &str) -> Result<Vec<u8>, String> {
-    let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut table = [255u8; 256];
-    for (i, &b) in alphabet.iter().enumerate() {
-        table[b as usize] = i as u8;
-    }
-
-    let clean = input
-        .bytes()
-        .filter(|b| !matches!(b, b'=' | b'\n' | b'\r' | b' ' | b'\t'))
-        .collect::<Vec<_>>();
-    let mut out = Vec::with_capacity(clean.len() * 3 / 4);
-    let mut buf = 0u32;
-    let mut bits = 0u32;
-
-    for b in clean {
-        let v = table[b as usize];
-        if v == 255 {
-            return Err(format!("invalid base64 char: {}", b as char));
-        }
-        buf = (buf << 6) | v as u32;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((buf >> bits) as u8);
-            buf &= (1 << bits) - 1;
-        }
-    }
-
-    Ok(out)
 }
 
 #[cfg(test)]

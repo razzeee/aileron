@@ -205,6 +205,15 @@ pub fn field_as_string(value: &Value, key: &str) -> Option<String> {
 }
 
 pub fn first_json_value(raw: &str) -> std::result::Result<String, String> {
+    let raw = raw.trim();
+    let raw = raw
+        .strip_prefix("```json")
+        .or_else(|| raw.strip_prefix("```JSON"))
+        .or_else(|| raw.strip_prefix("```"))
+        .and_then(|value| value.strip_suffix("```"))
+        .map(str::trim)
+        .unwrap_or(raw);
+
     for (index, _) in raw.match_indices(['{', '[']) {
         let candidate = &raw[index..];
         let mut values = serde_json::Deserializer::from_str(candidate).into_iter::<Value>();
@@ -275,6 +284,14 @@ mod tests {
     fn first_json_value_ignores_surrounding_text() {
         assert_eq!(
             first_json_value("Sure: {\"ok\":true} trailing text").unwrap(),
+            "{\"ok\":true}"
+        );
+    }
+
+    #[test]
+    fn first_json_value_accepts_fenced_json() {
+        assert_eq!(
+            first_json_value("```json\n{\"ok\":true}\n```").unwrap(),
             "{\"ok\":true}"
         );
     }

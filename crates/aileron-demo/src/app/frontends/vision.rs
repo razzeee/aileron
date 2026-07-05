@@ -1,6 +1,5 @@
 use super::super::{
-    VisionEvent, decode_base64, describe_image, format_segments, friendly_error, ocr_image,
-    segment_image,
+    VisionEvent, describe_image, format_segments, friendly_error, ocr_image, segment_image,
 };
 use super::scrollable_page;
 use gtk4::prelude::*;
@@ -20,7 +19,7 @@ pub(crate) fn build_page() -> gtk4::Widget {
 
     vbox.append(
         &Label::builder()
-            .label("Describe, extract text from, or segment an image through the vision portal path. Select a PNG/JPEG file or paste base64 image bytes.")
+            .label("Describe, extract text from, or segment an image through the vision portal path. Select a PNG/JPEG file.")
             .xalign(0.0)
             .wrap(true)
             .build(),
@@ -43,32 +42,11 @@ pub(crate) fn build_page() -> gtk4::Widget {
     vbox.append(&button_row);
 
     let selected_label = Label::builder()
-        .label("No file selected. Paste base64 below or choose an image.")
+        .label("No file selected. Choose an image.")
         .xalign(0.0)
         .wrap(true)
         .build();
     vbox.append(&selected_label);
-
-    let paste_buffer = TextBuffer::new(None);
-    let paste_view = TextView::builder()
-        .buffer(&paste_buffer)
-        .editable(true)
-        .wrap_mode(gtk4::WrapMode::Char)
-        .hexpand(true)
-        .vexpand(false)
-        .build();
-    vbox.append(
-        &Label::builder()
-            .label("Pasted base64 image")
-            .xalign(0.0)
-            .build(),
-    );
-    vbox.append(
-        &ScrolledWindow::builder()
-            .child(&paste_view)
-            .min_content_height(120)
-            .build(),
-    );
 
     let instructions_buffer = TextBuffer::new(None);
     let instructions_view = TextView::builder()
@@ -114,7 +92,7 @@ pub(crate) fn build_page() -> gtk4::Widget {
         .css_classes(vec!["heading"])
         .build();
     let status_detail = Label::builder()
-        .label("Choose or paste an image, then describe it locally.")
+        .label("Choose an image, then describe it locally.")
         .xalign(0.0)
         .wrap(true)
         .build();
@@ -218,7 +196,6 @@ pub(crate) fn build_page() -> gtk4::Widget {
 
     {
         let selected_image = selected_image.clone();
-        let paste_buffer = paste_buffer.clone();
         let instructions_buffer = instructions_buffer.clone();
         let description_buffer = description_buffer.clone();
         let describe_button_for_click = describe_button.clone();
@@ -228,7 +205,7 @@ pub(crate) fn build_page() -> gtk4::Widget {
         let status_title = status_title.clone();
         let status_detail = status_detail.clone();
         describe_button.connect_clicked(move |_| {
-            let image = match image_bytes_from_inputs(&selected_image, &paste_buffer) {
+            let image = match image_bytes_from_selection(&selected_image) {
                 Ok(bytes) => bytes,
                 Err(message) => {
                     status_title.set_text("No image input");
@@ -314,7 +291,6 @@ pub(crate) fn build_page() -> gtk4::Widget {
 
     {
         let selected_image = selected_image.clone();
-        let paste_buffer = paste_buffer.clone();
         let instructions_buffer = instructions_buffer.clone();
         let ocr_buffer = ocr_buffer.clone();
         let describe_button_for_click = describe_button.clone();
@@ -324,7 +300,7 @@ pub(crate) fn build_page() -> gtk4::Widget {
         let status_title = status_title.clone();
         let status_detail = status_detail.clone();
         ocr_button.connect_clicked(move |_| {
-            let image = match image_bytes_from_inputs(&selected_image, &paste_buffer) {
+            let image = match image_bytes_from_selection(&selected_image) {
                 Ok(bytes) => bytes,
                 Err(message) => {
                     status_title.set_text("No image input");
@@ -410,7 +386,6 @@ pub(crate) fn build_page() -> gtk4::Widget {
 
     {
         let selected_image = selected_image.clone();
-        let paste_buffer = paste_buffer.clone();
         let instructions_buffer = instructions_buffer.clone();
         let segments_buffer = segments_buffer.clone();
         let describe_button_for_click = describe_button.clone();
@@ -420,7 +395,7 @@ pub(crate) fn build_page() -> gtk4::Widget {
         let status_title = status_title.clone();
         let status_detail = status_detail.clone();
         segment_button.connect_clicked(move |_| {
-            let image = match image_bytes_from_inputs(&selected_image, &paste_buffer) {
+            let image = match image_bytes_from_selection(&selected_image) {
                 Ok(bytes) => bytes,
                 Err(message) => {
                     status_title.set_text("No image input");
@@ -511,9 +486,8 @@ fn buffer_text(buffer: &TextBuffer) -> String {
     buffer.text(&start, &end, false).trim().to_string()
 }
 
-fn image_bytes_from_inputs(
+fn image_bytes_from_selection(
     selected_image: &Rc<RefCell<Option<Vec<u8>>>>,
-    paste_buffer: &TextBuffer,
 ) -> Result<Vec<u8>, String> {
     if let Some(bytes) = selected_image.borrow().clone() {
         if bytes.is_empty() {
@@ -522,17 +496,5 @@ fn image_bytes_from_inputs(
         return Ok(bytes);
     }
 
-    let (start, end) = paste_buffer.bounds();
-    let pasted = paste_buffer.text(&start, &end, false);
-    let pasted = pasted.trim();
-    if pasted.is_empty() {
-        return Err("Choose an image file or paste base64 image bytes first.".to_string());
-    }
-
-    let bytes =
-        decode_base64(pasted).map_err(|e| format!("Pasted image is not valid base64: {e}"))?;
-    if bytes.is_empty() {
-        return Err("Pasted image decoded to empty bytes.".to_string());
-    }
-    Ok(bytes)
+    Err("Choose an image file first.".to_string())
 }
