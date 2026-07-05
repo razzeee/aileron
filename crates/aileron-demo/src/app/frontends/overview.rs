@@ -54,83 +54,81 @@ pub(crate) fn build_page(stack: &ViewStack) -> gtk4::Widget {
     );
 
     let cards = Box::new(Orientation::Vertical, 12);
-    cards.append(&lab_card(
-        "Chat Lab",
-        "Run guided chat turns, then verify local session memory across follow-ups.",
-        "CreateSession, StreamRespondGuided, Session.Close",
-        "Try: tell it a preference, then ask a follow-up that uses memory.",
-        "Open Chat Lab",
-        "chat",
-        "user-available-symbolic",
-        "Memory lane",
-        stack,
-    ));
-    cards.append(&lab_card(
-        "Text Lab",
-        "Fetch or paste text, then summarize, translate, rephrase, classify, extract JSON, or analyze.",
-        "StreamResponse, StreamRespondGuided",
-        "Try: paste an article, classify it, then extract JSON facts.",
-        "Open Text Lab",
-        "text",
-        "text-x-generic-symbolic",
-        "Workbench",
-        stack,
-    ));
-    cards.append(&lab_card(
-        "Prediction Lab",
-        "Type a sentence and preview a short ghost continuation from the local language model.",
-        "StreamPredictNext",
-        "Try: The old lighthouse keeper opened the door and",
-        "Open Prediction Lab",
-        "predict",
-        "insert-text-symbolic",
-        "Ghost text",
-        stack,
-    ));
-    cards.append(&lab_card(
-        "Tool Lab",
-        "Run tiny agent loops where the model asks for app-owned tools, including whole-PC Linux diagnostics.",
-        "CreateSession, StreamRespondGuided, Session.Close",
-        "Try: collect read-only PC diagnostics and ask for safe bugfix guidance.",
-        "Open Tool Lab",
-        "tools",
-        "applications-system-symbolic",
-        "Tool loop",
-        stack,
-    ));
-    cards.append(&lab_card(
-        "Speech Lab",
-        "Record microphone audio and stream transcription or translation through the Speech portal path.",
-        "StreamTranscribe",
-        "Try: start Live Transcribe, speak for 5-10 seconds, then stop for the final pass.",
-        "Open Speech Lab",
-        "speech",
-        "audio-input-microphone-symbolic",
-        "Live audio",
-        stack,
-    ));
-    cards.append(&lab_card(
-        "Vision Lab",
-        "Choose an image file and run description or segmentation through the vision portal path.",
-        "StreamDescribe, StreamSegment",
-        "Try: choose a screenshot, describe it, then segment visible objects.",
-        "Open Vision Lab",
-        "vision",
-        "image-x-generic-symbolic",
-        "Pixels in",
-        stack,
-    ));
-    cards.append(&lab_card(
-        "Embeddings",
-        "Generate dense vectors for short text and inspect the numerical output without leaving the sandbox.",
-        "Embed",
-        "Try: compare two short snippets and inspect their vector shapes.",
-        "Open Embeddings",
-        "embed",
-        "emblem-documents-symbolic",
-        "Vector dock",
-        stack,
-    ));
+    let labs = [
+        LabCard {
+            title: "Chat Lab",
+            subtitle: "Run guided chat turns, then verify local session memory across follow-ups.",
+            methods: "CreateSession, StreamRespondGuided, Session.Close",
+            example: "Try: tell it a preference, then ask a follow-up that uses memory.",
+            button_label: "Open Chat Lab",
+            page_name: "chat",
+            icon_name: "user-available-symbolic",
+            tag: "Memory lane",
+        },
+        LabCard {
+            title: "Text Lab",
+            subtitle: "Fetch or paste text, then summarize, translate, rephrase, classify, extract JSON, or analyze.",
+            methods: "StreamResponse, StreamRespondGuided",
+            example: "Try: paste an article, classify it, then extract JSON facts.",
+            button_label: "Open Text Lab",
+            page_name: "text",
+            icon_name: "text-x-generic-symbolic",
+            tag: "Workbench",
+        },
+        LabCard {
+            title: "Prediction Lab",
+            subtitle: "Type a sentence and preview a short ghost continuation from the local language model.",
+            methods: "StreamPredictNext",
+            example: "Try: The old lighthouse keeper opened the door and",
+            button_label: "Open Prediction Lab",
+            page_name: "predict",
+            icon_name: "insert-text-symbolic",
+            tag: "Ghost text",
+        },
+        LabCard {
+            title: "Tool Lab",
+            subtitle: "Run tiny agent loops where the model asks for app-owned tools, including whole-PC Linux diagnostics.",
+            methods: "CreateSession, StreamRespondGuided, Session.Close",
+            example: "Try: collect read-only PC diagnostics and ask for safe bugfix guidance.",
+            button_label: "Open Tool Lab",
+            page_name: "tools",
+            icon_name: "applications-system-symbolic",
+            tag: "Tool loop",
+        },
+        LabCard {
+            title: "Speech Lab",
+            subtitle: "Record microphone audio and stream transcription or translation through the Speech portal path.",
+            methods: "StreamTranscribe",
+            example: "Try: start Live Transcribe, speak for 5-10 seconds, then stop for the final pass.",
+            button_label: "Open Speech Lab",
+            page_name: "speech",
+            icon_name: "audio-input-microphone-symbolic",
+            tag: "Live audio",
+        },
+        LabCard {
+            title: "Vision Lab",
+            subtitle: "Choose an image file and run description or segmentation through the vision portal path.",
+            methods: "StreamDescribe, StreamSegment",
+            example: "Try: choose a screenshot, describe it, then segment visible objects.",
+            button_label: "Open Vision Lab",
+            page_name: "vision",
+            icon_name: "image-x-generic-symbolic",
+            tag: "Pixels in",
+        },
+        LabCard {
+            title: "Embeddings",
+            subtitle: "Generate dense vectors for short text and inspect the numerical output without leaving the sandbox.",
+            methods: "Embed",
+            example: "Try: compare two short snippets and inspect their vector shapes.",
+            button_label: "Open Embeddings",
+            page_name: "embed",
+            icon_name: "emblem-documents-symbolic",
+            tag: "Vector dock",
+        },
+    ];
+    for lab in labs {
+        cards.append(&lab_card(lab, stack));
+    }
     root.append(&cards);
 
     scrollable_page(&root)
@@ -212,17 +210,18 @@ fn stat_pill(value: &str, label: &str) -> Box {
     pill
 }
 
-fn lab_card(
-    title: &str,
-    subtitle: &str,
-    methods: &str,
-    example: &str,
-    button_label: &str,
+struct LabCard {
+    title: &'static str,
+    subtitle: &'static str,
+    methods: &'static str,
+    example: &'static str,
+    button_label: &'static str,
     page_name: &'static str,
-    icon_name: &str,
-    tag: &str,
-    stack: &ViewStack,
-) -> Box {
+    icon_name: &'static str,
+    tag: &'static str,
+}
+
+fn lab_card(lab: LabCard, stack: &ViewStack) -> Box {
     let card = Box::new(Orientation::Horizontal, 14);
     card.add_css_class("card");
     card.add_css_class("overview-card");
@@ -238,7 +237,7 @@ fn lab_card(
     icon_box.set_margin_bottom(14);
     icon_box.set_margin_start(14);
     icon_box.set_valign(Align::Start);
-    let icon = Image::from_icon_name(icon_name);
+    let icon = Image::from_icon_name(lab.icon_name);
     icon.set_pixel_size(28);
     icon_box.append(&icon);
 
@@ -252,32 +251,32 @@ fn lab_card(
     let title_row = Box::new(Orientation::Horizontal, 8);
     title_row.set_hexpand(true);
     let title = Label::builder()
-        .label(title)
+        .label(lab.title)
         .xalign(0.0)
         .hexpand(true)
         .css_classes(vec!["heading"])
         .build();
     let tag = Label::builder()
-        .label(tag)
+        .label(lab.tag)
         .valign(Align::Center)
         .css_classes(vec!["caption", "overview-tag"])
         .build();
     title_row.append(&title);
     title_row.append(&tag);
     let subtitle = Label::builder()
-        .label(subtitle)
+        .label(lab.subtitle)
         .xalign(0.0)
         .wrap(true)
         .css_classes(vec!["dim-label"])
         .build();
     let methods = Label::builder()
-        .label(format!("Portal: {methods}"))
+        .label(format!("Portal: {}", lab.methods))
         .xalign(0.0)
         .wrap(true)
         .css_classes(vec!["caption", "dim-label"])
         .build();
     let example = Label::builder()
-        .label(example)
+        .label(lab.example)
         .xalign(0.0)
         .wrap(true)
         .css_classes(vec!["caption"])
@@ -293,13 +292,13 @@ fn lab_card(
     action_box.set_margin_end(14);
     action_box.set_valign(Align::Center);
     let button = Button::builder()
-        .label(button_label)
+        .label(lab.button_label)
         .css_classes(vec!["suggested-action"])
         .build();
     {
         let stack = stack.clone();
         button.connect_clicked(move |_| {
-            stack.set_visible_child_name(page_name);
+            stack.set_visible_child_name(lab.page_name);
         });
     }
     action_box.append(&button);
