@@ -1193,36 +1193,42 @@ async fn stream_tokens(
             let mut saw_token = false;
             let mut cancelled = false;
 
-            let result = container.generate(
-                Some(&instructions),
-                &prompt,
-                Some(&input),
-                max_tokens,
-                |token| {
-                    if cancelled || state.is_session_cancelled(&session_id) {
-                        cancelled = true;
-                        return;
-                    }
-                    if !token.is_empty() {
-                        saw_token = true;
-                    }
-                    if !wants_more {
-                        pending_token = Some(token);
-                        return;
-                    }
-
-                    if reply_error.is_some() {
-                        return;
-                    }
-
-                    if let Some(previous) = pending_token.replace(token) {
-                        call.set_continues(true);
-                        if let Err(e) = call.reply(previous) {
-                            reply_error = Some(e);
+            macro_rules! generate_with_instructions {
+                ($instructions:expr) => {
+                    container.generate(Some($instructions), &prompt, Some(&input), max_tokens, |token| {
+                        if cancelled || state.is_session_cancelled(&session_id) {
+                            cancelled = true;
+                            return;
                         }
-                    }
-                },
-            );
+                        if !token.is_empty() {
+                            saw_token = true;
+                        }
+                        if !wants_more {
+                            pending_token = Some(token);
+                            return;
+                        }
+
+                        if reply_error.is_some() {
+                            return;
+                        }
+
+                        if let Some(previous) = pending_token.replace(token) {
+                            call.set_continues(true);
+                            if let Err(e) = call.reply(previous) {
+                                reply_error = Some(e);
+                            }
+                        }
+                    })
+                };
+            }
+
+            let mut result = generate_with_instructions!(&instructions);
+            if result.is_ok() && !saw_token && reply_error.is_none() && !cancelled {
+                let retry_instructions = format!(
+                    "{instructions}\nYou must produce a non-empty plain-text response. Do not return an empty answer."
+                );
+                result = generate_with_instructions!(&retry_instructions);
+            }
 
             if let Some(e) = reply_error {
                 return Err(GenerationError::Reply(e));
