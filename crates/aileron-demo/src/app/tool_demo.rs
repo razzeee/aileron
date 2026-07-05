@@ -390,7 +390,7 @@ fn run_multi_tool_choice_demo(
     let tools = multi_tool_choice_definitions()?;
     let options = generation_options(256, "", "");
     let loop_prompt = format!(
-        "Available app tools:\n- count_character_occurrences(word: string, character: string): exact deterministic character count.\n- collect_linux_pc_diagnostics(scope?: all|user|system, unit?: systemd unit, lines?: number): bounded read-only Linux PC diagnostics.\n\nUser request: {prompt}\n\nChoose one concrete tool. Prefer count_character_occurrences for counting text. Prefer collect_linux_pc_diagnostics only for Linux PC status, logs, resources, failed units, or bugfix evidence. If native tool calls are unavailable, return JSON with tool_name and arguments for the one selected tool."
+        "Available app tools include count_character_occurrences plus individual read-only Linux diagnostics tools such as get_disk_usage, get_memory_summary, get_failed_system_units, and get_recent_kernel_warnings.\n\nUser request: {prompt}\n\nChoose one concrete tool. Prefer count_character_occurrences for counting text. Prefer a specific diagnostics tool only for Linux PC status, logs, resources, failed units, or bugfix evidence. If native tool calls are unavailable, return JSON with tool_name and arguments for the one selected tool."
     );
 
     tx.send(ToolEvent::Trace(
@@ -501,7 +501,8 @@ fn run_linux_diagnostics_tool_demo(
     tx: std::sync::mpsc::Sender<ToolEvent>,
 ) -> anyhow::Result<()> {
     tx.send(ToolEvent::Trace(
-        "before_agent_loop: seed messages and register collect_linux_pc_diagnostics".to_string(),
+        "before_agent_loop: seed messages and register individual read-only diagnostics tools"
+            .to_string(),
     ))?;
 
     let conn = portal_connection()?;
@@ -509,14 +510,14 @@ fn run_linux_diagnostics_tool_demo(
     let session_handle = create_public_session(
         &proxy,
         "language.analyze",
-        "You are a local Linux PC diagnostics assistant. Use the app-provided read-only diagnostics tool before answering. Recommend safe bugfix steps, but do not claim that you changed the machine.",
+        "You are a local Linux PC diagnostics assistant. Choose only the app-provided read-only diagnostics tools needed for the user's question before answering. Recommend safe bugfix steps, but do not claim that you changed the machine.",
     )?;
 
     let fields = guided_linux_pc_diagnostics_loop_fields();
     let tools = linux_pc_diagnostics_tool_definitions()?;
     let options = generation_options(384, "", "");
     let loop_prompt = format!(
-        "Available app tool:\n- collect_linux_pc_diagnostics(scope?: all|user|system, unit?: systemd unit, lines?: number): collect bounded read-only Linux PC status, resource usage, failed units, kernel messages, and journal excerpts from the local machine.\n\nPolicy:\n- The app may read local status and logs only.\n- Analyze the whole PC unless the user asks for a specific unit or subsystem.\n- Do not run repair commands automatically.\n- Final answers should include likely cause, evidence from logs/status, and safe commands the user can review.\n\nUser request: {prompt}\n\nReturn action=call_tool with tool_name=collect_linux_pc_diagnostics before answering. Put arguments in scope, unit, and lines. If you use tool_input for compatibility, it must be a JSON string, not an object."
+        "Available read-only app tools:\n- get_kernel_os_version(): uname -a.\n- get_uptime_load(): uptime.\n- get_disk_usage(): df excluding tmpfs/devtmpfs.\n- get_memory_summary(): free -h.\n- get_swap_devices(): swapon --show.\n- get_failed_system_units(): systemctl --failed.\n- get_system_unit_status(unit): systemctl status for a safe unit name.\n- get_system_unit_journal(unit, lines): recent journal for a safe system unit.\n- get_recent_system_warnings(lines): recent system warning journal.\n- get_recent_kernel_warnings(lines): recent kernel warning journal.\n- get_failed_user_units(): systemctl --user --failed.\n- get_user_unit_status(unit): user systemctl status for a safe unit name.\n- get_user_unit_journal(unit, lines): recent user journal for a safe unit.\n- get_recent_user_warnings(lines): recent user warning journal.\n\nPolicy:\n- The app may read local status and logs only.\n- Choose only the specific tools needed for the user's question; do not run every tool by default.\n- Do not run repair commands automatically.\n- Final answers should include likely cause, evidence from logs/status, and safe commands the user can review.\n\nUser request: {prompt}\n\nPrefer native tool calls and call one or more concrete tools. If native tool calls are unavailable, return JSON with action=call_tool, one tool_name, and optional unit/lines."
     );
 
     tx.send(ToolEvent::Trace(
@@ -577,15 +578,12 @@ fn run_linux_diagnostics_tool_demo(
         )))?;
         result_json
     } else {
-        let mut last_result = serde_json::Value::Null;
+        let mut command_results = Vec::new();
         for call in tool_calls {
             tx.send(ToolEvent::Trace(format!(
                 "before_tool_execution: {} id={} args={}; awaiting user approval",
                 call.name, call.id, call.arguments_json
             )))?;
-            if call.name != "collect_linux_pc_diagnostics" {
-                anyhow::bail!("unexpected diagnostics tool call: {}", call.name);
-            }
             if !request_tool_confirmation(&tx, &call.name, &call.arguments_json)? {
                 return cancel_tool_execution(&tx, &session_handle, &call.name);
             }
@@ -593,14 +591,20 @@ fn run_linux_diagnostics_tool_demo(
                 "before_tool_execution: user approved {} id={}",
                 call.name, call.id
             )))?;
-            let result_json = execute_linux_pc_diagnostics_tool(&call.arguments_json)?;
+            let result_json =
+                execute_linux_diagnostics_tool_call(&call.name, &call.arguments_json)?;
             tx.send(ToolEvent::Trace(format!(
                 "after_tool_execution: result={}",
                 format_diagnostics_tool_result_for_trace(&result_json)
             )))?;
-            last_result = result_json;
+            command_results.extend(
+                result_json["commands"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default(),
+            );
         }
-        last_result
+        linux_pc_diagnostics_result("selected_diagnostics_tools", None, 120, command_results)
     };
     let model_result_json = compact_diagnostics_result_for_model(&result_json);
 
@@ -666,15 +670,44 @@ fn execute_linux_pc_diagnostics_tool(arguments_json: &str) -> anyhow::Result<ser
         .map(run_diagnostic_command)
         .collect::<Vec<_>>();
 
-    Ok(serde_json::json!({
+    Ok(linux_pc_diagnostics_result(
+        &plan.scope,
+        plan.unit.as_deref(),
+        plan.lines,
+        command_results,
+    ))
+}
+
+fn execute_linux_diagnostics_tool_call(
+    tool_name: &str,
+    arguments_json: &str,
+) -> anyhow::Result<serde_json::Value> {
+    let parsed = serde_json::from_str::<serde_json::Value>(arguments_json).unwrap_or_default();
+    let command = diagnostic_command_for_tool(tool_name, &parsed)?;
+    let command_result = run_diagnostic_command(&command);
+    Ok(linux_pc_diagnostics_result(
+        tool_name,
+        parsed.get("unit").and_then(|value| value.as_str()),
+        diagnostics_lines_arg(&parsed),
+        vec![command_result],
+    ))
+}
+
+fn linux_pc_diagnostics_result(
+    scope: &str,
+    unit: Option<&str>,
+    lines: u64,
+    command_results: Vec<serde_json::Value>,
+) -> serde_json::Value {
+    serde_json::json!({
         "tool": "collect_linux_pc_diagnostics",
         "read_only": true,
-        "scope": plan.scope,
-        "unit": plan.unit,
-        "lines": plan.lines,
+        "scope": scope,
+        "unit": unit,
+        "lines": lines,
         "fix_policy": "No changes were applied. Recommend commands only after reviewing evidence.",
         "commands": command_results,
-    }))
+    })
 }
 
 fn compact_diagnostics_result_for_model(result: &serde_json::Value) -> serde_json::Value {
@@ -909,6 +942,139 @@ fn build_linux_pc_diagnostics_plan(arguments_json: &str) -> LinuxDiagnosticsPlan
     }
 }
 
+fn diagnostic_command_for_tool(
+    tool_name: &str,
+    parsed: &serde_json::Value,
+) -> anyhow::Result<DiagnosticCommand> {
+    let lines = diagnostics_lines_arg(parsed);
+    let unit = parsed
+        .get("unit")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| is_safe_systemd_unit(value));
+
+    Ok(match tool_name {
+        "get_kernel_os_version" => diagnostic_command("kernel and OS version", "uname", vec!["-a"]),
+        "get_uptime_load" => diagnostic_command("uptime and load", "uptime", vec![]),
+        "get_disk_usage" => diagnostic_command(
+            "disk usage",
+            "df",
+            vec!["-h", "-x", "tmpfs", "-x", "devtmpfs"],
+        ),
+        "get_memory_summary" => diagnostic_command("memory and swap summary", "free", vec!["-h"]),
+        "get_swap_devices" => diagnostic_command("swap devices", "swapon", vec!["--show"]),
+        "get_failed_system_units" => diagnostic_command(
+            "failed system units",
+            "systemctl",
+            vec!["--no-pager", "--failed"],
+        ),
+        "get_system_unit_status" => {
+            let unit = unit.ok_or_else(|| anyhow::anyhow!("missing or unsafe system unit"))?;
+            diagnostic_command(
+                "selected system unit status",
+                "systemctl",
+                vec!["--no-pager", "status", unit],
+            )
+        }
+        "get_system_unit_journal" => {
+            let unit = unit.ok_or_else(|| anyhow::anyhow!("missing or unsafe system unit"))?;
+            diagnostic_command(
+                "selected system unit journal",
+                "journalctl",
+                vec![
+                    "--no-pager",
+                    "--since",
+                    "2 hours ago",
+                    "-n",
+                    &lines.to_string(),
+                    "-u",
+                    unit,
+                ],
+            )
+        }
+        "get_recent_system_warnings" => diagnostic_command(
+            "recent system journal warnings",
+            "journalctl",
+            vec![
+                "--no-pager",
+                "--since",
+                "2 hours ago",
+                "-n",
+                &lines.to_string(),
+                "-p",
+                "warning",
+            ],
+        ),
+        "get_recent_kernel_warnings" => diagnostic_command(
+            "recent kernel warnings",
+            "journalctl",
+            vec![
+                "--no-pager",
+                "--since",
+                "2 hours ago",
+                "-n",
+                &lines.to_string(),
+                "-k",
+                "-p",
+                "warning",
+            ],
+        ),
+        "get_failed_user_units" => diagnostic_command(
+            "failed user units",
+            "systemctl",
+            vec!["--user", "--no-pager", "--failed"],
+        ),
+        "get_user_unit_status" => {
+            let unit = unit.ok_or_else(|| anyhow::anyhow!("missing or unsafe user unit"))?;
+            diagnostic_command(
+                "selected user unit status",
+                "systemctl",
+                vec!["--user", "--no-pager", "status", unit],
+            )
+        }
+        "get_user_unit_journal" => {
+            let unit = unit.ok_or_else(|| anyhow::anyhow!("missing or unsafe user unit"))?;
+            diagnostic_command(
+                "selected user unit journal",
+                "journalctl",
+                vec![
+                    "--user",
+                    "--no-pager",
+                    "--since",
+                    "2 hours ago",
+                    "-n",
+                    &lines.to_string(),
+                    "-u",
+                    unit,
+                ],
+            )
+        }
+        "get_recent_user_warnings" => diagnostic_command(
+            "recent user journal warnings",
+            "journalctl",
+            vec![
+                "--user",
+                "--no-pager",
+                "--since",
+                "2 hours ago",
+                "-n",
+                &lines.to_string(),
+                "-p",
+                "warning",
+            ],
+        ),
+        _ => anyhow::bail!("unexpected diagnostics tool call: {tool_name}"),
+    })
+}
+
+fn diagnostics_lines_arg(parsed: &serde_json::Value) -> u64 {
+    parsed
+        .get("lines")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(120)
+        .clamp(20, 300)
+}
+
 fn diagnostics_arg<'a>(
     parsed: &'a serde_json::Value,
     parsed_tool_input: Option<&'a serde_json::Value>,
@@ -1052,7 +1218,7 @@ fn guided_multi_tool_choice_fields() -> Vec<(String, String, String, bool)> {
         (
             "tool_name".to_string(),
             "string".to_string(),
-            "Exactly one selected tool: count_character_occurrences or collect_linux_pc_diagnostics".to_string(),
+            "Exactly one selected tool, such as count_character_occurrences or a get_* diagnostics tool".to_string(),
             true,
         ),
         (
@@ -1142,17 +1308,39 @@ fn guided_linux_pc_diagnostics_loop_fields() -> Vec<(String, String, String, boo
 }
 
 fn linux_pc_diagnostics_tool_definitions() -> anyhow::Result<Vec<ToolDefinitionDbus>> {
-    let schema = serde_json::json!({
+    let empty_schema = serde_json::json!({
         "type": "object",
+        "properties": {},
+        "additionalProperties": false
+    });
+    let unit_schema = serde_json::json!({
+        "type": "object",
+        "required": ["unit"],
         "properties": {
-            "scope": {
-                "type": "string",
-                "enum": ["all", "user", "system"],
-                "description": "Read all PC diagnostics, user-session diagnostics, or system diagnostics; all is the default"
-            },
             "unit": {
                 "type": "string",
-                "description": "Optional systemd unit to inspect when a service-specific issue is suspected"
+                "description": "Systemd unit name to inspect. The app rejects unsafe names."
+            }
+        },
+        "additionalProperties": false
+    });
+    let lines_schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "lines": {
+                "type": "integer",
+                "description": "Maximum recent journal lines to collect, clamped to 20..300"
+            }
+        },
+        "additionalProperties": false
+    });
+    let unit_lines_schema = serde_json::json!({
+        "type": "object",
+        "required": ["unit"],
+        "properties": {
+            "unit": {
+                "type": "string",
+                "description": "Systemd unit name to inspect. The app rejects unsafe names."
             },
             "lines": {
                 "type": "integer",
@@ -1162,12 +1350,89 @@ fn linux_pc_diagnostics_tool_definitions() -> anyhow::Result<Vec<ToolDefinitionD
         "additionalProperties": false
     });
 
-    Ok(vec![ToolDefinitionDbus {
-        name: "collect_linux_pc_diagnostics".to_string(),
-        description: "Collect bounded read-only Linux PC status, resource usage, failed units, kernel messages, and journal excerpts from the local machine."
-            .to_string(),
-        schema_json: serde_json::to_string(&schema)?,
-    }])
+    let specs = [
+        (
+            "get_kernel_os_version",
+            "Run uname -a to read kernel and OS version information.",
+            &empty_schema,
+        ),
+        (
+            "get_uptime_load",
+            "Run uptime to read uptime and load averages.",
+            &empty_schema,
+        ),
+        (
+            "get_disk_usage",
+            "Run df for mounted disk usage, excluding tmpfs and devtmpfs.",
+            &empty_schema,
+        ),
+        (
+            "get_memory_summary",
+            "Run free -h to read memory and swap summary.",
+            &empty_schema,
+        ),
+        (
+            "get_swap_devices",
+            "Run swapon --show to read configured swap devices.",
+            &empty_schema,
+        ),
+        (
+            "get_failed_system_units",
+            "Run systemctl --failed to read failed system units.",
+            &empty_schema,
+        ),
+        (
+            "get_system_unit_status",
+            "Run systemctl status for one safe system unit name.",
+            &unit_schema,
+        ),
+        (
+            "get_system_unit_journal",
+            "Run journalctl for one safe system unit name.",
+            &unit_lines_schema,
+        ),
+        (
+            "get_recent_system_warnings",
+            "Run journalctl for recent system warning messages.",
+            &lines_schema,
+        ),
+        (
+            "get_recent_kernel_warnings",
+            "Run journalctl -k for recent kernel warning messages.",
+            &lines_schema,
+        ),
+        (
+            "get_failed_user_units",
+            "Run systemctl --user --failed to read failed user units.",
+            &empty_schema,
+        ),
+        (
+            "get_user_unit_status",
+            "Run systemctl --user status for one safe user unit name.",
+            &unit_schema,
+        ),
+        (
+            "get_user_unit_journal",
+            "Run user journalctl for one safe user unit name.",
+            &unit_lines_schema,
+        ),
+        (
+            "get_recent_user_warnings",
+            "Run journalctl --user for recent user-session warning messages.",
+            &lines_schema,
+        ),
+    ];
+
+    specs
+        .into_iter()
+        .map(|(name, description, schema)| {
+            Ok(ToolDefinitionDbus {
+                name: name.to_string(),
+                description: description.to_string(),
+                schema_json: serde_json::to_string(schema)?,
+            })
+        })
+        .collect()
 }
 
 fn parse_guided_tool_loop_response(
@@ -1250,14 +1515,14 @@ fn infer_multi_tool_name(prompt: &str) -> &'static str {
         || lower.contains("systemd")
         || lower.contains("failed unit")
     {
-        "collect_linux_pc_diagnostics"
+        "get_recent_system_warnings"
     } else {
         "count_character_occurrences"
     }
 }
 
 fn multi_tool_arguments_from_response(response: &GuidedMultiToolChoiceResponse) -> String {
-    if response.tool_name == "collect_linux_pc_diagnostics" {
+    if response.tool_name != "count_character_occurrences" {
         return diagnostics_arguments_from_response(&GuidedDiagnosticsLoopResponse {
             action: "call_tool".to_string(),
             tool_name: response.tool_name.clone(),
@@ -1284,12 +1549,12 @@ fn execute_multi_tool_call(
     match tool_name {
         "count_character_occurrences" => execute_count_tool(prompt, arguments_json),
         "collect_linux_pc_diagnostics" => execute_linux_pc_diagnostics_tool(arguments_json),
-        _ => anyhow::bail!("unexpected multi-tool choice: {tool_name}"),
+        _ => execute_linux_diagnostics_tool_call(tool_name, arguments_json),
     }
 }
 
 fn format_multi_tool_result_for_trace(tool_name: &str, result: &serde_json::Value) -> String {
-    if tool_name == "collect_linux_pc_diagnostics" {
+    if tool_name != "count_character_occurrences" {
         format_diagnostics_tool_result_for_trace(result)
     } else {
         result.to_string()
@@ -1304,7 +1569,7 @@ fn format_tool_result_answer(result: &serde_json::Value) -> String {
 }
 
 fn format_multi_tool_result_answer(tool_name: &str, result: &serde_json::Value) -> String {
-    if tool_name == "collect_linux_pc_diagnostics" {
+    if tool_name != "count_character_occurrences" {
         format_linux_pc_diagnostics_answer(result)
     } else {
         format_tool_result_answer(result)
@@ -1435,8 +1700,9 @@ mod tests {
         diagnostics_arguments_from_response, execute_count_tool,
         guided_linux_pc_diagnostics_loop_fields, guided_multi_tool_choice_fields,
         guided_tool_loop_fields, initial_final_answer, is_safe_systemd_unit,
-        multi_tool_arguments_from_response, parse_guided_diagnostics_loop_response,
-        parse_guided_multi_tool_choice_response, parse_guided_tool_loop_response,
+        linux_pc_diagnostics_tool_definitions, multi_tool_arguments_from_response,
+        parse_guided_diagnostics_loop_response, parse_guided_multi_tool_choice_response,
+        parse_guided_tool_loop_response,
     };
     use hegel::TestCase;
     use hegel::generators as gs;
@@ -1647,6 +1913,20 @@ mod tests {
     }
 
     #[test]
+    fn diagnostics_tools_are_split_by_command_family() {
+        let names = linux_pc_diagnostics_tool_definitions()
+            .expect("diagnostics tools should serialize")
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<Vec<_>>();
+
+        assert!(names.contains(&"get_kernel_os_version".to_string()));
+        assert!(names.contains(&"get_disk_usage".to_string()));
+        assert!(names.contains(&"get_recent_kernel_warnings".to_string()));
+        assert!(!names.contains(&"collect_linux_pc_diagnostics".to_string()));
+    }
+
+    #[test]
     fn multi_tool_choice_schema_requires_only_tool_name() {
         let required_fields = guided_multi_tool_choice_fields()
             .into_iter()
@@ -1681,7 +1961,7 @@ mod tests {
         )
         .expect("stub multi-tool response should be repaired");
 
-        assert_eq!(response.tool_name, "collect_linux_pc_diagnostics");
+        assert_eq!(response.tool_name, "get_recent_system_warnings");
     }
 
     #[test]
