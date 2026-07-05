@@ -2121,9 +2121,9 @@ dependencies = [
 
 [[package]]
 name = "llmfit-core"
-version = "0.9.33"
+version = "0.9.38"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bd2770f6d225dd7174c84363b16efd424deff2ea22f6390a47ba9c3a8a2144d4"
+checksum = "68bc7da401ce3326a63ac7373c33212d8adf883bcc91c36595fb33b00367ecc5"
 dependencies = [
  "dirs",
  "http",
@@ -3363,7 +3363,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.2",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

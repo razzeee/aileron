@@ -23,7 +23,7 @@ aileron-ipc     = { path = "crates/aileron-ipc" }
 tokio    = { version = "1", features = ["full"] }
 serde    = { version = "1", features = ["derive"] }
 serde_json = "1"
-llmfit-core = "0.9.31"
+llmfit-core = "0.9.38"
 uuid     = { version = "1", features = ["v4"] }
 anyhow   = "1"
 thiserror = "2"

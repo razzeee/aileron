@@ -397,7 +397,7 @@ impl VarlinkInterface for ModelsHandler {
                     best_quant: fit_analysis.as_ref().map(|fit| fit.best_quant.clone()),
                     effective_context_length: fit_analysis
                         .as_ref()
-                        .map(|fit| i64::from(fit.effective_context_length)),
+                        .map(|fit| i64::from(fit.usable_context)),
                     fit_notes: fit_analysis.as_ref().map(|fit| fit.notes.clone()),
                     score_components: fit_analysis.as_ref().map(llmfit_score_components),
                     recommended,
@@ -673,10 +673,10 @@ fn llmfit_recommendation_reason(fit: &llmfit_core::ModelFit) -> String {
     if estimated_tps > 0.0 {
         reason.push_str(&format!(", about {:.1} tok/s", estimated_tps));
     }
-    if fit.effective_context_length > 0 {
+    if fit.usable_context > 0 {
         reason.push_str(&format!(
-            ", estimated at {} context tokens",
-            fit.effective_context_length
+            ", estimated at {} usable context tokens",
+            fit.usable_context
         ));
     }
     reason.push('.');
@@ -2749,10 +2749,14 @@ mod tests {
             &mut manifest.runtime_options,
             &system,
         );
+        let fit = llmfit_core::ModelFit::analyze(
+            crate::llmfit_metadata::find(&manifest.llmfit_model_id).expect("metadata exists"),
+            &system,
+        );
 
         assert_eq!(
             manifest.runtime_options.get("N_CTX"),
-            Some(&"8192".to_string())
+            Some(&fit.usable_context.to_string())
         );
         assert_eq!(
             manifest.runtime_options.get("N_GPU_LAYERS"),

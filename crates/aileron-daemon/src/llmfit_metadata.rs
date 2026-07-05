@@ -54,10 +54,10 @@ pub fn apply_llama_runtime_options(
     }
 
     let fit = ModelFit::analyze(model, system);
-    if fit.effective_context_length > 0 {
+    if fit.usable_context > 0 {
         runtime_options
             .entry("N_CTX".to_string())
-            .or_insert_with(|| fit.effective_context_length.to_string());
+            .or_insert_with(|| fit.usable_context.to_string());
     }
     if fit.run_mode == RunMode::CpuOnly {
         runtime_options
