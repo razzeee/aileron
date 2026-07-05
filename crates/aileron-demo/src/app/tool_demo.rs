@@ -22,15 +22,13 @@ pub(crate) enum ToolEvent {
 #[derive(Clone, Copy)]
 pub(crate) enum ToolDemoCase {
     CharacterCounter,
-    MultiToolChoice,
     LinuxDiagnostics,
 }
 
 impl ToolDemoCase {
-    pub(crate) fn labels() -> [&'static str; 3] {
+    pub(crate) fn labels() -> [&'static str; 2] {
         [
             ToolDemoCase::CharacterCounter.label(),
-            ToolDemoCase::MultiToolChoice.label(),
             ToolDemoCase::LinuxDiagnostics.label(),
         ]
     }
@@ -38,16 +36,14 @@ impl ToolDemoCase {
     pub(crate) fn index(&self) -> u32 {
         match self {
             ToolDemoCase::CharacterCounter => 0,
-            ToolDemoCase::MultiToolChoice => 1,
-            ToolDemoCase::LinuxDiagnostics => 2,
+            ToolDemoCase::LinuxDiagnostics => 1,
         }
     }
 
     pub(crate) fn from_index(index: u32) -> Option<Self> {
         match index {
             0 => Some(ToolDemoCase::CharacterCounter),
-            1 => Some(ToolDemoCase::MultiToolChoice),
-            2 => Some(ToolDemoCase::LinuxDiagnostics),
+            1 => Some(ToolDemoCase::LinuxDiagnostics),
             _ => None,
         }
     }
@@ -55,7 +51,6 @@ impl ToolDemoCase {
     fn label(&self) -> &'static str {
         match self {
             ToolDemoCase::CharacterCounter => "Character counter",
-            ToolDemoCase::MultiToolChoice => "Native multi-tool choice",
             ToolDemoCase::LinuxDiagnostics => "Linux PC diagnostics",
         }
     }
@@ -64,9 +59,6 @@ impl ToolDemoCase {
         match self {
             ToolDemoCase::CharacterCounter => {
                 "How many times does the letter r occur in strawrberrry?"
-            }
-            ToolDemoCase::MultiToolChoice => {
-                "Use count_character_occurrences to count the letter s in Mississippi. Do not run diagnostics."
             }
             ToolDemoCase::LinuxDiagnostics => {
                 "Analyze this Linux PC for recent failures or resource problems and recommend safe bugfix steps."
@@ -79,9 +71,6 @@ impl ToolDemoCase {
             ToolDemoCase::CharacterCounter => {
                 "Run the deterministic character-counter tool through the Language portal."
             }
-            ToolDemoCase::MultiToolChoice => {
-                "Offer multiple app tools and verify the model chooses one specific tool call."
-            }
             ToolDemoCase::LinuxDiagnostics => {
                 "Collect read-only Linux PC diagnostics locally, then ask the model for fix guidance."
             }
@@ -91,9 +80,6 @@ impl ToolDemoCase {
     pub(crate) fn running_detail(&self) -> &'static str {
         match self {
             ToolDemoCase::CharacterCounter => "The app owns the loop and executes tools locally.",
-            ToolDemoCase::MultiToolChoice => {
-                "The app offered multiple tools and is waiting for one concrete tool call."
-            }
             ToolDemoCase::LinuxDiagnostics => {
                 "The app is waiting for approval before collecting bounded, read-only PC diagnostics."
             }
@@ -129,24 +115,6 @@ struct GuidedDiagnosticsLoopResponse {
     answer: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct GuidedMultiToolChoiceResponse {
-    #[serde(default)]
-    tool_name: String,
-    #[serde(default)]
-    word: String,
-    #[serde(default)]
-    character: String,
-    #[serde(default)]
-    scope: String,
-    #[serde(default)]
-    unit: String,
-    #[serde(default)]
-    lines: Option<i64>,
-    #[serde(default)]
-    answer: String,
-}
-
 #[derive(Clone)]
 struct LinuxDiagnosticsPlan {
     scope: String,
@@ -169,7 +137,6 @@ pub(crate) fn run_tool_demo(
 ) -> anyhow::Result<()> {
     match case {
         ToolDemoCase::CharacterCounter => run_character_tool_demo(prompt, tx),
-        ToolDemoCase::MultiToolChoice => run_multi_tool_choice_demo(prompt, tx),
         ToolDemoCase::LinuxDiagnostics => run_linux_diagnostics_tool_demo(prompt, tx),
     }
 }
@@ -362,133 +329,6 @@ fn run_character_tool_demo(
         } else {
             response.answer
         },
-    ))?;
-
-    close_public_session(&session_handle)?;
-    tx.send(ToolEvent::Done)?;
-    Ok(())
-}
-
-fn run_multi_tool_choice_demo(
-    prompt: &str,
-    tx: std::sync::mpsc::Sender<ToolEvent>,
-) -> anyhow::Result<()> {
-    tx.send(ToolEvent::Trace(
-        "before_agent_loop: register count_character_occurrences and collect_linux_pc_diagnostics"
-            .to_string(),
-    ))?;
-
-    let conn = portal_connection()?;
-    let proxy = zbus::blocking::Proxy::new(&conn, PORTAL_BUS, PORTAL_PATH, LANGUAGE_IFACE)?;
-    let session_handle = create_public_session(
-        &proxy,
-        "language.analyze",
-        "You are a local tool router. Choose exactly one app-provided tool that matches the user request. Do not call every available tool.",
-    )?;
-
-    let fields = guided_multi_tool_choice_fields();
-    let tools = multi_tool_choice_definitions()?;
-    let options = generation_options(256, "", "");
-    let loop_prompt = format!(
-        "Available app tools include count_character_occurrences plus individual read-only Linux diagnostics tools such as get_disk_usage, get_memory_summary, get_failed_system_units, and get_recent_kernel_warnings.\n\nUser request: {prompt}\n\nChoose one concrete tool. Prefer count_character_occurrences for counting text. Prefer a specific diagnostics tool only for Linux PC status, logs, resources, failed units, or bugfix evidence. If native tool calls are unavailable, return JSON with tool_name and arguments for the one selected tool."
-    );
-
-    tx.send(ToolEvent::Trace(
-        "before_llm_call: ask StreamRespondGuided with multiple available tools".to_string(),
-    ))?;
-    let (content, tool_calls) = stream_guided_response(
-        &session_handle,
-        &loop_prompt,
-        fields.clone(),
-        tools.clone(),
-        options.clone(),
-    )?;
-    tx.send(ToolEvent::Trace(format!(
-        "after_llm_call: native_tool_calls={}, fallback_json={:?}",
-        tool_calls.len(),
-        content
-    )))?;
-
-    let mut results = Vec::new();
-    let (tool_name, result_json) = if tool_calls.is_empty() {
-        let response = parse_guided_multi_tool_choice_response(&content, prompt)?;
-        let tool_name = response.tool_name.clone();
-        let arguments_json = multi_tool_arguments_from_response(&response);
-        tx.send(ToolEvent::Trace(format!(
-            "before_tool_execution: {tool_name} args={arguments_json}; awaiting user approval"
-        )))?;
-        if !request_tool_confirmation(&tx, &tool_name, &arguments_json)? {
-            return cancel_tool_execution(&tx, &session_handle, &tool_name);
-        }
-        tx.send(ToolEvent::Trace(format!(
-            "before_tool_execution: user approved {tool_name}"
-        )))?;
-        let result_json = execute_multi_tool_call(prompt, &tool_name, &arguments_json)?;
-        tx.send(ToolEvent::Trace(format!(
-            "after_tool_execution: result={}",
-            format_multi_tool_result_for_trace(&tool_name, &result_json)
-        )))?;
-        (tool_name, result_json)
-    } else {
-        let mut last_tool_name = String::new();
-        let mut last_result = serde_json::Value::Null;
-        for call in tool_calls {
-            tx.send(ToolEvent::Trace(format!(
-                "before_tool_execution: {} id={} args={}; awaiting user approval",
-                call.name, call.id, call.arguments_json
-            )))?;
-            if !request_tool_confirmation(&tx, &call.name, &call.arguments_json)? {
-                return cancel_tool_execution(&tx, &session_handle, &call.name);
-            }
-            tx.send(ToolEvent::Trace(format!(
-                "before_tool_execution: user approved {} id={}",
-                call.name, call.id
-            )))?;
-            let result_json = execute_multi_tool_call(prompt, &call.name, &call.arguments_json)?;
-            tx.send(ToolEvent::Trace(format!(
-                "after_tool_execution: result={}",
-                format_multi_tool_result_for_trace(&call.name, &result_json)
-            )))?;
-            results.push(ToolResultDbus {
-                id: call.id,
-                content: result_json.to_string(),
-                content_json: result_json.to_string(),
-            });
-            last_tool_name = call.name;
-            last_result = result_json;
-        }
-        (last_tool_name, last_result)
-    };
-
-    tx.send(ToolEvent::Trace(
-        "before_llm_call: submit the selected tool result and request final answer".to_string(),
-    ))?;
-    let final_prompt = format!(
-        "User request: {prompt}\n\nThe app executed exactly one selected tool: {tool_name}. Tool result:\n{result_json}\n\nReturn JSON with answer."
-    );
-    let final_content = if results.is_empty() {
-        let (content, _) =
-            stream_guided_response(&session_handle, &final_prompt, fields, Vec::new(), options)?;
-        content
-    } else {
-        let (content, _) = stream_guided_tool_results(
-            &session_handle,
-            &final_prompt,
-            results,
-            fields,
-            tools,
-            options,
-        )?;
-        content
-    };
-    tx.send(ToolEvent::Trace(format!(
-        "after_llm_call: final_json={final_content:?}"
-    )))?;
-    let final_response = parse_guided_multi_tool_choice_response(&final_content, prompt).ok();
-    tx.send(ToolEvent::Final(
-        final_response
-            .and_then(|response| (!response.answer.trim().is_empty()).then_some(response.answer))
-            .unwrap_or_else(|| format_multi_tool_result_answer(&tool_name, &result_json)),
     ))?;
 
     close_public_session(&session_handle)?;
@@ -1207,59 +1047,6 @@ fn count_tool_definitions() -> anyhow::Result<Vec<ToolDefinitionDbus>> {
     }])
 }
 
-fn multi_tool_choice_definitions() -> anyhow::Result<Vec<ToolDefinitionDbus>> {
-    let mut tools = count_tool_definitions()?;
-    tools.extend(linux_pc_diagnostics_tool_definitions()?);
-    Ok(tools)
-}
-
-fn guided_multi_tool_choice_fields() -> Vec<(String, String, String, bool)> {
-    vec![
-        (
-            "tool_name".to_string(),
-            "string".to_string(),
-            "Exactly one selected tool, such as count_character_occurrences or a get_* diagnostics tool".to_string(),
-            true,
-        ),
-        (
-            "word".to_string(),
-            "string".to_string(),
-            "Word or text for count_character_occurrences".to_string(),
-            false,
-        ),
-        (
-            "character".to_string(),
-            "string".to_string(),
-            "Single character for count_character_occurrences".to_string(),
-            false,
-        ),
-        (
-            "scope".to_string(),
-            "string".to_string(),
-            "Diagnostics scope: all, user, or system".to_string(),
-            false,
-        ),
-        (
-            "unit".to_string(),
-            "string".to_string(),
-            "Optional systemd unit for diagnostics".to_string(),
-            false,
-        ),
-        (
-            "lines".to_string(),
-            "integer".to_string(),
-            "Optional diagnostics journal line limit".to_string(),
-            false,
-        ),
-        (
-            "answer".to_string(),
-            "string".to_string(),
-            "Final user-facing answer after a selected tool result is available".to_string(),
-            false,
-        ),
-    ]
-}
-
 fn guided_linux_pc_diagnostics_loop_fields() -> Vec<(String, String, String, bool)> {
     vec![
         (
@@ -1486,94 +1273,11 @@ fn parse_guided_diagnostics_loop_response(
     Ok(response)
 }
 
-fn parse_guided_multi_tool_choice_response(
-    content: &str,
-    prompt: &str,
-) -> anyhow::Result<GuidedMultiToolChoiceResponse> {
-    let mut response = serde_json::from_str::<GuidedMultiToolChoiceResponse>(content)?;
-    if response.tool_name.trim().is_empty() || response.tool_name == "stub" {
-        response.tool_name = infer_multi_tool_name(prompt).to_string();
-    }
-    if response.tool_name == "count_character_occurrences" {
-        if response.word.trim().is_empty() || response.word == "stub" {
-            response.word = infer_word_from_prompt(prompt).unwrap_or_default();
-        }
-        if response.character.trim().is_empty() || response.character == "stub" {
-            response.character = infer_character_from_prompt(prompt)
-                .unwrap_or('r')
-                .to_string();
-        }
-    }
-    Ok(response)
-}
-
-fn infer_multi_tool_name(prompt: &str) -> &'static str {
-    let lower = prompt.to_lowercase();
-    if lower.contains("diagnostic")
-        || lower.contains("linux")
-        || lower.contains("journal")
-        || lower.contains("systemd")
-        || lower.contains("failed unit")
-    {
-        "get_recent_system_warnings"
-    } else {
-        "count_character_occurrences"
-    }
-}
-
-fn multi_tool_arguments_from_response(response: &GuidedMultiToolChoiceResponse) -> String {
-    if response.tool_name != "count_character_occurrences" {
-        return diagnostics_arguments_from_response(&GuidedDiagnosticsLoopResponse {
-            action: "call_tool".to_string(),
-            tool_name: response.tool_name.clone(),
-            scope: response.scope.clone(),
-            unit: response.unit.clone(),
-            lines: response.lines,
-            tool_input: String::new(),
-            answer: response.answer.clone(),
-        });
-    }
-
-    serde_json::json!({
-        "word": response.word,
-        "character": response.character,
-    })
-    .to_string()
-}
-
-fn execute_multi_tool_call(
-    prompt: &str,
-    tool_name: &str,
-    arguments_json: &str,
-) -> anyhow::Result<serde_json::Value> {
-    match tool_name {
-        "count_character_occurrences" => execute_count_tool(prompt, arguments_json),
-        "collect_linux_pc_diagnostics" => execute_linux_pc_diagnostics_tool(arguments_json),
-        _ => execute_linux_diagnostics_tool_call(tool_name, arguments_json),
-    }
-}
-
-fn format_multi_tool_result_for_trace(tool_name: &str, result: &serde_json::Value) -> String {
-    if tool_name != "count_character_occurrences" {
-        format_diagnostics_tool_result_for_trace(result)
-    } else {
-        result.to_string()
-    }
-}
-
 fn format_tool_result_answer(result: &serde_json::Value) -> String {
     let word = result["word"].as_str().unwrap_or("the input");
     let character = result["character"].as_str().unwrap_or("?");
     let count = result["count"].as_u64().unwrap_or_default();
     format!("The character '{character}' occurs {count} times in {word}.")
-}
-
-fn format_multi_tool_result_answer(tool_name: &str, result: &serde_json::Value) -> String {
-    if tool_name != "count_character_occurrences" {
-        format_linux_pc_diagnostics_answer(result)
-    } else {
-        format_tool_result_answer(result)
-    }
 }
 
 fn format_linux_pc_diagnostics_answer(result: &serde_json::Value) -> String {
@@ -1698,11 +1402,9 @@ mod tests {
     use super::{
         build_linux_pc_diagnostics_plan, compact_diagnostics_result_for_model,
         diagnostics_arguments_from_response, execute_count_tool,
-        guided_linux_pc_diagnostics_loop_fields, guided_multi_tool_choice_fields,
-        guided_tool_loop_fields, initial_final_answer, is_safe_systemd_unit,
-        linux_pc_diagnostics_tool_definitions, multi_tool_arguments_from_response,
-        parse_guided_diagnostics_loop_response, parse_guided_multi_tool_choice_response,
-        parse_guided_tool_loop_response,
+        guided_linux_pc_diagnostics_loop_fields, guided_tool_loop_fields, initial_final_answer,
+        is_safe_systemd_unit, linux_pc_diagnostics_tool_definitions,
+        parse_guided_diagnostics_loop_response, parse_guided_tool_loop_response,
     };
     use hegel::TestCase;
     use hegel::generators as gs;
@@ -1924,44 +1626,6 @@ mod tests {
         assert!(names.contains(&"get_disk_usage".to_string()));
         assert!(names.contains(&"get_recent_kernel_warnings".to_string()));
         assert!(!names.contains(&"collect_linux_pc_diagnostics".to_string()));
-    }
-
-    #[test]
-    fn multi_tool_choice_schema_requires_only_tool_name() {
-        let required_fields = guided_multi_tool_choice_fields()
-            .into_iter()
-            .filter_map(|(name, _, _, required)| required.then_some(name))
-            .collect::<Vec<_>>();
-
-        assert_eq!(required_fields, vec!["tool_name"]);
-    }
-
-    #[test]
-    fn multi_tool_choice_fallback_selects_count_tool_arguments() {
-        let response = parse_guided_multi_tool_choice_response(
-            r#"{"tool_name":"stub","word":"stub","character":"stub","answer":""}"#,
-            "Use count_character_occurrences to count the letter s in Mississippi",
-        )
-        .expect("stub multi-tool response should be repaired");
-        let arguments = serde_json::from_str::<serde_json::Value>(
-            &multi_tool_arguments_from_response(&response),
-        )
-        .expect("arguments should be JSON");
-
-        assert_eq!(response.tool_name, "count_character_occurrences");
-        assert_eq!(arguments["word"], "Mississippi");
-        assert_eq!(arguments["character"], "s");
-    }
-
-    #[test]
-    fn multi_tool_choice_fallback_selects_diagnostics_tool() {
-        let response = parse_guided_multi_tool_choice_response(
-            r#"{"tool_name":"stub","answer":""}"#,
-            "Analyze this Linux PC for failed systemd units",
-        )
-        .expect("stub multi-tool response should be repaired");
-
-        assert_eq!(response.tool_name, "get_recent_system_warnings");
     }
 
     #[test]
