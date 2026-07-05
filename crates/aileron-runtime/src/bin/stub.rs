@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use aileron_runtime::{
-    ContentPart, Request, clamp_choices, first_tool_name, send, send_unsupported,
+    ContentPart, Request, clamp_choices, select_tool_name, send, send_unsupported,
 };
 use anyhow::Result;
 use serde_json::json;
@@ -119,7 +119,7 @@ fn handle_generate_structured(req: &Request) -> Result<()> {
             "id": req.id,
             "tool_calls": [{
                 "id": "stub-tool-call-1",
-                "name": first_tool_name(req.tools.as_deref()),
+                "name": select_tool_name(req.tools.as_deref(), req.prompt.as_deref()),
                 "arguments_json": "{}",
             }],
             "done": true,
@@ -147,7 +147,7 @@ fn handle_generate_structured_stream(req: &Request) -> Result<()> {
             "id": req.id,
             "tool_calls": [{
                 "id": "stub-tool-call-1",
-                "name": first_tool_name(req.tools.as_deref()),
+                "name": select_tool_name(req.tools.as_deref(), req.prompt.as_deref()),
                 "arguments_json": "{}",
             }],
             "done": true,
