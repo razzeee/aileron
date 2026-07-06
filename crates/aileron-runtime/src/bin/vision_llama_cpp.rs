@@ -142,6 +142,7 @@ fn handle_generate(
         max_tokens,
         temperature,
         None,
+        req.execution_mode.as_deref(),
         |token| send(json!({"id": req.id, "token": token})),
     )?;
     send(json!({"id": req.id, "done": true}))
@@ -164,16 +165,16 @@ fn handle_predict_next(
     let mut completions = Vec::new();
 
     for temperature in temperatures {
-        let raw =
-            generate_completion(
-                model,
-                ctx,
-                prefix,
-                max_tokens,
-                temperature,
-                None,
-                |_| Ok(()),
-            )?;
+        let raw = generate_completion(
+            model,
+            ctx,
+            prefix,
+            max_tokens,
+            temperature,
+            None,
+            req.execution_mode.as_deref(),
+            |_| Ok(()),
+        )?;
         let completion = clean_inline_completion(prefix, &raw);
         if !completion.is_empty() && !completions.contains(&completion) {
             completions.push(completion);
@@ -277,6 +278,7 @@ fn structured_result(
         max_tokens,
         0.0,
         Some(schema),
+        req.execution_mode.as_deref(),
         |_| Ok(()),
     )
     .map_err(|err| err.to_string())?
@@ -516,6 +518,7 @@ fn generate_for_image_data(
         max_tokens,
         req.temperature.unwrap_or(0.0),
         schema,
+        req.execution_mode.as_deref(),
         |_| Ok(()),
     )?)
 }

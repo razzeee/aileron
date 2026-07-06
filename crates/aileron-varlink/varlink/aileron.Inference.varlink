@@ -8,12 +8,37 @@ type ModelAvailability (
   reason: string
 )
 
-type GenerationOptions (
+type ResponseOptions (
   maximum_response_tokens: int,
   temperature: float,
-  sampling_mode: string,
   source_language_hint: string,
-  target_language_hint: string
+  target_language_hint: string,
+  execution_mode: string
+)
+
+type PredictNextOptions (
+  maximum_response_tokens: int,
+  temperature: float,
+  execution_mode: string
+)
+
+type GuidedOptions (
+  maximum_response_tokens: int,
+  temperature: float,
+  execution_mode: string
+)
+
+type EmbedOptions (
+  execution_mode: string
+)
+
+type SpeechOptions (
+  source_language_hint: string,
+  execution_mode: string
+)
+
+type VisionOptions (
+  execution_mode: string
 )
 
 type GuidedField (
@@ -61,44 +86,44 @@ method Prewarm(session_id: string) -> ()
 
 # Stream response tokens. Session must have been created with a language generation use_case.
 # input_json is either content-part shorthand or a role-message array. media_paths contains readable request-scoped media paths referenced by fd_index.
-method StreamResponse(session_id: string, input_json: string, media_paths: []string, options: GenerationOptions) -> (token: string)
+method StreamResponse(session_id: string, input_json: string, media_paths: []string, options: ResponseOptions) -> (token: string)
 
 # Stream up to three short inline continuations from the raw text prefix. Session must have been created with use_case: language.complete.
 # Newer StreamPredictNext calls for the same session supersede older in-flight calls; superseded calls fail with RequestCancelled.
-method StreamPredictNext(session_id: string, prefix: string, options: GenerationOptions) -> (completions: []string)
+method StreamPredictNext(session_id: string, prefix: string, options: PredictNextOptions) -> (completions: []string)
 
 # Stream schema-valid guided output snapshots. The final reply has continues=false.
 # prompt is plain text or content-part/role-message JSON. media_paths contains readable request-scoped media paths referenced by fd_index.
-method StreamRespondGuided(session_id: string, prompt: string, media_paths: []string, fields: []GuidedField, tools: []ToolDefinition, options: GenerationOptions) -> (snapshot_json: string, tool_calls: []ToolCall)
+method StreamRespondGuided(session_id: string, prompt: string, media_paths: []string, fields: []GuidedField, tools: []ToolDefinition, options: GuidedOptions) -> (snapshot_json: string, tool_calls: []ToolCall)
 
 # Stream guided generation after the app executes or rejects requested tools.
-method StreamSubmitToolResultsGuided(session_id: string, prompt: string, media_paths: []string, results: []ToolResult, fields: []GuidedField, tools: []ToolDefinition, options: GenerationOptions) -> (snapshot_json: string, tool_calls: []ToolCall)
+method StreamSubmitToolResultsGuided(session_id: string, prompt: string, media_paths: []string, results: []ToolResult, fields: []GuidedField, tools: []ToolDefinition, options: GuidedOptions) -> (snapshot_json: string, tool_calls: []ToolCall)
 
 # Stream embedding vectors for text. Session must have been created with use_case: language.embed
 # embedding: the embedding vector for the supplied text
-method StreamEmbed(session_id: string, text: string) -> (embedding: []float)
+method StreamEmbed(session_id: string, text: string, options: EmbedOptions) -> (embedding: []float)
 
 # Stream transcript or translation segments. Session must have been created with
 # use_case: speech.transcribe (verbatim, source language) or speech.translate (translated to English).
 # audio_path: readable path for 16 kHz mono f32le PCM bytes
 # The final reply has continues=false.
-method StreamTranscribe(session_id: string, audio_path: string, source_language_hint: string) -> (token: string)
+method StreamTranscribe(session_id: string, audio_path: string, options: SpeechOptions) -> (token: string)
 
 # Stream image description tokens. Session must have been created with vision.describe
 # image_path: readable path for PNG or JPEG bytes
 # instructions: optional per-image instructions
-method StreamDescribe(session_id: string, image_path: string, instructions: string) -> (token: string)
+method StreamDescribe(session_id: string, image_path: string, instructions: string, options: VisionOptions) -> (token: string)
 
 # Stream OCR text tokens. Session must have been created with vision.ocr
 # image_path: readable path for PNG or JPEG bytes
 # instructions: optional per-image instructions
-method StreamOcr(session_id: string, image_path: string, instructions: string) -> (token: string)
+method StreamOcr(session_id: string, image_path: string, instructions: string, options: VisionOptions) -> (token: string)
 
 # Stream identified objects in an image. Session must have been created with vision.segment
 # Coordinates are normalized to 0.0..1.0, relative to the image dimensions.
 # image_path: readable path for PNG or JPEG bytes
 # instructions: optional per-image instructions
-method StreamSegment(session_id: string, image_path: string, instructions: string) -> (segments: []VisionSegment)
+method StreamSegment(session_id: string, image_path: string, instructions: string, options: VisionOptions) -> (segments: []VisionSegment)
 
 # End a session. The per-profile container remains pooled until idle timeout.
 method EndSession(session_id: string) -> ()

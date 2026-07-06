@@ -21,9 +21,9 @@ use aileron_varlink::aileron_Inference::{
     Call_CreateSession, Call_EndSession, Call_GetUseCaseAvailability, Call_Prewarm,
     Call_StreamDescribe, Call_StreamEmbed, Call_StreamOcr, Call_StreamPredictNext,
     Call_StreamRespondGuided, Call_StreamResponse, Call_StreamSegment,
-    Call_StreamSubmitToolResultsGuided, Call_StreamTranscribe, GenerationOptions, GuidedField,
-    ModelAvailability, ToolCall, ToolDefinition, ToolResult, VarlinkCallError, VarlinkInterface,
-    VisionSegment,
+    Call_StreamSubmitToolResultsGuided, Call_StreamTranscribe, EmbedOptions, GuidedField,
+    GuidedOptions, ModelAvailability, PredictNextOptions, ResponseOptions, SpeechOptions, ToolCall,
+    ToolDefinition, ToolResult, VarlinkCallError, VarlinkInterface, VisionOptions, VisionSegment,
 };
 
 pub struct InferenceHandler {
@@ -60,6 +60,58 @@ struct ActiveContainerRequest<'a> {
     profile_id: &'a str,
     session_id: &'a str,
     handle: ContainerHandle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestExecutionMode {
+    Interactive,
+    Background,
+}
+
+impl RequestExecutionMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Interactive => "interactive",
+            Self::Background => "background",
+        }
+    }
+}
+
+struct InteractiveExecution<'a> {
+    state: &'a SharedState,
+    profile_id: String,
+    active: bool,
+}
+
+impl Drop for InteractiveExecution<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            self.state.end_interactive_execution(&self.profile_id);
+        } else {
+            self.state
+                .cancel_pending_interactive_execution(&self.profile_id);
+        }
+    }
+}
+
+struct BackgroundExecution<'a> {
+    state: &'a SharedState,
+    profile_id: String,
+    handle: ContainerHandle,
+    preempted: Arc<AtomicBool>,
+}
+
+impl BackgroundExecution<'_> {
+    fn was_preempted(&self) -> bool {
+        self.preempted.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for BackgroundExecution<'_> {
+    fn drop(&mut self) {
+        self.state
+            .end_background_execution(&self.profile_id, &self.handle);
+    }
 }
 
 impl<'a> ActiveContainerRequest<'a> {
@@ -245,6 +297,7 @@ impl VarlinkInterface for InferenceHandler {
                 &self.state,
                 &session_id,
                 resolved.clone(),
+                RequestExecutionMode::Interactive,
                 std::convert::identity,
                 |_container, _handle, _spawned| Ok(()),
             )
@@ -263,7 +316,7 @@ impl VarlinkInterface for InferenceHandler {
         session_id: String,
         input_json: String,
         media_paths: Vec<String>,
-        options: GenerationOptions,
+        options: ResponseOptions,
     ) -> varlink::Result<()> {
         self.rt.block_on(async {
             match stream_tokens(
@@ -296,7 +349,7 @@ impl VarlinkInterface for InferenceHandler {
         call: &mut dyn Call_StreamPredictNext,
         session_id: String,
         prefix: String,
-        options: GenerationOptions,
+        options: PredictNextOptions,
     ) -> varlink::Result<()> {
         self.rt.block_on(async {
             match predict_next_completions(&self.state, session_id, prefix, options).await {
@@ -320,18 +373,10 @@ impl VarlinkInterface for InferenceHandler {
         call: &mut dyn Call_StreamTranscribe,
         session_id: String,
         audio_path: String,
-        source_language_hint: String,
+        options: SpeechOptions,
     ) -> varlink::Result<()> {
         self.rt.block_on(async {
-            match stream_transcription(
-                &self.state,
-                call,
-                session_id,
-                audio_path,
-                source_language_hint,
-            )
-            .await
-            {
+            match stream_transcription(&self.state, call, session_id, audio_path, options).await {
                 Ok(()) => Ok(()),
                 Err(SpeechError::SessionNotFound(id)) => call.reply_session_not_found(id),
                 Err(SpeechError::ModelUnavailable(reason)) => call.reply_model_unavailable(reason),
@@ -348,6 +393,7 @@ impl VarlinkInterface for InferenceHandler {
         session_id: String,
         image_path: String,
         instructions: String,
+        options: VisionOptions,
     ) -> varlink::Result<()> {
         self.rt.block_on(async {
             match stream_vision_text(
@@ -356,6 +402,7 @@ impl VarlinkInterface for InferenceHandler {
                 session_id,
                 image_path,
                 instructions,
+                options,
                 "vision.describe",
             )
             .await
@@ -376,6 +423,7 @@ impl VarlinkInterface for InferenceHandler {
         session_id: String,
         image_path: String,
         instructions: String,
+        options: VisionOptions,
     ) -> varlink::Result<()> {
         self.rt.block_on(async {
             match stream_vision_text(
@@ -384,6 +432,7 @@ impl VarlinkInterface for InferenceHandler {
                 session_id,
                 image_path,
                 instructions,
+                options,
                 "vision.ocr",
             )
             .await
@@ -404,9 +453,11 @@ impl VarlinkInterface for InferenceHandler {
         session_id: String,
         image_path: String,
         instructions: String,
+        options: VisionOptions,
     ) -> varlink::Result<()> {
         self.rt.block_on(async {
-            match vision_segments(&self.state, session_id, image_path, instructions).await {
+            match vision_segments(&self.state, session_id, image_path, instructions, options).await
+            {
                 Ok(segments) => call.reply(segments),
                 Err(VisionError::SessionNotFound(id)) => call.reply_session_not_found(id),
                 Err(VisionError::ModelUnavailable(reason)) => call.reply_model_unavailable(reason),
@@ -422,9 +473,10 @@ impl VarlinkInterface for InferenceHandler {
         call: &mut dyn Call_StreamEmbed,
         session_id: String,
         text: String,
+        options: EmbedOptions,
     ) -> varlink::Result<()> {
         self.rt.block_on(async {
-            match embedding_vector(&self.state, session_id, text).await {
+            match embedding_vector(&self.state, session_id, text, options).await {
                 Ok(embedding) => call.reply(embedding),
                 Err(GenerationError::SessionNotFound(id)) => call.reply_session_not_found(id),
                 Err(GenerationError::ModelUnavailable(reason)) => {
@@ -448,7 +500,7 @@ impl VarlinkInterface for InferenceHandler {
         media_paths: Vec<String>,
         fields: Vec<GuidedField>,
         tools: Vec<ToolDefinition>,
-        options: GenerationOptions,
+        options: GuidedOptions,
     ) -> varlink::Result<()> {
         self.rt.block_on(async {
             match stream_guided_snapshots(
@@ -489,7 +541,7 @@ impl VarlinkInterface for InferenceHandler {
         results: Vec<ToolResult>,
         fields: Vec<GuidedField>,
         tools: Vec<ToolDefinition>,
-        options: GenerationOptions,
+        options: GuidedOptions,
     ) -> varlink::Result<()> {
         self.rt.block_on(async {
             match stream_guided_tool_results(
@@ -650,8 +702,10 @@ async fn stream_transcription(
     call: &mut dyn Call_StreamTranscribe,
     session_id: String,
     audio_path: String,
-    source_language_hint: String,
+    options: SpeechOptions,
 ) -> Result<(), SpeechError> {
+    let execution_mode =
+        parse_execution_mode(&options.execution_mode).map_err(SpeechError::InvalidInput)?;
     let resolved = resolve_session_runtime(state, &session_id, |use_case| {
         ensure_speech_use_case(use_case).map(|_| ())
     })
@@ -664,6 +718,7 @@ async fn stream_transcription(
         state,
         &session_id,
         resolved.clone(),
+        execution_mode,
         SpeechError::Failed,
         |container, _handle, _spawned| {
             let wants_more = call.wants_more();
@@ -673,8 +728,9 @@ async fn stream_transcription(
 
             let result = container.stream_transcribe(
                 audio_bytes,
-                Some(&source_language_hint),
+                Some(&options.source_language_hint),
                 task,
+                execution_mode.as_str(),
                 |token| {
                     if cancelled || state.is_session_cancelled(&session_id) {
                         cancelled = true;
@@ -732,8 +788,11 @@ async fn stream_vision_text<C: TextStreamCall + ?Sized>(
     session_id: String,
     image_path: String,
     instructions: String,
+    options: VisionOptions,
     expected_use_case: &str,
 ) -> Result<(), VisionError> {
+    let execution_mode =
+        parse_execution_mode(&options.execution_mode).map_err(VisionError::InvalidInput)?;
     let method = if expected_use_case == "vision.describe" {
         "StreamDescribe"
     } else {
@@ -750,6 +809,7 @@ async fn stream_vision_text<C: TextStreamCall + ?Sized>(
         state,
         &session_id,
         resolved.clone(),
+        execution_mode,
         VisionError::Failed,
         |container, _handle, _spawned| {
             let wants_more = call.wants_more();
@@ -759,35 +819,45 @@ async fn stream_vision_text<C: TextStreamCall + ?Sized>(
             let mut cancelled = false;
 
             let result = if expected_use_case == "vision.describe" {
-                container.stream_describe(image_bytes, &instructions, |token| {
-                    if cancelled || state.is_session_cancelled(&session_id) {
-                        cancelled = true;
-                        return;
-                    }
-                    forward_text_stream_token(
-                        call,
-                        wants_more,
-                        token,
-                        &mut pending_token,
-                        &mut saw_token,
-                        &mut reply_error,
-                    );
-                })
+                container.stream_describe(
+                    image_bytes,
+                    &instructions,
+                    execution_mode.as_str(),
+                    |token| {
+                        if cancelled || state.is_session_cancelled(&session_id) {
+                            cancelled = true;
+                            return;
+                        }
+                        forward_text_stream_token(
+                            call,
+                            wants_more,
+                            token,
+                            &mut pending_token,
+                            &mut saw_token,
+                            &mut reply_error,
+                        );
+                    },
+                )
             } else {
-                container.stream_ocr(image_bytes, &instructions, |token| {
-                    if cancelled || state.is_session_cancelled(&session_id) {
-                        cancelled = true;
-                        return;
-                    }
-                    forward_text_stream_token(
-                        call,
-                        wants_more,
-                        token,
-                        &mut pending_token,
-                        &mut saw_token,
-                        &mut reply_error,
-                    );
-                })
+                container.stream_ocr(
+                    image_bytes,
+                    &instructions,
+                    execution_mode.as_str(),
+                    |token| {
+                        if cancelled || state.is_session_cancelled(&session_id) {
+                            cancelled = true;
+                            return;
+                        }
+                        forward_text_stream_token(
+                            call,
+                            wants_more,
+                            token,
+                            &mut pending_token,
+                            &mut saw_token,
+                            &mut reply_error,
+                        );
+                    },
+                )
             };
 
             if let Some(e) = reply_error {
@@ -856,7 +926,10 @@ async fn vision_segments(
     session_id: String,
     image_path: String,
     instructions: String,
+    options: VisionOptions,
 ) -> Result<Vec<VisionSegment>, VisionError> {
+    let execution_mode =
+        parse_execution_mode(&options.execution_mode).map_err(VisionError::InvalidInput)?;
     let resolved = resolve_session_runtime(state, &session_id, |use_case| {
         ensure_exact_use_case(use_case, "vision.segment", "StreamSegment")
     })
@@ -868,10 +941,11 @@ async fn vision_segments(
         state,
         &session_id,
         resolved.clone(),
+        execution_mode,
         VisionError::Failed,
         |container, handle, spawned| {
             let result = container
-                .segment(image_bytes, &instructions)
+                .segment(image_bytes, &instructions, execution_mode.as_str())
                 .map(|segments| {
                     segments
                         .into_iter()
@@ -898,7 +972,10 @@ async fn embedding_vector(
     state: &SharedState,
     session_id: String,
     text: String,
+    options: EmbedOptions,
 ) -> Result<Vec<f64>, GenerationError> {
+    let execution_mode =
+        parse_execution_mode(&options.execution_mode).map_err(GenerationError::InvalidInput)?;
     let resolved = resolve_session_runtime(state, &session_id, |use_case| {
         ensure_exact_use_case(use_case, "language.embed", "StreamEmbed")
     })
@@ -909,10 +986,11 @@ async fn embedding_vector(
         state,
         &session_id,
         resolved.clone(),
+        execution_mode,
         GenerationError::Failed,
         |container, handle, spawned| {
             let result = container
-                .embed(&text)
+                .embed(&text, execution_mode.as_str())
                 .map(|embedding| embedding.into_iter().map(f64::from).collect())
                 .map_err(|e| GenerationError::Failed(e.to_string()));
             ensure_session_not_cancelled_or_terminate_spawned(state, &session_id, handle, spawned)
@@ -1169,9 +1247,14 @@ async fn stream_tokens(
     session_id: String,
     input_json: String,
     media_paths: Vec<String>,
-    options: GenerationOptions,
+    options: ResponseOptions,
 ) -> Result<(), GenerationError> {
-    let max_tokens = validate_options(&options).map_err(GenerationError::InvalidOptions)?;
+    let (max_tokens, execution_mode) = validate_token_options(
+        options.maximum_response_tokens,
+        options.temperature,
+        &options.execution_mode,
+    )
+    .map_err(GenerationError::InvalidOptions)?;
     let resolved = resolve_session_runtime(state, &session_id, ensure_language_generation_use_case)
         .await
         .map_err(GenerationError::from)?;
@@ -1185,6 +1268,7 @@ async fn stream_tokens(
         state,
         &session_id,
         resolved.clone(),
+        execution_mode,
         GenerationError::Failed,
         |container, _handle, _spawned| {
             let wants_more = call.wants_more();
@@ -1195,7 +1279,7 @@ async fn stream_tokens(
 
             macro_rules! generate_with_instructions {
                 ($instructions:expr) => {
-                    container.generate(Some($instructions), &prompt, Some(&input), max_tokens, |token| {
+                    container.generate(Some($instructions), &prompt, Some(&input), max_tokens, execution_mode.as_str(), |token| {
                         if cancelled || state.is_session_cancelled(&session_id) {
                             cancelled = true;
                             return;
@@ -1468,6 +1552,7 @@ async fn model_container(
     state: &SharedState,
     session_id: &str,
     resolved: &ResolvedSessionRuntime,
+    execution_mode: RequestExecutionMode,
 ) -> Result<(ContainerHandle, bool), String> {
     ensure_resolved_session_active(state, session_id, resolved).await?;
     let (container, spawned) = state
@@ -1484,6 +1569,9 @@ async fn model_container(
             |_| {},
             || {
                 ensure_session_not_cancelled(state, session_id)
+                    .and_then(|_| {
+                        ensure_background_start_still_allowed(state, resolved, execution_mode)
+                    })
                     .and_then(|_| ensure_profile_epoch_current(state, resolved))
             },
         )
@@ -1527,6 +1615,7 @@ async fn with_locked_container<T, E: ObservabilityFailure>(
     state: &SharedState,
     session_id: &str,
     mut resolved: ResolvedSessionRuntime,
+    execution_mode: RequestExecutionMode,
     map_failed: impl Fn(String) -> E,
     op: impl FnOnce(&mut Container, &ContainerHandle, bool) -> Result<T, E>,
 ) -> Result<T, E> {
@@ -1535,8 +1624,46 @@ async fn with_locked_container<T, E: ObservabilityFailure>(
     let started_at = observability::log_inference_request_started(inference_request_fields(
         method, session_id, &resolved,
     ));
+    let mut interactive_execution = match execution_mode {
+        RequestExecutionMode::Interactive => {
+            state.begin_interactive_execution(&resolved.profile_id);
+            Some(InteractiveExecution {
+                state,
+                profile_id: resolved.profile_id.clone(),
+                active: false,
+            })
+        }
+        RequestExecutionMode::Background => None,
+    };
     loop {
-        let (handle, spawned) = match model_container(state, session_id, &resolved).await {
+        if let Some(execution) = interactive_execution.as_mut()
+            && !execution.active
+            && execution.profile_id != resolved.profile_id
+        {
+            state.cancel_pending_interactive_execution(&execution.profile_id);
+            state.begin_interactive_execution(&resolved.profile_id);
+            execution.profile_id = resolved.profile_id.clone();
+        }
+        if execution_mode == RequestExecutionMode::Background
+            && !state.background_execution_can_start(&resolved.profile_id)
+        {
+            ensure_session_not_cancelled(state, session_id).map_err(|reason| {
+                map_observed_failure(
+                    method,
+                    session_id,
+                    &resolved,
+                    started_at,
+                    "unavailable",
+                    &map_failed,
+                    reason,
+                )
+            })?;
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            continue;
+        }
+        let (handle, spawned) = match model_container(state, session_id, &resolved, execution_mode)
+            .await
+        {
             Ok(container) => container,
             Err(reason) if is_startup_finalizing_retry(&reason) => {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1668,10 +1795,44 @@ async fn with_locked_container<T, E: ObservabilityFailure>(
                     handle.publish();
                 }
 
+                let _background_execution = if execution_mode == RequestExecutionMode::Background {
+                    if let Some(preempted) =
+                        state.begin_background_execution(&resolved.profile_id, handle.clone())
+                    {
+                        Some(BackgroundExecution {
+                            state,
+                            profile_id: resolved.profile_id.clone(),
+                            handle: handle.clone(),
+                            preempted,
+                        })
+                    } else {
+                        drop(container);
+                        continue;
+                    }
+                } else {
+                    if let Some(execution) = interactive_execution.as_mut()
+                        && !execution.active
+                    {
+                        state.activate_interactive_execution(&resolved.profile_id);
+                        execution.active = true;
+                    }
+                    None
+                };
+
                 let op = op.take().expect("container operation called once");
                 let cancel_watcher = spawn_cancel_watcher(state, session_id, &handle);
-                let result = op(&mut container, &handle, spawned);
+                let mut result = op(&mut container, &handle, spawned);
                 cancel_watcher.stop();
+                if result.is_err()
+                    && _background_execution
+                        .as_ref()
+                        .is_some_and(BackgroundExecution::was_preempted)
+                {
+                    result = Err(map_failed(
+                        "container returned error request_cancelled: background request was preempted by interactive request"
+                            .to_string(),
+                    ));
+                }
                 match &result {
                     Ok(_) => observability::log_inference_request_succeeded(
                         inference_request_fields(method, session_id, &resolved),
@@ -1825,6 +1986,22 @@ fn ensure_profile_epoch_current(
     }
 }
 
+fn ensure_background_start_still_allowed(
+    state: &SharedState,
+    resolved: &ResolvedSessionRuntime,
+    execution_mode: RequestExecutionMode,
+) -> Result<(), String> {
+    if execution_mode == RequestExecutionMode::Background
+        && !state.background_execution_can_start(&resolved.profile_id)
+    {
+        return Err(
+            "container returned error request_cancelled: background request was preempted by interactive request"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 fn ensure_handle_ready_for_request(
     handle: &ContainerHandle,
     spawned: bool,
@@ -1975,9 +2152,14 @@ async fn predict_next_completions(
     state: &SharedState,
     session_id: String,
     prefix: String,
-    options: GenerationOptions,
+    options: PredictNextOptions,
 ) -> Result<Vec<String>, GenerationError> {
-    let max_tokens = validate_options(&options).map_err(GenerationError::InvalidOptions)?;
+    let (max_tokens, execution_mode) = validate_token_options(
+        options.maximum_response_tokens,
+        options.temperature,
+        &options.execution_mode,
+    )
+    .map_err(GenerationError::InvalidOptions)?;
     let generation = state.begin_predict_next(&session_id);
     let resolved = match resolve_session_runtime(state, &session_id, |use_case| {
         ensure_exact_use_case(use_case, "language.complete", "StreamPredictNext")
@@ -1997,10 +2179,16 @@ async fn predict_next_completions(
         state,
         &session_id,
         resolved.clone(),
+        execution_mode,
         GenerationError::Failed,
         |container, _handle, _spawned| {
             let result = container
-                .predict_next(&prefix, max_tokens, options.temperature)
+                .predict_next(
+                    &prefix,
+                    max_tokens,
+                    options.temperature,
+                    execution_mode.as_str(),
+                )
                 .map_err(|e| GenerationError::Failed(e.to_string()));
             if state.is_session_cancelled(&session_id) {
                 return Err(GenerationError::Failed(request_cancelled_reason()));
@@ -2023,7 +2211,7 @@ struct GuidedStreamRequest {
     media_paths: Vec<String>,
     fields: Vec<GuidedField>,
     tools: Vec<ToolDefinition>,
-    options: GenerationOptions,
+    options: GuidedOptions,
 }
 
 async fn stream_guided_snapshots(
@@ -2039,7 +2227,12 @@ async fn stream_guided_snapshots(
         tools,
         options,
     } = request;
-    let max_tokens = validate_options(&options).map_err(GenerationError::InvalidOptions)?;
+    let (max_tokens, execution_mode) = validate_token_options(
+        options.maximum_response_tokens,
+        options.temperature,
+        &options.execution_mode,
+    )
+    .map_err(GenerationError::InvalidOptions)?;
     let schema = guided_fields_schema(&fields).map_err(GenerationError::Failed)?;
     let resolved = resolve_session_runtime(state, &session_id, ensure_language_generation_use_case)
         .await
@@ -2052,6 +2245,7 @@ async fn stream_guided_snapshots(
         state,
         &session_id,
         resolved.clone(),
+        execution_mode,
         GenerationError::Failed,
         |container, _handle, _spawned| {
             let wants_more = call.wants_more();
@@ -2068,6 +2262,7 @@ async fn stream_guided_snapshots(
                 input.as_deref(),
                 max_tokens,
                 &schema,
+                execution_mode.as_str(),
                 tools,
                 Vec::new(),
                 |snapshot, tool_calls, done| {
@@ -2156,9 +2351,14 @@ async fn stream_guided_tool_results(
     results: Vec<ToolResult>,
     fields: Vec<GuidedField>,
     tools: Vec<ToolDefinition>,
-    options: GenerationOptions,
+    options: GuidedOptions,
 ) -> Result<(), GenerationError> {
-    let max_tokens = validate_options(&options).map_err(GenerationError::InvalidOptions)?;
+    let (max_tokens, execution_mode) = validate_token_options(
+        options.maximum_response_tokens,
+        options.temperature,
+        &options.execution_mode,
+    )
+    .map_err(GenerationError::InvalidOptions)?;
     let schema = guided_fields_schema(&fields).map_err(GenerationError::Failed)?;
     let resolved = resolve_session_runtime(state, &session_id, ensure_language_generation_use_case)
         .await
@@ -2171,6 +2371,7 @@ async fn stream_guided_tool_results(
         state,
         &session_id,
         resolved.clone(),
+        execution_mode,
         GenerationError::Failed,
         |container, _handle, _spawned| {
             let wants_more = call.wants_more();
@@ -2188,6 +2389,7 @@ async fn stream_guided_tool_results(
                 input.as_deref(),
                 max_tokens,
                 &schema,
+                execution_mode.as_str(),
                 tools,
                 tool_results,
                 |snapshot, tool_calls, done| {
@@ -2296,7 +2498,7 @@ fn varlink_tool_calls(calls: Vec<crate::container::ToolCall>) -> Vec<ToolCall> {
 fn apply_translation_hints(
     use_case: &str,
     instructions: String,
-    options: &GenerationOptions,
+    options: &ResponseOptions,
 ) -> String {
     if use_case != "language.translate" {
         return instructions;
@@ -2418,20 +2620,32 @@ fn runtime_missing_reason(candidates: &[RuntimeCandidate]) -> String {
     }
 }
 
-fn validate_options(options: &GenerationOptions) -> Result<u32, String> {
-    if options.maximum_response_tokens <= 0 {
+fn validate_token_options(
+    maximum_response_tokens: i64,
+    temperature: f64,
+    execution_mode: &str,
+) -> Result<(u32, RequestExecutionMode), String> {
+    if maximum_response_tokens <= 0 {
         return Err("maximum_response_tokens must be greater than zero".to_string());
     }
-    if options.maximum_response_tokens > u32::MAX as i64 {
+    if maximum_response_tokens > u32::MAX as i64 {
         return Err("maximum_response_tokens is too large".to_string());
     }
-    if !options.temperature.is_finite() || options.temperature < 0.0 {
+    if !temperature.is_finite() || temperature < 0.0 {
         return Err("temperature must be a finite non-negative number".to_string());
     }
-    if options.sampling_mode.trim().is_empty() {
-        return Err("sampling_mode must not be empty".to_string());
+    let execution_mode = parse_execution_mode(execution_mode)?;
+    Ok((maximum_response_tokens as u32, execution_mode))
+}
+
+fn parse_execution_mode(value: &str) -> Result<RequestExecutionMode, String> {
+    match value {
+        "" | "interactive" => Ok(RequestExecutionMode::Interactive),
+        "background" => Ok(RequestExecutionMode::Background),
+        other => Err(format!(
+            "execution_mode must be interactive or background, got {other}"
+        )),
     }
-    Ok(options.maximum_response_tokens as u32)
 }
 
 fn ensure_language_generation_use_case(use_case: &str) -> Result<(), String> {
@@ -2527,19 +2741,24 @@ mod tests {
     use hegel::TestCase;
     use hegel::generators as gs;
 
-    fn generation_options() -> GenerationOptions {
-        GenerationOptions {
-            maximum_response_tokens: 128,
-            temperature: 0.7,
-            sampling_mode: "default".to_string(),
-            source_language_hint: String::new(),
-            target_language_hint: String::new(),
-        }
+    fn token_options() -> (i64, f64, String) {
+        (128, 0.7, "interactive".to_string())
     }
 
     #[test]
     fn validate_options_accepts_normal_generation_options() {
-        assert_eq!(validate_options(&generation_options()), Ok(128));
+        assert_eq!(
+            validate_token_options(128, 0.7, "interactive"),
+            Ok((128, RequestExecutionMode::Interactive))
+        );
+    }
+
+    #[test]
+    fn validate_options_accepts_background_execution_mode() {
+        assert_eq!(
+            validate_token_options(128, 0.7, "background"),
+            Ok((128, RequestExecutionMode::Background))
+        );
     }
 
     #[test]
@@ -2641,55 +2860,46 @@ mod tests {
     fn validate_options_accepts_generated_valid_options(tc: TestCase) {
         let maximum_response_tokens = tc.draw(gs::integers::<i64>().min_value(1).max_value(4096));
         let temperature_tenths = tc.draw(gs::integers::<i64>().min_value(0).max_value(20));
-        let sampling_mode = tc.draw(gs::sampled_from(vec![
-            "default".to_string(),
-            "greedy".to_string(),
-            "creative".to_string(),
-        ]));
-        let options = GenerationOptions {
-            maximum_response_tokens,
-            temperature: temperature_tenths as f64 / 10.0,
-            sampling_mode,
-            source_language_hint: String::new(),
-            target_language_hint: String::new(),
-        };
-
         assert_eq!(
-            validate_options(&options),
-            Ok(maximum_response_tokens as u32)
+            validate_token_options(
+                maximum_response_tokens,
+                temperature_tenths as f64 / 10.0,
+                "interactive",
+            ),
+            Ok((
+                maximum_response_tokens as u32,
+                RequestExecutionMode::Interactive
+            ))
         );
     }
 
     #[test]
     fn validate_options_rejects_zero_tokens() {
-        let mut options = generation_options();
-        options.maximum_response_tokens = 0;
+        let (_, temperature, execution_mode) = token_options();
 
         assert_eq!(
-            validate_options(&options),
+            validate_token_options(0, temperature, &execution_mode),
             Err("maximum_response_tokens must be greater than zero".to_string())
         );
     }
 
     #[test]
     fn validate_options_rejects_invalid_temperature() {
-        let mut options = generation_options();
-        options.temperature = f64::NAN;
+        let (maximum_response_tokens, _, execution_mode) = token_options();
 
         assert_eq!(
-            validate_options(&options),
+            validate_token_options(maximum_response_tokens, f64::NAN, &execution_mode),
             Err("temperature must be a finite non-negative number".to_string())
         );
     }
 
     #[test]
-    fn validate_options_rejects_empty_sampling_mode() {
-        let mut options = generation_options();
-        options.sampling_mode = "  ".to_string();
+    fn validate_options_rejects_unknown_execution_mode() {
+        let (maximum_response_tokens, temperature, _) = token_options();
 
         assert_eq!(
-            validate_options(&options),
-            Err("sampling_mode must not be empty".to_string())
+            validate_token_options(maximum_response_tokens, temperature, "urgent"),
+            Err("execution_mode must be interactive or background, got urgent".to_string())
         );
     }
 

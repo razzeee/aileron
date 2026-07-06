@@ -148,12 +148,42 @@ struct ModelAvailabilityDbus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
-struct GenerationOptionsDbus {
+struct ResponseOptionsDbus {
     maximum_response_tokens: i64,
     temperature: f64,
-    sampling_mode: String,
     source_language_hint: String,
     target_language_hint: String,
+    execution_mode: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+struct PredictNextOptionsDbus {
+    maximum_response_tokens: i64,
+    temperature: f64,
+    execution_mode: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+struct GuidedOptionsDbus {
+    maximum_response_tokens: i64,
+    temperature: f64,
+    execution_mode: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+struct EmbedOptionsDbus {
+    execution_mode: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+struct SpeechOptionsDbus {
+    source_language_hint: String,
+    execution_mode: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+struct VisionOptionsDbus {
+    execution_mode: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -350,7 +380,7 @@ impl LanguagePortalBackend {
         session_handle: OwnedObjectPath,
         input_json: &str,
         media_fds: Vec<OwnedFd>,
-        options: GenerationOptionsDbus,
+        options: ResponseOptionsDbus,
         #[zbus(connection)] conn: &zbus::Connection,
         #[zbus(header)] header: Header<'_>,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
@@ -435,7 +465,7 @@ impl LanguagePortalBackend {
         request_handle: OwnedObjectPath,
         session_handle: OwnedObjectPath,
         prefix: &str,
-        options: GenerationOptionsDbus,
+        options: PredictNextOptionsDbus,
         #[zbus(connection)] conn: &zbus::Connection,
         #[zbus(header)] header: Header<'_>,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
@@ -523,7 +553,7 @@ impl LanguagePortalBackend {
         media_fds: Vec<OwnedFd>,
         fields: Vec<GuidedFieldDbus>,
         tools: Vec<ToolDefinitionDbus>,
-        options: GenerationOptionsDbus,
+        options: GuidedOptionsDbus,
         #[zbus(connection)] conn: &zbus::Connection,
         #[zbus(header)] header: Header<'_>,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
@@ -651,7 +681,7 @@ impl LanguagePortalBackend {
         results: Vec<ToolResultDbus>,
         fields: Vec<GuidedFieldDbus>,
         tools: Vec<ToolDefinitionDbus>,
-        options: GenerationOptionsDbus,
+        options: GuidedOptionsDbus,
         #[zbus(connection)] conn: &zbus::Connection,
         #[zbus(header)] header: Header<'_>,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
@@ -760,6 +790,7 @@ impl LanguagePortalBackend {
         request_handle: OwnedObjectPath,
         session_handle: OwnedObjectPath,
         text: &str,
+        options: EmbedOptionsDbus,
         #[zbus(connection)] conn: &zbus::Connection,
         #[zbus(header)] header: Header<'_>,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
@@ -780,7 +811,8 @@ impl LanguagePortalBackend {
             let daemon_session_id = record.daemon_session_id;
             let ipc_conn = connect_request_daemon(&self.state, request_id)?;
             let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(ipc_conn);
-            let mut call = client.stream_embed(daemon_session_id, text.to_string());
+            let mut call =
+                client.stream_embed(daemon_session_id, text.to_string(), options.into_varlink());
             let iter = call
                 .more()
                 .map_err(|e| map_request_error(&self.state, request_id, e))?;
@@ -941,7 +973,7 @@ impl SpeechPortalBackend {
         request_handle: OwnedObjectPath,
         session_handle: OwnedObjectPath,
         audio_fd: OwnedFd,
-        source_language_hint: &str,
+        options: SpeechOptionsDbus,
         #[zbus(connection)] conn: &zbus::Connection,
         #[zbus(header)] header: Header<'_>,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
@@ -963,11 +995,8 @@ impl SpeechPortalBackend {
             let audio_path = fd_proc_path(&audio_fd);
             let ipc_conn = connect_request_daemon(&self.state, request_id)?;
             let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(ipc_conn);
-            let mut call = client.stream_transcribe(
-                daemon_session_id,
-                audio_path,
-                source_language_hint.to_string(),
-            );
+            let mut call =
+                client.stream_transcribe(daemon_session_id, audio_path, options.into_varlink());
             let iter = call
                 .more()
                 .map_err(|e| map_request_error(&self.state, request_id, e))?;
@@ -1142,6 +1171,7 @@ impl VisionPortalBackend {
         session_handle: OwnedObjectPath,
         image_fd: OwnedFd,
         instructions: &str,
+        options: VisionOptionsDbus,
         #[zbus(connection)] conn: &zbus::Connection,
         #[zbus(header)] header: Header<'_>,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
@@ -1163,8 +1193,12 @@ impl VisionPortalBackend {
             let image_path = fd_proc_path(&image_fd);
             let ipc_conn = connect_request_daemon(&self.state, request_id)?;
             let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(ipc_conn);
-            let mut call =
-                client.stream_describe(daemon_session_id, image_path, instructions.to_string());
+            let mut call = client.stream_describe(
+                daemon_session_id,
+                image_path,
+                instructions.to_string(),
+                options.into_varlink(),
+            );
             let iter = call
                 .more()
                 .map_err(|e| map_request_error(&self.state, request_id, e))?;
@@ -1214,6 +1248,7 @@ impl VisionPortalBackend {
         session_handle: OwnedObjectPath,
         image_fd: OwnedFd,
         instructions: &str,
+        options: VisionOptionsDbus,
         #[zbus(connection)] conn: &zbus::Connection,
         #[zbus(header)] header: Header<'_>,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
@@ -1235,8 +1270,12 @@ impl VisionPortalBackend {
             let image_path = fd_proc_path(&image_fd);
             let ipc_conn = connect_request_daemon(&self.state, request_id)?;
             let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(ipc_conn);
-            let mut call =
-                client.stream_ocr(daemon_session_id, image_path, instructions.to_string());
+            let mut call = client.stream_ocr(
+                daemon_session_id,
+                image_path,
+                instructions.to_string(),
+                options.into_varlink(),
+            );
             let iter = call
                 .more()
                 .map_err(|e| map_request_error(&self.state, request_id, e))?;
@@ -1286,6 +1325,7 @@ impl VisionPortalBackend {
         session_handle: OwnedObjectPath,
         image_fd: OwnedFd,
         instructions: &str,
+        options: VisionOptionsDbus,
         #[zbus(connection)] conn: &zbus::Connection,
         #[zbus(header)] header: Header<'_>,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
@@ -1307,8 +1347,12 @@ impl VisionPortalBackend {
             let image_path = fd_proc_path(&image_fd);
             let ipc_conn = connect_request_daemon(&self.state, request_id)?;
             let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(ipc_conn);
-            let mut call =
-                client.stream_segment(daemon_session_id, image_path, instructions.to_string());
+            let mut call = client.stream_segment(
+                daemon_session_id,
+                image_path,
+                instructions.to_string(),
+                options.into_varlink(),
+            );
             let iter = call
                 .more()
                 .map_err(|e| map_request_error(&self.state, request_id, e))?;
@@ -2156,14 +2200,59 @@ impl VisionPortalBackend {
     }
 }
 
-impl GenerationOptionsDbus {
-    fn into_varlink(self) -> aileron_varlink::aileron_Inference::GenerationOptions {
-        aileron_varlink::aileron_Inference::GenerationOptions {
+impl ResponseOptionsDbus {
+    fn into_varlink(self) -> aileron_varlink::aileron_Inference::ResponseOptions {
+        aileron_varlink::aileron_Inference::ResponseOptions {
             maximum_response_tokens: self.maximum_response_tokens,
             temperature: self.temperature,
-            sampling_mode: self.sampling_mode,
             source_language_hint: self.source_language_hint,
             target_language_hint: self.target_language_hint,
+            execution_mode: self.execution_mode,
+        }
+    }
+}
+
+impl PredictNextOptionsDbus {
+    fn into_varlink(self) -> aileron_varlink::aileron_Inference::PredictNextOptions {
+        aileron_varlink::aileron_Inference::PredictNextOptions {
+            maximum_response_tokens: self.maximum_response_tokens,
+            temperature: self.temperature,
+            execution_mode: self.execution_mode,
+        }
+    }
+}
+
+impl GuidedOptionsDbus {
+    fn into_varlink(self) -> aileron_varlink::aileron_Inference::GuidedOptions {
+        aileron_varlink::aileron_Inference::GuidedOptions {
+            maximum_response_tokens: self.maximum_response_tokens,
+            temperature: self.temperature,
+            execution_mode: self.execution_mode,
+        }
+    }
+}
+
+impl EmbedOptionsDbus {
+    fn into_varlink(self) -> aileron_varlink::aileron_Inference::EmbedOptions {
+        aileron_varlink::aileron_Inference::EmbedOptions {
+            execution_mode: self.execution_mode,
+        }
+    }
+}
+
+impl SpeechOptionsDbus {
+    fn into_varlink(self) -> aileron_varlink::aileron_Inference::SpeechOptions {
+        aileron_varlink::aileron_Inference::SpeechOptions {
+            source_language_hint: self.source_language_hint,
+            execution_mode: self.execution_mode,
+        }
+    }
+}
+
+impl VisionOptionsDbus {
+    fn into_varlink(self) -> aileron_varlink::aileron_Inference::VisionOptions {
+        aileron_varlink::aileron_Inference::VisionOptions {
+            execution_mode: self.execution_mode,
         }
     }
 }
@@ -2245,29 +2334,24 @@ mod tests {
     }
 
     #[hegel::test]
-    fn generation_options_conversion_preserves_generated_fields(tc: TestCase) {
+    fn response_options_conversion_preserves_generated_fields(tc: TestCase) {
         let maximum_response_tokens = tc.draw(gs::integers::<i64>().min_value(1).max_value(4096));
         let temperature_tenths = tc.draw(gs::integers::<i64>().min_value(0).max_value(20));
-        let sampling_mode = tc.draw(gs::sampled_from(vec![
-            "default".to_string(),
-            "greedy".to_string(),
-            "creative".to_string(),
-        ]));
-        let options = GenerationOptionsDbus {
+        let options = ResponseOptionsDbus {
             maximum_response_tokens,
             temperature: temperature_tenths as f64 / 10.0,
-            sampling_mode: sampling_mode.clone(),
             source_language_hint: "en".to_string(),
             target_language_hint: "es".to_string(),
+            execution_mode: "background".to_string(),
         };
 
         let converted = options.into_varlink();
 
         assert_eq!(converted.maximum_response_tokens, maximum_response_tokens);
         assert_eq!(converted.temperature, temperature_tenths as f64 / 10.0);
-        assert_eq!(converted.sampling_mode, sampling_mode);
         assert_eq!(converted.source_language_hint, "en");
         assert_eq!(converted.target_language_hint, "es");
+        assert_eq!(converted.execution_mode, "background");
     }
 
     #[hegel::test]

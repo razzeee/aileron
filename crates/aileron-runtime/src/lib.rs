@@ -26,6 +26,8 @@ pub struct Request {
     #[serde(default)]
     pub temperature: Option<f64>,
     #[serde(default)]
+    pub execution_mode: Option<String>,
+    #[serde(default)]
     pub audio: Option<String>,
     #[serde(default)]
     pub image: Option<Value>,

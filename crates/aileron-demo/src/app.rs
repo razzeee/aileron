@@ -78,6 +78,15 @@ fn generation_options(
     options
 }
 
+fn speech_options(source_language_hint: &str) -> PortalOptions {
+    let mut options = HashMap::new();
+    options.insert(
+        "source_language_hint".to_string(),
+        string_option_value(source_language_hint),
+    );
+    options
+}
+
 fn create_public_session(
     proxy: &zbus::blocking::Proxy<'_>,
     use_case: &str,
@@ -2470,8 +2479,7 @@ fn stream_speech_audio(
         &(
             session_handle,
             audio_fd,
-            source_language_hint,
-            empty_options(),
+            speech_options(source_language_hint),
         ),
     );
     let request_handle = stream_result?;

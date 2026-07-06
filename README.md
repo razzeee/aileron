@@ -306,7 +306,7 @@ varlink call "unix:$XDG_RUNTIME_DIR/aileron.socket/aileron.Inference.CreateSessi
 
 # 7. Generate (replace SESSION_ID)
 varlink call --more "unix:$XDG_RUNTIME_DIR/aileron.socket/aileron.Inference.StreamResponse" \
-    '{"session_id":"SESSION_ID","input_json":"[{\"type\":\"input_text\",\"text\":\"Hello world\"}]","media_paths":[],"options":{"maximum_response_tokens":64,"temperature":0.0,"sampling_mode":"greedy"}}'
+    '{"session_id":"SESSION_ID","input_json":"[{\"type\":\"input_text\",\"text\":\"Hello world\"}]","media_paths":[],"options":{"maximum_response_tokens":64,"temperature":0.0,"source_language_hint":"","target_language_hint":"","execution_mode":"interactive"}}'
 # → {"token": "Hello world"}   stub echoes the rendered input
 
 # 8. End the session
@@ -382,7 +382,12 @@ Create sessions, generate text, get structured JSON output, compute embeddings, 
 
 ```varlink
 type ModelAvailability (is_available: bool, code: string, reason: string)
-type GenerationOptions (maximum_response_tokens: int, temperature: float, sampling_mode: string, source_language_hint: string, target_language_hint: string)
+type ResponseOptions (maximum_response_tokens: int, temperature: float, source_language_hint: string, target_language_hint: string, execution_mode: string)
+type PredictNextOptions (maximum_response_tokens: int, temperature: float, execution_mode: string)
+type GuidedOptions (maximum_response_tokens: int, temperature: float, execution_mode: string)
+type EmbedOptions (execution_mode: string)
+type SpeechOptions (source_language_hint: string, execution_mode: string)
+type VisionOptions (execution_mode: string)
 type GuidedField (name: string, kind: string, description: string, required: bool)
 type ToolDefinition (name: string, description: string, schema_json: string)
 type ToolCall (id: string, name: string, arguments_json: string)
@@ -392,21 +397,21 @@ type VisionSegment (label: string, confidence: float, x: float, y: float, width:
 method GetUseCaseAvailability(app_id: string, use_case: string) -> (availability: ModelAvailability)
 method CreateSession(app_id: string, use_case: string, instructions: string) -> (session_id: string, profile_id: string)
 method Prewarm(session_id: string) -> ()
-method StreamResponse(session_id: string, input_json: string, media_paths: []string, options: GenerationOptions) -> (token: string)
-method StreamPredictNext(session_id: string, prefix: string, options: GenerationOptions) -> (completions: []string)
-method StreamRespondGuided(session_id: string, prompt: string, media_paths: []string, fields: []GuidedField, tools: []ToolDefinition, options: GenerationOptions) -> (snapshot_json: string, tool_calls: []ToolCall)
-method StreamSubmitToolResultsGuided(session_id: string, prompt: string, media_paths: []string, results: []ToolResult, fields: []GuidedField, tools: []ToolDefinition, options: GenerationOptions) -> (snapshot_json: string, tool_calls: []ToolCall)
-method StreamEmbed(session_id: string, text: string) -> (embedding: []float)
-method StreamTranscribe(session_id: string, audio_path: string, source_language_hint: string) -> (token: string)
-method StreamDescribe(session_id: string, image_path: string, instructions: string) -> (token: string)
-method StreamOcr(session_id: string, image_path: string, instructions: string) -> (token: string)
-method StreamSegment(session_id: string, image_path: string, instructions: string) -> (segments: []VisionSegment)
+method StreamResponse(session_id: string, input_json: string, media_paths: []string, options: ResponseOptions) -> (token: string)
+method StreamPredictNext(session_id: string, prefix: string, options: PredictNextOptions) -> (completions: []string)
+method StreamRespondGuided(session_id: string, prompt: string, media_paths: []string, fields: []GuidedField, tools: []ToolDefinition, options: GuidedOptions) -> (snapshot_json: string, tool_calls: []ToolCall)
+method StreamSubmitToolResultsGuided(session_id: string, prompt: string, media_paths: []string, results: []ToolResult, fields: []GuidedField, tools: []ToolDefinition, options: GuidedOptions) -> (snapshot_json: string, tool_calls: []ToolCall)
+method StreamEmbed(session_id: string, text: string, options: EmbedOptions) -> (embedding: []float)
+method StreamTranscribe(session_id: string, audio_path: string, options: SpeechOptions) -> (token: string)
+method StreamDescribe(session_id: string, image_path: string, instructions: string, options: VisionOptions) -> (token: string)
+method StreamOcr(session_id: string, image_path: string, instructions: string, options: VisionOptions) -> (token: string)
+method StreamSegment(session_id: string, image_path: string, instructions: string, options: VisionOptions) -> (segments: []VisionSegment)
 method EndSession(session_id: string) -> ()
 ```
 
 `CreateSession` returns the backend session id and selected profile id; the portal frontend exposes only an opaque public session handle to apps. Missing app permissions fail with `PermissionPromptRequired` so the portal backend can prompt once and persist the decision; explicit denials fail with `PermissionDenied` and are not re-prompted. `instructions` are stored on the session and forwarded to text containers as the container `system` prompt. `StreamPredictNext` is for inline typing assistance on `language.complete` sessions: the daemon forwards the raw prefix to the runtime and streams one completions event with up to three short completions, typically word suffixes or next words. Newer `StreamPredictNext` calls for the same session supersede older in-flight prediction calls; superseded calls fail with `RequestCancelled` and do not emit completions. `StreamTranscribe` reads raw 16 kHz mono f32le PCM from `audio_path` and streams a verbatim transcript for `speech.transcribe` sessions or an English translation for `speech.translate` sessions. Vision methods read PNG or JPEG bytes from `image_path` and pass non-empty per-image `instructions` to the container as the request `prompt`. `StreamEmbed` streams one embedding vector event for `text`. `VisionSegment` coordinates are normalized `0.0..1.0` rectangles relative to image dimensions.
 
-`GenerationOptions.maximum_response_tokens` must be greater than zero and fit in `u32`. `temperature` must be finite and non-negative. `sampling_mode` must be non-empty. `source_language_hint` and `target_language_hint` are optional strings for `language.translate`; pass empty strings when unspecified. Today the daemon validates sampling fields, forwards `maximum_response_tokens` to containers as `max_tokens`, and folds translation hints into the session instructions for `language.translate`.
+Token-generating option structs require `maximum_response_tokens` to be greater than zero and fit in `u32`; `temperature` must be finite and non-negative. `ResponseOptions.source_language_hint` and `target_language_hint` are optional strings for `language.translate`; pass empty strings when unspecified. The daemon forwards `maximum_response_tokens` to containers as `max_tokens` and folds translation hints into the session instructions for `language.translate`.
 
 `GuidedField.kind` supports `string`, `number`, `integer`, `boolean`, and `string_array`. The daemon converts guided fields into a JSON Schema object with `additionalProperties: false`, sends it to the container as `response_format.schema`, then validates the returned JSON before replying. `StreamRespondGuided` returns validated JSON snapshots or app-mediated tool calls rather than token deltas. Guided `prompt` may be plain text or the same content-part/role-message JSON accepted by `StreamResponse`; media parts reference `media_paths` by `fd_index`.
 
@@ -499,7 +504,7 @@ Apps call the public interfaces on `org.freedesktop.portal.Desktop`. The public 
 
 | Method | Parameters | Returns | Notes |
 |---|---|---|---|
-| `StreamTranscribe` | `session_handle: o, audio_fd: h, source_language_hint: s, options: a{sv}` | `handle: o` | 16 kHz mono f32le PCM readable from a sealable memfd; empty hint means auto-detect/no hint; emits `TranscriptionReceived` signals; final segment has `done=true` |
+| `StreamTranscribe` | `session_handle: o, audio_fd: h, options: a{sv}` | `handle: o` | 16 kHz mono f32le PCM readable from a sealable memfd; empty `source_language_hint` option means auto-detect/no hint; emits `TranscriptionReceived` signals; final segment has `done=true` |
 
 Streaming D-Bus methods return an `org.freedesktop.portal.Request` handle immediately. Callers should subscribe to both the stream signal and the request's `Response` signal before invoking a stream method when using caller-chosen `handle_token` values. Stream payload signals are correlated by `request_handle`; the request response indicates success, portal/backend cancellation, or failure. If the app calls `Close` on the request, the request is unexported and the app should not wait for a later `Response` on that handle.
 
@@ -511,7 +516,7 @@ Streaming D-Bus methods return an `org.freedesktop.portal.Request` handle immedi
 | `StreamOcr` | `session_handle: o, image_fd: h, instructions: s, options: a{sv}` | `handle: o` | `vision.ocr` sessions only; reads PNG/JPEG bytes from a sealable memfd; optional per-image instructions; emits `VisionTextReceived` signals |
 | `StreamSegment` | `session_handle: o, image_fd: h, instructions: s, options: a{sv}` | `handle: o` | `vision.segment` sessions only; reads PNG/JPEG bytes from a sealable memfd; optional per-image instructions; emits one `VisionSegmentsReceived` signal with normalized boxes |
 
-These are D-Bus signatures: parentheses define a struct, `a(...)` means an array of structs, `a{sv}` is an options vardict, and `h` is a Unix fd handle. `parent_window` follows xdg-desktop-portal window identifier rules such as `x11:<XID>` or `wayland:<HANDLE>`; pass an empty string when no suitable handle exists. Aileron's fallback `zenity`/`kdialog` prompt currently attaches only X11 parent windows. Public language generation methods accept these option keys: `maximum_response_tokens` as int64, `source_language_hint` as string, and `target_language_hint` as string. `temperature` and `sampling_mode` are reserved for future public portal sampling controls. Empty language hints and empty Vision `instructions` mean unspecified. The generation option language hints only affect `language.translate`; `StreamEmbed`, Speech stream options, and Vision stream options are reserved except for standard request options such as `handle_token`. Speech methods use their `source_language_hint` argument only to identify the spoken input language; the session use-case selects whether speech output is a transcript or English translation. `fields: a(sssb)` is an array of `GuidedField` structs: name, kind, description, required. Tool structs are `a(sss)`: definitions are name, description, schema JSON; calls are id, name, arguments JSON; results are id, content, content JSON.
+These are D-Bus signatures: parentheses define a struct, `a(...)` means an array of structs, `a{sv}` is an options vardict, and `h` is a Unix fd handle. `parent_window` follows xdg-desktop-portal window identifier rules such as `x11:<XID>` or `wayland:<HANDLE>`; pass an empty string when no suitable handle exists. Aileron's fallback `zenity`/`kdialog` prompt currently attaches only X11 parent windows. Public language response methods accept `maximum_response_tokens` as int64, `temperature` as double, `source_language_hint` as string, `target_language_hint` as string, and `execution_mode` as string. Predict-next and guided language methods accept `maximum_response_tokens`, `temperature`, and `execution_mode`. Embed and Vision stream options accept `execution_mode`. Speech stream options accept `source_language_hint` and `execution_mode`. Empty language hints and empty Vision `instructions` mean unspecified. Language response hints only affect `language.translate`; speech `source_language_hint` identifies the spoken input language, while the session use-case selects transcript vs English translation. `fields: a(sssb)` is an array of `GuidedField` structs: name, kind, description, required. Tool structs are `a(sss)`: definitions are name, description, schema JSON; calls are id, name, arguments JSON; results are id, content, content JSON.
 
 Audio and image payloads are passed to the public portal as readable, sealable memfd handles, avoiding D-Bus string payload limits for media bytes while preventing mutation after the portal accepts the handle. Apps should still use user-initiated actions, visible progress, resized images, app-side audio chunking, and cancellation-friendly UI. The daemon's container runtime protocol remains JSON over stdio and base64-encodes these bytes internally for runtime compatibility.
 
@@ -567,7 +572,7 @@ Each OCI image implements a simple newline-delimited JSON protocol over stdin/st
 | `type` | string | all requests | One of `generate`, `predict_next`, `generate_structured`, `generate_structured_stream`, `transcribe`, `describe`, `ocr`, `segment`, `embed` |
 | `system` | string | `generate`, structured generation, tool generation | Session instructions from `CreateSession` |
 | `prompt` | string | `generate`, `predict_next`, structured generation, tool generation, optionally `describe` | User prompt, raw prediction prefix, or image prompt |
-| `max_tokens` | number | text, structured, and tool generation | Derived from `GenerationOptions.maximum_response_tokens` for text requests |
+| `max_tokens` | number | text, structured, and tool generation | Derived from the endpoint option struct's `maximum_response_tokens` field |
 | `audio` | string | `transcribe` | Base64-encoded raw PCM bytes, 16 kHz mono f32le |
 | `language_hint` | string | `transcribe` | Runtime protocol source-language hint for speech input; omitted when unspecified |
 | `image` | string | `describe` | Base64-encoded PNG or JPEG bytes |

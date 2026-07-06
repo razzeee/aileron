@@ -50,11 +50,12 @@ Request:
       ]
     }
   ],
-  "max_tokens": 512
+  "max_tokens": 512,
+  "execution_mode": "interactive"
 }
 ```
 
-The `system` field is optional. `input` is the canonical multimodal message array for `generate` requests. The daemon also sends `prompt` as the text-only rendering of `input` for runtimes that implement text generation. `max_tokens` is a positive integer selected by the caller or daemon defaults.
+The `system` field is optional. `input` is the canonical multimodal message array for `generate` requests. The daemon also sends `prompt` as the text-only rendering of `input` for runtimes that implement text generation. `max_tokens` is a positive integer selected by the caller or daemon defaults. `execution_mode` is `interactive` by default or `background` for work that may be delayed, deprioritized, preempted, or cancelled to protect interactive requests and reduce system pressure.
 
 Streaming response:
 
@@ -79,7 +80,8 @@ Request:
   "type": "predict_next",
   "prompt": "The lighthouse",
   "choices": 3,
-  "max_tokens": 4
+  "max_tokens": 4,
+  "execution_mode": "interactive"
 }
 ```
 
@@ -102,6 +104,7 @@ Request:
   "system": "Stable system instructions",
   "prompt": "Extract a contact record",
   "max_tokens": 1024,
+  "execution_mode": "interactive",
   "response_format": {
     "type": "json_schema",
     "schema": {
@@ -136,6 +139,7 @@ Request:
   "system": "Stable system instructions",
   "prompt": "Extract a contact record",
   "max_tokens": 1024,
+  "execution_mode": "interactive",
   "response_format": {
     "type": "json_schema",
     "schema": {
@@ -225,7 +229,8 @@ Request:
 {
   "id": "request-id",
   "type": "embed",
-  "prompt": "text to embed"
+  "prompt": "text to embed",
+  "execution_mode": "interactive"
 }
 ```
 
@@ -247,7 +252,8 @@ Request:
   "type": "transcribe",
   "audio": "base64-encoded-audio",
   "task": "transcribe",
-  "language_hint": "en"
+  "language_hint": "en",
+  "execution_mode": "interactive"
 }
 ```
 

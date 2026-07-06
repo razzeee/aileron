@@ -54,6 +54,8 @@ Operations that may prompt, load a model, or stream output return `org.freedeskt
 
 For conversational features, keep stable instructions in the session and send the relevant local history as part of the prompt with `StreamResponse` or `StreamRespondGuided`. The app owns conversation history and can trim it to fit its UI or context policy. For one-shot features such as "summarize this article", a short-lived session with `StreamResponse` is usually enough.
 
+Generation methods accept an `execution_mode` option. Use `interactive` for user-visible work that should start promptly. Use `background` for work that may be delayed, deprioritized, preempted, or cancelled so interactive requests stay responsive and the system can reduce CPU/GPU pressure. Treat `RequestCancelled` for background work as a normal retry-later result.
+
 ## Text Generation
 
 Use task-specific language generation use cases with `StreamResponse`. `language.complete` is reserved for inline completion through `StreamPredictNext`; do not use `language.rephrase` for ghost text or next-word suggestions.
@@ -68,7 +70,7 @@ Summarize the article below in three bullet points. Preserve important names and
 
 Prefer explicit output constraints over relying on a specific model's behavior.
 
-For `language.translate`, `GenerationOptions` includes optional `source_language_hint` and `target_language_hint` strings. Pass empty strings when the app does not know one side. These are hints, not strict locale settings; apps should still make the requested translation clear in the prompt.
+For `language.translate`, `ResponseOptions` includes optional `source_language_hint` and `target_language_hint` strings. Pass empty strings when the app does not know one side. These are hints, not strict locale settings; apps should still make the requested translation clear in the prompt.
 
 ## Inline Completion
 
@@ -98,7 +100,7 @@ Use `language.embed` with `StreamEmbed` to turn text into a fixed-length vector 
 
 ## Speech And Vision
 
-Use `speech.transcribe` for verbatim speech-to-text and `speech.translate` to translate spoken audio into English text. Both use `StreamTranscribe`; the daemon selects the whisper transcribe or translate task from the session use-case. Audio is passed to the portal as a readable, sealable memfd containing raw PCM bytes. The method accepts an optional `source_language_hint` string; pass an empty string to let the runtime auto-detect or use its default behavior. This hint describes the spoken input language only; it does not select translation or the output language.
+Use `speech.transcribe` for verbatim speech-to-text and `speech.translate` to translate spoken audio into English text. Both use `StreamTranscribe`; the daemon selects the whisper transcribe or translate task from the session use-case. Audio is passed to the portal as a readable, sealable memfd containing raw PCM bytes. `SpeechOptions` accepts an optional `source_language_hint` string; pass an empty string to let the runtime auto-detect or use its default behavior. This hint describes the spoken input language only; it does not select translation or the output language.
 
 Live microphone chunking is app behavior in the current API. Apps that want interim text can keep recording locally, periodically send sufficiently large aligned PCM chunks through `StreamTranscribe`, and run one final `StreamTranscribe` pass over the complete recording when capture stops.
 

@@ -2,6 +2,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Mutex;
 
 use crate::assignments::Assignments;
@@ -15,6 +16,21 @@ use crate::profiles::ProfileStore;
 pub type ActiveContainerEntry = (String, ContainerHandle);
 pub type ActiveContainerRequests = HashMap<String, Vec<ActiveContainerEntry>>;
 pub type SharedActiveContainerRequests = Arc<StdMutex<ActiveContainerRequests>>;
+
+#[derive(Default)]
+pub struct ProfileExecutionState {
+    pub pending_interactive: u64,
+    pub active_interactive: u64,
+    pub active_background: Vec<BackgroundExecutionEntry>,
+}
+
+pub struct BackgroundExecutionEntry {
+    pub handle: ContainerHandle,
+    pub preempted: Arc<AtomicBool>,
+}
+
+pub type ProfileExecutionStates = HashMap<String, ProfileExecutionState>;
+pub type SharedProfileExecutionStates = Arc<StdMutex<ProfileExecutionStates>>;
 
 #[derive(Debug, Clone)]
 pub struct InstallRecord {
@@ -76,6 +92,7 @@ pub struct SharedState(
     pub Arc<StdMutex<HashSet<String>>>,
     pub SharedActiveContainerRequests,
     pub Arc<StdMutex<HashMap<String, u64>>>,
+    pub SharedProfileExecutionStates,
 );
 
 impl SharedState {
@@ -112,6 +129,7 @@ impl SharedState {
             Arc::new(StdMutex::new(HashMap::new())),
             Arc::new(Mutex::new(containers)),
             Arc::new(StdMutex::new(HashSet::new())),
+            Arc::new(StdMutex::new(HashMap::new())),
             Arc::new(StdMutex::new(HashMap::new())),
             Arc::new(StdMutex::new(HashMap::new())),
         ))
@@ -252,6 +270,93 @@ impl SharedState {
         }
         handles
     }
+
+    pub fn begin_interactive_execution(&self, profile_id: &str) {
+        let mut states = self.6.lock().expect("execution state mutex poisoned");
+        let state = states.entry(profile_id.to_string()).or_default();
+        state.pending_interactive = state.pending_interactive.saturating_add(1);
+        for background in &state.active_background {
+            background.preempted.store(true, Ordering::SeqCst);
+            background.handle.terminate();
+        }
+    }
+
+    pub fn activate_interactive_execution(&self, profile_id: &str) {
+        let mut states = self.6.lock().expect("execution state mutex poisoned");
+        let state = states.entry(profile_id.to_string()).or_default();
+        state.pending_interactive = state.pending_interactive.saturating_sub(1);
+        state.active_interactive = state.active_interactive.saturating_add(1);
+    }
+
+    pub fn cancel_pending_interactive_execution(&self, profile_id: &str) {
+        let mut states = self.6.lock().expect("execution state mutex poisoned");
+        let Some(state) = states.get_mut(profile_id) else {
+            return;
+        };
+        state.pending_interactive = state.pending_interactive.saturating_sub(1);
+        if state.pending_interactive == 0
+            && state.active_interactive == 0
+            && state.active_background.is_empty()
+        {
+            states.remove(profile_id);
+        }
+    }
+
+    pub fn end_interactive_execution(&self, profile_id: &str) {
+        let mut states = self.6.lock().expect("execution state mutex poisoned");
+        let Some(state) = states.get_mut(profile_id) else {
+            return;
+        };
+        state.active_interactive = state.active_interactive.saturating_sub(1);
+        if state.pending_interactive == 0
+            && state.active_interactive == 0
+            && state.active_background.is_empty()
+        {
+            states.remove(profile_id);
+        }
+    }
+
+    pub fn background_execution_can_start(&self, profile_id: &str) -> bool {
+        self.6
+            .lock()
+            .expect("execution state mutex poisoned")
+            .get(profile_id)
+            .is_none_or(|state| state.pending_interactive == 0 && state.active_interactive == 0)
+    }
+
+    pub fn begin_background_execution(
+        &self,
+        profile_id: &str,
+        handle: ContainerHandle,
+    ) -> Option<Arc<AtomicBool>> {
+        let mut states = self.6.lock().expect("execution state mutex poisoned");
+        let state = states.entry(profile_id.to_string()).or_default();
+        if state.pending_interactive > 0 || state.active_interactive > 0 {
+            return None;
+        }
+        let preempted = Arc::new(AtomicBool::new(false));
+        state.active_background.push(BackgroundExecutionEntry {
+            handle,
+            preempted: preempted.clone(),
+        });
+        Some(preempted)
+    }
+
+    pub fn end_background_execution(&self, profile_id: &str, handle: &ContainerHandle) {
+        let mut states = self.6.lock().expect("execution state mutex poisoned");
+        let Some(state) = states.get_mut(profile_id) else {
+            return;
+        };
+        state
+            .active_background
+            .retain(|active| !active.handle.ptr_eq(handle));
+        if state.pending_interactive == 0
+            && state.active_interactive == 0
+            && state.active_background.is_empty()
+        {
+            states.remove(profile_id);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -291,6 +396,7 @@ mod tests {
             Arc::new(StdMutex::new(HashMap::new())),
             Arc::new(Mutex::new(ContainerPool::new())),
             Arc::new(StdMutex::new(HashSet::new())),
+            Arc::new(StdMutex::new(HashMap::new())),
             Arc::new(StdMutex::new(HashMap::new())),
             Arc::new(StdMutex::new(HashMap::new())),
         )

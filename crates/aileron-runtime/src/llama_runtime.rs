@@ -160,6 +160,7 @@ pub fn generate_chat(
     max_tokens: u32,
     temperature: f64,
     schema: Option<&Value>,
+    execution_mode: Option<&str>,
     on_token: impl FnMut(&str) -> Result<()>,
 ) -> Result<String> {
     let prompt = render_chat_prompt(model, system, prompt)?;
@@ -170,6 +171,7 @@ pub fn generate_chat(
         max_tokens,
         temperature,
         schema,
+        execution_mode,
         on_token,
     )
 }
@@ -181,6 +183,7 @@ pub fn generate_completion(
     max_tokens: u32,
     temperature: f64,
     schema: Option<&Value>,
+    execution_mode: Option<&str>,
     mut on_token: impl FnMut(&str) -> Result<()>,
 ) -> Result<String> {
     ctx.clear_kv_cache();
@@ -230,6 +233,7 @@ pub fn generate_completion(
         batch.add(token, n_cur, &[0], true)?;
         n_cur += 1;
         ctx.decode(&mut batch).context("decode generated token")?;
+        throttle_background_generation(execution_mode);
     }
 
     Ok(output)
@@ -242,6 +246,7 @@ pub fn generate_from_evaluated_prompt(
     max_tokens: u32,
     temperature: f64,
     schema: Option<&Value>,
+    execution_mode: Option<&str>,
     mut on_token: impl FnMut(&str) -> Result<()>,
 ) -> Result<String> {
     if n_past <= 0 {
@@ -278,9 +283,16 @@ pub fn generate_from_evaluated_prompt(
         batch.add(token, n_past, &[0], true)?;
         n_past += 1;
         ctx.decode(&mut batch).context("decode generated token")?;
+        throttle_background_generation(execution_mode);
     }
 
     Ok(output)
+}
+
+fn throttle_background_generation(execution_mode: Option<&str>) {
+    if execution_mode == Some("background") {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
 }
 
 fn sampler_for(model: &LlamaModel, temperature: f64, schema: Option<&Value>) -> LlamaSampler {

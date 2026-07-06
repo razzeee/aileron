@@ -366,6 +366,7 @@ impl Container {
         prompt: &str,
         input: Option<&[InputMessage]>,
         max_tokens: u32,
+        execution_mode: &str,
         mut on_token: impl FnMut(String),
     ) -> Result<()> {
         let id = Uuid::new_v4().to_string();
@@ -374,6 +375,7 @@ impl Container {
         req.prompt = Some(prompt.to_string());
         req.input = input.map(|messages| messages.to_vec());
         req.max_tokens = Some(max_tokens);
+        req.execution_mode = Some(execution_mode.to_string());
         let line = serde_json::to_string(&req)? + "\n";
         self.stdin.write_all(line.as_bytes())?;
         self.stdin.flush()?;
@@ -409,6 +411,7 @@ impl Container {
         prefix: &str,
         max_tokens: u32,
         temperature: f64,
+        execution_mode: &str,
     ) -> Result<Vec<String>> {
         let id = Uuid::new_v4().to_string();
         let mut req = ContainerRequest::new(id.clone(), "predict_next");
@@ -416,6 +419,7 @@ impl Container {
         req.max_tokens = Some(max_tokens);
         req.choices = Some(PREDICTION_COMPLETION_COUNT);
         req.temperature = Some(temperature);
+        req.execution_mode = Some(execution_mode.to_string());
         let line = serde_json::to_string(&req)? + "\n";
         self.stdin.write_all(line.as_bytes())?;
         self.stdin.flush()?;
@@ -507,6 +511,7 @@ impl Container {
         prompt: Option<&str>,
         max_tokens: u32,
         schema: &Value,
+        execution_mode: &str,
         tools: Vec<ToolDefinition>,
         tool_results: Vec<ToolResult>,
     ) -> Result<GuidedToolResponse> {
@@ -515,6 +520,7 @@ impl Container {
         req.system = system.map(str::to_string);
         req.prompt = prompt.map(str::to_string);
         req.max_tokens = Some(max_tokens);
+        req.execution_mode = Some(execution_mode.to_string());
         req.response_format = Some(ResponseFormat {
             r#type: "json_schema".to_string(),
             schema: schema.clone(),
@@ -572,6 +578,7 @@ impl Container {
         input: Option<&[InputMessage]>,
         max_tokens: u32,
         schema: &Value,
+        execution_mode: &str,
         tools: Vec<ToolDefinition>,
         tool_results: Vec<ToolResult>,
         mut on_event: impl FnMut(String, Vec<ToolCall>, bool),
@@ -582,6 +589,7 @@ impl Container {
         req.prompt = Some(prompt.to_string());
         req.input = input.map(|messages| messages.to_vec());
         req.max_tokens = Some(max_tokens);
+        req.execution_mode = Some(execution_mode.to_string());
         req.response_format = Some(ResponseFormat {
             r#type: "json_schema".to_string(),
             schema: schema.clone(),
@@ -636,7 +644,9 @@ impl Container {
         task: &str,
     ) -> Result<String> {
         let mut result = String::new();
-        self.stream_transcribe(audio, language_hint, task, |token| result.push_str(&token))?;
+        self.stream_transcribe(audio, language_hint, task, "interactive", |token| {
+            result.push_str(&token)
+        })?;
         Ok(result)
     }
 
@@ -646,10 +656,18 @@ impl Container {
         audio: Vec<u8>,
         language_hint: Option<&str>,
         task: &str,
+        execution_mode: &str,
         on_token: impl FnMut(String),
     ) -> Result<()> {
         let id = Uuid::new_v4().to_string();
-        write_transcribe_request(&mut self.stdin, &id, &audio, language_hint, task)?;
+        write_transcribe_request(
+            &mut self.stdin,
+            &id,
+            &audio,
+            language_hint,
+            task,
+            execution_mode,
+        )?;
         self.last_used = std::time::Instant::now();
         read_text_stream_response(&mut self.stdout, &id, on_token)
     }
@@ -657,7 +675,9 @@ impl Container {
     /// Send a vision describe request and return the full description.
     pub fn describe(&mut self, image: Vec<u8>, instructions: &str) -> Result<String> {
         let mut result = String::new();
-        self.stream_describe(image, instructions, |token| result.push_str(&token))?;
+        self.stream_describe(image, instructions, "interactive", |token| {
+            result.push_str(&token)
+        })?;
         Ok(result)
     }
 
@@ -666,15 +686,18 @@ impl Container {
         &mut self,
         image: Vec<u8>,
         instructions: &str,
+        execution_mode: &str,
         on_token: impl FnMut(String),
     ) -> Result<()> {
-        self.stream_vision_text("describe", image, instructions, on_token)
+        self.stream_vision_text("describe", image, instructions, execution_mode, on_token)
     }
 
     /// Send a vision OCR request and return the extracted text.
     pub fn ocr(&mut self, image: Vec<u8>, instructions: &str) -> Result<String> {
         let mut result = String::new();
-        self.stream_ocr(image, instructions, |token| result.push_str(&token))?;
+        self.stream_ocr(image, instructions, "interactive", |token| {
+            result.push_str(&token)
+        })?;
         Ok(result)
     }
 
@@ -683,16 +706,22 @@ impl Container {
         &mut self,
         image: Vec<u8>,
         instructions: &str,
+        execution_mode: &str,
         on_token: impl FnMut(String),
     ) -> Result<()> {
-        self.stream_vision_text("ocr", image, instructions, on_token)
+        self.stream_vision_text("ocr", image, instructions, execution_mode, on_token)
     }
 
     /// Send a vision segment request and return normalized object boxes.
-    pub fn segment(&mut self, image: Vec<u8>, instructions: &str) -> Result<Vec<VisionSegment>> {
+    pub fn segment(
+        &mut self,
+        image: Vec<u8>,
+        instructions: &str,
+        execution_mode: &str,
+    ) -> Result<Vec<VisionSegment>> {
         let id = Uuid::new_v4().to_string();
         let schema = vision_segment_schema();
-        let req = vision_request(id.clone(), "segment", &image, instructions);
+        let req = vision_request(id.clone(), "segment", &image, instructions, execution_mode);
         let line = serde_json::to_string(&req)? + "\n";
         self.stdin.write_all(line.as_bytes())?;
         self.stdin.flush()?;
@@ -716,10 +745,11 @@ impl Container {
     }
 
     /// Send an embedding request and return the embedding vector.
-    pub fn embed(&mut self, text: &str) -> Result<Vec<f32>> {
+    pub fn embed(&mut self, text: &str, execution_mode: &str) -> Result<Vec<f32>> {
         let id = Uuid::new_v4().to_string();
         let mut req = ContainerRequest::new(id.clone(), "embed");
         req.prompt = Some(text.to_string());
+        req.execution_mode = Some(execution_mode.to_string());
         let line = serde_json::to_string(&req)? + "\n";
         self.stdin.write_all(line.as_bytes())?;
         self.stdin.flush()?;
@@ -753,10 +783,17 @@ impl Container {
         request_type: &str,
         image: Vec<u8>,
         instructions: &str,
+        execution_mode: &str,
         on_token: impl FnMut(String),
     ) -> Result<()> {
         let id = Uuid::new_v4().to_string();
-        let req = vision_request(id.clone(), request_type, &image, instructions);
+        let req = vision_request(
+            id.clone(),
+            request_type,
+            &image,
+            instructions,
+            execution_mode,
+        );
         let line = serde_json::to_string(&req)? + "\n";
         self.stdin.write_all(line.as_bytes())?;
         self.stdin.flush()?;
@@ -770,9 +807,11 @@ fn vision_request(
     request_type: &str,
     image: &[u8],
     instructions: &str,
+    execution_mode: &str,
 ) -> ContainerRequest {
     let mut req = ContainerRequest::new(id, request_type);
     req.image = Some(base64_encode(image));
+    req.execution_mode = Some(execution_mode.to_string());
     if !instructions.trim().is_empty() {
         req.prompt = Some(instructions.to_string());
     }
@@ -785,10 +824,12 @@ fn write_transcribe_request(
     audio: &[u8],
     language_hint: Option<&str>,
     task: &str,
+    execution_mode: &str,
 ) -> Result<()> {
     let mut req = ContainerRequest::new(id.to_string(), "transcribe");
     req.audio = Some(base64_encode(audio));
     req.task = Some(task.to_string());
+    req.execution_mode = Some(execution_mode.to_string());
     req.language_hint = language_hint
         .filter(|hint| !hint.is_empty())
         .map(str::to_string);
@@ -2173,6 +2214,8 @@ struct ContainerRequest {
     image: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     language_hint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    execution_mode: Option<String>,
     /// Present only for `generate_structured` requests.
     #[serde(skip_serializing_if = "Option::is_none")]
     response_format: Option<ResponseFormat>,
@@ -2197,6 +2240,7 @@ impl ContainerRequest {
             task: None,
             image: None,
             language_hint: None,
+            execution_mode: None,
             response_format: None,
             tools: None,
             tool_results: None,
@@ -3039,6 +3083,7 @@ mod tests {
             "describe",
             b"image bytes",
             "focus on text labels",
+            "interactive",
         );
         let value = serde_json::to_value(request).expect("request should serialize");
 
@@ -3049,7 +3094,13 @@ mod tests {
 
     #[test]
     fn vision_request_omits_empty_instructions_prompt() {
-        let request = vision_request("request-id".to_string(), "ocr", b"image bytes", "  ");
+        let request = vision_request(
+            "request-id".to_string(),
+            "ocr",
+            b"image bytes",
+            "  ",
+            "interactive",
+        );
         let value = serde_json::to_value(request).expect("request should serialize");
 
         assert_eq!(value["type"], "ocr");
@@ -3289,8 +3340,15 @@ mod tests {
     fn transcribe_request_matches_existing_container_shape() {
         let mut output = Vec::new();
 
-        write_transcribe_request(&mut output, "request-1", b"pcm", Some("en"), "translate")
-            .expect("request should serialize");
+        write_transcribe_request(
+            &mut output,
+            "request-1",
+            b"pcm",
+            Some("en"),
+            "translate",
+            "interactive",
+        )
+        .expect("request should serialize");
         let value: Value = serde_json::from_slice(&output).expect("request should be JSON");
 
         assert_eq!(value["id"], "request-1");
@@ -3444,7 +3502,7 @@ mod tests {
 
         let mut generated = String::new();
         container
-            .generate(None, "hello world", None, 16, |token| {
+            .generate(None, "hello world", None, 16, "interactive", |token| {
                 generated.push_str(&token)
             })
             .expect("generate through container wrapper");
@@ -3471,7 +3529,7 @@ mod tests {
 
         let mut streamed_transcript = String::new();
         container
-            .stream_transcribe(Vec::new(), None, "transcribe", |token| {
+            .stream_transcribe(Vec::new(), None, "transcribe", "interactive", |token| {
                 streamed_transcript.push_str(&token)
             })
             .expect("stream transcribe through container wrapper");
@@ -3483,7 +3541,7 @@ mod tests {
         assert!(!translation.is_empty());
 
         let embedding = container
-            .embed("hello world")
+            .embed("hello world", "interactive")
             .expect("embed through container wrapper");
         assert!(!embedding.is_empty());
 
@@ -3498,7 +3556,7 @@ mod tests {
         assert!(!extracted.is_empty());
 
         let segments = container
-            .segment(Vec::new(), "")
+            .segment(Vec::new(), "", "interactive")
             .expect("segment through container wrapper");
         assert!(!segments.is_empty());
 
