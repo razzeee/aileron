@@ -35,9 +35,8 @@ pub(crate) fn build_page(stack: &ViewStack) -> gtk4::Widget {
         .build();
 
     let stats = Box::new(Orientation::Horizontal, 8);
-    stats.append(&stat_pill("7", "labs"));
-    stats.append(&stat_pill("0", "cloud calls"));
-    stats.append(&stat_pill("portal", "first"));
+    stats.append(&stat_pill("7", "portal paths"));
+    stats.append(&stat_pill("0", "required cloud calls"));
 
     hero.append(&eyebrow);
     hero.append(&title);
@@ -63,7 +62,6 @@ pub(crate) fn build_page(stack: &ViewStack) -> gtk4::Widget {
             button_label: "Open Chat Lab",
             page_name: "chat",
             icon_name: "user-available-symbolic",
-            tag: "Memory lane",
         },
         LabCard {
             title: "Text Lab",
@@ -73,7 +71,6 @@ pub(crate) fn build_page(stack: &ViewStack) -> gtk4::Widget {
             button_label: "Open Text Lab",
             page_name: "text",
             icon_name: "text-x-generic-symbolic",
-            tag: "Workbench",
         },
         LabCard {
             title: "Prediction Lab",
@@ -83,7 +80,6 @@ pub(crate) fn build_page(stack: &ViewStack) -> gtk4::Widget {
             button_label: "Open Prediction Lab",
             page_name: "predict",
             icon_name: "insert-text-symbolic",
-            tag: "Ghost text",
         },
         LabCard {
             title: "Tool Lab",
@@ -93,7 +89,6 @@ pub(crate) fn build_page(stack: &ViewStack) -> gtk4::Widget {
             button_label: "Open Tool Lab",
             page_name: "tools",
             icon_name: "applications-system-symbolic",
-            tag: "Tool loop",
         },
         LabCard {
             title: "Speech Lab",
@@ -103,7 +98,6 @@ pub(crate) fn build_page(stack: &ViewStack) -> gtk4::Widget {
             button_label: "Open Speech Lab",
             page_name: "speech",
             icon_name: "audio-input-microphone-symbolic",
-            tag: "Live audio",
         },
         LabCard {
             title: "Vision Lab",
@@ -113,7 +107,6 @@ pub(crate) fn build_page(stack: &ViewStack) -> gtk4::Widget {
             button_label: "Open Vision Lab",
             page_name: "vision",
             icon_name: "image-x-generic-symbolic",
-            tag: "Pixels in",
         },
         LabCard {
             title: "Embeddings",
@@ -122,8 +115,7 @@ pub(crate) fn build_page(stack: &ViewStack) -> gtk4::Widget {
             example: "Try: compare two short snippets and inspect their vector shapes.",
             button_label: "Open Embeddings",
             page_name: "embed",
-            icon_name: "emblem-documents-symbolic",
-            tag: "Vector dock",
+            icon_name: "view-grid-symbolic",
         },
     ];
     for lab in labs {
@@ -178,10 +170,6 @@ fn install_overview_css() {
             color: @accent_color;
         }
 
-        .overview-tag {
-            color: @accent_color;
-            font-weight: 700;
-        }
         "#,
     );
     gtk4::style_context_add_provider_for_display(
@@ -218,7 +206,6 @@ struct LabCard {
     button_label: &'static str,
     page_name: &'static str,
     icon_name: &'static str,
-    tag: &'static str,
 }
 
 fn lab_card(lab: LabCard, stack: &ViewStack) -> Box {
@@ -248,21 +235,11 @@ fn lab_card(lab: LabCard, stack: &ViewStack) -> Box {
     content.set_margin_start(0);
     content.set_margin_end(8);
 
-    let title_row = Box::new(Orientation::Horizontal, 8);
-    title_row.set_hexpand(true);
     let title = Label::builder()
         .label(lab.title)
         .xalign(0.0)
-        .hexpand(true)
         .css_classes(vec!["heading"])
         .build();
-    let tag = Label::builder()
-        .label(lab.tag)
-        .valign(Align::Center)
-        .css_classes(vec!["caption", "overview-tag"])
-        .build();
-    title_row.append(&title);
-    title_row.append(&tag);
     let subtitle = Label::builder()
         .label(lab.subtitle)
         .xalign(0.0)
@@ -281,7 +258,7 @@ fn lab_card(lab: LabCard, stack: &ViewStack) -> Box {
         .wrap(true)
         .css_classes(vec!["caption"])
         .build();
-    content.append(&title_row);
+    content.append(&title);
     content.append(&subtitle);
     content.append(&methods);
     content.append(&example);
