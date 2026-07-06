@@ -155,9 +155,9 @@ impl RuntimeManifestStore {
                 if path.extension().and_then(|s| s.to_str()) != Some("json") {
                     continue;
                 }
-                let data = std::fs::read_to_string(&path)
+                let data = std::fs::read(&path)
                     .with_context(|| format!("read runtime manifest {}", path.display()))?;
-                let runtime = parse_runtime_manifest_json(&data)
+                let runtime = parse_runtime_manifest_json_bytes(&data)
                     .with_context(|| format!("parse runtime manifest {}", path.display()))?;
                 runtimes.insert(runtime.runtime_id.clone(), runtime);
             }
@@ -528,14 +528,14 @@ fn parse_model_manifest_json_with_profile_id_hint(
 }
 
 fn normalize_model_manifest(
-    raw: RawModelManifest,
+    mut raw: RawModelManifest,
     profile_id_hint: Option<&str>,
 ) -> Result<ModelManifest> {
     if raw.artifact.is_some() && !raw.artifacts.is_empty() {
         bail!("model manifest must use either artifact or artifacts, not both");
     }
-    let mut artifacts = raw.artifacts.clone();
-    if let Some(artifact) = raw.artifact.clone() {
+    let mut artifacts = std::mem::take(&mut raw.artifacts);
+    if let Some(artifact) = raw.artifact.take() {
         artifacts.push(artifact);
     }
     normalize_artifacts(&mut artifacts)?;
@@ -662,7 +662,7 @@ fn derive_runtime_id(
     }
     if artifacts
         .iter()
-        .any(|artifact| artifact_filename_extension(artifact).as_deref() == Some("gguf"))
+        .any(|artifact| artifact_filename_extension_is(artifact, "gguf"))
     {
         return Ok(ML_RUNTIME_ID.to_string());
     }
@@ -677,7 +677,7 @@ fn derive_use_cases(
     if runtime_id == ML_RUNTIME_ID
         && artifacts
             .iter()
-            .any(|artifact| artifact_filename_extension(artifact).as_deref() == Some("bin"))
+            .any(|artifact| artifact_filename_extension_is(artifact, "bin"))
     {
         return Ok(vec![
             "speech.transcribe".to_string(),
@@ -765,31 +765,33 @@ fn normalize_artifacts(artifacts: &mut [ManifestArtifact]) -> Result<()> {
 
 fn default_artifact_filename(artifact: &ManifestArtifact, artifact_count: usize) -> Result<String> {
     match artifact.role.as_str() {
-        "model" => match artifact_filename_extension(artifact).as_deref() {
-            Some("bin") => Ok("model.bin".to_string()),
-            Some("gguf") => Ok("model.gguf".to_string()),
-            _ if artifact_count == 1 => artifact_url_filename(&artifact.url)
-                .ok_or_else(|| anyhow::anyhow!("artifacts[].filename is required")),
-            _ => bail!("artifacts[].filename is required for model artifact"),
-        },
+        "model" if artifact_filename_extension_is(artifact, "bin") => Ok("model.bin".to_string()),
+        "model" if artifact_filename_extension_is(artifact, "gguf") => Ok("model.gguf".to_string()),
+        "model" if artifact_count == 1 => artifact_url_filename(&artifact.url)
+            .ok_or_else(|| anyhow::anyhow!("artifacts[].filename is required")),
+        "model" => bail!("artifacts[].filename is required for model artifact"),
         "mmproj" => Ok("mmproj.gguf".to_string()),
         _ => artifact_url_filename(&artifact.url)
             .ok_or_else(|| anyhow::anyhow!("artifacts[].filename is required")),
     }
 }
 
-fn artifact_filename_extension(artifact: &ManifestArtifact) -> Option<String> {
+fn artifact_filename_extension_is(artifact: &ManifestArtifact, expected: &str) -> bool {
     let filename = if artifact.filename.trim().is_empty() {
-        artifact_url_filename(&artifact.url)?
+        artifact_url_filename_ref(&artifact.url)
     } else {
-        artifact.filename.clone()
+        Some(artifact.filename.as_str())
     };
     filename
-        .rsplit_once('.')
-        .map(|(_, extension)| extension.to_ascii_lowercase())
+        .and_then(|filename| filename.rsplit_once('.').map(|(_, extension)| extension))
+        .is_some_and(|extension| extension.eq_ignore_ascii_case(expected))
 }
 
 fn artifact_url_filename(url: &str) -> Option<String> {
+    artifact_url_filename_ref(url).map(str::to_string)
+}
+
+fn artifact_url_filename_ref(url: &str) -> Option<&str> {
     let without_fragment = url.split('#').next().unwrap_or(url);
     let without_query = without_fragment
         .split('?')
@@ -799,7 +801,7 @@ fn artifact_url_filename(url: &str) -> Option<String> {
     if filename.is_empty() || filename == "." || filename == ".." {
         None
     } else {
-        Some(filename.to_string())
+        Some(filename)
     }
 }
 
@@ -810,8 +812,13 @@ fn filename_stem(filename: &str) -> &str {
         .unwrap_or(filename)
 }
 
+#[cfg(test)]
 fn parse_runtime_manifest_json(data: &str) -> Result<RuntimeManifest> {
-    let manifest: RuntimeManifest = serde_json::from_str(data)?;
+    parse_runtime_manifest_json_bytes(data.as_bytes())
+}
+
+fn parse_runtime_manifest_json_bytes(data: &[u8]) -> Result<RuntimeManifest> {
+    let manifest: RuntimeManifest = serde_json::from_slice(data)?;
     validate_non_empty("runtime_id", &manifest.runtime_id)?;
     if manifest.images.is_empty() {
         bail!("runtime manifest must define at least one image");
