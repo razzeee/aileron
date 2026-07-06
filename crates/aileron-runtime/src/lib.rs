@@ -89,8 +89,14 @@ pub fn serve_requests(
 ) -> Result<()> {
     eprintln!("[{log_prefix}] ready");
 
-    for raw_line in std::io::stdin().lock().lines() {
-        let line = raw_line?;
+    let stdin = std::io::stdin();
+    let mut stdin = stdin.lock();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if stdin.read_line(&mut line)? == 0 {
+            break;
+        }
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;

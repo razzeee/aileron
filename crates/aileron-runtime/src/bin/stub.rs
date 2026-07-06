@@ -1,5 +1,3 @@
-use std::time::Duration;
-
 use aileron_runtime::{
     ContentPart, Request, clamp_choices, select_tool_name, send, send_unsupported,
 };
@@ -84,7 +82,6 @@ fn handle_generate(req: &Request) -> Result<()> {
             chunk["done"] = true.into();
         }
         send(chunk)?;
-        std::thread::sleep(Duration::from_millis(20));
     }
 
     Ok(())

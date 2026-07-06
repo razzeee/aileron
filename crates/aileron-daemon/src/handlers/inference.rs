@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::path::PathBuf;
 use std::sync::{
-    Arc, MutexGuard, TryLockError,
+    Arc, Condvar, Mutex as StdMutex, MutexGuard, TryLockError,
     atomic::{AtomicBool, Ordering},
 };
 use std::thread;
@@ -1196,26 +1196,37 @@ fn render_text_prompt(input: &[InputMessage]) -> String {
         return render_text_content(&input[0]);
     }
 
-    input
-        .iter()
-        .map(|message| {
-            let content = render_text_content(message);
-            format!("{}: {content}", message.role)
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    let mut out = String::new();
+    for (index, message) in input.iter().enumerate() {
+        if index > 0 {
+            out.push('\n');
+        }
+        out.push_str(&message.role);
+        out.push_str(": ");
+        push_text_content(&mut out, message);
+    }
+    out
 }
 
 fn render_text_content(message: &InputMessage) -> String {
-    message
-        .content
-        .iter()
-        .filter_map(|part| match part {
-            InputPart::InputText { text } | InputPart::OutputText { text } => Some(text.as_str()),
-            InputPart::InputImage { .. } | InputPart::InputAudio { .. } => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    let mut out = String::new();
+    push_text_content(&mut out, message);
+    out
+}
+
+fn push_text_content(out: &mut String, message: &InputMessage) {
+    let mut wrote_text = false;
+    for part in &message.content {
+        let text = match part {
+            InputPart::InputText { text } | InputPart::OutputText { text } => text,
+            InputPart::InputImage { .. } | InputPart::InputAudio { .. } => continue,
+        };
+        if wrote_text {
+            out.push('\n');
+        }
+        out.push_str(text);
+        wrote_text = true;
+    }
 }
 
 fn base64_encode(data: &[u8]) -> String {
@@ -1871,13 +1882,13 @@ async fn with_locked_container<T, E: ObservabilityFailure>(
 }
 
 struct CancelWatcher {
-    stop: Arc<AtomicBool>,
+    stop: Arc<(StdMutex<bool>, Condvar)>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
 impl CancelWatcher {
     fn stop(mut self) {
-        self.stop.store(true, Ordering::SeqCst);
+        notify_cancel_watcher_stop(&self.stop);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -1886,7 +1897,7 @@ impl CancelWatcher {
 
 impl Drop for CancelWatcher {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::SeqCst);
+        notify_cancel_watcher_stop(&self.stop);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -1901,21 +1912,40 @@ fn spawn_cancel_watcher(
     let state = state.clone();
     let session_id = session_id.to_string();
     let handle = handle.clone();
-    let stop = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new((StdMutex::new(false), Condvar::new()));
     let thread_stop = stop.clone();
     let thread = thread::spawn(move || {
-        while !thread_stop.load(Ordering::SeqCst) {
+        loop {
             if state.is_session_cancelled(&session_id) {
                 handle.terminate();
                 break;
             }
-            thread::sleep(Duration::from_millis(20));
+            let (lock, wake) = &*thread_stop;
+            let Ok(stopped) = lock.lock() else {
+                break;
+            };
+            let Ok((stopped, _)) =
+                wake.wait_timeout_while(stopped, Duration::from_millis(20), |stopped| !*stopped)
+            else {
+                break;
+            };
+            if *stopped {
+                break;
+            }
         }
     });
 
     CancelWatcher {
         stop,
         thread: Some(thread),
+    }
+}
+
+fn notify_cancel_watcher_stop(stop: &Arc<(StdMutex<bool>, Condvar)>) {
+    let (lock, wake) = &**stop;
+    if let Ok(mut stopped) = lock.lock() {
+        *stopped = true;
+        wake.notify_one();
     }
 }
 

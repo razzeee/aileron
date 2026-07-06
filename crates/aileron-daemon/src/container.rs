@@ -376,13 +376,12 @@ impl Container {
         req.input = input.map(|messages| messages.to_vec());
         req.max_tokens = Some(max_tokens);
         req.execution_mode = Some(execution_mode.to_string());
-        let line = serde_json::to_string(&req)? + "\n";
-        self.stdin.write_all(line.as_bytes())?;
-        self.stdin.flush()?;
+        write_request_line(&mut self.stdin, &req)?;
         self.last_used = std::time::Instant::now();
 
+        let mut buf = String::new();
         loop {
-            let mut buf = String::new();
+            buf.clear();
             let n = self.stdout.read_line(&mut buf)?;
             if n == 0 {
                 bail!("container stdout closed unexpectedly");
@@ -420,13 +419,12 @@ impl Container {
         req.choices = Some(PREDICTION_COMPLETION_COUNT);
         req.temperature = Some(temperature);
         req.execution_mode = Some(execution_mode.to_string());
-        let line = serde_json::to_string(&req)? + "\n";
-        self.stdin.write_all(line.as_bytes())?;
-        self.stdin.flush()?;
+        write_request_line(&mut self.stdin, &req)?;
         self.last_used = std::time::Instant::now();
 
+        let mut buf = String::new();
         loop {
-            let mut buf = String::new();
+            buf.clear();
             let n = self.stdout.read_line(&mut buf)?;
             if n == 0 {
                 bail!("container stdout closed unexpectedly");
@@ -483,14 +481,13 @@ impl Container {
             r#type: "json_schema".to_string(),
             schema: schema.clone(),
         });
-        let line = serde_json::to_string(&req)? + "\n";
-        self.stdin.write_all(line.as_bytes())?;
-        self.stdin.flush()?;
+        write_request_line(&mut self.stdin, &req)?;
         self.last_used = std::time::Instant::now();
 
         // Structured responses arrive as a single line with `result`.
+        let mut buf = String::new();
         loop {
-            let mut buf = String::new();
+            buf.clear();
             let n = self.stdout.read_line(&mut buf)?;
             if n == 0 {
                 bail!("container stdout closed unexpectedly");
@@ -505,6 +502,7 @@ impl Container {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn generate_structured_with_tools(
         &mut self,
         system: Option<&str>,
@@ -531,13 +529,12 @@ impl Container {
         } else {
             Some(tool_results)
         };
-        let line = serde_json::to_string(&req)? + "\n";
-        self.stdin.write_all(line.as_bytes())?;
-        self.stdin.flush()?;
+        write_request_line(&mut self.stdin, &req)?;
         self.last_used = std::time::Instant::now();
 
+        let mut buf = String::new();
         loop {
-            let mut buf = String::new();
+            buf.clear();
             let n = self.stdout.read_line(&mut buf)?;
             if n == 0 {
                 bail!("container stdout closed unexpectedly");
@@ -600,13 +597,12 @@ impl Container {
         } else {
             Some(tool_results)
         };
-        let line = serde_json::to_string(&req)? + "\n";
-        self.stdin.write_all(line.as_bytes())?;
-        self.stdin.flush()?;
+        write_request_line(&mut self.stdin, &req)?;
         self.last_used = std::time::Instant::now();
 
+        let mut buf = String::new();
         loop {
-            let mut buf = String::new();
+            buf.clear();
             let n = self.stdout.read_line(&mut buf)?;
             if n == 0 {
                 bail!("container stdout closed unexpectedly");
@@ -722,13 +718,12 @@ impl Container {
         let id = Uuid::new_v4().to_string();
         let schema = vision_segment_schema();
         let req = vision_request(id.clone(), "segment", &image, instructions, execution_mode);
-        let line = serde_json::to_string(&req)? + "\n";
-        self.stdin.write_all(line.as_bytes())?;
-        self.stdin.flush()?;
+        write_request_line(&mut self.stdin, &req)?;
         self.last_used = std::time::Instant::now();
 
+        let mut buf = String::new();
         loop {
-            let mut buf = String::new();
+            buf.clear();
             let n = self.stdout.read_line(&mut buf)?;
             if n == 0 {
                 bail!("container stdout closed unexpectedly");
@@ -750,13 +745,12 @@ impl Container {
         let mut req = ContainerRequest::new(id.clone(), "embed");
         req.prompt = Some(text.to_string());
         req.execution_mode = Some(execution_mode.to_string());
-        let line = serde_json::to_string(&req)? + "\n";
-        self.stdin.write_all(line.as_bytes())?;
-        self.stdin.flush()?;
+        write_request_line(&mut self.stdin, &req)?;
         self.last_used = std::time::Instant::now();
 
+        let mut buf = String::new();
         loop {
-            let mut buf = String::new();
+            buf.clear();
             let n = self.stdout.read_line(&mut buf)?;
             if n == 0 {
                 bail!("container stdout closed unexpectedly");
@@ -794,12 +788,17 @@ impl Container {
             instructions,
             execution_mode,
         );
-        let line = serde_json::to_string(&req)? + "\n";
-        self.stdin.write_all(line.as_bytes())?;
-        self.stdin.flush()?;
+        write_request_line(&mut self.stdin, &req)?;
         self.last_used = std::time::Instant::now();
         read_text_stream_response(&mut self.stdout, &id, on_token)
     }
+}
+
+fn write_request_line(writer: &mut impl Write, req: &ContainerRequest) -> Result<()> {
+    serde_json::to_writer(&mut *writer, req)?;
+    writer.write_all(b"\n")?;
+    writer.flush()?;
+    Ok(())
 }
 
 fn vision_request(
@@ -833,10 +832,7 @@ fn write_transcribe_request(
     req.language_hint = language_hint
         .filter(|hint| !hint.is_empty())
         .map(str::to_string);
-    let line = serde_json::to_string(&req)? + "\n";
-    writer.write_all(line.as_bytes())?;
-    writer.flush()?;
-    Ok(())
+    write_request_line(writer, &req)
 }
 
 fn read_text_stream_response(
@@ -844,8 +840,9 @@ fn read_text_stream_response(
     id: &str,
     mut on_token: impl FnMut(String),
 ) -> Result<()> {
+    let mut buf = String::new();
     loop {
-        let mut buf = String::new();
+        buf.clear();
         let n = reader.read_line(&mut buf)?;
         if n == 0 {
             bail!("container stdout closed unexpectedly");
@@ -868,6 +865,192 @@ fn read_text_stream_response(
         }
     }
     Ok(())
+}
+
+#[doc(hidden)]
+pub fn benchmark_read_text_stream_response(input: &[u8], id: &str) -> Result<usize> {
+    let mut reader = BufReader::new(std::io::Cursor::new(input));
+    let mut token_count = 0;
+    read_text_stream_response(&mut reader, id, |_| token_count += 1)?;
+    Ok(token_count)
+}
+
+#[doc(hidden)]
+pub fn benchmark_read_response_for_use_case(use_case: &str, input: &[u8]) -> Result<usize> {
+    let mut reader = BufReader::new(std::io::Cursor::new(input));
+    match use_case {
+        "language.generate" | "speech.transcribe" | "vision.describe" | "vision.ocr" => {
+            let mut token_count = 0;
+            read_text_stream_response(&mut reader, "request-1", |_| token_count += 1)?;
+            Ok(token_count)
+        }
+        "language.predict_next" => {
+            let resp = read_matching_response(&mut reader, "request-1")?;
+            Ok(resp
+                .completions
+                .or_else(|| resp.completion.map(|completion| vec![completion]))
+                .unwrap_or_default()
+                .len())
+        }
+        "language.structured" | "language.tool" => {
+            let schema = serde_json::json!({
+                "type": "object",
+                "required": ["answer"],
+                "properties": { "answer": { "type": "string" } }
+            });
+            let resp = read_matching_response(&mut reader, "request-1")?;
+            Ok(structured_response_result(resp, &schema)?.map_or(0, |result| result.len()))
+        }
+        "language.embed" => {
+            let resp = read_matching_response(&mut reader, "request-1")?;
+            Ok(resp.embedding.unwrap_or_default().len())
+        }
+        "vision.segment" => {
+            let schema = vision_segment_schema();
+            let resp = read_matching_response(&mut reader, "request-1")?;
+            let Some(result) = structured_response_result(resp, &schema)? else {
+                return Ok(0);
+            };
+            let value: VisionSegmentResult = serde_json::from_str(&result)?;
+            Ok(value.segments.len())
+        }
+        other => bail!("unsupported benchmark use-case: {other}"),
+    }
+}
+
+fn read_matching_response(reader: &mut impl BufRead, id: &str) -> Result<ContainerResponse> {
+    let mut buf = String::new();
+    loop {
+        buf.clear();
+        let n = reader.read_line(&mut buf)?;
+        if n == 0 {
+            bail!("container stdout closed unexpectedly");
+        }
+        let resp: ContainerResponse = serde_json::from_str(buf.trim())?;
+        if resp.id == id {
+            return Ok(resp);
+        }
+    }
+}
+
+#[doc(hidden)]
+pub fn benchmark_write_request_for_use_case(
+    use_case: &str,
+    input: &[InputMessage],
+) -> Result<usize> {
+    let mut output = Vec::new();
+    match use_case {
+        "language.generate" => {
+            let mut req = ContainerRequest::new("request-1".to_string(), "generate");
+            req.system = Some("system instructions".to_string());
+            req.prompt = Some("summarize this".to_string());
+            req.input = Some(input.to_vec());
+            req.max_tokens = Some(256);
+            req.execution_mode = Some("interactive".to_string());
+            write_request_line(&mut output, &req)?;
+        }
+        "language.predict_next" => {
+            let mut req = ContainerRequest::new("request-1".to_string(), "predict_next");
+            req.prompt = Some("The next words are".to_string());
+            req.max_tokens = Some(8);
+            req.choices = Some(PREDICTION_COMPLETION_COUNT);
+            req.temperature = Some(0.4);
+            req.execution_mode = Some("interactive".to_string());
+            write_request_line(&mut output, &req)?;
+        }
+        "language.structured" => {
+            let mut req =
+                ContainerRequest::new("request-1".to_string(), "generate_structured_stream");
+            req.system = Some("system instructions".to_string());
+            req.prompt = Some("extract fields".to_string());
+            req.input = Some(input.to_vec());
+            req.max_tokens = Some(256);
+            req.execution_mode = Some("interactive".to_string());
+            req.response_format = Some(ResponseFormat {
+                r#type: "json_schema".to_string(),
+                schema: serde_json::json!({
+                    "type": "object",
+                    "required": ["summary"],
+                    "properties": { "summary": { "type": "string" } }
+                }),
+            });
+            write_request_line(&mut output, &req)?;
+        }
+        "language.tool" => {
+            let mut req = ContainerRequest::new("request-1".to_string(), "generate_structured");
+            req.system = Some("system instructions".to_string());
+            req.prompt = Some("call the lookup tool".to_string());
+            req.max_tokens = Some(256);
+            req.execution_mode = Some("interactive".to_string());
+            req.response_format = Some(ResponseFormat {
+                r#type: "json_schema".to_string(),
+                schema: serde_json::json!({
+                    "type": "object",
+                    "required": ["answer"],
+                    "properties": { "answer": { "type": "string" } }
+                }),
+            });
+            req.tools = Some(vec![ToolDefinition {
+                name: "lookup".to_string(),
+                description: "Look up a fact".to_string(),
+                schema_json: r#"{"type":"object","required":["query"],"properties":{"query":{"type":"string"}}}"#.to_string(),
+            }]);
+            req.tool_results = Some(vec![ToolResult {
+                id: "tool-1".to_string(),
+                content: "result".to_string(),
+                content_json: r#"{"result":"ok"}"#.to_string(),
+            }]);
+            write_request_line(&mut output, &req)?;
+        }
+        "language.embed" => {
+            let mut req = ContainerRequest::new("request-1".to_string(), "embed");
+            req.prompt = Some("text to embed".to_string());
+            req.execution_mode = Some("interactive".to_string());
+            write_request_line(&mut output, &req)?;
+        }
+        "speech.transcribe" => {
+            write_transcribe_request(
+                &mut output,
+                "request-1",
+                b"fake-pcm-audio",
+                Some("en"),
+                "transcribe",
+                "interactive",
+            )?;
+        }
+        "vision.describe" => {
+            let req = vision_request(
+                "request-1".to_string(),
+                "describe",
+                b"fake-image-bytes",
+                "describe the image",
+                "interactive",
+            );
+            write_request_line(&mut output, &req)?;
+        }
+        "vision.ocr" => {
+            let req = vision_request(
+                "request-1".to_string(),
+                "ocr",
+                b"fake-image-bytes",
+                "extract text",
+                "interactive",
+            );
+            write_request_line(&mut output, &req)?;
+        }
+        "vision.segment" => {
+            let req = vision_request(
+                "request-1".to_string(),
+                "segment",
+                b"fake-image-bytes",
+                "segment objects",
+                "interactive",
+            );
+            write_request_line(&mut output, &req)?;
+        }
+        other => bail!("unsupported benchmark use-case: {other}"),
+    }
+    Ok(output.len())
 }
 
 fn structured_response_result(resp: ContainerResponse, schema: &Value) -> Result<Option<String>> {
