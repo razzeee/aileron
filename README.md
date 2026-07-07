@@ -480,7 +480,7 @@ The portal does not talk to containers directly. It translates D-Bus calls into 
 
 Apps call the public interfaces on `org.freedesktop.portal.Desktop`. The public frontend derives the app identity, returns request handles for operations that may prompt, load, or stream, and closes backend sessions when the app calls `Close` on the corresponding `org.freedesktop.portal.Session` object. The implementation backend receives the standard `handle: o` and `session_handle: o` object paths plus internal `app_id: s` strings and is only called by xdg-desktop-portal.
 
-`GetUseCaseAvailability`, `CreateSession`, and `Prewarm` have the same public signatures on each interface. `CreateSession` takes a `parent_window` string so permission prompts can be associated with the triggering app window where the platform supports it. Each interface validates that the requested use-case token is one of its supported tokens.
+`GetUseCaseAvailability`, `CreateSession`, and `Prewarm` have the same public signatures on each interface. `CreateSession` takes a `parent_window` string so permission prompts can be associated with the triggering app window where the platform supports it. The public frontend and implementation backend both validate that the requested use-case token is one of the selected interface's supported tokens.
 
 ### Shared Methods
 

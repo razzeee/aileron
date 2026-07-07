@@ -15,6 +15,26 @@ const BUS_NAME: &str = "org.freedesktop.impl.portal.desktop.aileron";
 const OBJECT_PATH: &str = "/org/freedesktop/portal/desktop";
 const FRONTEND_BUS_NAME: &str = "org.freedesktop.portal.Desktop";
 const MAX_PREWARM_WORKERS: usize = 4;
+const LANGUAGE_GENERATION_USE_CASES: &[&str] = &[
+    "language.summarize",
+    "language.translate",
+    "language.rephrase",
+    "language.classify",
+    "language.extract",
+    "language.analyze",
+];
+const LANGUAGE_USE_CASES: &[&str] = &[
+    "language.summarize",
+    "language.translate",
+    "language.rephrase",
+    "language.complete",
+    "language.classify",
+    "language.extract",
+    "language.analyze",
+    "language.embed",
+];
+const SPEECH_USE_CASES: &[&str] = &["speech.transcribe", "speech.translate"];
+const VISION_USE_CASES: &[&str] = &["vision.describe", "vision.ocr", "vision.segment"];
 
 pub async fn run() -> Result<()> {
     info!("registering D-Bus portal backend");
@@ -290,7 +310,7 @@ impl LanguagePortalBackend {
         instructions: &str,
     ) -> zbus::fdo::Result<()> {
         ensure_portal_frontend(conn, &header).await?;
-        ensure_use_case_prefix(use_case, "language.", "Language")?;
+        ensure_interface_use_case(use_case, PortalInterface::Language)?;
         let request_id = request_handle.as_str();
         let session_handle = session_handle.as_str();
         begin_request(conn, &self.state, request_id, None).await?;
@@ -884,7 +904,7 @@ impl SpeechPortalBackend {
         instructions: &str,
     ) -> zbus::fdo::Result<()> {
         ensure_portal_frontend(conn, &header).await?;
-        ensure_use_case_prefix(use_case, "speech.", "Speech")?;
+        ensure_interface_use_case(use_case, PortalInterface::Speech)?;
         let request_id = request_handle.as_str();
         let session_handle = session_handle.as_str();
         begin_request(conn, &self.state, request_id, None).await?;
@@ -1081,7 +1101,7 @@ impl VisionPortalBackend {
         instructions: &str,
     ) -> zbus::fdo::Result<()> {
         ensure_portal_frontend(conn, &header).await?;
-        ensure_use_case_prefix(use_case, "vision.", "Vision")?;
+        ensure_interface_use_case(use_case, PortalInterface::Vision)?;
         let request_id = request_handle.as_str();
         let session_handle = session_handle.as_str();
         begin_request(conn, &self.state, request_id, None).await?;
@@ -1439,14 +1459,25 @@ async fn ensure_portal_frontend(
     }
 }
 
-fn ensure_use_case_prefix(use_case: &str, prefix: &str, interface: &str) -> zbus::fdo::Result<()> {
-    if use_case.starts_with(prefix) {
+fn ensure_interface_use_case(use_case: &str, interface: PortalInterface) -> zbus::fdo::Result<()> {
+    let supported = supported_use_cases(interface);
+    if supported.contains(&use_case) {
         return Ok(());
     }
 
     Err(zbus::fdo::Error::Failed(format!(
-        "aileron.Inference.InvalidInput: {interface} portal expects {prefix} use-cases, got {use_case}"
+        "aileron.Inference.InvalidInput: {} portal does not support use-case {use_case}; supported use-cases: {}",
+        interface.label(),
+        supported.join(", ")
     )))
+}
+
+fn supported_use_cases(interface: PortalInterface) -> &'static [&'static str] {
+    match interface {
+        PortalInterface::Language => LANGUAGE_USE_CASES,
+        PortalInterface::Speech => SPEECH_USE_CASES,
+        PortalInterface::Vision => VISION_USE_CASES,
+    }
 }
 
 async fn begin_request(
@@ -1871,21 +1902,24 @@ fn ensure_known_session(
 }
 
 fn ensure_language_generation_session(record: &SessionRecord) -> zbus::fdo::Result<()> {
-    match record.use_case.as_str() {
-        "language.summarize" | "language.translate" | "language.rephrase" | "language.classify"
-        | "language.extract" | "language.analyze" => Ok(()),
-        use_case => Err(zbus::fdo::Error::Failed(format!(
-            "aileron.Inference.InvalidInput: full text generation requires a language generation use-case, got {use_case}"
-        ))),
+    if LANGUAGE_GENERATION_USE_CASES.contains(&record.use_case.as_str()) {
+        Ok(())
+    } else {
+        Err(zbus::fdo::Error::Failed(format!(
+            "aileron.Inference.InvalidInput: full text generation requires a language generation use-case, got {use_case}",
+            use_case = &record.use_case
+        )))
     }
 }
 
 fn ensure_speech_session_use_case(record: &SessionRecord, method: &str) -> zbus::fdo::Result<()> {
-    match record.use_case.as_str() {
-        "speech.transcribe" | "speech.translate" => Ok(()),
-        use_case => Err(zbus::fdo::Error::Failed(format!(
-            "aileron.Inference.InvalidInput: {method} requires use-case speech.transcribe or speech.translate, got {use_case}"
-        ))),
+    if SPEECH_USE_CASES.contains(&record.use_case.as_str()) {
+        Ok(())
+    } else {
+        Err(zbus::fdo::Error::Failed(format!(
+            "aileron.Inference.InvalidInput: {method} requires use-case speech.transcribe or speech.translate, got {use_case}",
+            use_case = &record.use_case
+        )))
     }
 }
 
@@ -2305,32 +2339,34 @@ mod tests {
     use hegel::generators as gs;
 
     #[hegel::test]
-    fn use_case_prefix_accepts_matching_interface_prefix(tc: TestCase) {
-        let (prefix, interface) = tc.draw(gs::sampled_from(vec![
-            ("language.", "Language"),
-            ("speech.", "Speech"),
-            ("vision.", "Vision"),
+    fn interface_use_case_accepts_supported_tokens(tc: TestCase) {
+        let (use_case, interface) = tc.draw(gs::sampled_from(vec![
+            ("language.summarize", PortalInterface::Language),
+            ("language.embed", PortalInterface::Language),
+            ("speech.transcribe", PortalInterface::Speech),
+            ("speech.translate", PortalInterface::Speech),
+            ("vision.describe", PortalInterface::Vision),
+            ("vision.segment", PortalInterface::Vision),
         ]));
-        let suffix = tc.draw(gs::sampled_from(vec!["summarize", "translate", "describe"]));
-        let use_case = format!("{prefix}{suffix}");
 
-        assert!(ensure_use_case_prefix(&use_case, prefix, interface).is_ok());
+        assert!(ensure_interface_use_case(use_case, interface).is_ok());
     }
 
     #[hegel::test]
-    fn use_case_prefix_rejects_mismatched_interface_prefix(tc: TestCase) {
-        let (prefix, interface, use_case) = tc.draw(gs::sampled_from(vec![
-            ("language.", "Language", "speech.transcribe"),
-            ("speech.", "Speech", "vision.describe"),
-            ("vision.", "Vision", "language.summarize"),
+    fn interface_use_case_rejects_wrong_or_unknown_tokens(tc: TestCase) {
+        let (use_case, interface) = tc.draw(gs::sampled_from(vec![
+            ("language.generate", PortalInterface::Language),
+            ("speech.transcribe", PortalInterface::Language),
+            ("vision.describe", PortalInterface::Speech),
+            ("language.summarize", PortalInterface::Vision),
         ]));
 
-        let err = ensure_use_case_prefix(use_case, prefix, interface)
-            .expect_err("mismatched prefix should fail");
+        let err = ensure_interface_use_case(use_case, interface)
+            .expect_err("unsupported use-case should fail");
 
-        assert!(err.to_string().contains(interface));
-        assert!(err.to_string().contains(prefix));
+        assert!(err.to_string().contains(interface.label()));
         assert!(err.to_string().contains(use_case));
+        assert!(err.to_string().contains("supported use-cases"));
     }
 
     #[hegel::test]
