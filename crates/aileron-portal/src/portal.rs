@@ -805,6 +805,7 @@ impl LanguagePortalBackend {
         result
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn stream_embed(
         &self,
         request_handle: OwnedObjectPath,
