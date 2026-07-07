@@ -3,7 +3,7 @@ mod frontends;
 pub(crate) mod tool_demo;
 
 use gtk4::prelude::*;
-use gtk4::{Button, Label};
+use gtk4::{Button, DropDown, Label};
 use libadwaita::prelude::*;
 use libadwaita::{
     ApplicationWindow, HeaderBar, OverlaySplitView, ToolbarView, ViewStack, ViewSwitcherSidebar,
@@ -26,6 +26,7 @@ const SESSION_IFACE: &str = "org.freedesktop.portal.Session";
 const SPEECH_IFACE: &str = "org.freedesktop.portal.Speech";
 const VISION_IFACE: &str = "org.freedesktop.portal.Vision";
 static PORTAL_CONNECTION: OnceLock<zbus::blocking::Connection> = OnceLock::new();
+static USE_BACKGROUND_EXECUTION: AtomicBool = AtomicBool::new(false);
 
 type PortalOptions = HashMap<String, OwnedValue>;
 
@@ -57,12 +58,29 @@ fn string_option_value(value: &str) -> OwnedValue {
     OwnedValue::try_from(Value::from(value.to_string())).expect("string options are valid values")
 }
 
+fn selected_execution_mode() -> &'static str {
+    if USE_BACKGROUND_EXECUTION.load(Ordering::Relaxed) {
+        "background"
+    } else {
+        "interactive"
+    }
+}
+
+fn execution_options() -> PortalOptions {
+    let mut options = HashMap::new();
+    options.insert(
+        "execution_mode".to_string(),
+        string_option_value(selected_execution_mode()),
+    );
+    options
+}
+
 fn generation_options(
     maximum_response_tokens: i64,
     source_language_hint: &str,
     target_language_hint: &str,
 ) -> PortalOptions {
-    let mut options = HashMap::new();
+    let mut options = execution_options();
     options.insert(
         "maximum_response_tokens".to_string(),
         OwnedValue::from(maximum_response_tokens),
@@ -79,7 +97,7 @@ fn generation_options(
 }
 
 fn speech_options(source_language_hint: &str) -> PortalOptions {
-    let mut options = HashMap::new();
+    let mut options = execution_options();
     options.insert(
         "source_language_hint".to_string(),
         string_option_value(source_language_hint),
@@ -310,6 +328,17 @@ fn build_window(window: &ApplicationWindow) {
         });
     }
     content_header.pack_start(&show_sidebar_button);
+    let execution_mode_dropdown = DropDown::from_strings(&["Interactive", "Background"]);
+    execution_mode_dropdown.set_tooltip_text(Some("Execution mode sent with portal requests"));
+    execution_mode_dropdown.set_selected(if USE_BACKGROUND_EXECUTION.load(Ordering::Relaxed) {
+        1
+    } else {
+        0
+    });
+    execution_mode_dropdown.connect_selected_notify(|dropdown| {
+        USE_BACKGROUND_EXECUTION.store(dropdown.selected() == 1, Ordering::Relaxed);
+    });
+    content_header.pack_end(&execution_mode_dropdown);
     let title = WindowTitle::builder()
         .title("Lab overview")
         .subtitle("Aileron demo")
@@ -1575,7 +1604,7 @@ fn stream_embedding(session_handle: &OwnedObjectPath, text: &str) -> anyhow::Res
     });
 
     let stream_result: zbus::Result<OwnedObjectPath> =
-        proxy.call("StreamEmbed", &(session_handle, text, empty_options()));
+        proxy.call("StreamEmbed", &(session_handle, text, execution_options()));
     let request_handle = stream_result?;
     let response_request_handle = request_handle.clone();
     std::thread::spawn(move || {
@@ -1658,7 +1687,7 @@ fn stream_vision_text(
 
     let stream_result: zbus::Result<OwnedObjectPath> = proxy.call(
         method,
-        &(session_handle, image_fd, instructions, empty_options()),
+        &(session_handle, image_fd, instructions, execution_options()),
     );
     let request_handle = stream_result?;
     let response_request_handle = request_handle.clone();
@@ -1751,7 +1780,7 @@ fn stream_vision_segments(
 
     let stream_result: zbus::Result<OwnedObjectPath> = proxy.call(
         "StreamSegment",
-        &(session_handle, image_fd, instructions, empty_options()),
+        &(session_handle, image_fd, instructions, execution_options()),
     );
     let request_handle = stream_result?;
     let response_request_handle = request_handle.clone();
