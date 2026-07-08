@@ -4,9 +4,10 @@ use aileron_runtime::llama_runtime::{
     new_embedding_context, render_chat_prompt, render_tool_results,
 };
 use aileron_runtime::{
-    ContentPart, Request, clamp_choices, first_json_value, send, send_unsupported,
+    ContentPart, Request, clamp_choices, first_json_value, is_context_window_error, send,
+    send_unsupported,
 };
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::llama_backend::LlamaBackend;
@@ -195,10 +196,11 @@ fn handle_generate_structured(
 ) -> Result<()> {
     match structured_result(model, mtmd, ctx, req) {
         Ok(result) => send(json!({"id": req.id, "result": result, "done": true})),
+        Err(err) if is_context_window_error(&err) => Err(err),
         Err(reason) => send(json!({
             "id": req.id,
             "error": "schema_validation_failed",
-            "reason": reason,
+            "reason": reason.to_string(),
             "done": true,
         })),
     }
@@ -215,10 +217,11 @@ fn handle_generate_structured_stream(
             send(json!({"id": req.id, "snapshot": result}))?;
             send(json!({"id": req.id, "snapshot": result, "done": true}))
         }
+        Err(err) if is_context_window_error(&err) => Err(err),
         Err(reason) => send(json!({
             "id": req.id,
             "error": "schema_validation_failed",
-            "reason": reason,
+            "reason": reason.to_string(),
             "done": true,
         })),
     }
@@ -229,7 +232,7 @@ fn structured_result(
     mtmd: &MtmdContext,
     ctx: &mut LlamaContext<'_>,
     req: &Request,
-) -> std::result::Result<String, String> {
+) -> Result<String> {
     let system = req.system.as_deref().unwrap_or(DEFAULT_SYSTEM);
     let schema = req
         .response_format
@@ -243,13 +246,14 @@ fn structured_result(
     let prompt = structured_prompt(&source_prompt, schema);
     let max_tokens = req.max_tokens.unwrap_or(1024);
     if input_contains_audio(req) {
-        return Err("input_audio is not supported by this runtime structured path".to_string());
+        return Err(anyhow!(
+            "input_audio is not supported by this runtime structured path"
+        ));
     }
     if input_image_count(req) > 1 {
-        return Err(
+        return Err(anyhow!(
             "multiple input_image parts are not supported by this runtime structured path"
-                .to_string(),
-        );
+        ));
     }
     if let Some(image) = first_input_image(req) {
         return generate_for_image_bytes(
@@ -265,10 +269,10 @@ fn structured_result(
         )
         .map(|result| result.trim().to_string())
         .map_err(|err| match err {
-            ImageRequestError::InvalidImage(reason) => reason,
-            ImageRequestError::Runtime(err) => err.to_string(),
+            ImageRequestError::InvalidImage(reason) => anyhow!(reason),
+            ImageRequestError::Runtime(err) => err,
         })
-        .and_then(|result| first_json_value(&result));
+        .and_then(|result| first_json_value(&result).map_err(|err| anyhow!(err)));
     }
     let result = generate_chat(
         model,
@@ -280,12 +284,11 @@ fn structured_result(
         Some(schema),
         req.execution_mode.as_deref(),
         |_| Ok(()),
-    )
-    .map_err(|err| err.to_string())?
+    )?
     .trim()
     .to_string();
 
-    first_json_value(&result)
+    first_json_value(&result).map_err(|err| anyhow!(err))
 }
 
 fn handle_embed<'model>(

@@ -390,8 +390,7 @@ impl Container {
             if resp.id != id {
                 continue;
             }
-            if let Some(error) = resp.error {
-                let reason = resp.reason.unwrap_or_else(|| error.clone());
+            if let Some((error, reason)) = response_error(&resp) {
                 bail!("container returned error {error}: {reason}");
             }
             if let Some(token) = resp.token {
@@ -433,8 +432,7 @@ impl Container {
             if resp.id != id {
                 continue;
             }
-            if let Some(error) = resp.error {
-                let reason = resp.reason.unwrap_or_else(|| error.clone());
+            if let Some((error, reason)) = response_error(&resp) {
                 bail!("container returned error {error}: {reason}");
             }
             if resp.done.unwrap_or(false) {
@@ -543,8 +541,7 @@ impl Container {
             if resp.id != id {
                 continue;
             }
-            if let Some(error) = resp.error {
-                let reason = resp.reason.unwrap_or_else(|| error.clone());
+            if let Some((error, reason)) = response_error(&resp) {
                 bail!("container returned error {error}: {reason}");
             }
             if let Some(tool_calls) = resp.tool_calls {
@@ -611,8 +608,7 @@ impl Container {
             if resp.id != id {
                 continue;
             }
-            if let Some(error) = resp.error {
-                let reason = resp.reason.unwrap_or_else(|| error.clone());
+            if let Some((error, reason)) = response_error(&resp) {
                 bail!("container returned error {error}: {reason}");
             }
             if let Some(tool_calls) = resp.tool_calls {
@@ -759,8 +755,7 @@ impl Container {
             if resp.id != id {
                 continue;
             }
-            if let Some(error) = resp.error {
-                let reason = resp.reason.unwrap_or_else(|| error.clone());
+            if let Some((error, reason)) = response_error(&resp) {
                 bail!("container returned error {error}: {reason}");
             }
             if let Some(embedding) = resp.embedding {
@@ -851,8 +846,7 @@ fn read_text_stream_response(
         if resp.id != id {
             continue;
         }
-        if let Some(error) = resp.error {
-            let reason = resp.reason.unwrap_or_else(|| error.clone());
+        if let Some((error, reason)) = response_error(&resp) {
             bail!("container returned error {error}: {reason}");
         }
         if let Some(token) = resp.token
@@ -1054,8 +1048,7 @@ pub fn benchmark_write_request_for_use_case(
 }
 
 fn structured_response_result(resp: ContainerResponse, schema: &Value) -> Result<Option<String>> {
-    if let Some(error) = resp.error {
-        let reason = resp.reason.unwrap_or_else(|| error.clone());
+    if let Some((error, reason)) = response_error(&resp) {
         bail!("container returned error {error}: {reason}");
     }
     if let Some(result) = resp.result {
@@ -1066,6 +1059,20 @@ fn structured_response_result(resp: ContainerResponse, schema: &Value) -> Result
         bail!("container sent done without a result field");
     }
     Ok(None)
+}
+
+fn response_error(resp: &ContainerResponse) -> Option<(String, String)> {
+    let error = resp.error.as_ref()?;
+    if error == "context_window_exceeded" {
+        observability::log_context_window_exceeded(
+            resp.prompt_tokens,
+            resp.max_tokens,
+            resp.context_tokens,
+            resp.operation.as_deref(),
+        );
+    }
+    let reason = resp.reason.as_ref().unwrap_or(error).clone();
+    Some((error.clone(), reason))
 }
 
 fn limit_completions(mut completions: Vec<String>, count: u32) -> Vec<String> {
@@ -2476,6 +2483,10 @@ struct ContainerResponse {
     embedding: Option<Vec<f32>>,
     error: Option<String>,
     reason: Option<String>,
+    prompt_tokens: Option<u64>,
+    max_tokens: Option<u64>,
+    context_tokens: Option<u64>,
+    operation: Option<String>,
     done: Option<bool>,
 }
 
@@ -3443,6 +3454,10 @@ mod tests {
             embedding: None,
             error: Some("schema_validation_failed".to_string()),
             reason: Some("expected object".to_string()),
+            prompt_tokens: None,
+            max_tokens: None,
+            context_tokens: None,
+            operation: None,
             done: None,
         };
 
@@ -3465,6 +3480,10 @@ mod tests {
             embedding: None,
             error: None,
             reason: None,
+            prompt_tokens: None,
+            max_tokens: None,
+            context_tokens: None,
+            operation: None,
             done: Some(true),
         };
         let schema = serde_json::json!({
@@ -3479,6 +3498,29 @@ mod tests {
             .expect("valid structured response should succeed");
 
         assert_eq!(result.as_deref(), Some(r#"{"name":"Ada"}"#));
+    }
+
+    #[test]
+    fn container_response_deserializes_context_telemetry() {
+        let resp: ContainerResponse = serde_json::from_str(
+            r#"{
+                "id":"request-1",
+                "error":"context_window_exceeded",
+                "reason":"prompt plus requested output exceeds context: 4200 + 512 > 4096",
+                "prompt_tokens":4200,
+                "max_tokens":512,
+                "context_tokens":4096,
+                "operation":"generate",
+                "done":true
+            }"#,
+        )
+        .expect("deserialize context telemetry response");
+
+        assert_eq!(resp.error.as_deref(), Some("context_window_exceeded"));
+        assert_eq!(resp.prompt_tokens, Some(4200));
+        assert_eq!(resp.max_tokens, Some(512));
+        assert_eq!(resp.context_tokens, Some(4096));
+        assert_eq!(resp.operation.as_deref(), Some("generate"));
     }
 
     #[test]

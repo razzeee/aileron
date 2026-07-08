@@ -219,6 +219,32 @@ pub(crate) fn log_runtime_evicted_idle(profile_id: &str, idle_timeout_secs: u64)
     );
 }
 
+pub(crate) fn log_context_window_exceeded(
+    prompt_tokens: Option<u64>,
+    max_tokens: Option<u64>,
+    context_tokens: Option<u64>,
+    operation: Option<&str>,
+) {
+    let prompt_tokens = prompt_tokens
+        .map(|value| value.to_string())
+        .unwrap_or_default();
+    let max_tokens = max_tokens
+        .map(|value| value.to_string())
+        .unwrap_or_default();
+    let context_tokens = context_tokens
+        .map(|value| value.to_string())
+        .unwrap_or_default();
+    tracing::warn!(
+        target: OBSERVABILITY_TARGET,
+        event = "context_window_exceeded",
+        prompt_tokens = %prompt_tokens,
+        max_tokens = %max_tokens,
+        context_tokens = %context_tokens,
+        operation = %operation.unwrap_or(""),
+        "runtime context window exceeded"
+    );
+}
+
 pub(crate) fn container_source(spawned: bool) -> &'static str {
     if spawned { "cold" } else { "warm" }
 }

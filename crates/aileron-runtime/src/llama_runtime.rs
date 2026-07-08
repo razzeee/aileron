@@ -14,7 +14,7 @@ use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::{LogOptions, json_schema_to_grammar, send_logs_to_tracing};
 use serde_json::Value;
 
-use crate::{default_threads_for_device, field_as_string};
+use crate::{ContextWindowExceeded, default_threads_for_device, field_as_string};
 
 pub const DEFAULT_SYSTEM: &str = "You are a helpful assistant. Always respond in the same language as the user's message. Be concise and accurate.";
 
@@ -196,12 +196,7 @@ pub fn generate_completion(
 
     let n_ctx = ctx.n_ctx() as usize;
     if tokens.len() + max_tokens as usize > n_ctx {
-        bail!(
-            "prompt plus requested output exceeds context: {} + {} > {}",
-            tokens.len(),
-            max_tokens,
-            n_ctx
-        );
+        return Err(ContextWindowExceeded::generation(tokens.len(), max_tokens, n_ctx).into());
     }
 
     let mut batch = LlamaBatch::new(n_ctx, 1);
@@ -253,12 +248,12 @@ pub fn generate_from_evaluated_prompt(
         bail!("evaluated prompt has no tokens");
     }
     if n_past as usize + max_tokens as usize > ctx.n_ctx() as usize {
-        bail!(
-            "prompt plus requested output exceeds context: {} + {} > {}",
-            n_past,
+        return Err(ContextWindowExceeded::continuation(
+            n_past as usize,
             max_tokens,
-            ctx.n_ctx()
-        );
+            ctx.n_ctx() as usize,
+        )
+        .into());
     }
 
     let mut sampler = sampler_for(model, temperature, schema);
@@ -335,11 +330,7 @@ pub fn embedding(model: &LlamaModel, ctx: &mut LlamaContext<'_>, text: &str) -> 
 
     let n_ctx = ctx.n_ctx() as usize;
     if tokens.len() > n_ctx {
-        bail!(
-            "embedding input exceeds context: {} > {}",
-            tokens.len(),
-            n_ctx
-        );
+        return Err(ContextWindowExceeded::embedding(tokens.len(), n_ctx).into());
     }
 
     let mut batch = LlamaBatch::new(n_ctx, 1);

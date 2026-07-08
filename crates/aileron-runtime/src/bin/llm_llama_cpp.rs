@@ -4,9 +4,10 @@ use aileron_runtime::llama_runtime::{
     render_tool_results,
 };
 use aileron_runtime::{
-    ContentPart, Request, clamp_choices, first_json_value, send, send_unsupported,
+    ContentPart, Request, clamp_choices, first_json_value, is_context_window_error, send,
+    send_unsupported,
 };
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::model::LlamaModel;
@@ -130,10 +131,11 @@ fn handle_generate_structured(
 ) -> Result<()> {
     match structured_result(model, ctx, req) {
         Ok(result) => send(json!({"id": req.id, "result": result, "done": true})),
+        Err(err) if is_context_window_error(&err) => Err(err),
         Err(reason) => send(json!({
             "id": req.id,
             "error": "schema_validation_failed",
-            "reason": reason,
+            "reason": reason.to_string(),
             "done": true,
         })),
     }
@@ -149,10 +151,11 @@ fn handle_generate_structured_stream(
             send(json!({"id": req.id, "snapshot": result}))?;
             send(json!({"id": req.id, "snapshot": result, "done": true}))
         }
+        Err(err) if is_context_window_error(&err) => Err(err),
         Err(reason) => send(json!({
             "id": req.id,
             "error": "schema_validation_failed",
-            "reason": reason,
+            "reason": reason.to_string(),
             "done": true,
         })),
     }
@@ -162,9 +165,11 @@ fn structured_result(
     model: &LlamaModel,
     ctx: &mut LlamaContext<'_>,
     req: &Request,
-) -> std::result::Result<String, String> {
+) -> Result<String> {
     if input_contains_media(req) {
-        return Err("input_image and input_audio are not supported by this runtime".to_string());
+        return Err(anyhow!(
+            "input_image and input_audio are not supported by this runtime"
+        ));
     }
 
     let system = req.system.as_deref().unwrap_or(DEFAULT_SYSTEM);
@@ -192,12 +197,11 @@ fn structured_result(
         Some(schema),
         req.execution_mode.as_deref(),
         |_| Ok(()),
-    )
-    .map_err(|err| err.to_string())?
+    )?
     .trim()
     .to_string();
 
-    first_json_value(&result)
+    first_json_value(&result).map_err(|err| anyhow!(err))
 }
 
 fn handle_embed<'model>(

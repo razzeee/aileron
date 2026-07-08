@@ -346,6 +346,23 @@ Runtimes should use stable, machine-readable `error` codes and put details in `r
 
 The daemon maps these runtime error codes to specific app-facing inference errors when possible: `context_window_exceeded`, `unsupported_language`, `safety_refusal`, `request_cancelled`, and `invalid_input`. Unknown runtime codes are surfaced as generic inference failures. A runtime should prefer a clear error over malformed JSON, closed stdout, or hanging forever.
 
+For `context_window_exceeded`, runtimes should include count-only context telemetry when available:
+
+```json
+{
+  "id": "request-id",
+  "error": "context_window_exceeded",
+  "reason": "prompt plus requested output exceeds context: 4200 + 512 > 4096",
+  "prompt_tokens": 4200,
+  "max_tokens": 512,
+  "context_tokens": 4096,
+  "operation": "generate",
+  "done": true
+}
+```
+
+`prompt_tokens` is the token count for the evaluated prompt or embedding input. `max_tokens` is the requested output budget and may be omitted for non-generating requests such as `embed`. `context_tokens` is the active model context size. `operation` is a short runtime-defined label such as `generate`, `generate_continuation`, or `embed`. Do not include prompt text or user content in these fields.
+
 ## Security Assumptions
 
 The daemon runs runtimes with a hardened generated OCI runtime configuration:

@@ -2173,6 +2173,7 @@ fn reply_generation_failure(
 
 fn reply_guided_failure(call: &mut dyn VarlinkCallError, reason: String) -> varlink::Result<()> {
     match observability::runtime_error_code(&reason) {
+        Some("context_window_exceeded") => call.reply_context_window_exceeded(reason),
         Some("request_cancelled") => call.reply_request_cancelled(reason),
         _ => call.reply_guided_generation_failed(reason),
     }

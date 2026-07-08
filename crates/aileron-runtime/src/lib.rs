@@ -1,5 +1,7 @@
 use std::io::{BufRead, Write};
 
+use std::fmt;
+
 use anyhow::Result;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -75,6 +77,82 @@ fn unknown_id() -> String {
     "unknown".to_string()
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContextWindowExceeded {
+    pub prompt_tokens: usize,
+    pub max_tokens: Option<u32>,
+    pub context_tokens: usize,
+    pub operation: &'static str,
+}
+
+impl ContextWindowExceeded {
+    pub fn generation(prompt_tokens: usize, max_tokens: u32, context_tokens: usize) -> Self {
+        Self {
+            prompt_tokens,
+            max_tokens: Some(max_tokens),
+            context_tokens,
+            operation: "generate",
+        }
+    }
+
+    pub fn continuation(prompt_tokens: usize, max_tokens: u32, context_tokens: usize) -> Self {
+        Self {
+            prompt_tokens,
+            max_tokens: Some(max_tokens),
+            context_tokens,
+            operation: "generate_continuation",
+        }
+    }
+
+    pub fn embedding(prompt_tokens: usize, context_tokens: usize) -> Self {
+        Self {
+            prompt_tokens,
+            max_tokens: None,
+            context_tokens,
+            operation: "embed",
+        }
+    }
+
+    pub fn response(&self, id: &str) -> Value {
+        let mut response = json!({
+            "id": id,
+            "error": "context_window_exceeded",
+            "reason": self.to_string(),
+            "prompt_tokens": self.prompt_tokens,
+            "context_tokens": self.context_tokens,
+            "operation": self.operation,
+            "done": true,
+        });
+        if let Some(max_tokens) = self.max_tokens {
+            response["max_tokens"] = json!(max_tokens);
+        }
+        response
+    }
+}
+
+impl fmt::Display for ContextWindowExceeded {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.max_tokens {
+            Some(max_tokens) => write!(
+                f,
+                "prompt plus requested output exceeds context: {} + {} > {}",
+                self.prompt_tokens, max_tokens, self.context_tokens
+            ),
+            None => write!(
+                f,
+                "embedding input exceeds context: {} > {}",
+                self.prompt_tokens, self.context_tokens
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ContextWindowExceeded {}
+
+pub fn is_context_window_error(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<ContextWindowExceeded>().is_some()
+}
+
 pub fn send(value: Value) -> Result<()> {
     let mut stdout = std::io::stdout().lock();
     serde_json::to_writer(&mut stdout, &value)?;
@@ -113,6 +191,11 @@ pub fn serve_requests(
         let req_id = req.id.clone();
         let req_type = req.request_type.clone();
         if let Err(err) = handler(req) {
+            if let Some(context_error) = err.downcast_ref::<ContextWindowExceeded>() {
+                eprintln!("[{log_prefix}] context window exceeded handling {req_type}: {err}");
+                send(context_error.response(&req_id))?;
+                continue;
+            }
             eprintln!("[{log_prefix}] error handling {req_type}: {err:?}");
             send(json!({
                 "id": req_id,
@@ -348,5 +431,18 @@ mod tests {
             first_json_value("```json\n{\"ok\":true}\n```").unwrap(),
             "{\"ok\":true}"
         );
+    }
+
+    #[test]
+    fn context_window_error_response_includes_budget_fields() {
+        let response = ContextWindowExceeded::generation(4200, 512, 4096).response("req-1");
+
+        assert_eq!(response["id"], "req-1");
+        assert_eq!(response["error"], "context_window_exceeded");
+        assert_eq!(response["prompt_tokens"], 4200);
+        assert_eq!(response["max_tokens"], 512);
+        assert_eq!(response["context_tokens"], 4096);
+        assert_eq!(response["operation"], "generate");
+        assert_eq!(response["done"], true);
     }
 }
