@@ -8,6 +8,7 @@ pub mod manifests;
 mod observability;
 pub mod permissions;
 pub mod profiles;
+mod request_execution;
 pub mod service;
 pub mod state;
 

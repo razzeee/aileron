@@ -156,11 +156,12 @@ pub(crate) fn build_page() -> gtk4::Widget {
                         }) => {
                             status_title_for_rx.set_text("Approve tool call");
                             status_detail_for_rx.set_text(
-                                "The local model requested an app-owned tool. Review it before execution.",
+                                "The portal returned a model-requested tool call. The demo app will only execute it if you approve.",
                             );
                             let dialog = AlertDialog::builder()
-                                .heading("Run local tool?")
+                                .heading("Approve app-owned tool call?")
                                 .body(format_tool_confirmation_body(
+                                    case,
                                     &tool_name,
                                     &arguments_json,
                                 ))
@@ -231,11 +232,27 @@ pub(crate) fn build_page() -> gtk4::Widget {
     scrollable_page(&vbox)
 }
 
-fn format_tool_confirmation_body(tool_name: &str, arguments_json: &str) -> String {
+fn format_tool_confirmation_body(
+    case: ToolDemoCase,
+    tool_name: &str,
+    arguments_json: &str,
+) -> String {
     format!(
-        "Tool: {tool_name}\n\nArguments:\n{}",
+        "The Aileron portal does not run tools. It returned this request to the demo app, and the app is asking before it validates and executes anything.\n\n{}\n\nTool: {tool_name}\n\nArguments:\n{}",
+        tool_safety_context(case),
         truncate_confirmation_text(arguments_json, 4_000)
     )
+}
+
+fn tool_safety_context(case: ToolDemoCase) -> &'static str {
+    match case {
+        ToolDemoCase::CharacterCounter => {
+            "Safety context: this demo tool is deterministic and only counts characters in the supplied text."
+        }
+        ToolDemoCase::LinuxDiagnostics => {
+            "Safety context: this demo only runs bounded, read-only Linux diagnostic commands. It does not apply fixes or change system state."
+        }
+    }
 }
 
 fn truncate_confirmation_text(text: &str, max_chars: usize) -> String {

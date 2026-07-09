@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use crate::manifests::{self, ManifestArtifact, ModelManifest};
 use crate::observability;
 use crate::profiles::Profile;
+use crate::request_execution;
 use crate::state::{
     InstallRecord, InstallSample, RuntimeUpdateCheck as CachedRuntimeUpdateCheck, SharedState,
 };
@@ -518,7 +519,7 @@ impl VarlinkInterface for ModelsHandler {
 
                 let mut cancelled_sessions = Vec::new();
                 for session_id in &active_sessions {
-                    self.state.cancel_session_requests(session_id);
+                    request_execution::mark_session_closed(&self.state, session_id);
                     if let Some(session) = guard.sessions.remove(session_id.as_str()) {
                         cancelled_sessions.push(session);
                     }
@@ -539,19 +540,15 @@ impl VarlinkInterface for ModelsHandler {
                     profile_id: &session.profile_id,
                 });
             }
-            let active_containers = cancelled_sessions
-                .iter()
-                .flat_map(|session| {
-                    self.state.terminate_active_container_handles(
-                        &profile_id,
-                        session.session_id.as_str(),
-                    )
-                })
-                .collect::<Vec<_>>();
-            let mut containers = self.state.2.lock().await;
-            for container in active_containers {
-                containers.kill_handle(&profile_id, &container);
+            for session in &cancelled_sessions {
+                request_execution::terminate_active_container_handles_for_session(
+                    &self.state,
+                    &profile_id,
+                    session.session_id.as_str(),
+                )
+                .await;
             }
+            let mut containers = self.state.2.lock().await;
             let profile_still_missing = {
                 let guard = self.state.0.lock().await;
                 guard.profiles.get(&profile_id).is_none()

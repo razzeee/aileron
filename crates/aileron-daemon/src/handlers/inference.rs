@@ -4,16 +4,16 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::path::PathBuf;
 use std::sync::{
-    Arc, Condvar, Mutex as StdMutex, MutexGuard, TryLockError,
+    Arc, MutexGuard, TryLockError,
     atomic::{AtomicBool, Ordering},
 };
-use std::thread;
 use std::time::Duration;
 use uuid::Uuid;
 
 use crate::container::{Container, ContainerHandle, InputMessage, InputPart};
 use crate::observability::{self, ObservabilityFailure};
 use crate::profiles::RuntimeCandidate;
+use crate::request_execution::{self, ActiveContainerRequest, RequestCancellation};
 use crate::state::SharedState;
 #[allow(unused_imports)]
 // VarlinkCallError is a supertrait; its methods reach us via Call_* dyn objects.
@@ -53,13 +53,6 @@ struct ResolvedSessionRuntime {
     artifact_path: PathBuf,
     runtime_options: HashMap<String, String>,
     instructions: String,
-}
-
-struct ActiveContainerRequest<'a> {
-    state: &'a SharedState,
-    profile_id: &'a str,
-    session_id: &'a str,
-    handle: ContainerHandle,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,30 +104,6 @@ impl Drop for BackgroundExecution<'_> {
     fn drop(&mut self) {
         self.state
             .end_background_execution(&self.profile_id, &self.handle);
-    }
-}
-
-impl<'a> ActiveContainerRequest<'a> {
-    fn new(
-        state: &'a SharedState,
-        profile_id: &'a str,
-        session_id: &'a str,
-        handle: ContainerHandle,
-    ) -> Self {
-        state.begin_container_request(profile_id, session_id, handle.clone());
-        Self {
-            state,
-            profile_id,
-            session_id,
-            handle,
-        }
-    }
-}
-
-impl Drop for ActiveContainerRequest<'_> {
-    fn drop(&mut self) {
-        self.state
-            .end_container_request(self.profile_id, self.session_id, &self.handle);
     }
 }
 
@@ -583,11 +552,16 @@ impl VarlinkInterface for InferenceHandler {
                 let Some(session) = guard.sessions.remove(&session_id) else {
                     return call.reply_session_not_found(session_id);
                 };
-                self.state.cancel_session_requests(&session_id);
+                request_execution::mark_session_closed(&self.state, &session_id);
                 (session.profile_id, session.app_id, session.use_case)
             };
             self.state.clear_predict_next(&session_id);
-            kill_profile_if_session_active(&self.state, &profile_id, &session_id).await;
+            request_execution::terminate_active_container_handles_for_session(
+                &self.state,
+                &profile_id,
+                &session_id,
+            )
+            .await;
             observability::log_session_ended(observability::SessionFields {
                 session_id: &session_id,
                 app_id: &app_id,
@@ -732,7 +706,9 @@ async fn stream_transcription(
                 task,
                 execution_mode.as_str(),
                 |token| {
-                    if cancelled || state.is_session_cancelled(&session_id) {
+                    if cancelled
+                        || RequestCancellation::for_session(state, &session_id).is_cancelled()
+                    {
                         cancelled = true;
                         return;
                     }
@@ -758,11 +734,13 @@ async fn stream_transcription(
             if let Some(e) = reply_error {
                 return Err(SpeechError::Reply(e));
             }
-            if cancelled || state.is_session_cancelled(&session_id) {
+            if cancelled || RequestCancellation::for_session(state, &session_id).is_cancelled() {
                 if wants_more {
                     call.set_continues(false);
                 }
-                return Err(SpeechError::Failed(request_cancelled_reason()));
+                return Err(SpeechError::Failed(
+                    request_execution::request_cancelled_reason(),
+                ));
             }
 
             if let Err(e) = result {
@@ -824,7 +802,9 @@ async fn stream_vision_text<C: TextStreamCall + ?Sized>(
                     &instructions,
                     execution_mode.as_str(),
                     |token| {
-                        if cancelled || state.is_session_cancelled(&session_id) {
+                        if cancelled
+                            || RequestCancellation::for_session(state, &session_id).is_cancelled()
+                        {
                             cancelled = true;
                             return;
                         }
@@ -844,7 +824,9 @@ async fn stream_vision_text<C: TextStreamCall + ?Sized>(
                     &instructions,
                     execution_mode.as_str(),
                     |token| {
-                        if cancelled || state.is_session_cancelled(&session_id) {
+                        if cancelled
+                            || RequestCancellation::for_session(state, &session_id).is_cancelled()
+                        {
                             cancelled = true;
                             return;
                         }
@@ -863,11 +845,13 @@ async fn stream_vision_text<C: TextStreamCall + ?Sized>(
             if let Some(e) = reply_error {
                 return Err(VisionError::Reply(e));
             }
-            if cancelled || state.is_session_cancelled(&session_id) {
+            if cancelled || RequestCancellation::for_session(state, &session_id).is_cancelled() {
                 if wants_more {
                     call.set_continues(false);
                 }
-                return Err(VisionError::Failed(request_cancelled_reason()));
+                return Err(VisionError::Failed(
+                    request_execution::request_cancelled_reason(),
+                ));
             }
             if let Err(e) = result {
                 if wants_more {
@@ -960,7 +944,8 @@ async fn vision_segments(
                         .collect()
                 })
                 .map_err(|e| VisionError::Failed(e.to_string()));
-            ensure_session_not_cancelled_or_terminate_spawned(state, &session_id, handle, spawned)
+            RequestCancellation::for_session(state, &session_id)
+                .ensure_not_cancelled_or_terminate_spawned(handle, spawned)
                 .map_err(VisionError::Failed)?;
             result
         },
@@ -993,7 +978,8 @@ async fn embedding_vector(
                 .embed(&text, execution_mode.as_str())
                 .map(|embedding| embedding.into_iter().map(f64::from).collect())
                 .map_err(|e| GenerationError::Failed(e.to_string()));
-            ensure_session_not_cancelled_or_terminate_spawned(state, &session_id, handle, spawned)
+            RequestCancellation::for_session(state, &session_id)
+                .ensure_not_cancelled_or_terminate_spawned(handle, spawned)
                 .map_err(GenerationError::Failed)?;
             result
         },
@@ -1291,7 +1277,9 @@ async fn stream_tokens(
             macro_rules! generate_with_instructions {
                 ($instructions:expr) => {
                     container.generate(Some($instructions), &prompt, Some(&input), max_tokens, execution_mode.as_str(), |token| {
-                        if cancelled || state.is_session_cancelled(&session_id) {
+                        if cancelled
+                            || RequestCancellation::for_session(state, &session_id).is_cancelled()
+                        {
                             cancelled = true;
                             return;
                         }
@@ -1328,11 +1316,13 @@ async fn stream_tokens(
             if let Some(e) = reply_error {
                 return Err(GenerationError::Reply(e));
             }
-            if cancelled || state.is_session_cancelled(&session_id) {
+            if cancelled || RequestCancellation::for_session(state, &session_id).is_cancelled() {
                 if wants_more {
                     call.set_continues(false);
                 }
-                return Err(GenerationError::Failed(request_cancelled_reason()));
+                return Err(GenerationError::Failed(
+                    request_execution::request_cancelled_reason(),
+                ));
             }
 
             if let Err(e) = result {
@@ -1579,7 +1569,8 @@ async fn model_container(
             &resolved.runtime_options,
             |_| {},
             || {
-                ensure_session_not_cancelled(state, session_id)
+                RequestCancellation::for_session(state, session_id)
+                    .ensure_not_cancelled()
                     .and_then(|_| {
                         ensure_background_start_still_allowed(state, resolved, execution_mode)
                     })
@@ -1604,7 +1595,8 @@ fn lock_container_for_session<'a>(
     spawned: bool,
 ) -> Result<MutexGuard<'a, Container>, LockContainerError> {
     loop {
-        ensure_session_not_cancelled_or_terminate_spawned(state, session_id, handle, spawned)
+        RequestCancellation::for_session(state, session_id)
+            .ensure_not_cancelled_or_terminate_spawned(handle, spawned)
             .map_err(LockContainerError::Failed)?;
         ensure_handle_ready_for_request(handle, spawned)?;
         match handle.try_lock() {
@@ -1658,17 +1650,19 @@ async fn with_locked_container<T, E: ObservabilityFailure>(
         if execution_mode == RequestExecutionMode::Background
             && !state.background_execution_can_start(&resolved.profile_id)
         {
-            ensure_session_not_cancelled(state, session_id).map_err(|reason| {
-                map_observed_failure(
-                    method,
-                    session_id,
-                    &resolved,
-                    started_at,
-                    "unavailable",
-                    &map_failed,
-                    reason,
-                )
-            })?;
+            RequestCancellation::for_session(state, session_id)
+                .ensure_not_cancelled()
+                .map_err(|reason| {
+                    map_observed_failure(
+                        method,
+                        session_id,
+                        &resolved,
+                        started_at,
+                        "unavailable",
+                        &map_failed,
+                        reason,
+                    )
+                })?;
             tokio::time::sleep(Duration::from_millis(25)).await;
             continue;
         }
@@ -1730,7 +1724,8 @@ async fn with_locked_container<T, E: ObservabilityFailure>(
                     }
                 };
 
-            ensure_session_not_cancelled_or_terminate_spawned(state, session_id, &handle, spawned)
+            RequestCancellation::for_session(state, session_id)
+                .ensure_not_cancelled_or_terminate_spawned(&handle, spawned)
                 .map_err(|reason| {
                     map_observed_failure(
                         method,
@@ -1788,20 +1783,19 @@ async fn with_locked_container<T, E: ObservabilityFailure>(
                     session_id,
                     handle.clone(),
                 );
-                ensure_session_not_cancelled_or_terminate_spawned(
-                    state, session_id, &handle, spawned,
-                )
-                .map_err(|reason| {
-                    map_observed_failure(
-                        method,
-                        session_id,
-                        &resolved,
-                        started_at,
-                        observability::container_source(spawned),
-                        &map_failed,
-                        reason,
-                    )
-                })?;
+                RequestCancellation::for_session(state, session_id)
+                    .ensure_not_cancelled_or_terminate_spawned(&handle, spawned)
+                    .map_err(|reason| {
+                        map_observed_failure(
+                            method,
+                            session_id,
+                            &resolved,
+                            started_at,
+                            observability::container_source(spawned),
+                            &map_failed,
+                            reason,
+                        )
+                    })?;
                 if spawned {
                     handle.publish();
                 }
@@ -1831,7 +1825,8 @@ async fn with_locked_container<T, E: ObservabilityFailure>(
                 };
 
                 let op = op.take().expect("container operation called once");
-                let cancel_watcher = spawn_cancel_watcher(state, session_id, &handle);
+                let cancel_watcher =
+                    RequestCancellation::for_session(state, session_id).spawn_watcher(&handle);
                 let mut result = op(&mut container, &handle, spawned);
                 cancel_watcher.stop();
                 if result.is_err()
@@ -1839,10 +1834,7 @@ async fn with_locked_container<T, E: ObservabilityFailure>(
                         .as_ref()
                         .is_some_and(BackgroundExecution::was_preempted)
                 {
-                    result = Err(map_failed(
-                        "container returned error request_cancelled: background request was preempted by interactive request"
-                            .to_string(),
-                    ));
+                    result = Err(map_failed(request_execution::background_preempted_reason()));
                 }
                 match &result {
                     Ok(_) => observability::log_inference_request_succeeded(
@@ -1881,74 +1873,6 @@ async fn with_locked_container<T, E: ObservabilityFailure>(
     }
 }
 
-struct CancelWatcher {
-    stop: Arc<(StdMutex<bool>, Condvar)>,
-    thread: Option<thread::JoinHandle<()>>,
-}
-
-impl CancelWatcher {
-    fn stop(mut self) {
-        notify_cancel_watcher_stop(&self.stop);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
-}
-
-impl Drop for CancelWatcher {
-    fn drop(&mut self) {
-        notify_cancel_watcher_stop(&self.stop);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
-}
-
-fn spawn_cancel_watcher(
-    state: &SharedState,
-    session_id: &str,
-    handle: &ContainerHandle,
-) -> CancelWatcher {
-    let state = state.clone();
-    let session_id = session_id.to_string();
-    let handle = handle.clone();
-    let stop = Arc::new((StdMutex::new(false), Condvar::new()));
-    let thread_stop = stop.clone();
-    let thread = thread::spawn(move || {
-        loop {
-            if state.is_session_cancelled(&session_id) {
-                handle.terminate();
-                break;
-            }
-            let (lock, wake) = &*thread_stop;
-            let Ok(stopped) = lock.lock() else {
-                break;
-            };
-            let Ok((stopped, _)) =
-                wake.wait_timeout_while(stopped, Duration::from_millis(20), |stopped| !*stopped)
-            else {
-                break;
-            };
-            if *stopped {
-                break;
-            }
-        }
-    });
-
-    CancelWatcher {
-        stop,
-        thread: Some(thread),
-    }
-}
-
-fn notify_cancel_watcher_stop(stop: &Arc<(StdMutex<bool>, Condvar)>) {
-    let (lock, wake) = &**stop;
-    if let Ok(mut stopped) = lock.lock() {
-        *stopped = true;
-        wake.notify_one();
-    }
-}
-
 fn is_startup_finalizing_retry(reason: &str) -> bool {
     reason.starts_with("container startup is being finalized for profile ")
         && reason.ends_with("; retry request")
@@ -1982,7 +1906,7 @@ async fn refresh_resolved_session_runtime(
 
 fn resolve_session_wait_error(error: ResolveSessionError) -> String {
     match error {
-        ResolveSessionError::SessionNotFound(_) => request_cancelled_reason(),
+        ResolveSessionError::SessionNotFound(_) => request_execution::request_cancelled_reason(),
         ResolveSessionError::ModelUnavailable(reason)
         | ResolveSessionError::InvalidInput(reason) => reason,
     }
@@ -2024,10 +1948,7 @@ fn ensure_background_start_still_allowed(
     if execution_mode == RequestExecutionMode::Background
         && !state.background_execution_can_start(&resolved.profile_id)
     {
-        return Err(
-            "container returned error request_cancelled: background request was preempted by interactive request"
-                .to_string(),
-        );
+        return Err(request_execution::background_preempted_reason());
     }
     Ok(())
 }
@@ -2053,7 +1974,7 @@ async fn ensure_resolved_session_active(
     session_id: &str,
     resolved: &ResolvedSessionRuntime,
 ) -> Result<(), String> {
-    ensure_session_not_cancelled(state, session_id)?;
+    RequestCancellation::for_session(state, session_id).ensure_not_cancelled()?;
     let guard = state.0.lock().await;
     match guard.sessions.get(session_id) {
         Some(session) if session.profile_id == resolved.profile_id => {
@@ -2071,52 +1992,13 @@ async fn ensure_resolved_session_active(
                 )
             }
         }
-        _ => Err(request_cancelled_reason()),
+        _ => Err(request_execution::request_cancelled_reason()),
     }
 }
 
 async fn profile_is_missing(state: &SharedState, profile_id: &str) -> bool {
     let guard = state.0.lock().await;
     guard.profiles.get(profile_id).is_none()
-}
-
-fn ensure_session_not_cancelled(state: &SharedState, session_id: &str) -> Result<(), String> {
-    if state.is_session_cancelled(session_id) {
-        Err(request_cancelled_reason())
-    } else {
-        Ok(())
-    }
-}
-
-fn ensure_session_not_cancelled_or_terminate_spawned(
-    state: &SharedState,
-    session_id: &str,
-    handle: &ContainerHandle,
-    spawned: bool,
-) -> Result<(), String> {
-    if let Err(reason) = ensure_session_not_cancelled(state, session_id) {
-        if spawned {
-            handle.terminate();
-        }
-        Err(reason)
-    } else {
-        Ok(())
-    }
-}
-
-async fn kill_profile_if_session_active(state: &SharedState, profile_id: &str, session_id: &str) {
-    let handles = state.terminate_active_container_handles(profile_id, session_id);
-    if handles.is_empty() {
-        return;
-    }
-    let mut containers = state.2.lock().await;
-    for handle in handles {
-        containers.kill_handle(profile_id, &handle);
-    }
-}
-
-fn request_cancelled_reason() -> String {
-    "container returned error request_cancelled: session was closed".to_string()
 }
 
 trait TextStreamCall {
@@ -2161,21 +2043,55 @@ fn reply_generation_failure(
     call: &mut dyn VarlinkCallError,
     reason: String,
 ) -> varlink::Result<()> {
-    match observability::runtime_error_code(&reason) {
-        Some("context_window_exceeded") => call.reply_context_window_exceeded(reason),
-        Some("unsupported_language") => call.reply_unsupported_language(reason),
-        Some("safety_refusal") => call.reply_safety_refusal(reason),
-        Some("request_cancelled") => call.reply_request_cancelled(reason),
-        Some("invalid_input") => call.reply_invalid_input(reason),
-        _ => call.reply_generation_failed(reason),
+    match generation_failure_reply(&reason) {
+        FailureReply::ContextWindowExceeded => call.reply_context_window_exceeded(reason),
+        FailureReply::UnsupportedLanguage => call.reply_unsupported_language(reason),
+        FailureReply::SafetyRefusal => call.reply_safety_refusal(reason),
+        FailureReply::RequestCancelled => call.reply_request_cancelled(reason),
+        FailureReply::InvalidInput => call.reply_invalid_input(reason),
+        FailureReply::GenerationFailed => call.reply_generation_failed(reason),
     }
 }
 
 fn reply_guided_failure(call: &mut dyn VarlinkCallError, reason: String) -> varlink::Result<()> {
-    match observability::runtime_error_code(&reason) {
-        Some("context_window_exceeded") => call.reply_context_window_exceeded(reason),
-        Some("request_cancelled") => call.reply_request_cancelled(reason),
+    match guided_failure_reply(&reason) {
+        FailureReply::ContextWindowExceeded => call.reply_context_window_exceeded(reason),
+        FailureReply::RequestCancelled => call.reply_request_cancelled(reason),
         _ => call.reply_guided_generation_failed(reason),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailureReply {
+    ContextWindowExceeded,
+    UnsupportedLanguage,
+    SafetyRefusal,
+    RequestCancelled,
+    InvalidInput,
+    GenerationFailed,
+}
+
+fn generation_failure_reply(reason: &str) -> FailureReply {
+    if request_execution::is_request_cancelled_failure(reason) {
+        return FailureReply::RequestCancelled;
+    }
+    match observability::runtime_error_code(reason) {
+        Some("context_window_exceeded") => FailureReply::ContextWindowExceeded,
+        Some("unsupported_language") => FailureReply::UnsupportedLanguage,
+        Some("safety_refusal") => FailureReply::SafetyRefusal,
+        Some("invalid_input") => FailureReply::InvalidInput,
+        _ => FailureReply::GenerationFailed,
+    }
+}
+
+fn guided_failure_reply(reason: &str) -> FailureReply {
+    if request_execution::is_request_cancelled_failure(reason) {
+        return FailureReply::RequestCancelled;
+    }
+    match observability::runtime_error_code(reason) {
+        Some("context_window_exceeded") => FailureReply::ContextWindowExceeded,
+        Some("request_cancelled") => FailureReply::RequestCancelled,
+        _ => FailureReply::GenerationFailed,
     }
 }
 
@@ -2221,13 +2137,14 @@ async fn predict_next_completions(
                     execution_mode.as_str(),
                 )
                 .map_err(|e| GenerationError::Failed(e.to_string()));
-            if state.is_session_cancelled(&session_id) {
-                return Err(GenerationError::Failed(request_cancelled_reason()));
+            if RequestCancellation::for_session(state, &session_id).is_cancelled() {
+                return Err(GenerationError::Failed(
+                    request_execution::request_cancelled_reason(),
+                ));
             }
             if !state.is_current_predict_next(&session_id, generation) {
                 return Err(GenerationError::Failed(
-                    "container returned error request_cancelled: superseded by newer StreamPredictNext request"
-                        .to_string(),
+                    request_execution::predict_next_superseded_reason(),
                 ));
             }
             result
@@ -2297,7 +2214,9 @@ async fn stream_guided_snapshots(
                 tools,
                 Vec::new(),
                 |snapshot, tool_calls, done| {
-                    if cancelled || state.is_session_cancelled(&session_id) {
+                    if cancelled
+                        || RequestCancellation::for_session(state, &session_id).is_cancelled()
+                    {
                         cancelled = true;
                         return;
                     }
@@ -2338,11 +2257,13 @@ async fn stream_guided_snapshots(
             if let Some(e) = reply_error {
                 return Err(GenerationError::Reply(e));
             }
-            if cancelled || state.is_session_cancelled(&session_id) {
+            if cancelled || RequestCancellation::for_session(state, &session_id).is_cancelled() {
                 if wants_more {
                     call.set_continues(false);
                 }
-                return Err(GenerationError::Failed(request_cancelled_reason()));
+                return Err(GenerationError::Failed(
+                    request_execution::request_cancelled_reason(),
+                ));
             }
             if let Err(e) = result {
                 if wants_more {
@@ -2424,7 +2345,9 @@ async fn stream_guided_tool_results(
                 tools,
                 tool_results,
                 |snapshot, tool_calls, done| {
-                    if cancelled || state.is_session_cancelled(&session_id) {
+                    if cancelled
+                        || RequestCancellation::for_session(state, &session_id).is_cancelled()
+                    {
                         cancelled = true;
                         return;
                     }
@@ -2465,11 +2388,13 @@ async fn stream_guided_tool_results(
             if let Some(e) = reply_error {
                 return Err(GenerationError::Reply(e));
             }
-            if cancelled || state.is_session_cancelled(&session_id) {
+            if cancelled || RequestCancellation::for_session(state, &session_id).is_cancelled() {
                 if wants_more {
                     call.set_continues(false);
                 }
-                return Err(GenerationError::Failed(request_cancelled_reason()));
+                return Err(GenerationError::Failed(
+                    request_execution::request_cancelled_reason(),
+                ));
             }
             if let Err(e) = result {
                 if wants_more {
@@ -2789,6 +2714,34 @@ mod tests {
         assert_eq!(
             validate_token_options(128, 0.7, "background"),
             Ok((128, RequestExecutionMode::Background))
+        );
+    }
+
+    #[test]
+    fn generation_failure_reply_maps_request_cancelled() {
+        assert_eq!(
+            generation_failure_reply(&request_execution::request_cancelled_reason()),
+            FailureReply::RequestCancelled
+        );
+        assert_eq!(
+            generation_failure_reply(&request_execution::background_preempted_reason()),
+            FailureReply::RequestCancelled
+        );
+        assert_eq!(
+            generation_failure_reply(&request_execution::predict_next_superseded_reason()),
+            FailureReply::RequestCancelled
+        );
+    }
+
+    #[test]
+    fn guided_failure_reply_maps_only_request_cancelled_special_case() {
+        assert_eq!(
+            guided_failure_reply(&request_execution::request_cancelled_reason()),
+            FailureReply::RequestCancelled
+        );
+        assert_eq!(
+            guided_failure_reply("container returned error safety_refusal: no"),
+            FailureReply::GenerationFailed
         );
     }
 

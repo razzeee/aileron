@@ -1,5 +1,6 @@
 /// Varlink handler for `aileron.Sessions`.
 use crate::observability;
+use crate::request_execution;
 use crate::state::SharedState;
 #[allow(unused_imports)]
 // VarlinkCallError is a supertrait; its methods reach us via Call_* dyn objects
@@ -42,13 +43,18 @@ impl VarlinkInterface for SessionsHandler {
                         profile_id,
                         unused_profile_id,
                     } => {
-                        self.state.cancel_session_requests(&session_id);
+                        request_execution::mark_session_closed(&self.state, &session_id);
                         (app_id, use_case, profile_id, unused_profile_id)
                     }
                 }
             };
             self.state.clear_predict_next(&session_id);
-            kill_profile_if_session_active(&self.state, &profile_id, &session_id).await;
+            request_execution::terminate_active_container_handles_for_session(
+                &self.state,
+                &profile_id,
+                &session_id,
+            )
+            .await;
             if let Some(unused_profile_id) = unused_profile_id {
                 let mut containers = self.state.2.lock().await;
                 containers.kill(&unused_profile_id);
@@ -103,17 +109,6 @@ fn kill_session(guard: &mut crate::state::Inner, session_id: &str) -> KillSessio
         use_case: session.use_case,
         profile_id: session.profile_id.clone(),
         unused_profile_id: (!profile_still_used).then_some(session.profile_id),
-    }
-}
-
-async fn kill_profile_if_session_active(state: &SharedState, profile_id: &str, session_id: &str) {
-    let handles = state.terminate_active_container_handles(profile_id, session_id);
-    if handles.is_empty() {
-        return;
-    }
-    let mut containers = state.2.lock().await;
-    for handle in handles {
-        containers.kill_handle(profile_id, &handle);
     }
 }
 

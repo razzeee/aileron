@@ -90,6 +90,8 @@ Use guided tool calls when the model should ask the app for app-local data or ac
 
 The daemon and runtime never execute tools. Tool execution stays app-mediated so sandbox policy, user confirmation, and app-specific authorization remain under the app's control.
 
+See `docs/tool-calling.md` for the approval boundary and the demo confirmation pattern.
+
 ## Conversation History
 
 Aileron sessions do not retain conversation transcripts. Apps own chat history, trim it according to their UI and privacy policy, and include relevant context explicitly in prompts or tool results.
