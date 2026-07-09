@@ -92,6 +92,7 @@ mod tests {
 
         assert_eq!(profile.spdx_license, None);
         assert!(profile.llmfit_provider.is_none());
+        assert!(profile.supported_languages.is_none());
         assert!(profile.score_components.is_none());
     }
 
@@ -113,6 +114,7 @@ mod tests {
             "context_length": 0,
             "release_date": "",
             "capabilities": [],
+            "supported_languages": ["en"],
             "runtime_id": "llm-vision-whisper",
             "tier": "balanced",
             "disk_size_gb": 1.0,
@@ -153,5 +155,6 @@ mod tests {
             profile.spdx_license.as_deref(),
             include_license.then_some(license.as_str())
         );
+        assert_eq!(profile.supported_languages, Some(vec!["en".to_string()]));
     }
 }

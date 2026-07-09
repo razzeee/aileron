@@ -68,6 +68,7 @@ type CatalogProfileInfo (
     context_length: ?int,
     release_date: ?string,
     capabilities: ?[]string,
+    supported_languages: ?[]string,
     spdx_license: ?string,
     runtime_id: string,
     tier: string,

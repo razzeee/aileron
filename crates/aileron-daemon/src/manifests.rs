@@ -719,6 +719,7 @@ fn model_format_label(format: ModelFormat) -> &'static str {
         ModelFormat::Autoround => "autoround",
         ModelFormat::Mlx => "mlx",
         ModelFormat::Safetensors => "safetensors",
+        ModelFormat::Onnx => "onnx",
     }
 }
 
@@ -1519,7 +1520,11 @@ mod tests {
             let manifest = read_model_manifest_path(&path)
                 .expect("profile library model manifest should be valid");
             assert!(!manifest.llmfit_model_id.is_empty());
-            assert!(crate::llmfit_metadata::find(&manifest.llmfit_model_id).is_some());
+            assert!(
+                crate::llmfit_metadata::find(&manifest.llmfit_model_id).is_some(),
+                "{} is missing from llmfit metadata",
+                manifest.llmfit_model_id
+            );
             assert!(manifest_disk_size_gb(&manifest) > 0.0);
             tiers.insert(manifest.tier.clone());
             use_cases.extend(manifest.use_cases.iter().cloned());

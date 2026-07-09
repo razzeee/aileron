@@ -268,6 +268,7 @@ struct CatalogProfileDetails {
     context_length: i64,
     release_date: String,
     capabilities: Vec<String>,
+    supported_languages: Vec<String>,
     spdx_license: String,
     runtime_id: String,
     tier: String,
@@ -495,6 +496,7 @@ fn render_library_list(
             context_length: profile.context_length.unwrap_or_default(),
             release_date: profile.release_date.unwrap_or_default(),
             capabilities: profile.capabilities.unwrap_or_default(),
+            supported_languages: profile.supported_languages.unwrap_or_default(),
             spdx_license: profile.spdx_license.unwrap_or_default(),
             runtime_id: profile.runtime_id,
             tier: profile.tier,
@@ -569,6 +571,9 @@ fn show_catalog_profile_details(window: Option<&gtk4::Window>, details: &Catalog
             "Capabilities",
             &capability_labels(&details.capabilities),
         );
+    }
+    if !details.supported_languages.is_empty() {
+        add_detail_row(&list, "Languages", &details.supported_languages.join(", "));
     }
     add_detail_row(&list, "Runtime", &details.runtime_id);
     add_detail_row(&list, "Tier", &details.tier);
@@ -780,6 +785,7 @@ fn capability_label(capability: &str) -> &str {
         "vision" => "Vision",
         "tool_use" => "Tool use",
         "audio" => "Audio",
+        "tts" => "Text-to-speech",
         _ => capability,
     }
 }
@@ -2663,6 +2669,7 @@ mod tests {
             context_length: Some(0),
             release_date: Some(String::new()),
             capabilities: Some(Vec::new()),
+            supported_languages: Some(Vec::new()),
             spdx_license: Some(String::new()),
             runtime_id: "llm-vision-whisper".to_string(),
             tier: tier.to_string(),

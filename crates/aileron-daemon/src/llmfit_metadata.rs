@@ -13,10 +13,16 @@ static DATABASE: OnceLock<ModelDatabase> = OnceLock::new();
 
 pub fn find(model_id: &str) -> Option<&'static LlmModel> {
     let database = DATABASE.get_or_init(ModelDatabase::embedded);
-    database
-        .get_all_models()
+    let models = database.get_all_models();
+    models
         .iter()
         .find(|model| model.name == model_id)
+        .or_else(|| {
+            let model_slug = canonical_slug(model_id);
+            models
+                .iter()
+                .find(|model| canonical_slug(&model.name) == model_slug)
+        })
 }
 
 pub fn all() -> &'static [LlmModel] {
@@ -66,6 +72,14 @@ pub fn apply_llama_runtime_options(
     }
 }
 
+fn canonical_slug(name: &str) -> String {
+    name.split('/')
+        .next_back()
+        .unwrap_or(name)
+        .to_ascii_lowercase()
+        .replace(['-', '_', '.'], "")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -76,5 +90,12 @@ mod tests {
 
         assert_eq!(model.min_ram_gb, 1.0);
         assert_eq!(model.recommended_ram_gb, 2.0);
+    }
+
+    #[test]
+    fn finds_metadata_by_canonical_slug() {
+        let model = find("google/gemma-4-E4B-it").expect("deduplicated metadata exists");
+
+        assert_eq!(canonical_slug(&model.name), "gemma4e4bit");
     }
 }

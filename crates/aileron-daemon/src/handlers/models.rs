@@ -367,6 +367,7 @@ impl VarlinkInterface for ModelsHandler {
                     context_length: metadata.map(|model| i64::from(model.context_length)),
                     release_date: metadata.and_then(|model| model.release_date.clone()),
                     capabilities: metadata.map(llmfit_capability_ids),
+                    supported_languages: metadata.map(|model| model.languages.clone()),
                     spdx_license: Some(
                         metadata
                             .and_then(|model| model.license.clone())
@@ -626,6 +627,7 @@ fn llmfit_inference_runtime_id(fit: &llmfit_core::ModelFit) -> String {
         llmfit_core::InferenceRuntime::LlamaCpp => "llama_cpp",
         llmfit_core::InferenceRuntime::Mlx => "mlx",
         llmfit_core::InferenceRuntime::Vllm => "vllm",
+        llmfit_core::InferenceRuntime::Unsupported => "unsupported",
     }
     .to_string()
 }
@@ -637,6 +639,7 @@ fn llmfit_capability_ids(model: &llmfit_core::LlmModel) -> Vec<String> {
             llmfit_core::Capability::Vision => "vision".to_string(),
             llmfit_core::Capability::ToolUse => "tool_use".to_string(),
             llmfit_core::Capability::Audio => "audio".to_string(),
+            llmfit_core::Capability::Tts => "tts".to_string(),
         })
         .collect()
 }
