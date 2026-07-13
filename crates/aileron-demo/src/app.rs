@@ -1474,10 +1474,11 @@ fn stream_embedding(session_handle: &OwnedObjectPath, text: &str) -> anyhow::Res
     std::thread::spawn(move || {
         let result = (|| -> anyhow::Result<()> {
             for msg in &mut embedding_iter {
-                let (_sig_request, sig_session, embedding, done): (
+                let (_sig_request, sig_session, embedding, _embedding_pipeline_id, done): (
                     OwnedObjectPath,
                     OwnedObjectPath,
                     Vec<f64>,
+                    String,
                     bool,
                 ) = msg.body().deserialize()?;
                 if sig_session.as_str() != embedding_session_handle.as_str() {

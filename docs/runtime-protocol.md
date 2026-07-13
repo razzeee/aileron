@@ -214,10 +214,10 @@ Request:
 Response (single event):
 
 ```json
-{"id":"request-id","embedding":[0.012,-0.044,0.031],"done":true}
+{"id":"request-id","embedding":[0.012,-0.044,0.031],"embedding_pipeline_id":"profile-id","done":true}
 ```
 
-`embedding` is a flat array of floats. Documents and queries embedded by the same profile share a vector space.
+`embedding` is a flat array of floats. `embedding_pipeline_id` is the compatibility boundary for vector search; apps that persist vectors should store it and only compare vectors whose pipeline ids match. The pipeline id is derived from the assigned profile's model, runtime, artifact, runtime image, and runtime option metadata.
 
 ## Audio Transcription And Translation
 

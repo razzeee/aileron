@@ -746,11 +746,12 @@ impl LanguagePortalBackend {
                 .map_err(|e| map_request_error(&self.state, request_id, e))?;
 
             let mut last_embedding = Vec::new();
+            let mut embedding_pipeline_id = String::new();
             for reply in iter {
                 ensure_request_active(&self.state, request_id)?;
-                last_embedding = reply
-                    .map_err(|e| map_request_error(&self.state, request_id, e))?
-                    .embedding;
+                let reply = reply.map_err(|e| map_request_error(&self.state, request_id, e))?;
+                last_embedding = reply.embedding;
+                embedding_pipeline_id = reply.embedding_pipeline_id;
             }
 
             ensure_request_active(&self.state, request_id)?;
@@ -759,6 +760,7 @@ impl LanguagePortalBackend {
                 &request_handle,
                 &session_handle,
                 &last_embedding,
+                &embedding_pipeline_id,
                 true,
             )
             .await
@@ -776,6 +778,7 @@ impl LanguagePortalBackend {
         request_handle: &OwnedObjectPath,
         session_handle: &OwnedObjectPath,
         embedding: &[f64],
+        embedding_pipeline_id: &str,
         done: bool,
     ) -> zbus::Result<()>;
 }

@@ -91,7 +91,8 @@ method StreamSubmitToolResultsGuided(session_id: string, prompt: string, media_p
 
 # Stream embedding vectors for text. Session must have been created with use_case: language.embed
 # embedding: the embedding vector for the supplied text
-method StreamEmbed(session_id: string, text: string, options: EmbedOptions) -> (embedding: []float)
+# embedding_pipeline_id: stable compatibility id; only compare vectors with the same value
+method StreamEmbed(session_id: string, text: string, options: EmbedOptions) -> (embedding: []float, embedding_pipeline_id: string)
 
 # Stream transcript or translation segments. Session must have been created with
 # use_case: speech.transcribe (verbatim, source language) or speech.translate (translated to English).

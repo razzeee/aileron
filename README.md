@@ -398,7 +398,7 @@ method Prewarm(session_id: string) -> ()
 method StreamResponse(session_id: string, input_json: string, media_paths: []string, options: ResponseOptions) -> (token: string)
 method StreamRespondGuided(session_id: string, prompt: string, media_paths: []string, fields: []GuidedField, tools: []ToolDefinition, options: GuidedOptions) -> (snapshot_json: string, tool_calls: []ToolCall)
 method StreamSubmitToolResultsGuided(session_id: string, prompt: string, media_paths: []string, results: []ToolResult, fields: []GuidedField, tools: []ToolDefinition, options: GuidedOptions) -> (snapshot_json: string, tool_calls: []ToolCall)
-method StreamEmbed(session_id: string, text: string, options: EmbedOptions) -> (embedding: []float)
+method StreamEmbed(session_id: string, text: string, options: EmbedOptions) -> (embedding: []float, embedding_pipeline_id: string)
 method StreamTranscribe(session_id: string, audio_path: string, options: SpeechOptions) -> (token: string)
 method StreamDescribe(session_id: string, image_path: string, instructions: string, options: VisionOptions) -> (token: string)
 method StreamOcr(session_id: string, image_path: string, instructions: string, options: VisionOptions) -> (token: string)
@@ -406,7 +406,7 @@ method StreamSegment(session_id: string, image_path: string, instructions: strin
 method EndSession(session_id: string) -> ()
 ```
 
-`CreateSession` returns the backend session id and selected profile id; the portal frontend exposes only an opaque public session handle to apps. Missing app permissions fail with `PermissionPromptRequired` so the portal backend can prompt once and persist the decision; explicit denials fail with `PermissionDenied` and are not re-prompted. `instructions` are stored on the session and forwarded to text containers as the container `system` prompt. `StreamTranscribe` reads raw 16 kHz mono f32le PCM from `audio_path` and streams a verbatim transcript for `speech.transcribe` sessions or an English translation for `speech.translate` sessions. Vision methods read PNG or JPEG bytes from `image_path` and pass non-empty per-image `instructions` to the container as the request `prompt`. `StreamEmbed` streams one embedding vector event for `text`. `VisionSegment` coordinates are normalized `0.0..1.0` rectangles relative to image dimensions.
+`CreateSession` returns the backend session id and selected profile id; the portal frontend exposes only an opaque public session handle to apps. Missing app permissions fail with `PermissionPromptRequired` so the portal backend can prompt once and persist the decision; explicit denials fail with `PermissionDenied` and are not re-prompted. `instructions` are stored on the session and forwarded to text containers as the container `system` prompt. `StreamTranscribe` reads raw 16 kHz mono f32le PCM from `audio_path` and streams a verbatim transcript for `speech.transcribe` sessions or an English translation for `speech.translate` sessions. Vision methods read PNG or JPEG bytes from `image_path` and pass non-empty per-image `instructions` to the container as the request `prompt`. `StreamEmbed` streams one embedding vector event for `text` with `embedding_pipeline_id`; apps should persist it with stored vectors and only compare vectors whose pipeline ids match. `VisionSegment` coordinates are normalized `0.0..1.0` rectangles relative to image dimensions.
 
 Token-generating option structs require `maximum_response_tokens` to be greater than zero and fit in `u32`; `temperature` must be finite and non-negative. `ResponseOptions.source_language_hint` and `target_language_hint` are optional strings for `language.translate`; pass empty strings when unspecified. The daemon forwards `maximum_response_tokens` to containers as `max_tokens` and folds translation hints into the session instructions for `language.translate`.
 
@@ -524,7 +524,7 @@ Audio and image payloads are passed to the public portal as readable, sealable m
 | `TokenReceived` | `request_handle: o, session_handle: o, token: s, done: b` | Each token during `StreamResponse` on `Language` |
 | `GuidedSnapshotReceived` | `request_handle: o, session_handle: o, snapshot_json: s, done: b` | Each validated JSON snapshot during `StreamRespondGuided` on `Language` |
 | `GuidedToolCallsReceived` | `request_handle: o, session_handle: o, tool_calls: a(sss), done: b` | Tool calls requested during `StreamRespondGuided` or `StreamSubmitToolResultsGuided` on `Language` |
-| `EmbeddingReceived` | `request_handle: o, session_handle: o, embedding: ad, done: b` | Embedding vector during `StreamEmbed` on `Language` |
+| `EmbeddingReceived` | `request_handle: o, session_handle: o, embedding: ad, embedding_pipeline_id: s, done: b` | Embedding vector and compatibility metadata during `StreamEmbed` on `Language` |
 | `TranscriptionReceived` | `request_handle: o, session_handle: o, text: s, done: b` | Each segment during `StreamTranscribe` on `Speech` |
 | `VisionTextReceived` | `request_handle: o, session_handle: o, text: s, done: b` | Each text token during `StreamDescribe` or `StreamOcr` on `Vision` |
 | `VisionSegmentsReceived` | `request_handle: o, session_handle: o, segments: a(sddddd), done: b` | Segmentation result during `StreamSegment` on `Vision` |

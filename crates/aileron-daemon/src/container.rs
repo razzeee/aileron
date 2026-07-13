@@ -183,6 +183,10 @@ pub struct GuidedToolResponse {
 }
 
 impl Container {
+    pub fn runtime_options(&self) -> &HashMap<String, String> {
+        &self.runtime_options
+    }
+
     pub fn matches_any_runtime(
         &self,
         runtime_id: &str,

@@ -1,5 +1,6 @@
 /// Varlink handler for `aileron.Inference`.
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::PathBuf;
@@ -12,7 +13,7 @@ use uuid::Uuid;
 
 use crate::container::{Container, ContainerHandle, InputMessage, InputPart};
 use crate::observability::{self, ObservabilityFailure};
-use crate::profiles::RuntimeCandidate;
+use crate::profiles::{ArtifactHash, RuntimeCandidate};
 use crate::request_execution::{self, ActiveContainerRequest, RequestCancellation};
 use crate::state::SharedState;
 #[allow(unused_imports)]
@@ -35,6 +36,9 @@ type ProfileRuntime = (
     String,
     u64,
     String,
+    String,
+    Vec<ArtifactHash>,
+    String,
     Vec<RuntimeCandidate>,
     PathBuf,
     HashMap<String, String>,
@@ -48,11 +52,19 @@ struct ResolvedSessionRuntime {
     use_case: String,
     profile_id: String,
     profile_epoch: u64,
+    model_id: String,
+    installed_at: String,
+    artifact_hashes: Vec<ArtifactHash>,
     runtime_id: String,
     image_refs: Vec<RuntimeCandidate>,
     artifact_path: PathBuf,
     runtime_options: HashMap<String, String>,
     instructions: String,
+}
+
+struct EmbeddingResult {
+    embedding: Vec<f64>,
+    pipeline_id: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -422,7 +434,7 @@ impl VarlinkInterface for InferenceHandler {
     ) -> varlink::Result<()> {
         self.rt.block_on(async {
             match embedding_vector(&self.state, session_id, text, options).await {
-                Ok(embedding) => call.reply(embedding),
+                Ok(result) => call.reply(result.embedding, result.pipeline_id),
                 Err(GenerationError::SessionNotFound(id)) => call.reply_session_not_found(id),
                 Err(GenerationError::ModelUnavailable(reason)) => {
                     call.reply_model_unavailable(reason)
@@ -933,7 +945,7 @@ async fn embedding_vector(
     session_id: String,
     text: String,
     options: EmbedOptions,
-) -> Result<Vec<f64>, GenerationError> {
+) -> Result<EmbeddingResult, GenerationError> {
     let execution_mode =
         parse_execution_mode(&options.execution_mode).map_err(GenerationError::InvalidInput)?;
     let resolved = resolve_session_runtime(state, &session_id, |use_case| {
@@ -941,7 +953,7 @@ async fn embedding_vector(
     })
     .await
     .map_err(GenerationError::from)?;
-    with_locked_container(
+    let (embedding, pipeline_id): (Vec<f64>, String) = with_locked_container(
         "StreamEmbed",
         state,
         &session_id,
@@ -949,9 +961,10 @@ async fn embedding_vector(
         execution_mode,
         GenerationError::Failed,
         |container, handle, spawned| {
+            let pipeline_id = embedding_pipeline_id(&resolved, container);
             let result = container
                 .embed(&text, execution_mode.as_str())
-                .map(|embedding| embedding.into_iter().map(f64::from).collect())
+                .map(|embedding| (embedding.into_iter().map(f64::from).collect(), pipeline_id))
                 .map_err(|e| GenerationError::Failed(e.to_string()));
             RequestCancellation::for_session(state, &session_id)
                 .ensure_not_cancelled_or_terminate_spawned(handle, spawned)
@@ -959,7 +972,11 @@ async fn embedding_vector(
             result
         },
     )
-    .await
+    .await?;
+    Ok(EmbeddingResult {
+        embedding,
+        pipeline_id,
+    })
 }
 
 fn normalize_stream_input(
@@ -1501,14 +1518,26 @@ async fn resolve_session_runtime(
     let resolved = match guard.sessions.get(session_id) {
         Some(session) => {
             validate_use_case(&session.use_case).map_err(ResolveSessionError::InvalidInput)?;
-            let (profile_id, profile_epoch, runtime_id, image_refs, artifact_path, runtime_options) =
-                profile_runtime(&guard, &session.profile_id)
-                    .map_err(ResolveSessionError::ModelUnavailable)?;
+            let (
+                profile_id,
+                profile_epoch,
+                model_id,
+                installed_at,
+                artifact_hashes,
+                runtime_id,
+                image_refs,
+                artifact_path,
+                runtime_options,
+            ) = profile_runtime(&guard, &session.profile_id)
+                .map_err(ResolveSessionError::ModelUnavailable)?;
             ResolvedSessionRuntime {
                 app_id: session.app_id.clone(),
                 use_case: session.use_case.clone(),
                 profile_id,
                 profile_epoch,
+                model_id,
+                installed_at,
+                artifact_hashes,
                 runtime_id,
                 image_refs,
                 artifact_path,
@@ -2419,11 +2448,68 @@ fn profile_runtime(
             .get(profile_id)
             .copied()
             .unwrap_or_default(),
+        profile.model_id.clone(),
+        profile.installed_at.clone(),
+        profile.artifact_hashes.clone(),
         profile.runtime_id.clone(),
         candidates,
         profile.artifact_path.clone(),
         runtime_options,
     ))
+}
+
+fn embedding_pipeline_id(resolved: &ResolvedSessionRuntime, container: &Container) -> String {
+    let mut hasher = Sha256::new();
+    update_hash_field(&mut hasher, "profile_id", &resolved.profile_id);
+    update_hash_field(&mut hasher, "model_id", &resolved.model_id);
+    update_hash_field(&mut hasher, "runtime_id", &resolved.runtime_id);
+    update_hash_field(
+        &mut hasher,
+        "artifact_path",
+        &resolved.artifact_path.display().to_string(),
+    );
+    update_hash_field(&mut hasher, "installed_at", &resolved.installed_at);
+
+    let mut artifact_hashes = resolved.artifact_hashes.clone();
+    artifact_hashes
+        .sort_by(|a, b| (&a.role, &a.filename, &a.sha256).cmp(&(&b.role, &b.filename, &b.sha256)));
+    for artifact in artifact_hashes {
+        update_hash_field(&mut hasher, "artifact_role", &artifact.role);
+        update_hash_field(&mut hasher, "artifact_filename", &artifact.filename);
+        update_hash_field(&mut hasher, "artifact_sha256", &artifact.sha256);
+    }
+
+    update_hash_field(&mut hasher, "runtime_variant", container.variant.as_tag());
+    update_hash_field(&mut hasher, "runtime_image", &container.image_ref);
+
+    let mut runtime_options = container.runtime_options().iter().collect::<Vec<_>>();
+    runtime_options.sort_by(|(a, _), (b, _)| a.cmp(b));
+    for (key, value) in runtime_options {
+        update_hash_field(&mut hasher, key, value);
+    }
+
+    format!(
+        "{}:{}",
+        resolved.profile_id,
+        hex_lower(hasher.finalize().as_slice())
+    )
+}
+
+fn update_hash_field(hasher: &mut Sha256, name: &str, value: &str) {
+    hasher.update(name.as_bytes());
+    hasher.update([0]);
+    hasher.update(value.as_bytes());
+    hasher.update([0xff]);
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
 }
 
 fn profile_runtime_options(profile: &crate::profiles::Profile) -> HashMap<String, String> {

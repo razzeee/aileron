@@ -93,7 +93,7 @@ Aileron sessions do not retain conversation transcripts. Apps own chat history, 
 
 ## Embeddings
 
-Use `language.embed` with `StreamEmbed` to turn text into a fixed-length vector for semantic search, clustering, deduplication, or retrieval-augmented generation. `StreamEmbed` emits one embedding event as a list of floats. Embed documents and queries with the same assigned profile so the vectors share a space.
+Use `language.embed` with `StreamEmbed` to turn text into a fixed-length vector for semantic search, clustering, deduplication, or retrieval-augmented generation. `StreamEmbed` emits one embedding event with the vector and `embedding_pipeline_id`. Store `embedding_pipeline_id` with every persisted vector, and only compare documents and queries whose pipeline ids match. The pipeline id is derived from the assigned profile's model, runtime, artifact, runtime image, and runtime option metadata.
 
 ## Speech And Vision
 
