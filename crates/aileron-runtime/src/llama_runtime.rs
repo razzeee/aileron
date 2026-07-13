@@ -348,41 +348,6 @@ pub fn embedding(model: &LlamaModel, ctx: &mut LlamaContext<'_>, text: &str) -> 
         .to_vec())
 }
 
-pub fn clean_inline_completion(prefix: &str, raw: &str) -> String {
-    let starts_with_boundary = raw.chars().next().is_some_and(char::is_whitespace);
-    let suffix_mode = !starts_with_boundary
-        && prefix
-            .chars()
-            .next_back()
-            .map(|ch| ch.is_alphanumeric() || ch == '_' || ch == '-')
-            .unwrap_or(false);
-    let text = if suffix_mode {
-        raw.trim().to_string()
-    } else {
-        raw.trim_start().to_string()
-    };
-
-    let mut out = String::new();
-    let mut started = false;
-    for ch in text.chars() {
-        let is_word = ch.is_alphanumeric() || matches!(ch, '_' | '-' | '\'');
-        if is_word {
-            started = true;
-            out.push(ch);
-        } else if suffix_mode && !started {
-            continue;
-        } else {
-            break;
-        }
-    }
-
-    if !out.is_empty() && !suffix_mode && !prefix.ends_with([' ', '\n', '\t']) {
-        out.insert(0, ' ');
-    }
-
-    out.chars().take(20).collect()
-}
-
 pub fn render_tool_results(prompt: &str, tool_results: &[Value]) -> String {
     if tool_results.is_empty() {
         return prompt.to_string();
@@ -398,22 +363,4 @@ pub fn render_tool_results(prompt: &str, tool_results: &[Value]) -> String {
     }
 
     format!("{prompt}\n\nTool results:\n{}", rendered.join("\n"))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn inline_completion_keeps_suffix_word_characters() {
-        assert_eq!(clean_inline_completion("hel", "lo world"), "lo");
-        assert_eq!(clean_inline_completion("runn", "ing"), "ing");
-    }
-
-    #[test]
-    fn inline_completion_adds_space_for_mid_sentence_prefix() {
-        assert_eq!(clean_inline_completion("hello,", "world!"), " world");
-        assert_eq!(clean_inline_completion("hello ", "world!"), "world");
-        assert_eq!(clean_inline_completion("hello", " world"), " world");
-    }
 }

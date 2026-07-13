@@ -16,12 +16,6 @@ type ResponseOptions (
   execution_mode: string
 )
 
-type PredictNextOptions (
-  maximum_response_tokens: int,
-  temperature: float,
-  execution_mode: string
-)
-
 type GuidedOptions (
   maximum_response_tokens: int,
   temperature: float,
@@ -87,10 +81,6 @@ method Prewarm(session_id: string) -> ()
 # Stream response tokens. Session must have been created with a language generation use_case.
 # input_json is either content-part shorthand or a role-message array. media_paths contains readable request-scoped media paths referenced by fd_index.
 method StreamResponse(session_id: string, input_json: string, media_paths: []string, options: ResponseOptions) -> (token: string)
-
-# Stream up to three short inline continuations from the raw text prefix. Session must have been created with use_case: language.complete.
-# Newer StreamPredictNext calls for the same session supersede older in-flight calls; superseded calls fail with RequestCancelled.
-method StreamPredictNext(session_id: string, prefix: string, options: PredictNextOptions) -> (completions: []string)
 
 # Stream schema-valid guided output snapshots. The final reply has continues=false.
 # prompt is plain text or content-part/role-message JSON. media_paths contains readable request-scoped media paths referenced by fd_index.

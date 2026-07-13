@@ -24,8 +24,6 @@ pub struct Request {
     #[serde(default)]
     pub max_tokens: Option<u32>,
     #[serde(default)]
-    pub choices: Option<u32>,
-    #[serde(default)]
     pub temperature: Option<f64>,
     #[serde(default)]
     pub execution_mode: Option<String>,
@@ -221,10 +219,6 @@ pub fn send_unsupported(req: &Request, done: bool) -> Result<()> {
     send(response)
 }
 
-pub fn clamp_choices(value: Option<u32>) -> usize {
-    value.unwrap_or(1).clamp(1, 3) as usize
-}
-
 pub fn stub_value_for_schema(schema: &Value) -> Value {
     match schema_type(schema) {
         Some("object") => {
@@ -372,14 +366,6 @@ mod tests {
             stub_value_for_schema(&schema),
             json!({"name": "demo", "count": 3, "ok": true})
         );
-    }
-
-    #[test]
-    fn clamp_choices_limits_runtime_choice_count() {
-        assert_eq!(clamp_choices(None), 1);
-        assert_eq!(clamp_choices(Some(0)), 1);
-        assert_eq!(clamp_choices(Some(2)), 2);
-        assert_eq!(clamp_choices(Some(99)), 3);
     }
 
     #[test]

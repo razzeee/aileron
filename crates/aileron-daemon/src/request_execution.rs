@@ -113,11 +113,6 @@ pub(crate) fn background_preempted_reason() -> String {
         .to_string()
 }
 
-pub(crate) fn predict_next_superseded_reason() -> String {
-    "container returned error request_cancelled: superseded by newer StreamPredictNext request"
-        .to_string()
-}
-
 pub(crate) fn is_request_cancelled_failure(reason: &str) -> bool {
     crate::observability::runtime_error_code(reason) == Some("request_cancelled")
 }
@@ -256,9 +251,6 @@ mod tests {
     fn request_cancelled_failures_are_classified_for_adapters() {
         assert!(is_request_cancelled_failure(&request_cancelled_reason()));
         assert!(is_request_cancelled_failure(&background_preempted_reason()));
-        assert!(is_request_cancelled_failure(
-            &predict_next_superseded_reason()
-        ));
         assert!(!is_request_cancelled_failure(
             "container returned error invalid_input: bad"
         ));

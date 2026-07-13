@@ -73,7 +73,6 @@ use crate::profiles::RuntimeCandidate;
 
 const NVIDIA_LIBRARY_DIR: &str = "/usr/local/nvidia/lib64";
 const ML_RUNTIME_ID: &str = "llm-vision-whisper";
-const PREDICTION_COMPLETION_COUNT: u32 = 3;
 const VULKAN_ICD_DIR: &str = "/usr/share/vulkan/icd.d";
 const NVIDIA_DRIVER_LIBRARIES: &[&str] = &[
     "libcuda.so.1",
@@ -401,58 +400,6 @@ impl Container {
             }
         }
         Ok(())
-    }
-
-    /// Send a raw inline prediction request and return runtime-cleaned completions.
-    pub fn predict_next(
-        &mut self,
-        prefix: &str,
-        max_tokens: u32,
-        temperature: f64,
-        execution_mode: &str,
-    ) -> Result<Vec<String>> {
-        let id = Uuid::new_v4().to_string();
-        let mut req = ContainerRequest::new(id.clone(), "predict_next");
-        req.prompt = Some(prefix.to_string());
-        req.max_tokens = Some(max_tokens);
-        req.choices = Some(PREDICTION_COMPLETION_COUNT);
-        req.temperature = Some(temperature);
-        req.execution_mode = Some(execution_mode.to_string());
-        write_request_line(&mut self.stdin, &req)?;
-        self.last_used = std::time::Instant::now();
-
-        let mut buf = String::new();
-        loop {
-            buf.clear();
-            let n = self.stdout.read_line(&mut buf)?;
-            if n == 0 {
-                bail!("container stdout closed unexpectedly");
-            }
-            let resp: ContainerResponse = serde_json::from_str(buf.trim())?;
-            if resp.id != id {
-                continue;
-            }
-            if let Some((error, reason)) = response_error(&resp) {
-                bail!("container returned error {error}: {reason}");
-            }
-            if resp.done.unwrap_or(false) {
-                return Ok(limit_completions(
-                    resp.completions
-                        .or_else(|| resp.completion.map(|c| vec![c]))
-                        .unwrap_or_default(),
-                    PREDICTION_COMPLETION_COUNT,
-                ));
-            }
-            if let Some(completions) = resp.completions {
-                return Ok(limit_completions(completions, PREDICTION_COMPLETION_COUNT));
-            }
-            if let Some(completion) = resp.completion {
-                return Ok(limit_completions(
-                    vec![completion],
-                    PREDICTION_COMPLETION_COUNT,
-                ));
-            }
-        }
     }
 
     /// Send a structured-output request.
@@ -878,14 +825,6 @@ pub fn benchmark_read_response_for_use_case(use_case: &str, input: &[u8]) -> Res
             read_text_stream_response(&mut reader, "request-1", |_| token_count += 1)?;
             Ok(token_count)
         }
-        "language.predict_next" => {
-            let resp = read_matching_response(&mut reader, "request-1")?;
-            Ok(resp
-                .completions
-                .or_else(|| resp.completion.map(|completion| vec![completion]))
-                .unwrap_or_default()
-                .len())
-        }
         "language.structured" | "language.tool" => {
             let schema = serde_json::json!({
                 "type": "object",
@@ -940,15 +879,6 @@ pub fn benchmark_write_request_for_use_case(
             req.prompt = Some("summarize this".to_string());
             req.input = Some(input.to_vec());
             req.max_tokens = Some(256);
-            req.execution_mode = Some("interactive".to_string());
-            write_request_line(&mut output, &req)?;
-        }
-        "language.predict_next" => {
-            let mut req = ContainerRequest::new("request-1".to_string(), "predict_next");
-            req.prompt = Some("The next words are".to_string());
-            req.max_tokens = Some(8);
-            req.choices = Some(PREDICTION_COMPLETION_COUNT);
-            req.temperature = Some(0.4);
             req.execution_mode = Some("interactive".to_string());
             write_request_line(&mut output, &req)?;
         }
@@ -1073,11 +1003,6 @@ fn response_error(resp: &ContainerResponse) -> Option<(String, String)> {
     }
     let reason = resp.reason.as_ref().unwrap_or(error).clone();
     Some((error.clone(), reason))
-}
-
-fn limit_completions(mut completions: Vec<String>, count: u32) -> Vec<String> {
-    completions.truncate(count as usize);
-    completions
 }
 
 #[derive(Deserialize)]
@@ -2391,8 +2316,6 @@ struct ContainerRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    choices: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     audio: Option<String>,
@@ -2424,7 +2347,6 @@ impl ContainerRequest {
             prompt: None,
             input: None,
             max_tokens: None,
-            choices: None,
             temperature: None,
             audio: None,
             task: None,
@@ -2469,10 +2391,6 @@ struct ContainerResponse {
     id: String,
     /// Present in streaming token responses.
     token: Option<String>,
-    /// Present in inline prediction responses.
-    completion: Option<String>,
-    /// Present in inline prediction responses with multiple choices.
-    completions: Option<Vec<String>>,
     /// Present in structured output responses (the full JSON string).
     result: Option<String>,
     /// Present in structured streaming responses.
@@ -3446,8 +3364,6 @@ mod tests {
         let resp = ContainerResponse {
             id: "request-1".to_string(),
             token: None,
-            completion: None,
-            completions: None,
             result: None,
             snapshot: None,
             tool_calls: None,
@@ -3472,8 +3388,6 @@ mod tests {
         let resp = ContainerResponse {
             id: "request-1".to_string(),
             token: None,
-            completion: None,
-            completions: None,
             result: Some(r#"{"name":"Ada"}"#.to_string()),
             snapshot: None,
             tool_calls: None,

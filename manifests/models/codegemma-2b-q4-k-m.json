@@ -2,7 +2,6 @@
   "llmfit_model_id": "google/codegemma-2b",
   "tier": "small",
   "use_cases": [
-    "language.complete",
     "language.extract",
     "language.analyze"
   ],

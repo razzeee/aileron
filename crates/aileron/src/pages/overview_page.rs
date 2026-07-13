@@ -11,7 +11,6 @@ const USE_CASES: &[&str] = &[
     "language.summarize",
     "language.translate",
     "language.rephrase",
-    "language.complete",
     "language.classify",
     "language.extract",
     "language.analyze",

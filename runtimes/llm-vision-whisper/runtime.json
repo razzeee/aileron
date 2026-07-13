@@ -2,7 +2,6 @@
   "runtime_id": "llm-vision-whisper",
   "capabilities": [
     "generate",
-    "predict_next",
     "generate_structured",
     "generate_structured_stream",
     "embed",

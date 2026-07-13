@@ -29,7 +29,6 @@ Current tokens:
 - `language.summarize`
 - `language.translate`
 - `language.rephrase`
-- `language.complete`
 - `language.classify`
 - `language.extract`
 - `language.analyze`
@@ -58,7 +57,7 @@ Generation methods accept an `execution_mode` option. Use `interactive` for user
 
 ## Text Generation
 
-Use task-specific language generation use cases with `StreamResponse`. `language.complete` is reserved for inline completion through `StreamPredictNext`; do not use `language.rephrase` for ghost text or next-word suggestions.
+Use task-specific language generation use cases with `StreamResponse`.
 
 Good prompt shape:
 
@@ -71,10 +70,6 @@ Summarize the article below in three bullet points. Preserve important names and
 Prefer explicit output constraints over relying on a specific model's behavior.
 
 For `language.translate`, `ResponseOptions` includes optional `source_language_hint` and `target_language_hint` strings. Pass empty strings when the app does not know one side. These are hints, not strict locale settings; apps should still make the requested translation clear in the prompt.
-
-## Inline Completion
-
-Use `language.complete` with `StreamPredictNext` for ghost text, current-word endings, or next-word suggestions. Send the raw text prefix the user typed, not an instruction prompt. The daemon caps results at three short completions and emits each completion as a stream event. A newer `StreamPredictNext` call for the same session supersedes any older in-flight prediction call; handle a cancelled request response or `RequestCancelled` error text as a normal stale-result path.
 
 ## Guided Output
 

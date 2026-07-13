@@ -2,7 +2,6 @@
   "llmfit_model_id": "Qwen/Qwen2.5-Coder-7B-Instruct",
   "tier": "balanced",
   "use_cases": [
-    "language.complete",
     "language.extract",
     "language.analyze"
   ],

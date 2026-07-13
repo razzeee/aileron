@@ -727,7 +727,6 @@ fn default_language_use_cases() -> Vec<&'static str> {
     vec![
         "language.summarize",
         "language.rephrase",
-        "language.complete",
         "language.classify",
         "language.extract",
         "language.analyze",
@@ -847,7 +846,6 @@ pub const SUPPORTED_USE_CASES: &[&str] = &[
     "language.summarize",
     "language.translate",
     "language.rephrase",
-    "language.complete",
     "language.classify",
     "language.extract",
     "language.analyze",
@@ -1270,11 +1268,6 @@ mod tests {
         );
         assert!(manifest.use_cases.contains(&"language.analyze".to_string()));
         assert!(
-            manifest
-                .use_cases
-                .contains(&"language.complete".to_string())
-        );
-        assert!(
             !manifest
                 .use_cases
                 .contains(&"language.translate".to_string())
@@ -1535,7 +1528,6 @@ mod tests {
         assert!(tiers.contains("small"));
         assert!(tiers.contains("balanced"));
         assert!(tiers.contains("large"));
-        assert!(use_cases.contains("language.complete"));
         assert!(use_cases.contains("language.extract"));
         assert!(use_cases.contains("speech.transcribe"));
         assert!(use_cases.contains("vision.describe"));

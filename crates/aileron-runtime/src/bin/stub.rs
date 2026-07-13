@@ -1,6 +1,4 @@
-use aileron_runtime::{
-    ContentPart, Request, clamp_choices, select_tool_name, send, send_unsupported,
-};
+use aileron_runtime::{ContentPart, Request, select_tool_name, send, send_unsupported};
 use anyhow::Result;
 use serde_json::json;
 
@@ -11,7 +9,6 @@ fn main() -> Result<()> {
 fn handle_request(req: Request) -> Result<()> {
     match req.request_type.as_str() {
         "generate" => handle_generate(&req),
-        "predict_next" => handle_predict_next(&req),
         "generate_structured" => handle_generate_structured(&req),
         "generate_structured_stream" => handle_generate_structured_stream(&req),
         "embed" => send(json!({
@@ -85,27 +82,6 @@ fn handle_generate(req: &Request) -> Result<()> {
     }
 
     Ok(())
-}
-
-fn handle_predict_next(req: &Request) -> Result<()> {
-    let prompt = req.prompt.as_deref().unwrap_or_default();
-    let choices = clamp_choices(req.choices);
-    let suffix_mode = prompt
-        .chars()
-        .next_back()
-        .map(|ch| ch.is_alphanumeric() || ch == '_' || ch == '-')
-        .unwrap_or(false);
-    let candidates = if suffix_mode {
-        ["bed", "bing", "ble"]
-    } else {
-        [" stub", " demo", " local"]
-    };
-
-    send(json!({
-        "id": req.id,
-        "completions": candidates[..choices].to_vec(),
-        "done": true,
-    }))
 }
 
 fn handle_generate_structured(req: &Request) -> Result<()> {

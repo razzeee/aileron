@@ -27,7 +27,6 @@ const LANGUAGE_USE_CASES: &[&str] = &[
     "language.summarize",
     "language.translate",
     "language.rephrase",
-    "language.complete",
     "language.classify",
     "language.extract",
     "language.analyze",
@@ -173,13 +172,6 @@ struct ResponseOptionsDbus {
     temperature: f64,
     source_language_hint: String,
     target_language_hint: String,
-    execution_mode: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Type)]
-struct PredictNextOptionsDbus {
-    maximum_response_tokens: i64,
-    temperature: f64,
     execution_mode: String,
 }
 
@@ -476,91 +468,6 @@ impl LanguagePortalBackend {
         request_handle: &OwnedObjectPath,
         session_handle: &OwnedObjectPath,
         token: &str,
-        done: bool,
-    ) -> zbus::Result<()>;
-
-    #[allow(clippy::too_many_arguments)]
-    async fn stream_predict_next(
-        &self,
-        request_handle: OwnedObjectPath,
-        session_handle: OwnedObjectPath,
-        prefix: &str,
-        options: PredictNextOptionsDbus,
-        #[zbus(connection)] conn: &zbus::Connection,
-        #[zbus(header)] header: Header<'_>,
-        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
-    ) -> zbus::fdo::Result<()> {
-        use aileron_varlink::aileron_Inference::VarlinkClientInterface;
-
-        ensure_portal_frontend(conn, &header).await?;
-        let request_id = request_handle.as_str();
-        let session_id = session_handle.as_str();
-        begin_request(conn, &self.state, request_id, Some(session_id)).await?;
-        let result = async {
-            let record = ensure_known_session(&self.state, session_id, PortalInterface::Language)?;
-            ensure_exact_session_use_case(&record, "language.complete", "StreamPredictNext")?;
-            ensure_request_active(&self.state, request_id)?;
-            self.emit_loading(&request_handle, &session_handle, &emitter)
-                .await?;
-            ensure_request_active(&self.state, request_id)?;
-            let daemon_session_id = record.daemon_session_id;
-            let ipc_conn = connect_request_daemon(&self.state, request_id)?;
-            let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(ipc_conn);
-            let mut call = client.stream_predict_next(
-                daemon_session_id,
-                prefix.to_string(),
-                options.into_varlink(),
-            );
-            let iter = call
-                .more()
-                .map_err(|e| map_request_error(&self.state, request_id, e))?;
-
-            let mut completions = Vec::new();
-            for reply in iter {
-                ensure_request_active(&self.state, request_id)?;
-                completions = reply
-                    .map_err(|e| map_request_error(&self.state, request_id, e))?
-                    .completions;
-            }
-
-            ensure_request_active(&self.state, request_id)?;
-            if completions.is_empty() {
-                LanguagePortalBackend::prediction_received(
-                    &emitter,
-                    &request_handle,
-                    &session_handle,
-                    "",
-                    true,
-                )
-                .await
-                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-            } else {
-                let last_index = completions.len() - 1;
-                for (index, completion) in completions.iter().enumerate() {
-                    LanguagePortalBackend::prediction_received(
-                        &emitter,
-                        &request_handle,
-                        &session_handle,
-                        completion,
-                        index == last_index,
-                    )
-                    .await
-                    .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-                }
-            }
-            Ok(())
-        }
-        .await;
-        finish_request(conn, &self.state, request_id).await;
-        result
-    }
-
-    #[zbus(signal)]
-    async fn prediction_received(
-        emitter: &SignalEmitter<'_>,
-        request_handle: &OwnedObjectPath,
-        session_handle: &OwnedObjectPath,
-        completion: &str,
         done: bool,
     ) -> zbus::Result<()>;
 
@@ -2247,16 +2154,6 @@ impl ResponseOptionsDbus {
     }
 }
 
-impl PredictNextOptionsDbus {
-    fn into_varlink(self) -> aileron_varlink::aileron_Inference::PredictNextOptions {
-        aileron_varlink::aileron_Inference::PredictNextOptions {
-            maximum_response_tokens: self.maximum_response_tokens,
-            temperature: self.temperature,
-            execution_mode: self.execution_mode,
-        }
-    }
-}
-
 impl GuidedOptionsDbus {
     fn into_varlink(self) -> aileron_varlink::aileron_Inference::GuidedOptions {
         aileron_varlink::aileron_Inference::GuidedOptions {
@@ -2512,20 +2409,19 @@ mod tests {
 
     #[test]
     fn language_generation_validator_rejects_specialized_sessions() {
-        for use_case in ["language.complete", "language.embed"] {
-            let record = SessionRecord {
-                interface: PortalInterface::Language,
-                use_case: use_case.to_string(),
-                daemon_session_id: "daemon-session-1".to_string(),
-                closing: false,
-            };
+        let use_case = "language.embed";
+        let record = SessionRecord {
+            interface: PortalInterface::Language,
+            use_case: use_case.to_string(),
+            daemon_session_id: "daemon-session-1".to_string(),
+            closing: false,
+        };
 
-            let err = ensure_language_generation_session(&record)
-                .expect_err("specialized language session should be rejected");
+        let err = ensure_language_generation_session(&record)
+            .expect_err("specialized language session should be rejected");
 
-            assert!(err.to_string().contains("aileron.Inference.InvalidInput"));
-            assert!(err.to_string().contains(use_case));
-        }
+        assert!(err.to_string().contains("aileron.Inference.InvalidInput"));
+        assert!(err.to_string().contains(use_case));
     }
 
     #[test]

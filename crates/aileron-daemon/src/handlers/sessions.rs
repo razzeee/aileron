@@ -48,7 +48,6 @@ impl VarlinkInterface for SessionsHandler {
                     }
                 }
             };
-            self.state.clear_predict_next(&session_id);
             request_execution::terminate_active_container_handles_for_session(
                 &self.state,
                 &profile_id,

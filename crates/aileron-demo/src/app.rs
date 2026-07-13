@@ -262,12 +262,6 @@ fn build_window(window: &ApplicationWindow) {
     overview_page.set_icon_name(Some("view-grid-symbolic"));
     let text_page = stack.add_titled(&frontends::text::build_page(), Some("text"), "Text lab");
     text_page.set_icon_name(Some("text-x-generic-symbolic"));
-    let prediction_page = stack.add_titled(
-        &frontends::prediction::build_page(),
-        Some("predict"),
-        "Prediction lab",
-    );
-    prediction_page.set_icon_name(Some("insert-text-symbolic"));
     let chat_page = stack.add_titled(&frontends::chat::build_page(), Some("chat"), "Chat lab");
     chat_page.set_icon_name(Some("user-available-symbolic"));
     let tool_page = stack.add_titled(&frontends::tool::build_page(), Some("tools"), "Tool lab");
@@ -348,7 +342,6 @@ fn build_window(window: &ApplicationWindow) {
         title_for_stack.set_title(match stack.visible_child_name().as_deref() {
             Some("overview") => "Lab overview",
             Some("text") => "Text lab",
-            Some("predict") => "Prediction lab",
             Some("chat") => "Chat lab",
             Some("tools") => "Tool lab",
             Some("speech") => "Speech lab",
@@ -571,24 +564,6 @@ enum ChatEvent {
     Response(GuidedChatResponse),
     Error(String),
     Done,
-}
-
-enum PredictionEvent {
-    SessionReady {
-        seq: u64,
-        id: String,
-    },
-    Busy(u64),
-    Suggestion {
-        seq: u64,
-        input_text: String,
-        suggestions: Vec<String>,
-    },
-    Error {
-        seq: u64,
-        message: String,
-        attempted_session: Option<String>,
-    },
 }
 
 #[derive(Clone)]
@@ -1485,89 +1460,6 @@ fn stream_guided_call(
     }
 }
 
-fn stream_prediction(
-    session_handle: &OwnedObjectPath,
-    prefix: &str,
-    options: PortalOptions,
-) -> anyhow::Result<Vec<String>> {
-    let call_conn = portal_connection()?;
-    let signal_conn = call_conn.clone();
-    let proxy = zbus::blocking::Proxy::new(&call_conn, PORTAL_BUS, PORTAL_PATH, LANGUAGE_IFACE)?;
-    let sig_proxy =
-        zbus::blocking::Proxy::new(&signal_conn, PORTAL_BUS, PORTAL_PATH, LANGUAGE_IFACE)?;
-    let mut prediction_iter = sig_proxy.receive_signal("PredictionReceived")?;
-    let prediction_session_handle = session_handle.clone();
-    let (stream_event_tx, stream_event_rx) = std::sync::mpsc::channel();
-    let prediction_event_tx = stream_event_tx.clone();
-
-    std::thread::spawn(move || {
-        let result = (|| -> anyhow::Result<()> {
-            for msg in &mut prediction_iter {
-                let (_sig_request, sig_session, completion, done): (
-                    OwnedObjectPath,
-                    OwnedObjectPath,
-                    String,
-                    bool,
-                ) = msg.body().deserialize()?;
-                if sig_session.as_str() != prediction_session_handle.as_str() {
-                    continue;
-                }
-                prediction_event_tx
-                    .send(Ok(PredictionStreamEvent::Completion(completion, done)))?;
-                if done {
-                    break;
-                }
-            }
-            Ok(())
-        })();
-        if let Err(error) = result {
-            let _ = prediction_event_tx.send(Err(error));
-        }
-    });
-
-    let stream_result: zbus::Result<OwnedObjectPath> =
-        proxy.call("StreamPredictNext", &(session_handle, prefix, options));
-    let request_handle = stream_result?;
-    let response_request_handle = request_handle.clone();
-    std::thread::spawn(move || {
-        let result = wait_request_success(&response_request_handle);
-        let _ = stream_event_tx.send(Ok(PredictionStreamEvent::RequestDone(result)));
-    });
-
-    let mut completions = Vec::new();
-    let mut terminal_completions = None::<Vec<String>>;
-    let mut request_done = false;
-    loop {
-        match stream_event_rx.recv() {
-            Ok(event) => match event? {
-                PredictionStreamEvent::Completion(completion, done) => {
-                    if !completion.is_empty() {
-                        completions.push(completion);
-                    }
-                    if done {
-                        terminal_completions = Some(completions.clone());
-                    }
-                }
-                PredictionStreamEvent::RequestDone(result) => {
-                    result?;
-                    request_done = true;
-                }
-            },
-            Err(std::sync::mpsc::RecvError) => {
-                anyhow::bail!("prediction stream ended before the request completed");
-            }
-        }
-        if request_done && let Some(completions) = terminal_completions.take() {
-            return Ok(completions);
-        }
-    }
-}
-
-enum PredictionStreamEvent {
-    Completion(String, bool),
-    RequestDone(anyhow::Result<()>),
-}
-
 fn stream_embedding(session_handle: &OwnedObjectPath, text: &str) -> anyhow::Result<Vec<f64>> {
     let call_conn = portal_connection()?;
     let signal_conn = call_conn.clone();
@@ -1964,164 +1856,10 @@ fn respond_text_task(
     Ok(())
 }
 
-fn predict_inline_completion(
-    existing_session: Option<String>,
-    input: &str,
-) -> anyhow::Result<(String, Vec<String>)> {
-    let conn = portal_connection()?;
-    let proxy = zbus::blocking::Proxy::new(&conn, PORTAL_BUS, PORTAL_PATH, LANGUAGE_IFACE)?;
-    let used_existing_session = existing_session.is_some();
-    let create_session = || -> anyhow::Result<OwnedObjectPath> {
-        let handle = create_public_session(
-            &proxy,
-            "language.complete",
-            "Inline typing prediction session.",
-        )?;
-        let request_handle: OwnedObjectPath = proxy.call("Prewarm", &(&handle, empty_options()))?;
-        wait_request_success(&request_handle)?;
-        Ok(handle)
-    };
-    let mut session_handle = match existing_session {
-        Some(id) => cached_session_handle(id)?,
-        None => create_session()?,
-    };
-
-    let prompt_input = if input.chars().count() > 2048 {
-        input
-            .chars()
-            .rev()
-            .take(2048)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect::<String>()
-    } else {
-        input.to_string()
-    };
-    let options = generation_options(4, "", "");
-    let completions_result = stream_prediction(&session_handle, &prompt_input, options);
-    let completions = match completions_result {
-        Ok(completions) => completions,
-        Err(e) if used_existing_session && is_session_not_found_message(&e.to_string()) => {
-            session_handle = create_session()?;
-            match stream_prediction(
-                &session_handle,
-                &prompt_input,
-                generation_options(4, "", ""),
-            ) {
-                Ok(completions) => completions,
-                Err(e) => {
-                    let _ = close_public_session(&session_handle);
-                    return Err(e);
-                }
-            }
-        }
-        Err(e) => return Err(e),
-    };
-    let mut cleaned = Vec::new();
-    for completion in completions {
-        let completion = clean_prediction(input, &completion);
-        if !completion.trim().is_empty() && !cleaned.contains(&completion) {
-            cleaned.push(completion);
-        }
-        if cleaned.len() == 3 {
-            break;
-        }
-    }
-    Ok((session_handle.to_string(), cleaned))
-}
-
-fn clear_failed_prediction_session(
-    current: &mut Option<String>,
-    attempted_session: Option<&str>,
-) -> Option<String> {
-    let attempted_session = attempted_session?;
-    if current.as_deref() == Some(attempted_session) {
-        current.take()
-    } else {
-        None
-    }
-}
-
 fn is_session_not_found_message(message: &str) -> bool {
     message.contains("aileron.Inference.SessionNotFound")
         || message.contains("aileron.Inference.SessionNotFound_Args")
         || message.contains("SessionNotFound_Args")
-}
-
-fn end_prediction_session(session_id: &str) -> anyhow::Result<()> {
-    close_public_session(&cached_session_handle(session_id.to_string())?)?;
-    Ok(())
-}
-
-fn clean_prediction(input: &str, raw: &str) -> String {
-    let mut suggestion = raw
-        .trim_end()
-        .trim_matches(['"', '\'', '`'])
-        .replace(['\r', '\n'], " ");
-    while suggestion.contains("  ") {
-        suggestion = suggestion.replace("  ", " ");
-    }
-
-    if let Some(stripped) = suggestion.strip_prefix(input) {
-        suggestion = stripped.trim_start().to_string();
-    }
-    if suggestion.to_ascii_lowercase().starts_with("continuation:") {
-        suggestion = suggestion["continuation:".len()..].trim_start().to_string();
-    }
-    if suggestion.to_ascii_lowercase().starts_with("completion:") {
-        suggestion = suggestion["completion:".len()..].trim_start().to_string();
-    }
-
-    let starts_with_boundary = suggestion.chars().next().is_some_and(char::is_whitespace);
-    let suffix_mode = !starts_with_boundary
-        && input
-            .chars()
-            .last()
-            .is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-');
-    suggestion = one_prediction_unit(&suggestion, suffix_mode);
-
-    let mut out = String::new();
-    for ch in suggestion.chars() {
-        if out.chars().count() >= 96 {
-            break;
-        }
-        out.push(ch);
-    }
-
-    if out.is_empty() {
-        return out;
-    }
-    let input_ends_with_space = input.chars().last().is_some_and(char::is_whitespace);
-    let out_starts_with_space = out.chars().next().is_some_and(char::is_whitespace);
-    if !suffix_mode
-        && !input_ends_with_space
-        && !out_starts_with_space
-        && !out.starts_with(['.', ',', ';', ':', '!', '?'])
-    {
-        out.insert(0, ' ');
-    }
-    out
-}
-
-fn one_prediction_unit(raw: &str, suffix_mode: bool) -> String {
-    let trimmed = raw.trim_start();
-    let mut out = String::new();
-    let mut started = false;
-
-    for ch in trimmed.chars() {
-        let is_word = ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' || ch == '\'';
-        if is_word {
-            started = true;
-            out.push(ch);
-        } else if suffix_mode && !started {
-            continue;
-        } else {
-            break;
-        }
-    }
-
-    out
 }
 
 fn guided_chat_turn(
@@ -2770,10 +2508,7 @@ fn media_file_from_bytes(bytes: &[u8]) -> anyhow::Result<std::fs::File> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        DemoMode, clean_prediction, clear_failed_prediction_session, concise_error,
-        guided_chat_answer_draft, is_session_not_found_message,
-    };
+    use super::{DemoMode, concise_error, guided_chat_answer_draft, is_session_not_found_message};
     use hegel::TestCase;
     use hegel::generators as gs;
 
@@ -2798,27 +2533,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_prediction_clears_matching_cached_session() {
-        let mut current = Some("session-a".to_string());
-
-        let cleared = clear_failed_prediction_session(&mut current, Some("session-a"));
-
-        assert_eq!(cleared.as_deref(), Some("session-a"));
-        assert_eq!(current, None);
-    }
-
-    #[test]
-    fn failed_prediction_keeps_unrelated_cached_session() {
-        let mut current = Some("session-b".to_string());
-
-        let cleared = clear_failed_prediction_session(&mut current, Some("session-a"));
-
-        assert_eq!(cleared, None);
-        assert_eq!(current.as_deref(), Some("session-b"));
-    }
-
-    #[test]
-    fn stale_prediction_session_errors_are_detected() {
+    fn stale_session_errors_are_detected() {
         let error = "org.freedesktop.DBus.Error.Failed: aileron.Inference.SessionNotFound: Some(SessionNotFound_Args { session_id: \"missing\" })";
 
         assert!(is_session_not_found_message(error));
@@ -2828,17 +2543,6 @@ mod tests {
         assert!(!is_session_not_found_message(
             "aileron.Inference.GenerationFailed"
         ));
-    }
-
-    #[test]
-    fn clean_prediction_preserves_next_word_boundary() {
-        assert_eq!(clean_prediction("hey, das ist", " eine"), " eine");
-        assert_eq!(clean_prediction("hey, my", " 10-year"), " 10-year");
-    }
-
-    #[test]
-    fn clean_prediction_keeps_current_word_suffixes_attached() {
-        assert_eq!(clean_prediction("runn", "ing"), "ing");
     }
 
     #[test]

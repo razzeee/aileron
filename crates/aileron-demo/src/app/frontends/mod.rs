@@ -1,7 +1,6 @@
 pub(super) mod chat;
 pub(super) mod embedding;
 pub(super) mod overview;
-pub(super) mod prediction;
 pub(super) mod speech;
 pub(super) mod text;
 pub(super) mod tool;

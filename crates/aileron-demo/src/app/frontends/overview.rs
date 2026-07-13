@@ -28,14 +28,14 @@ pub(crate) fn build_page(stack: &ViewStack) -> gtk4::Widget {
         .css_classes(vec!["title-1"])
         .build();
     let subtitle = Label::builder()
-        .label("Aileron Demo is a local control room for exercising text, chat, prediction, tools, speech, vision, and embeddings through the portal surface.")
+        .label("Aileron Demo is a local control room for exercising text, chat, tools, speech, vision, and embeddings through the portal surface.")
         .xalign(0.0)
         .wrap(true)
         .css_classes(vec!["overview-hero-copy"])
         .build();
 
     let stats = Box::new(Orientation::Horizontal, 8);
-    stats.append(&stat_pill("7", "portal paths"));
+    stats.append(&stat_pill("6", "portal paths"));
     stats.append(&stat_pill("0", "required cloud calls"));
 
     hero.append(&eyebrow);
@@ -71,15 +71,6 @@ pub(crate) fn build_page(stack: &ViewStack) -> gtk4::Widget {
             button_label: "Open Text Lab",
             page_name: "text",
             icon_name: "text-x-generic-symbolic",
-        },
-        LabCard {
-            title: "Prediction Lab",
-            subtitle: "Type a sentence and preview a short ghost continuation from the local language model.",
-            methods: "StreamPredictNext",
-            example: "Try: The old lighthouse keeper opened the door and",
-            button_label: "Open Prediction Lab",
-            page_name: "predict",
-            icon_name: "insert-text-symbolic",
         },
         LabCard {
             title: "Tool Lab",

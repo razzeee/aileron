@@ -533,7 +533,6 @@ impl VarlinkInterface for ModelsHandler {
                 cancelled_sessions
             };
             for session in &cancelled_sessions {
-                self.state.clear_predict_next(session.session_id.as_str());
                 observability::log_session_ended(observability::SessionFields {
                     session_id: &session.session_id,
                     app_id: &session.app_id,
@@ -764,9 +763,7 @@ fn use_case_fit_scores(
 
 fn fit_category(use_case: &str) -> Option<&'static str> {
     match use_case {
-        "language.summarize" | "language.translate" | "language.rephrase" | "language.complete" => {
-            Some("Text")
-        }
+        "language.summarize" | "language.translate" | "language.rephrase" => Some("Text"),
         "language.analyze" => Some("Reasoning"),
         "language.classify" | "language.extract" => Some("General"),
         "language.embed" => Some("Embeddings"),

@@ -108,11 +108,6 @@ fn response_fixture(use_case: &str) -> Vec<u8> {
         "language.generate" | "speech.transcribe" | "vision.describe" | "vision.ocr" => {
             return stream_response_fixture(32);
         }
-        "language.predict_next" => serde_json::json!({
-            "id": "request-1",
-            "completions": [" first", " second", " third"],
-            "done": true,
-        }),
         "language.structured" | "language.tool" => serde_json::json!({
             "id": "request-1",
             "result": r#"{"answer":"ok"}"#,
@@ -133,10 +128,9 @@ fn response_fixture(use_case: &str) -> Vec<u8> {
     format!("{response}\n").into_bytes()
 }
 
-fn model_use_cases() -> [&'static str; 9] {
+fn model_use_cases() -> [&'static str; 8] {
     [
         "language.generate",
-        "language.predict_next",
         "language.structured",
         "language.tool",
         "language.embed",
@@ -250,14 +244,6 @@ fn stub_request(use_case: &str, id: &str) -> serde_json::Value {
             "type": "generate",
             "prompt": "summarize this article quickly",
             "max_tokens": 32,
-            "execution_mode": "interactive",
-        }),
-        "language.predict_next" => serde_json::json!({
-            "id": id,
-            "type": "predict_next",
-            "prompt": "The next words are",
-            "choices": 3,
-            "max_tokens": 8,
             "execution_mode": "interactive",
         }),
         "language.structured" => serde_json::json!({

@@ -19,11 +19,11 @@ use crate::state::SharedState;
 // VarlinkCallError is a supertrait; its methods reach us via Call_* dyn objects.
 use aileron_varlink::aileron_Inference::{
     Call_CreateSession, Call_EndSession, Call_GetUseCaseAvailability, Call_Prewarm,
-    Call_StreamDescribe, Call_StreamEmbed, Call_StreamOcr, Call_StreamPredictNext,
-    Call_StreamRespondGuided, Call_StreamResponse, Call_StreamSegment,
-    Call_StreamSubmitToolResultsGuided, Call_StreamTranscribe, EmbedOptions, GuidedField,
-    GuidedOptions, ModelAvailability, PredictNextOptions, ResponseOptions, SpeechOptions, ToolCall,
-    ToolDefinition, ToolResult, VarlinkCallError, VarlinkInterface, VisionOptions, VisionSegment,
+    Call_StreamDescribe, Call_StreamEmbed, Call_StreamOcr, Call_StreamRespondGuided,
+    Call_StreamResponse, Call_StreamSegment, Call_StreamSubmitToolResultsGuided,
+    Call_StreamTranscribe, EmbedOptions, GuidedField, GuidedOptions, ModelAvailability,
+    ResponseOptions, SpeechOptions, ToolCall, ToolDefinition, ToolResult, VarlinkCallError,
+    VarlinkInterface, VisionOptions, VisionSegment,
 };
 
 pub struct InferenceHandler {
@@ -313,30 +313,6 @@ impl VarlinkInterface for InferenceHandler {
         })
     }
 
-    fn stream_predict_next(
-        &self,
-        call: &mut dyn Call_StreamPredictNext,
-        session_id: String,
-        prefix: String,
-        options: PredictNextOptions,
-    ) -> varlink::Result<()> {
-        self.rt.block_on(async {
-            match predict_next_completions(&self.state, session_id, prefix, options).await {
-                Ok(completions) => call.reply(completions),
-                Err(GenerationError::SessionNotFound(id)) => call.reply_session_not_found(id),
-                Err(GenerationError::ModelUnavailable(reason)) => {
-                    call.reply_model_unavailable(reason)
-                }
-                Err(GenerationError::InvalidOptions(reason)) => {
-                    call.reply_invalid_generation_options(reason)
-                }
-                Err(GenerationError::InvalidInput(reason)) => call.reply_invalid_input(reason),
-                Err(GenerationError::Failed(reason)) => reply_generation_failure(call, reason),
-                Err(GenerationError::Reply(e)) => Err(e),
-            }
-        })
-    }
-
     fn stream_transcribe(
         &self,
         call: &mut dyn Call_StreamTranscribe,
@@ -555,7 +531,6 @@ impl VarlinkInterface for InferenceHandler {
                 request_execution::mark_session_closed(&self.state, &session_id);
                 (session.profile_id, session.app_id, session.use_case)
             };
-            self.state.clear_predict_next(&session_id);
             request_execution::terminate_active_container_handles_for_session(
                 &self.state,
                 &profile_id,
@@ -2095,64 +2070,6 @@ fn guided_failure_reply(reason: &str) -> FailureReply {
     }
 }
 
-async fn predict_next_completions(
-    state: &SharedState,
-    session_id: String,
-    prefix: String,
-    options: PredictNextOptions,
-) -> Result<Vec<String>, GenerationError> {
-    let (max_tokens, execution_mode) = validate_token_options(
-        options.maximum_response_tokens,
-        options.temperature,
-        &options.execution_mode,
-    )
-    .map_err(GenerationError::InvalidOptions)?;
-    let generation = state.begin_predict_next(&session_id);
-    let resolved = match resolve_session_runtime(state, &session_id, |use_case| {
-        ensure_exact_use_case(use_case, "language.complete", "StreamPredictNext")
-    })
-    .await
-    {
-        Ok(resolved) => resolved,
-        Err(ResolveSessionError::SessionNotFound(id)) => {
-            state.clear_predict_next(&session_id);
-            return Err(GenerationError::SessionNotFound(id));
-        }
-        Err(error) => return Err(GenerationError::from(error)),
-    };
-
-    with_locked_container(
-        "StreamPredictNext",
-        state,
-        &session_id,
-        resolved.clone(),
-        execution_mode,
-        GenerationError::Failed,
-        |container, _handle, _spawned| {
-            let result = container
-                .predict_next(
-                    &prefix,
-                    max_tokens,
-                    options.temperature,
-                    execution_mode.as_str(),
-                )
-                .map_err(|e| GenerationError::Failed(e.to_string()));
-            if RequestCancellation::for_session(state, &session_id).is_cancelled() {
-                return Err(GenerationError::Failed(
-                    request_execution::request_cancelled_reason(),
-                ));
-            }
-            if !state.is_current_predict_next(&session_id, generation) {
-                return Err(GenerationError::Failed(
-                    request_execution::predict_next_superseded_reason(),
-                ));
-            }
-            result
-        },
-    )
-    .await
-}
-
 struct GuidedStreamRequest {
     session_id: String,
     prompt: String,
@@ -2727,10 +2644,6 @@ mod tests {
             generation_failure_reply(&request_execution::background_preempted_reason()),
             FailureReply::RequestCancelled
         );
-        assert_eq!(
-            generation_failure_reply(&request_execution::predict_next_superseded_reason()),
-            FailureReply::RequestCancelled
-        );
     }
 
     #[test]
@@ -2933,40 +2846,6 @@ mod tests {
             ensure_language_generation_use_case("language.embed"),
             Err(
                 "full text generation requires a language generation use-case, got language.embed"
-                    .to_string()
-            )
-        );
-    }
-
-    #[test]
-    fn language_generation_excludes_completion_use_case() {
-        assert_eq!(
-            ensure_language_generation_use_case("language.complete"),
-            Err(
-                "full text generation requires a language generation use-case, got language.complete"
-                    .to_string()
-            )
-        );
-    }
-
-    #[test]
-    fn predict_next_requires_completion_use_case() {
-        assert!(
-            ensure_exact_use_case(
-                "language.complete",
-                "language.complete",
-                "StreamPredictNext"
-            )
-            .is_ok()
-        );
-        assert_eq!(
-            ensure_exact_use_case(
-                "language.rephrase",
-                "language.complete",
-                "StreamPredictNext"
-            ),
-            Err(
-                "StreamPredictNext requires use-case language.complete, got language.rephrase"
                     .to_string()
             )
         );
