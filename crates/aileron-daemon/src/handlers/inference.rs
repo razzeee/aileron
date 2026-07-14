@@ -2483,7 +2483,7 @@ fn embedding_pipeline_id(resolved: &ResolvedSessionRuntime, container: &Containe
     update_hash_field(&mut hasher, "runtime_image", &container.image_ref);
 
     let mut runtime_options = container.runtime_options().iter().collect::<Vec<_>>();
-    runtime_options.sort_by(|(a, _), (b, _)| a.cmp(b));
+    runtime_options.sort_by_key(|(key, _)| *key);
     for (key, value) in runtime_options {
         update_hash_field(&mut hasher, key, value);
     }
