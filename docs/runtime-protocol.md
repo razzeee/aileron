@@ -160,16 +160,18 @@ Initial guided request with tools:
     {
       "name": "calendar_lookup",
       "description": "Look up calendar events",
-      "schema_json": "{\"type\":\"object\",\"properties\":{}}"
+      "schema_json": "{\"type\":\"object\",\"required\":[\"date\"],\"properties\":{\"date\":{\"type\":\"string\"}}}"
     }
   ]
 }
 ```
 
+`schema_json` is a JSON Schema object serialized as a string. It describes the expected JSON object for `arguments_json`; runtimes use it to choose and shape tool calls, and apps must still validate the returned arguments before execution.
+
 Response requesting app tool execution:
 
 ```json
-{"id":"request-id","tool_calls":[{"id":"call-1","name":"calendar_lookup","arguments_json":"{}"}],"done":true}
+{"id":"request-id","tool_calls":[{"id":"call-1","name":"calendar_lookup","arguments_json":"{\"date\":\"today\"}"}],"done":true}
 ```
 
 Continuation request with app-provided results:

@@ -8,6 +8,8 @@ The portal and daemon enforce access to local model capabilities at the app/use-
 
 Tool calls are different. The daemon and runtime may return `ToolCall` objects from guided generation, but they do not execute those tools. The portal forwards the tool call to the app. The app decides whether to reject it, ask the user, validate arguments, execute app-local code, and submit `ToolResult` objects back to the model.
 
+Each tool definition has `name`, `description`, and `schema_json`. `schema_json` is a JSON Schema object serialized as a string, describing the JSON object the model should put in `ToolCall.arguments_json`. For example, a calendar lookup tool might use `{"type":"object","required":["date"],"properties":{"date":{"type":"string"}}}`. Treat this as guidance for generation and app validation, not as permission: the app must parse `arguments_json`, validate it against its own registered schema, and reject unknown tools or invalid arguments before executing anything.
+
 ```text
 app -> StreamRespondGuided(tools)
 portal -> daemon -> runtime

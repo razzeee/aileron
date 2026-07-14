@@ -3,8 +3,11 @@
 interface aileron.Inference
 
 type ModelAvailability (
+  # Whether the requested use-case can create a session now.
   is_available: bool,
+  # Stable availability status string for app control flow; not localized and not a Varlink or portal response code.
   code: string,
+  # Human-readable diagnostic detail for logs or UI copy; apps must not parse it.
   reason: string
 )
 
@@ -45,6 +48,7 @@ type GuidedField (
 type ToolDefinition (
   name: string,
   description: string,
+  # JSON Schema object, serialized as a string, describing the tool arguments.
   schema_json: string
 )
 
@@ -75,11 +79,14 @@ method GetUseCaseAvailability(app_id: string, use_case: string) -> (availability
 # Create an inference session with stable system instructions.
 method CreateSession(app_id: string, use_case: string, instructions: string) -> (session_id: string, profile_id: string)
 
-# Start the backing container before the first user-visible response.
+# Optionally start the backing container before the first user-visible response.
+# First inference also starts it on demand; Prewarm only moves that latency earlier.
 method Prewarm(session_id: string) -> ()
 
 # Stream response tokens. Session must have been created with a language generation use_case.
-# input_json is either content-part shorthand or a role-message array. media_paths contains readable request-scoped media paths referenced by fd_index.
+# input_json is either content-part shorthand or a role-message array. A role-message
+# array is [{"role":"user|assistant|system|tool","content":[parts...]}].
+# media_paths contains readable request-scoped media paths referenced by fd_index.
 method StreamResponse(session_id: string, input_json: string, media_paths: []string, options: ResponseOptions) -> (token: string)
 
 # Stream schema-valid guided output snapshots. The final reply has continues=false.

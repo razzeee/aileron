@@ -45,11 +45,11 @@ Avoid treating model names as application requirements. A user may satisfy `lang
 
 1. Check availability for all use cases.
 2. Create a session with stable instructions and read `session_handle` from the returned request's `Response` signal.
-3. Optionally prewarm on the same portal interface before the first visible operation.
+3. Optionally prewarm on the same portal interface before the first visible operation to move model startup latency earlier.
 4. Send task input through the appropriate method and correlate stream signals by `request_handle`.
 5. Close the returned `org.freedesktop.portal.Session` handle when the user-visible task is complete.
 
-Operations that may prompt, load a model, or stream output return `org.freedesktop.portal.Request` handles. Use `handle_token` and `session_handle_token` option values when you need race-free signal subscription. Closing a request asks the portal to stop waiting and unexports that request handle, so do not wait for a later `Response` after closing it yourself. Any already-started runtime preparation may finish in the background. Closing the session releases the model session.
+Operations that may prompt, load a model, or stream output return `org.freedesktop.portal.Request` handles. Use `handle_token` when you need to predict the returned request object path and subscribe to `Response` before the call; this avoids missing fast responses or early stream signals. If you do not need to pre-subscribe, omit `handle_token` and use the returned request handle. Use `session_handle_token` only with `CreateSession` when you also need to predict the returned `org.freedesktop.portal.Session` path; the actual session path is delivered as `session_handle` in the request response. These tokens are caller-chosen object-path suffixes, not authorization tokens or model/session IDs. Use unique, hard-to-guess strings and still verify the handles returned by the portal because the frontend may append a suffix if a predicted path is already in use. `Prewarm` is optional; if skipped, the first inference request starts the runtime on demand and may take longer. Closing a request asks the portal to stop waiting and unexports that request handle, so do not wait for a later `Response` after closing it yourself. Any already-started runtime preparation may finish in the background. Closing the session releases the model session.
 
 For conversational features, keep stable instructions in the session and send the relevant local history as part of the prompt with `StreamResponse` or `StreamRespondGuided`. The app owns conversation history and can trim it to fit its UI or context policy. For one-shot features such as "summarize this article", a short-lived session with `StreamResponse` is usually enough.
 
@@ -69,6 +69,24 @@ Summarize the article below in three bullet points. Preserve important names and
 
 Prefer explicit output constraints over relying on a specific model's behavior.
 
+`StreamResponse.input_json` is a JSON string, not raw prompt text. For one-shot prompts, pass a content-part shorthand array; the portal treats it as one user message:
+
+```json
+[{"type":"input_text","text":"Summarize this article in three bullets."}]
+```
+
+For chat or tool-mediated flows, pass a role-message array. Each message has a `role` of `system`, `user`, `assistant`, or `tool`, and a non-empty `content` array:
+
+```json
+[
+  {"role":"user","content":[{"type":"input_text","text":"Hello"}]},
+  {"role":"assistant","content":[{"type":"output_text","text":"Hi. How can I help?"}]},
+  {"role":"user","content":[{"type":"input_text","text":"Summarize this."}]}
+]
+```
+
+Supported content part types are `input_text`, `output_text`, `input_image`, and `input_audio`. Media parts reference the method's media fd array by `fd_index` and include a matching `mime_type`, such as `image/png` or `audio/wav`. Do not mix top-level shorthand parts and role-message objects in the same array.
+
 For `language.translate`, `ResponseOptions` includes optional `source_language_hint` and `target_language_hint` strings. Pass empty strings when the app does not know one side. These are hints, not strict locale settings; apps should still make the requested translation clear in the prompt.
 
 ## Guided Output
@@ -82,6 +100,8 @@ Use `StreamRespondGuided` for structured updates. It accepts guided fields and t
 ## Tool Calling
 
 Use guided tool calls when the model should ask the app for app-local data or actions. Pass tool definitions to `StreamRespondGuided`, execute or reject any streamed `ToolCall` objects in the app, then send results back with `StreamSubmitToolResultsGuided` using the same guided fields.
+
+In each tool definition, `schema_json` is a JSON Schema object serialized as a string. It describes the expected JSON object in `ToolCall.arguments_json`; keep it narrow and validate model-supplied arguments against the app's registered schema before executing the tool.
 
 The daemon and runtime never execute tools. Tool execution stays app-mediated so sandbox policy, user confirmation, and app-specific authorization remain under the app's control.
 
@@ -119,7 +139,7 @@ Design UI as if local model access is a user-controlled capability, not a hidden
 
 An unavailable use case is normal. The user may not have installed a matching profile, the runtime image may be unavailable for the hardware, or policy may deny the app.
 
-Availability responses include a stable `code` and a human-readable `reason`. Apps should branch on `code`, not parse `reason`. Common codes are `available`, `unsupported_use_case`, `permission_denied`, `no_profile_assigned`, `profile_not_installed`, `artifact_missing`, `runtime_unsupported`, and `runtime_missing`.
+Availability responses include a stable availability status `code` and a human-readable `reason`. `code` is not localized, not a Varlink error name, and not the numeric xdg-desktop-portal request response code; apps should branch on `code`, not parse `reason`. Common codes are `available`, `unsupported_use_case`, `permission_denied`, `no_profile_assigned`, `profile_not_installed`, `artifact_missing`, `runtime_unsupported`, and `runtime_missing`.
 
 Recommended behavior:
 

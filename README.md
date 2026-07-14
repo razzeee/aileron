@@ -410,11 +410,13 @@ method EndSession(session_id: string) -> ()
 
 Token-generating option structs require `maximum_response_tokens` to be greater than zero and fit in `u32`; `temperature` must be finite and non-negative. `ResponseOptions.source_language_hint` and `target_language_hint` are optional strings for `language.translate`; pass empty strings when unspecified. The daemon forwards `maximum_response_tokens` to containers as `max_tokens` and folds translation hints into the session instructions for `language.translate`.
 
+`StreamResponse.input_json` accepts either a content-part shorthand array or a role-message array. The shorthand form is treated as one `user` message, for example `[{"type":"input_text","text":"Summarize this"}]`. A role-message array is an ordered transcript where each entry is an object with `role` and `content`: `[{"role":"user","content":[{"type":"input_text","text":"Hello"}]},{"role":"assistant","content":[{"type":"output_text","text":"Hi"}]}]`. Supported roles are `system`, `user`, `assistant`, and `tool`. `content` must be a non-empty array of content parts. Supported part types are `input_text`, `output_text`, `input_image`, and `input_audio`; media parts use `fd_index` and `mime_type` to reference `media_paths` or portal `media_fds`. Do not mix top-level shorthand parts and role messages in one array.
+
 `GuidedField.kind` supports `string`, `number`, `integer`, `boolean`, and `string_array`. The daemon converts guided fields into a JSON Schema object with `additionalProperties: false`, sends it to the container as `response_format.schema`, then validates the returned JSON before replying. `StreamRespondGuided` returns validated JSON snapshots or app-mediated tool calls rather than token deltas. Guided `prompt` may be plain text or the same content-part/role-message JSON accepted by `StreamResponse`; media parts reference `media_paths` by `fd_index`.
 
-Tool calls are app-mediated and per request: `StreamRespondGuided` may stream `ToolCall` objects when the app supplies tool definitions, the app executes or rejects them under its own policy, and `StreamSubmitToolResultsGuided` continues generation with the same guided schema. The daemon and runtime do not execute tools. Aileron does not retain daemon-side transcripts; apps own conversation history and pass relevant context explicitly.
+Tool calls are app-mediated and per request: `StreamRespondGuided` may stream `ToolCall` objects when the app supplies tool definitions, the app executes or rejects them under its own policy, and `StreamSubmitToolResultsGuided` continues generation with the same guided schema. `ToolDefinition.schema_json` is a JSON Schema object serialized as a string; it describes the expected JSON object for `ToolCall.arguments_json`. The daemon forwards tool schemas to the runtime but does not execute tools or treat schemas as an authorization boundary. Apps must parse and validate `arguments_json` against their own registered schema before executing or rejecting a tool call. Aileron does not retain daemon-side transcripts; apps own conversation history and pass relevant context explicitly.
 
-`ModelAvailability.code` is stable and machine-readable. Known values are `available`, `unsupported_use_case`, `permission_denied`, `no_profile_assigned`, `profile_not_installed`, `artifact_missing`, `runtime_unsupported`, and `runtime_missing`. `reason` is human-readable detail.
+`ModelAvailability.code` is the stable, machine-readable availability status for the requested use case. It is not localized, not a Varlink error name, and not the numeric xdg-desktop-portal request response code; apps should branch on it instead of parsing `reason`. Known values are `available`, `unsupported_use_case`, `permission_denied`, `no_profile_assigned`, `profile_not_installed`, `artifact_missing`, `runtime_unsupported`, and `runtime_missing`. `reason` is human-readable diagnostic detail.
 
 Inference errors are represented as Varlink errors: `PermissionPromptRequired`, `PermissionDenied`, `SessionNotFound`, `ModelUnavailable`, `InvalidGenerationOptions`, `GuidedGenerationFailed`, `GenerationFailed`, `ContextWindowExceeded`, `UnsupportedLanguage`, `SafetyRefusal`, `RequestCancelled`, and `InvalidInput`.
 
@@ -479,13 +481,15 @@ Apps call the public interfaces on `org.freedesktop.portal.Desktop`. The public 
 
 `GetUseCaseAvailability`, `CreateSession`, and `Prewarm` have the same public signatures on each interface. `CreateSession` takes a `parent_window` string so permission prompts can be associated with the triggering app window where the platform supports it. The public frontend and implementation backend both validate that the requested use-case token is one of the selected interface's supported tokens.
 
+`handle_token` and `session_handle_token` are optional caller-chosen object-path tokens, not bearer credentials, authorization tokens, model IDs, or daemon session IDs. `handle_token` lets the caller predict the returned `org.freedesktop.portal.Request` path as `/org/freedesktop/portal/desktop/request/SENDER/TOKEN` and subscribe to `Response` before making a portal call; this is useful when the response or stream signals may arrive immediately. If the caller does not need to pre-subscribe, it can omit `handle_token` and use the request handle returned by the method. `session_handle_token` is only accepted by `CreateSession`; it lets the caller predict the `org.freedesktop.portal.Session` path that will be returned in the request response as `session_handle`. Use unique, hard-to-guess token strings, and still verify the object path returned by the portal because the frontend may append a suffix if the predicted path is already in use.
+
 ### Shared Methods
 
 | Method | Parameters | Returns | Notes |
 |---|---|---|---|
-| `GetUseCaseAvailability` | `use_case: s, options: a{sv}` | `(is_available: b, code: s, reason: s)` | Checks whether an assigned profile has local artifacts and a runtime image |
+| `GetUseCaseAvailability` | `use_case: s, options: a{sv}` | `(is_available: b, code: s, reason: s)` | Checks whether an assigned profile has local artifacts and a runtime image; `code` is a stable availability status string for app control flow |
 | `CreateSession` | `parent_window: s, use_case: s, instructions: s, options: a{sv}` | `handle: o` | Creates a session bound to the assigned profile; the request response contains `session_handle: o` |
-| `Prewarm` | `session_handle: o, options: a{sv}` | `handle: o` | Starts the backing container before the first user-visible operation; close the request to stop waiting for completion |
+| `Prewarm` | `session_handle: o, options: a{sv}` | `handle: o` | Optional latency optimization that starts the backing container before the first user-visible operation; first inference starts it on demand if skipped; close the request to stop waiting for completion |
 
 ### Language Methods
 
@@ -502,7 +506,7 @@ Apps call the public interfaces on `org.freedesktop.portal.Desktop`. The public 
 |---|---|---|---|
 | `StreamTranscribe` | `session_handle: o, audio_fd: h, options: a{sv}` | `handle: o` | 16 kHz mono f32le PCM readable from a sealable memfd; empty `source_language_hint` option means auto-detect/no hint; emits `TranscriptionReceived` signals; final segment has `done=true` |
 
-Streaming D-Bus methods return an `org.freedesktop.portal.Request` handle immediately. Callers should subscribe to both the stream signal and the request's `Response` signal before invoking a stream method when using caller-chosen `handle_token` values. Stream payload signals are correlated by `request_handle`; the request response indicates success, portal/backend cancellation, or failure. If the app calls `Close` on the request, the request is unexported and the app should not wait for a later `Response` on that handle.
+Streaming D-Bus methods return an `org.freedesktop.portal.Request` handle immediately. Callers should subscribe to both the stream signal and the request's `Response` signal before invoking a stream method when using caller-chosen `handle_token` values. Stream payload signals are correlated by `request_handle`; the request response indicates success, portal/backend cancellation, or failure. `session_handle_token` is not used for stream methods because they operate on an existing `session_handle`. If the app calls `Close` on the request, the request is unexported and the app should not wait for a later `Response` on that handle.
 
 ### Vision Methods
 
@@ -572,7 +576,7 @@ Each OCI image implements a simple newline-delimited JSON protocol over stdin/st
 | `language_hint` | string | `transcribe` | Runtime protocol source-language hint for speech input; omitted when unspecified |
 | `image` | string | `describe` | Base64-encoded PNG or JPEG bytes |
 | `response_format` | object | structured generation | `{ "type": "json_schema", "schema": ... }` |
-| `tools` | array | `generate_structured` | Optional tool definitions with `name`, `description`, and `schema_json` |
+| `tools` | array | `generate_structured` | Optional tool definitions with `name`, `description`, and `schema_json`; `schema_json` is a string containing the JSON Schema for tool arguments |
 | `tool_results` | array | `generate_structured` | Optional app-provided tool results with `id`, `content`, and `content_json` |
 
 All requests may include an optional `system` field (string) to set the system prompt. The entrypoint defaults to: _"You are a helpful assistant. Always respond in the same language as the user's message."_
@@ -648,7 +652,7 @@ The daemon sends a `response_format` object containing the caller's JSON Schema.
 
 ## Container lifecycle
 
-- Containers start on demand when `Prewarm` or the first inference call needs an assigned profile runtime.
+- Containers start on demand when `Prewarm` or the first inference call needs an assigned profile runtime. `Prewarm` is optional; it only moves startup latency earlier in the flow.
 - The daemon waits for the container to signal `ready` on stderr before using it.
 - The portal emits `ModelLoading(request_handle, session_handle, "preparing model")` before language, speech, or vision operations that may touch the backing runtime.
 - One container runs per profile, shared across all sessions bound to that profile.
