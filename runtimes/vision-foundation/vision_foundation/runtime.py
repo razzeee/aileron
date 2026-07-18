@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import io
 import json
 import os
 import sys
-import tempfile
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
@@ -230,14 +230,15 @@ def handle_depth(request: dict[str, Any]) -> dict[str, Any]:
 
 def handle_da3_depth(request: dict[str, Any], decoded: DecodedImage, model_path: Path) -> dict[str, Any]:
     try:
-        import torch
-        from depth_anything_3.api import DepthAnything3
+        with contextlib.redirect_stdout(sys.stderr):
+            import torch
+            from depth_anything_3.api import DepthAnything3
     except Exception as exc:  # noqa: BLE001
         raise RuntimeErrorCode("model_unavailable", "depth-anything-3 is required for DA3 inference") from exc
     try:
-        model = DepthAnything3.from_pretrained(str(model_path)).to(device=torch.device("cpu"))
-        with tempfile.TemporaryDirectory() as export_dir:
-            prediction = model.inference([np.asarray(decoded.image)], export_dir=export_dir, export_format="mini_npz")
+        with contextlib.redirect_stdout(sys.stderr):
+            model = DepthAnything3.from_pretrained(str(model_path)).to(device=torch.device("cpu"))
+            prediction = model.inference([np.asarray(decoded.image)], export_dir=None)
         predicted = np.asarray(prediction.depth)[0]
     except Exception as exc:  # noqa: BLE001
         raise RuntimeErrorCode("inference_failed", f"DA3 inference failed: {exc}") from exc

@@ -1869,6 +1869,15 @@ fn stream_vision_depth(
     let sig_proxy =
         zbus::blocking::Proxy::new(&signal_conn, PORTAL_BUS, PORTAL_PATH, VISION_IFACE)?;
     let mut depth_iter = sig_proxy.receive_signal("VisionDepthReceived")?;
+    let token_suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let handle_token = format!("depth_{token_suffix}");
+    let request_path = portal_request_path(&call_conn, &handle_token)?;
+    let request_proxy =
+        zbus::blocking::Proxy::new(&call_conn, PORTAL_BUS, request_path.as_str(), REQUEST_IFACE)?;
+    let mut response_iter = request_proxy.receive_signal("Response")?;
     let depth_session_handle = session_handle.clone();
     let (stream_event_tx, stream_event_rx) = std::sync::mpsc::channel();
     let depth_event_tx = stream_event_tx.clone();
@@ -1897,38 +1906,55 @@ fn stream_vision_depth(
         }
     });
 
+    let mut options = execution_options();
+    options.insert(
+        "handle_token".to_string(),
+        string_option_value(&handle_token),
+    );
     let stream_result: zbus::Result<OwnedObjectPath> = proxy.call(
         "StreamDepth",
-        &(session_handle, image_fd, instructions, execution_options()),
+        &(session_handle, image_fd, instructions, options),
     );
     let request_handle = stream_result?;
-    let response_request_handle = request_handle.clone();
+    if request_handle.as_str() != request_path {
+        anyhow::bail!(
+            "StreamDepth returned unexpected request handle: {}",
+            request_handle.as_str()
+        );
+    }
     std::thread::spawn(move || {
-        let result = wait_request_success(&response_request_handle);
+        let result = wait_request_response_from_iter(&mut response_iter).map(|_| ());
         let _ = stream_event_tx.send(Ok(VisionDepthStreamEvent::RequestDone(result)));
     });
 
-    let mut terminal_depth = None::<VisionDepthMapDbus>;
     let mut request_done = false;
     loop {
-        match stream_event_rx.recv() {
-            Ok(event) => match event? {
-                VisionDepthStreamEvent::Depth(value, done) => {
-                    if done {
-                        terminal_depth = Some(value);
+        let event = if request_done {
+            stream_event_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .map_err(|error| match error {
+                    std::sync::mpsc::RecvTimeoutError::Timeout => {
+                        anyhow::anyhow!("vision depth request completed without a depth signal")
                     }
+                    std::sync::mpsc::RecvTimeoutError::Disconnected => {
+                        anyhow::anyhow!("vision depth stream ended before the request completed")
+                    }
+                })?
+        } else {
+            stream_event_rx.recv().map_err(|_| {
+                anyhow::anyhow!("vision depth stream ended before the request completed")
+            })?
+        };
+        match event? {
+            VisionDepthStreamEvent::Depth(value, done) => {
+                if done {
+                    return Ok(value);
                 }
-                VisionDepthStreamEvent::RequestDone(result) => {
-                    result?;
-                    request_done = true;
-                }
-            },
-            Err(std::sync::mpsc::RecvError) => {
-                anyhow::bail!("vision depth stream ended before the request completed");
             }
-        }
-        if request_done && let Some(depth) = terminal_depth.take() {
-            return Ok(depth);
+            VisionDepthStreamEvent::RequestDone(result) => {
+                result?;
+                request_done = true;
+            }
         }
     }
 }
