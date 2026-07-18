@@ -336,14 +336,16 @@ pub fn list_catalog_profiles() -> Result<Vec<CatalogProfileInfo>> {
                 continue;
             }
             let manifest = read_model_manifest_path(&path)?;
-            if manifest.llmfit_model_id.is_empty()
-                || crate::llmfit_metadata::find(&manifest.llmfit_model_id).is_none()
+            if !manifest.llmfit_model_id.is_empty()
+                && crate::llmfit_metadata::find(&manifest.llmfit_model_id).is_none()
             {
                 continue;
             }
             let disk_size_gb = manifest_disk_size_gb(&manifest);
             seen_profile_ids.insert(manifest.profile_id.clone());
-            seen_llmfit_model_ids.insert(manifest.llmfit_model_id.clone());
+            if !manifest.llmfit_model_id.is_empty() {
+                seen_llmfit_model_ids.insert(manifest.llmfit_model_id.clone());
+            }
             profiles.push(CatalogProfileInfo {
                 profile_id: manifest.profile_id,
                 model_id: manifest.model_id,
@@ -1535,6 +1537,18 @@ mod tests {
         assert!(use_cases.contains("language.extract"));
         assert!(use_cases.contains("speech.transcribe"));
         assert!(use_cases.contains("vision.describe"));
+        assert!(use_cases.contains("vision.depth"));
+    }
+
+    #[test]
+    fn catalog_includes_explicit_profiles_without_llmfit_metadata() {
+        let profiles = list_catalog_profiles().expect("list catalog profiles");
+
+        assert!(profiles.iter().any(|profile| {
+            profile.profile_id == "depth-anything-3-small"
+                && profile.runtime_id == "vision-foundation"
+                && profile.llmfit_model_id.is_empty()
+        }));
     }
 
     #[test]
