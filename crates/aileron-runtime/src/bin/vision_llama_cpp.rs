@@ -18,7 +18,7 @@ use serde_json::{Value, json};
 
 const DEFAULT_VISION_PROMPT: &str = "Describe this image clearly and concisely. Include visible objects, people, text, and relevant context.";
 const DEFAULT_OCR_PROMPT: &str = "Extract all text visible in this image exactly as written. Preserve the reading order and line breaks. Return only the transcribed text with no commentary. If there is no text, return an empty response.";
-const DEFAULT_SEGMENT_PROMPT: &str = "Identify the main visible objects in this image. Return only JSON matching the schema. Use normalized bounding boxes where x and y are the top-left corner and width and height are relative to the image size.";
+const DEFAULT_DETECT_PROMPT: &str = "Identify the main visible objects in this image. Return only JSON matching the schema. Use normalized bounding boxes where x and y are the top-left corner and width and height are relative to the image size.";
 
 fn main() -> Result<()> {
     let config = LlamaRuntimeConfig::from_env();
@@ -89,7 +89,7 @@ fn handle_request<'model>(
         "embed" => handle_embed(backend, model, embed_ctx, config, &req),
         "describe" => handle_describe(model, mtmd, ctx, &req),
         "ocr" => handle_ocr(model, mtmd, ctx, &req),
-        "segment" => handle_segment(model, mtmd, ctx, &req),
+        "detect" => handle_detect(model, mtmd, ctx, &req),
         _ => send_unsupported(&req, false),
     }
 }
@@ -309,14 +309,14 @@ fn handle_ocr(
     }
 }
 
-fn handle_segment(
+fn handle_detect(
     model: &LlamaModel,
     mtmd: &MtmdContext,
     ctx: &mut LlamaContext<'_>,
     req: &Request,
 ) -> Result<()> {
-    let prompt = prompt_from_request_or_env(req, "VISION_SEGMENT_PROMPT", DEFAULT_SEGMENT_PROMPT);
-    let schema = segment_schema();
+    let prompt = prompt_from_request_or_env(req, "VISION_DETECT_PROMPT", DEFAULT_DETECT_PROMPT);
+    let schema = detect_schema();
     match generate_for_image(
         model,
         mtmd,
@@ -546,13 +546,13 @@ fn structured_prompt(prompt: &str, schema: &Value) -> String {
     }
 }
 
-fn segment_schema() -> Value {
+fn detect_schema() -> Value {
     json!({
         "type": "object",
-        "required": ["segments"],
+        "required": ["detections"],
         "additionalProperties": false,
         "properties": {
-            "segments": {
+            "detections": {
                 "type": "array",
                 "items": {
                     "type": "object",

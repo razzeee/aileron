@@ -27,7 +27,9 @@ fn handle_request(req: Request) -> Result<()> {
             "token": "Stub OCR: extracted text from image.",
             "done": true,
         })),
+        "detect" => handle_detect(&req),
         "segment" => handle_segment(&req),
+        "depth" => handle_depth(&req),
         _ => send_unsupported(&req, false),
     }
 }
@@ -162,9 +164,9 @@ fn handle_transcribe(req: &Request) -> Result<()> {
     }))
 }
 
-fn handle_segment(req: &Request) -> Result<()> {
+fn handle_detect(req: &Request) -> Result<()> {
     let result = json!({
-        "segments": [{
+        "detections": [{
             "label": "stub object",
             "confidence": 1.0,
             "x": 0.1,
@@ -172,6 +174,58 @@ fn handle_segment(req: &Request) -> Result<()> {
             "width": 0.8,
             "height": 0.8,
         }]
+    });
+
+    send(json!({
+        "id": req.id,
+        "result": serde_json::to_string(&result)?,
+        "done": true,
+    }))
+}
+
+fn handle_segment(req: &Request) -> Result<()> {
+    let label = if req.points.as_ref().is_some_and(|points| !points.is_empty()) {
+        "stub prompted object"
+    } else if req.boxes.as_ref().is_some_and(|boxes| !boxes.is_empty()) {
+        "stub boxed object"
+    } else {
+        "stub mask"
+    };
+    let result = json!({
+        "masks": [{
+            "label": label,
+            "confidence": 1.0,
+            "x": 0.2,
+            "y": 0.2,
+            "width": 0.6,
+            "height": 0.6,
+            "mask_base64": "/w==",
+            "mask_width": 1,
+            "mask_height": 1,
+        }]
+    });
+
+    send(json!({
+        "id": req.id,
+        "result": serde_json::to_string(&result)?,
+        "done": true,
+    }))
+}
+
+fn handle_depth(req: &Request) -> Result<()> {
+    let result = json!({
+        "depth": {
+            "width": 4,
+            "height": 4,
+            "values": [
+                0.0, 0.1, 0.2, 0.3,
+                0.1, 0.2, 0.3, 0.4,
+                0.2, 0.3, 0.4, 0.5,
+                0.3, 0.4, 0.5, 1.0
+            ],
+            "minimum": 0.0,
+            "maximum": 1.0
+        }
     });
 
     send(json!({

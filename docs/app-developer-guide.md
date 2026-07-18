@@ -37,7 +37,9 @@ Current tokens:
 - `speech.translate`
 - `vision.describe`
 - `vision.ocr`
+- `vision.detect`
 - `vision.segment`
+- `vision.depth`
 
 Avoid treating model names as application requirements. A user may satisfy `language.summarize` with a small CPU model, a GPU model, or a future system model without changing the app.
 
@@ -121,7 +123,7 @@ Use `speech.transcribe` for verbatim speech-to-text and `speech.translate` to tr
 
 Live microphone chunking is app behavior in the current API. Apps that want interim text can keep recording locally, periodically send sufficiently large aligned PCM chunks through `StreamTranscribe`, and run one final `StreamTranscribe` pass over the complete recording when capture stops.
 
-Use `vision.describe` with `StreamDescribe`, `vision.ocr` with `StreamOcr`, and `vision.segment` with `StreamSegment`. Description and OCR stream text; segmentation emits one segment-list event with normalized rectangular boxes. Images are passed to the portal as readable, sealable memfds containing PNG or JPEG bytes. Each Vision stream method also accepts an `instructions` string for per-image guidance; pass an empty string when unspecified.
+Use `vision.describe` with `StreamDescribe`, `vision.ocr` with `StreamOcr`, `vision.detect` with `StreamDetect`, mask-capable `vision.segment` with `StreamSegment`, and `vision.depth` with `StreamDepth`. Description and OCR stream text; detection emits normalized rectangular boxes; segmentation emits masks selected by point/box prompts; depth emits a dense normalized map. Images are passed to the portal as readable, sealable memfds containing PNG or JPEG bytes. Each Vision stream method also accepts an `instructions` string for per-image guidance; pass an empty string when unspecified.
 
 Large media inputs can be expensive even when transported by fd. Prefer user-initiated actions, visible progress, resized images, app-side audio chunking, and cancellation-friendly UI.
 

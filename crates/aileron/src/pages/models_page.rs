@@ -26,7 +26,9 @@ const USE_CASES: &[&str] = &[
     "speech.transcribe",
     "speech.translate",
     "vision.describe",
+    "vision.detect",
     "vision.segment",
+    "vision.depth",
     "vision.ocr",
 ];
 

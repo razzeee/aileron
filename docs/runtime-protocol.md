@@ -287,14 +287,14 @@ Response uses the same token stream shape as text generation:
 {"id":"request-id","token":"Invoice #4815 - Total: $42.00","done":true}
 ```
 
-## Image Segmentation
+## Image Detection
 
 Request:
 
 ```json
 {
   "id": "request-id",
-  "type": "segment",
+  "type": "detect",
   "image": "base64-encoded-png-or-jpeg",
   "prompt": "optional per-image instructions"
 }
@@ -305,10 +305,50 @@ Request:
 Response is a single line containing a JSON string of normalized object boxes:
 
 ```json
-{"id":"request-id","result":"{\"segments\":[{\"label\":\"cat\",\"confidence\":0.9,\"x\":0.1,\"y\":0.1,\"width\":0.5,\"height\":0.6}]}","done":true}
+{"id":"request-id","result":"{\"detections\":[{\"label\":\"cat\",\"confidence\":0.9,\"x\":0.1,\"y\":0.1,\"width\":0.5,\"height\":0.6}]}","done":true}
 ```
 
 `result` is a string containing JSON. Coordinates are normalized to `0.0..1.0` relative to the image dimensions, where `x` and `y` are the top-left corner.
+
+## Image Segmentation
+
+Request:
+
+```json
+{
+  "id": "request-id",
+  "type": "segment",
+  "image": "base64-encoded-png-or-jpeg",
+  "prompt": "optional per-image instructions",
+  "points": [{"x": 0.5, "y": 0.5, "positive": true}],
+  "boxes": [{"x": 0.1, "y": 0.1, "width": 0.8, "height": 0.8}]
+}
+```
+
+Response is a single line containing a JSON string of promptable masks:
+
+```json
+{"id":"request-id","result":"{\"masks\":[{\"label\":\"cat\",\"confidence\":0.9,\"x\":0.1,\"y\":0.1,\"width\":0.5,\"height\":0.6,\"mask_base64\":\"/w==\",\"mask_width\":1,\"mask_height\":1}]}","done":true}
+```
+
+## Image Depth
+
+Request:
+
+```json
+{
+  "id": "request-id",
+  "type": "depth",
+  "image": "base64-encoded-png-or-jpeg",
+  "prompt": "optional per-image instructions"
+}
+```
+
+Response is a single line containing a JSON string of normalized row-major depth values:
+
+```json
+{"id":"request-id","result":"{\"depth\":{\"width\":2,\"height\":2,\"values\":[0.0,0.3,0.6,1.0],\"minimum\":0.0,\"maximum\":1.0}}","done":true}
+```
 
 ## Error Responses
 

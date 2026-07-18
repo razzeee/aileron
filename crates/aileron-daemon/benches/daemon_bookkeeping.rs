@@ -118,9 +118,19 @@ fn response_fixture(use_case: &str) -> Vec<u8> {
             "embedding": [0.1, 0.2, 0.3, 0.4],
             "done": true,
         }),
+        "vision.detect" => serde_json::json!({
+            "id": "request-1",
+            "result": r#"{"detections":[{"label":"object","confidence":0.9,"x":0.1,"y":0.2,"width":0.3,"height":0.4}]}"#,
+            "done": true,
+        }),
         "vision.segment" => serde_json::json!({
             "id": "request-1",
-            "result": r#"{"segments":[{"label":"object","confidence":0.9,"x":0.1,"y":0.2,"width":0.3,"height":0.4}]}"#,
+            "result": r#"{"masks":[{"label":"object","confidence":0.9,"x":0.1,"y":0.2,"width":0.3,"height":0.4,"mask_base64":"/w==","mask_width":1,"mask_height":1}]}"#,
+            "done": true,
+        }),
+        "vision.depth" => serde_json::json!({
+            "id": "request-1",
+            "result": r#"{"depth":{"width":2,"height":2,"values":[0.0,0.3,0.6,1.0],"minimum":0.0,"maximum":1.0}}"#,
             "done": true,
         }),
         other => panic!("unsupported benchmark use-case: {other}"),
@@ -128,7 +138,7 @@ fn response_fixture(use_case: &str) -> Vec<u8> {
     format!("{response}\n").into_bytes()
 }
 
-fn model_use_cases() -> [&'static str; 8] {
+fn model_use_cases() -> [&'static str; 10] {
     [
         "language.generate",
         "language.structured",
@@ -137,7 +147,9 @@ fn model_use_cases() -> [&'static str; 8] {
         "speech.transcribe",
         "vision.describe",
         "vision.ocr",
+        "vision.detect",
         "vision.segment",
+        "vision.depth",
     ]
 }
 
@@ -307,11 +319,25 @@ fn stub_request(use_case: &str, id: &str) -> serde_json::Value {
             "prompt": "extract text",
             "execution_mode": "interactive",
         }),
+        "vision.detect" => serde_json::json!({
+            "id": id,
+            "type": "detect",
+            "image": "",
+            "prompt": "detect objects",
+            "execution_mode": "interactive",
+        }),
         "vision.segment" => serde_json::json!({
             "id": id,
             "type": "segment",
             "image": "",
             "prompt": "segment objects",
+            "execution_mode": "interactive",
+        }),
+        "vision.depth" => serde_json::json!({
+            "id": id,
+            "type": "depth",
+            "image": "",
+            "prompt": "estimate depth",
             "execution_mode": "interactive",
         }),
         other => panic!("unsupported benchmark use-case: {other}"),

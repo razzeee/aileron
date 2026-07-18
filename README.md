@@ -354,7 +354,7 @@ Paste or fetch an article URL, then click **Summarize**. Tokens stream into the 
 
 Use-case tokens are the daemon's routing and policy keys. A token maps to one assigned profile, permissions are granted per app and token, and warm containers are pooled per profile. Assigning the same profile to multiple declared tokens is valid.
 
-Use-cases describe the task intent and modality; methods describe the operation shape. All inference results are exposed through stream-named methods. `StreamResponse`, `StreamRespondGuided`, and `StreamSubmitToolResultsGuided` are for language generation use-cases other than `language.embed`. `StreamEmbed` is for `language.embed`. `StreamTranscribe` serves both `speech.transcribe` and `speech.translate` (the daemon runs the whisper transcribe or translate-to-English task based on the session use-case). `StreamDescribe` is for `vision.describe`, `StreamOcr` is for `vision.ocr`, and `StreamSegment` is for `vision.segment`. There is intentionally no separate `language.guided` token: guided generation is an output constraint for a real language task use-case, not a task intent of its own. Use `language.analyze` when one guided response combines multiple analytical intents, such as summary, extraction, and classification fields.
+Use-cases describe the task intent and modality; methods describe the operation shape. All inference results are exposed through stream-named methods. `StreamResponse`, `StreamRespondGuided`, and `StreamSubmitToolResultsGuided` are for language generation use-cases other than `language.embed`. `StreamEmbed` is for `language.embed`. `StreamTranscribe` serves both `speech.transcribe` and `speech.translate` (the daemon runs the whisper transcribe or translate-to-English task based on the session use-case). `StreamDescribe` is for `vision.describe`, `StreamOcr` is for `vision.ocr`, `StreamDetect` is for `vision.detect`, `StreamSegment` is for mask-capable `vision.segment`, and `StreamDepth` is for `vision.depth`. There is intentionally no separate `language.guided` token: guided generation is an output constraint for a real language task use-case, not a task intent of its own. Use `language.analyze` when one guided response combines multiple analytical intents, such as summary, extraction, and classification fields.
 
 | Token | Task | Backend |
 |---|---|---|
@@ -369,7 +369,9 @@ Use-cases describe the task intent and modality; methods describe the operation 
 | `speech.translate` | Translate spoken audio to English text | whisper.cpp |
 | `vision.describe` | Describe image contents (PNG/JPEG) | llava / llama.cpp |
 | `vision.ocr` | Extract text from an image (PNG/JPEG) | llama.cpp multimodal |
-| `vision.segment` | Identify objects in image | llama.cpp multimodal |
+| `vision.detect` | Identify objects with normalized boxes | llama.cpp multimodal |
+| `vision.segment` | Return promptable instance masks | CV runtimes |
+| `vision.depth` | Estimate a dense depth map | CV runtimes |
 
 ## Varlink interfaces
 
@@ -390,7 +392,12 @@ type GuidedField (name: string, kind: string, description: string, required: boo
 type ToolDefinition (name: string, description: string, schema_json: string)
 type ToolCall (id: string, name: string, arguments_json: string)
 type ToolResult (id: string, content: string, content_json: string)
-type VisionSegment (label: string, confidence: float, x: float, y: float, width: float, height: float)
+type VisionPointPrompt (x: float, y: float, positive: bool)
+type VisionBoxPrompt (x: float, y: float, width: float, height: float)
+type VisionSegmentOptions (execution_mode: string, points: []VisionPointPrompt, boxes: []VisionBoxPrompt)
+type VisionDetection (label: string, confidence: float, x: float, y: float, width: float, height: float)
+type VisionMask (label: string, confidence: float, x: float, y: float, width: float, height: float, mask_base64: string, mask_width: int, mask_height: int)
+type VisionDepthMap (width: int, height: int, values: []float, minimum: float, maximum: float)
 
 method GetUseCaseAvailability(app_id: string, use_case: string) -> (availability: ModelAvailability)
 method CreateSession(app_id: string, use_case: string, instructions: string) -> (session_id: string, profile_id: string)
@@ -402,11 +409,13 @@ method StreamEmbed(session_id: string, text: string, options: EmbedOptions) -> (
 method StreamTranscribe(session_id: string, audio_path: string, options: SpeechOptions) -> (token: string)
 method StreamDescribe(session_id: string, image_path: string, instructions: string, options: VisionOptions) -> (token: string)
 method StreamOcr(session_id: string, image_path: string, instructions: string, options: VisionOptions) -> (token: string)
-method StreamSegment(session_id: string, image_path: string, instructions: string, options: VisionOptions) -> (segments: []VisionSegment)
+method StreamDetect(session_id: string, image_path: string, instructions: string, options: VisionOptions) -> (detections: []VisionDetection)
+method StreamSegment(session_id: string, image_path: string, instructions: string, options: VisionSegmentOptions) -> (masks: []VisionMask)
+method StreamDepth(session_id: string, image_path: string, instructions: string, options: VisionOptions) -> (depth: VisionDepthMap)
 method EndSession(session_id: string) -> ()
 ```
 
-`CreateSession` returns the backend session id and selected profile id; the portal frontend exposes only an opaque public session handle to apps. Missing app permissions fail with `PermissionPromptRequired` so the portal backend can prompt once and persist the decision; explicit denials fail with `PermissionDenied` and are not re-prompted. `instructions` are stored on the session and forwarded to text containers as the container `system` prompt. `StreamTranscribe` reads raw 16 kHz mono f32le PCM from `audio_path` and streams a verbatim transcript for `speech.transcribe` sessions or an English translation for `speech.translate` sessions. Vision methods read PNG or JPEG bytes from `image_path` and pass non-empty per-image `instructions` to the container as the request `prompt`. `StreamEmbed` streams one embedding vector event for `text` with `embedding_pipeline_id`; apps should persist it with stored vectors and only compare vectors whose pipeline ids match. `VisionSegment` coordinates are normalized `0.0..1.0` rectangles relative to image dimensions.
+`CreateSession` returns the backend session id and selected profile id; the portal frontend exposes only an opaque public session handle to apps. Missing app permissions fail with `PermissionPromptRequired` so the portal backend can prompt once and persist the decision; explicit denials fail with `PermissionDenied` and are not re-prompted. `instructions` are stored on the session and forwarded to text containers as the container `system` prompt. `StreamTranscribe` reads raw 16 kHz mono f32le PCM from `audio_path` and streams a verbatim transcript for `speech.transcribe` sessions or an English translation for `speech.translate` sessions. Vision methods read PNG or JPEG bytes from `image_path` and pass non-empty per-image `instructions` to the container as the request `prompt`. `StreamEmbed` streams one embedding vector event for `text` with `embedding_pipeline_id`; apps should persist it with stored vectors and only compare vectors whose pipeline ids match. Detection and mask coordinates are normalized `0.0..1.0` rectangles relative to image dimensions; segmentation uses point and box prompts for geometric object selection.
 
 Token-generating option structs require `maximum_response_tokens` to be greater than zero and fit in `u32`; `temperature` must be finite and non-negative. `ResponseOptions.source_language_hint` and `target_language_hint` are optional strings for `language.translate`; pass empty strings when unspecified. The daemon forwards `maximum_response_tokens` to containers as `max_tokens` and folds translation hints into the session instructions for `language.translate`.
 
@@ -475,7 +484,7 @@ The portal does not talk to containers directly. It translates D-Bus calls into 
 |---|---|---|
 | `org.freedesktop.portal.Language` | `language.*` | `GetUseCaseAvailability`, `CreateSession`, `Prewarm`, `StreamResponse`, `StreamRespondGuided`, `StreamSubmitToolResultsGuided`, `StreamEmbed` |
 | `org.freedesktop.portal.Speech` | `speech.*` | `GetUseCaseAvailability`, `CreateSession`, `Prewarm`, `StreamTranscribe` |
-| `org.freedesktop.portal.Vision` | `vision.*` | `GetUseCaseAvailability`, `CreateSession`, `Prewarm`, `StreamDescribe`, `StreamOcr`, `StreamSegment` |
+| `org.freedesktop.portal.Vision` | `vision.*` | `GetUseCaseAvailability`, `CreateSession`, `Prewarm`, `StreamDescribe`, `StreamOcr`, `StreamDetect`, `StreamSegment`, `StreamDepth` |
 
 Apps call the public interfaces on `org.freedesktop.portal.Desktop`. The public frontend derives the app identity, returns request handles for operations that may prompt, load, or stream, and closes backend sessions when the app calls `Close` on the corresponding `org.freedesktop.portal.Session` object. The implementation backend receives the standard `handle: o` and `session_handle: o` object paths plus internal `app_id: s` strings and is only called by xdg-desktop-portal.
 
@@ -514,9 +523,11 @@ Streaming D-Bus methods return an `org.freedesktop.portal.Request` handle immedi
 |---|---|---|---|
 | `StreamDescribe` | `session_handle: o, image_fd: h, instructions: s, options: a{sv}` | `handle: o` | `vision.describe` sessions only; reads PNG/JPEG bytes from a sealable memfd; optional per-image instructions; emits `VisionTextReceived` signals |
 | `StreamOcr` | `session_handle: o, image_fd: h, instructions: s, options: a{sv}` | `handle: o` | `vision.ocr` sessions only; reads PNG/JPEG bytes from a sealable memfd; optional per-image instructions; emits `VisionTextReceived` signals |
-| `StreamSegment` | `session_handle: o, image_fd: h, instructions: s, options: a{sv}` | `handle: o` | `vision.segment` sessions only; reads PNG/JPEG bytes from a sealable memfd; optional per-image instructions; emits one `VisionSegmentsReceived` signal with normalized boxes |
+| `StreamDetect` | `session_handle: o, image_fd: h, instructions: s, options: a{sv}` | `handle: o` | `vision.detect` sessions only; emits one `VisionDetectionsReceived` signal with normalized boxes |
+| `StreamSegment` | `session_handle: o, image_fd: h, instructions: s, options: a{sv}` | `handle: o` | `vision.segment` sessions only; accepts `point_prompts: a(ddb)` and `box_prompts: a(dddd)` options and emits one `VisionMasksReceived` signal |
+| `StreamDepth` | `session_handle: o, image_fd: h, instructions: s, options: a{sv}` | `handle: o` | `vision.depth` sessions only; emits one `VisionDepthReceived` signal |
 
-These are D-Bus signatures: parentheses define a struct, `a(...)` means an array of structs, `a{sv}` is an options vardict, and `h` is a Unix fd handle. `parent_window` follows xdg-desktop-portal window identifier rules such as `x11:<XID>` or `wayland:<HANDLE>`; pass an empty string when no suitable handle exists. Aileron's fallback `zenity`/`kdialog` prompt currently attaches only X11 parent windows. Public language response methods accept `maximum_response_tokens` as int64, `temperature` as double, `source_language_hint` as string, `target_language_hint` as string, and `execution_mode` as string. Guided language methods accept `maximum_response_tokens`, `temperature`, and `execution_mode`. Embed and Vision stream options accept `execution_mode`. Speech stream options accept `source_language_hint` and `execution_mode`. Empty language hints and empty Vision `instructions` mean unspecified. Language response hints only affect `language.translate`; speech `source_language_hint` identifies the spoken input language, while the session use-case selects transcript vs English translation. `fields: a(sssb)` is an array of `GuidedField` structs: name, kind, description, required. Tool structs are `a(sss)`: definitions are name, description, schema JSON; calls are id, name, arguments JSON; results are id, content, content JSON.
+These are D-Bus signatures: parentheses define a struct, `a(...)` means an array of structs, `a{sv}` is an options vardict, and `h` is a Unix fd handle. `parent_window` follows xdg-desktop-portal window identifier rules such as `x11:<XID>` or `wayland:<HANDLE>`; pass an empty string when no suitable handle exists. Aileron's fallback `zenity`/`kdialog` prompt currently attaches only X11 parent windows. Public language response methods accept `maximum_response_tokens` as int64, `temperature` as double, `source_language_hint` as string, `target_language_hint` as string, and `execution_mode` as string. Guided language methods accept `maximum_response_tokens`, `temperature`, and `execution_mode`. Embed and Vision stream options accept `execution_mode`; `StreamSegment` also accepts `point_prompts` and `box_prompts`. Speech stream options accept `source_language_hint` and `execution_mode`. Empty language hints and empty Vision `instructions` mean unspecified. Language response hints only affect `language.translate`; speech `source_language_hint` identifies the spoken input language, while the session use-case selects transcript vs English translation. `fields: a(sssb)` is an array of `GuidedField` structs: name, kind, description, required. Tool structs are `a(sss)`: definitions are name, description, schema JSON; calls are id, name, arguments JSON; results are id, content, content JSON.
 
 Audio and image payloads are passed to the public portal as readable, sealable memfd handles, avoiding D-Bus string payload limits for media bytes while preventing mutation after the portal accepts the handle. Apps should still use user-initiated actions, visible progress, resized images, app-side audio chunking, and cancellation-friendly UI. The daemon's container runtime protocol remains JSON over stdio and base64-encodes these bytes internally for runtime compatibility.
 
@@ -531,7 +542,9 @@ Audio and image payloads are passed to the public portal as readable, sealable m
 | `EmbeddingReceived` | `request_handle: o, session_handle: o, embedding: ad, embedding_pipeline_id: s, done: b` | Embedding vector and compatibility metadata during `StreamEmbed` on `Language` |
 | `TranscriptionReceived` | `request_handle: o, session_handle: o, text: s, done: b` | Each segment during `StreamTranscribe` on `Speech` |
 | `VisionTextReceived` | `request_handle: o, session_handle: o, text: s, done: b` | Each text token during `StreamDescribe` or `StreamOcr` on `Vision` |
-| `VisionSegmentsReceived` | `request_handle: o, session_handle: o, segments: a(sddddd), done: b` | Segmentation result during `StreamSegment` on `Vision` |
+| `VisionDetectionsReceived` | `request_handle: o, session_handle: o, detections: a(sddddd), done: b` | Detection result during `StreamDetect` on `Vision` |
+| `VisionMasksReceived` | `request_handle: o, session_handle: o, masks: a(sdddddsii), done: b` | Mask result during `StreamSegment` on `Vision` |
+| `VisionDepthReceived` | `request_handle: o, session_handle: o, depth: (iiadd), done: b` | Depth map result during `StreamDepth` on `Vision` |
 
 The implementation backend exposes the same task methods with implementation-oriented identifiers: `CreateSession` receives `handle: o`, `session_handle: o`, `app_id: s`, and `parent_window: s`; streaming methods receive `handle: o` and `session_handle: o`; and session close uses the shared `org.freedesktop.impl.portal.Session.Close` path. Public apps should not call the implementation interfaces directly.
 
@@ -640,14 +653,24 @@ The daemon sends a `response_format` object containing the caller's JSON Schema.
 {"id": "uuid", "token": "A cat", "done": true}
 ```
 
+### Image detection
+
+```jsonc
+// request
+{"id": "uuid", "type": "detect", "image": "<base64 PNG or JPEG>", "prompt": "optional per-image instructions"}
+
+// response (single line)
+{"id": "uuid", "result": "{\"detections\":[{\"label\":\"cat\",\"confidence\":0.82,\"x\":0.1,\"y\":0.2,\"width\":0.5,\"height\":0.4}]}", "done": true}
+```
+
 ### Image segmentation
 
 ```jsonc
 // request
-{"id": "uuid", "type": "segment", "image": "<base64 PNG or JPEG>", "prompt": "optional per-image instructions"}
+{"id": "uuid", "type": "segment", "image": "<base64 PNG or JPEG>", "prompt": "optional per-image instructions", "points": [{"x": 0.5, "y": 0.5, "positive": true}]}
 
 // response (single line)
-{"id": "uuid", "result": "{\"segments\":[{\"label\":\"cat\",\"confidence\":0.82,\"x\":0.1,\"y\":0.2,\"width\":0.5,\"height\":0.4}]}", "done": true}
+{"id": "uuid", "result": "{\"masks\":[{\"label\":\"cat\",\"confidence\":0.82,\"x\":0.1,\"y\":0.2,\"width\":0.5,\"height\":0.4,\"mask_base64\":\"/w==\",\"mask_width\":1,\"mask_height\":1}]}", "done": true}
 ```
 
 ## Container lifecycle

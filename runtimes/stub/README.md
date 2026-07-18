@@ -2,7 +2,7 @@
 
 This runtime implements the Aileron container stdio protocol without loading a model. It is intended for end-to-end tests of the daemon, portal, and clients.
 
-The stub supports the container stdio request types with deterministic fake responses, including `generate`, `generate_structured`, `embed`, `transcribe`, `describe`, `ocr`, and `segment`.
+The stub supports the container stdio request types with deterministic fake responses, including `generate`, `generate_structured`, `embed`, `transcribe`, `describe`, `ocr`, `detect`, `segment`, and `depth`.
 
 Run all commands below from the repository root.
 

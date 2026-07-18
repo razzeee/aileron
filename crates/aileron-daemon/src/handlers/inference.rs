@@ -20,11 +20,12 @@ use crate::state::SharedState;
 // VarlinkCallError is a supertrait; its methods reach us via Call_* dyn objects.
 use aileron_varlink::aileron_Inference::{
     Call_CreateSession, Call_EndSession, Call_GetUseCaseAvailability, Call_Prewarm,
-    Call_StreamDescribe, Call_StreamEmbed, Call_StreamOcr, Call_StreamRespondGuided,
-    Call_StreamResponse, Call_StreamSegment, Call_StreamSubmitToolResultsGuided,
-    Call_StreamTranscribe, EmbedOptions, GuidedField, GuidedOptions, ModelAvailability,
-    ResponseOptions, SpeechOptions, ToolCall, ToolDefinition, ToolResult, VarlinkCallError,
-    VarlinkInterface, VisionOptions, VisionSegment,
+    Call_StreamDepth, Call_StreamDescribe, Call_StreamDetect, Call_StreamEmbed, Call_StreamOcr,
+    Call_StreamRespondGuided, Call_StreamResponse, Call_StreamSegment,
+    Call_StreamSubmitToolResultsGuided, Call_StreamTranscribe, EmbedOptions, GuidedField,
+    GuidedOptions, ModelAvailability, ResponseOptions, SpeechOptions, ToolCall, ToolDefinition,
+    ToolResult, VarlinkCallError, VarlinkInterface, VisionBoxPrompt, VisionDepthMap,
+    VisionDetection, VisionMask, VisionOptions, VisionPointPrompt, VisionSegmentOptions,
 };
 
 pub struct InferenceHandler {
@@ -404,18 +405,59 @@ impl VarlinkInterface for InferenceHandler {
         })
     }
 
-    fn stream_segment(
+    fn stream_detect(
         &self,
-        call: &mut dyn Call_StreamSegment,
+        call: &mut dyn Call_StreamDetect,
         session_id: String,
         image_path: String,
         instructions: String,
         options: VisionOptions,
     ) -> varlink::Result<()> {
         self.rt.block_on(async {
-            match vision_segments(&self.state, session_id, image_path, instructions, options).await
+            match vision_detections(&self.state, session_id, image_path, instructions, options)
+                .await
             {
-                Ok(segments) => call.reply(segments),
+                Ok(detections) => call.reply(detections),
+                Err(VisionError::SessionNotFound(id)) => call.reply_session_not_found(id),
+                Err(VisionError::ModelUnavailable(reason)) => call.reply_model_unavailable(reason),
+                Err(VisionError::InvalidInput(reason)) => call.reply_invalid_input(reason),
+                Err(VisionError::Failed(reason)) => reply_generation_failure(call, reason),
+                Err(VisionError::Reply(e)) => Err(e),
+            }
+        })
+    }
+
+    fn stream_segment(
+        &self,
+        call: &mut dyn Call_StreamSegment,
+        session_id: String,
+        image_path: String,
+        instructions: String,
+        options: VisionSegmentOptions,
+    ) -> varlink::Result<()> {
+        self.rt.block_on(async {
+            match vision_masks(&self.state, session_id, image_path, instructions, options).await {
+                Ok(masks) => call.reply(masks),
+                Err(VisionError::SessionNotFound(id)) => call.reply_session_not_found(id),
+                Err(VisionError::ModelUnavailable(reason)) => call.reply_model_unavailable(reason),
+                Err(VisionError::InvalidInput(reason)) => call.reply_invalid_input(reason),
+                Err(VisionError::Failed(reason)) => reply_generation_failure(call, reason),
+                Err(VisionError::Reply(e)) => Err(e),
+            }
+        })
+    }
+
+    fn stream_depth(
+        &self,
+        call: &mut dyn Call_StreamDepth,
+        session_id: String,
+        image_path: String,
+        instructions: String,
+        options: VisionOptions,
+    ) -> varlink::Result<()> {
+        self.rt.block_on(async {
+            match vision_depth(&self.state, session_id, image_path, instructions, options).await {
+                Ok(depth) => call.reply(depth),
                 Err(VisionError::SessionNotFound(id)) => call.reply_session_not_found(id),
                 Err(VisionError::ModelUnavailable(reason)) => call.reply_model_unavailable(reason),
                 Err(VisionError::InvalidInput(reason)) => call.reply_invalid_input(reason),
@@ -892,13 +934,61 @@ fn vision_text_allows_empty_output(expected_use_case: &str) -> bool {
     expected_use_case == "vision.ocr"
 }
 
-async fn vision_segments(
+async fn vision_detections(
     state: &SharedState,
     session_id: String,
     image_path: String,
     instructions: String,
     options: VisionOptions,
-) -> Result<Vec<VisionSegment>, VisionError> {
+) -> Result<Vec<VisionDetection>, VisionError> {
+    let execution_mode =
+        parse_execution_mode(&options.execution_mode).map_err(VisionError::InvalidInput)?;
+    let resolved = resolve_session_runtime(state, &session_id, |use_case| {
+        ensure_exact_use_case(use_case, "vision.detect", "StreamDetect")
+    })
+    .await
+    .map_err(VisionError::from)?;
+    let image_bytes = read_media_path(&image_path).map_err(VisionError::InvalidInput)?;
+    with_locked_container(
+        "StreamDetect",
+        state,
+        &session_id,
+        resolved.clone(),
+        execution_mode,
+        VisionError::Failed,
+        |container, handle, spawned| {
+            let result = container
+                .detect(image_bytes, &instructions, execution_mode.as_str())
+                .map(|detections| {
+                    detections
+                        .into_iter()
+                        .map(|detection| VisionDetection {
+                            label: detection.label,
+                            confidence: detection.confidence,
+                            x: detection.x,
+                            y: detection.y,
+                            width: detection.width,
+                            height: detection.height,
+                        })
+                        .collect()
+                })
+                .map_err(|e| VisionError::Failed(e.to_string()));
+            RequestCancellation::for_session(state, &session_id)
+                .ensure_not_cancelled_or_terminate_spawned(handle, spawned)
+                .map_err(VisionError::Failed)?;
+            result
+        },
+    )
+    .await
+}
+
+async fn vision_masks(
+    state: &SharedState,
+    session_id: String,
+    image_path: String,
+    instructions: String,
+    options: VisionSegmentOptions,
+) -> Result<Vec<VisionMask>, VisionError> {
     let execution_mode =
         parse_execution_mode(&options.execution_mode).map_err(VisionError::InvalidInput)?;
     let resolved = resolve_session_runtime(state, &session_id, |use_case| {
@@ -907,6 +997,25 @@ async fn vision_segments(
     .await
     .map_err(VisionError::from)?;
     let image_bytes = read_media_path(&image_path).map_err(VisionError::InvalidInput)?;
+    let points = options
+        .points
+        .into_iter()
+        .map(|point| crate::container::VisionPointPrompt {
+            x: point.x,
+            y: point.y,
+            positive: point.positive,
+        })
+        .collect::<Vec<_>>();
+    let boxes = options
+        .boxes
+        .into_iter()
+        .map(|bbox| crate::container::VisionBoxPrompt {
+            x: bbox.x,
+            y: bbox.y,
+            width: bbox.width,
+            height: bbox.height,
+        })
+        .collect::<Vec<_>>();
     with_locked_container(
         "StreamSegment",
         state,
@@ -916,19 +1025,70 @@ async fn vision_segments(
         VisionError::Failed,
         |container, handle, spawned| {
             let result = container
-                .segment(image_bytes, &instructions, execution_mode.as_str())
-                .map(|segments| {
-                    segments
+                .segment(
+                    image_bytes,
+                    &instructions,
+                    execution_mode.as_str(),
+                    points,
+                    boxes,
+                )
+                .map(|masks| {
+                    masks
                         .into_iter()
-                        .map(|segment| VisionSegment {
-                            label: segment.label,
-                            confidence: segment.confidence,
-                            x: segment.x,
-                            y: segment.y,
-                            width: segment.width,
-                            height: segment.height,
+                        .map(|mask| VisionMask {
+                            label: mask.label,
+                            confidence: mask.confidence,
+                            x: mask.x,
+                            y: mask.y,
+                            width: mask.width,
+                            height: mask.height,
+                            mask_base64: mask.mask_base64,
+                            mask_width: mask.mask_width,
+                            mask_height: mask.mask_height,
                         })
                         .collect()
+                })
+                .map_err(|e| VisionError::Failed(e.to_string()));
+            RequestCancellation::for_session(state, &session_id)
+                .ensure_not_cancelled_or_terminate_spawned(handle, spawned)
+                .map_err(VisionError::Failed)?;
+            result
+        },
+    )
+    .await
+}
+
+async fn vision_depth(
+    state: &SharedState,
+    session_id: String,
+    image_path: String,
+    instructions: String,
+    options: VisionOptions,
+) -> Result<VisionDepthMap, VisionError> {
+    let execution_mode =
+        parse_execution_mode(&options.execution_mode).map_err(VisionError::InvalidInput)?;
+    let resolved = resolve_session_runtime(state, &session_id, |use_case| {
+        ensure_exact_use_case(use_case, "vision.depth", "StreamDepth")
+    })
+    .await
+    .map_err(VisionError::from)?;
+    let image_bytes = read_media_path(&image_path).map_err(VisionError::InvalidInput)?;
+    with_locked_container(
+        "StreamDepth",
+        state,
+        &session_id,
+        resolved.clone(),
+        execution_mode,
+        VisionError::Failed,
+        |container, handle, spawned| {
+            let result = container
+                .depth(image_bytes, &instructions, execution_mode.as_str())
+                .map(|depth| VisionDepthMap {
+                    width: depth.width,
+                    height: depth.height,
+                    values: depth.values,
+                    minimum: depth.minimum,
+                    maximum: depth.maximum,
                 })
                 .map_err(|e| VisionError::Failed(e.to_string()));
             RequestCancellation::for_session(state, &session_id)
@@ -2890,7 +3050,9 @@ mod tests {
     fn supported_use_case_catalog_accepts_public_tokens() {
         assert!(is_supported_use_case("language.summarize"));
         assert!(is_supported_use_case("speech.translate"));
+        assert!(is_supported_use_case("vision.detect"));
         assert!(is_supported_use_case("vision.segment"));
+        assert!(is_supported_use_case("vision.depth"));
     }
 
     #[test]

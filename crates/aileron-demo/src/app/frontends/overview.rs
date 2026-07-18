@@ -93,7 +93,7 @@ pub(crate) fn build_page(stack: &ViewStack) -> gtk4::Widget {
         LabCard {
             title: "Vision Lab",
             subtitle: "Choose an image file and run description or segmentation through the vision portal path.",
-            methods: "StreamDescribe, StreamSegment",
+            methods: "StreamDescribe, StreamDetect, StreamSegment, StreamDepth",
             example: "Try: choose a screenshot, describe it, then segment visible objects.",
             button_label: "Open Vision Lab",
             page_name: "vision",

@@ -75,6 +75,24 @@ fn execution_options() -> PortalOptions {
     options
 }
 
+fn segment_options(points: Vec<VisionPointPromptDbus>) -> PortalOptions {
+    let mut options = execution_options();
+    let point_prompts = points
+        .into_iter()
+        .map(|point| (point.x, point.y, point.positive))
+        .collect::<Vec<_>>();
+    options.insert(
+        "point_prompts".to_string(),
+        OwnedValue::try_from(Value::from(point_prompts)).expect("point prompts are valid values"),
+    );
+    options.insert(
+        "box_prompts".to_string(),
+        OwnedValue::try_from(Value::from(Vec::<(f64, f64, f64, f64)>::new()))
+            .expect("box prompts are valid values"),
+    );
+    options
+}
+
 fn generation_options(
     maximum_response_tokens: i64,
     source_language_hint: &str,
@@ -846,7 +864,9 @@ enum VisionEvent {
     Phase(VisionPhase),
     Description(String),
     Ocr(String),
-    Segments(Vec<VisionSegmentDbus>),
+    Detections(Vec<VisionDetectionDbus>),
+    Masks(Vec<VisionMaskDbus>),
+    Depth(VisionDepthMapDbus),
     Error(String),
     Done,
 }
@@ -862,7 +882,9 @@ enum VisionPhase {
     LoadingModel,
     Describing,
     Ocr,
+    Detecting,
     Segmenting,
+    Depth,
 }
 
 impl VisionPhase {
@@ -872,7 +894,9 @@ impl VisionPhase {
             VisionPhase::LoadingModel => "Loading vision model",
             VisionPhase::Describing => "Describing image",
             VisionPhase::Ocr => "Extracting text",
+            VisionPhase::Detecting => "Detecting objects",
             VisionPhase::Segmenting => "Segmenting image",
+            VisionPhase::Depth => "Estimating depth",
         }
     }
 
@@ -882,19 +906,50 @@ impl VisionPhase {
             VisionPhase::LoadingModel => "Starting the local vision container if it is cold...",
             VisionPhase::Describing => "Sending image bytes to the vision model...",
             VisionPhase::Ocr => "Asking the vision model to extract text from the image...",
-            VisionPhase::Segmenting => "Asking the vision model for normalized object boxes...",
+            VisionPhase::Detecting => "Asking the vision model for normalized object boxes...",
+            VisionPhase::Segmenting => "Asking the vision model for prompted object masks...",
+            VisionPhase::Depth => "Asking the vision model for a dense depth map...",
         }
     }
 }
 
 #[derive(Debug, Clone, Deserialize, Type)]
-struct VisionSegmentDbus {
+struct VisionDetectionDbus {
     label: String,
     confidence: f64,
     x: f64,
     y: f64,
     width: f64,
     height: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Type)]
+struct VisionPointPromptDbus {
+    x: f64,
+    y: f64,
+    positive: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Type)]
+struct VisionMaskDbus {
+    label: String,
+    confidence: f64,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    mask_base64: String,
+    mask_width: i32,
+    mask_height: i32,
+}
+
+#[derive(Debug, Clone, Deserialize, Type)]
+struct VisionDepthMapDbus {
+    width: i32,
+    height: i32,
+    values: Vec<f64>,
+    minimum: f64,
+    maximum: f64,
 }
 
 enum EmbedEvent {
@@ -1630,11 +1685,11 @@ enum VisionTextStreamEvent {
     RequestDone(anyhow::Result<()>),
 }
 
-fn stream_vision_segments(
+fn stream_vision_detections(
     session_handle: &OwnedObjectPath,
     image: &[u8],
     instructions: &str,
-) -> anyhow::Result<Vec<VisionSegmentDbus>> {
+) -> anyhow::Result<Vec<VisionDetectionDbus>> {
     let image_file = media_file_from_bytes(image)?;
     let image_fd = Fd::from(&image_file);
     let call_conn = portal_connection()?;
@@ -1642,24 +1697,25 @@ fn stream_vision_segments(
     let proxy = zbus::blocking::Proxy::new(&call_conn, PORTAL_BUS, PORTAL_PATH, VISION_IFACE)?;
     let sig_proxy =
         zbus::blocking::Proxy::new(&signal_conn, PORTAL_BUS, PORTAL_PATH, VISION_IFACE)?;
-    let mut segment_iter = sig_proxy.receive_signal("VisionSegmentsReceived")?;
-    let segment_session_handle = session_handle.clone();
+    let mut detection_iter = sig_proxy.receive_signal("VisionDetectionsReceived")?;
+    let detection_session_handle = session_handle.clone();
     let (stream_event_tx, stream_event_rx) = std::sync::mpsc::channel();
-    let segment_event_tx = stream_event_tx.clone();
+    let detection_event_tx = stream_event_tx.clone();
 
     std::thread::spawn(move || {
         let result = (|| -> anyhow::Result<()> {
-            for msg in &mut segment_iter {
-                let (_sig_request, sig_session, segments, done): (
+            for msg in &mut detection_iter {
+                let (_sig_request, sig_session, detections, done): (
                     OwnedObjectPath,
                     OwnedObjectPath,
-                    Vec<VisionSegmentDbus>,
+                    Vec<VisionDetectionDbus>,
                     bool,
                 ) = msg.body().deserialize()?;
-                if sig_session.as_str() != segment_session_handle.as_str() {
+                if sig_session.as_str() != detection_session_handle.as_str() {
                     continue;
                 }
-                segment_event_tx.send(Ok(VisionSegmentStreamEvent::Segments(segments, done)))?;
+                detection_event_tx
+                    .send(Ok(VisionDetectStreamEvent::Detections(detections, done)))?;
                 if done {
                     break;
                 }
@@ -1667,48 +1723,218 @@ fn stream_vision_segments(
             Ok(())
         })();
         if let Err(error) = result {
-            let _ = segment_event_tx.send(Err(error));
+            let _ = detection_event_tx.send(Err(error));
         }
     });
 
     let stream_result: zbus::Result<OwnedObjectPath> = proxy.call(
-        "StreamSegment",
+        "StreamDetect",
         &(session_handle, image_fd, instructions, execution_options()),
     );
     let request_handle = stream_result?;
     let response_request_handle = request_handle.clone();
     std::thread::spawn(move || {
         let result = wait_request_success(&response_request_handle);
-        let _ = stream_event_tx.send(Ok(VisionSegmentStreamEvent::RequestDone(result)));
+        let _ = stream_event_tx.send(Ok(VisionDetectStreamEvent::RequestDone(result)));
     });
 
-    let mut terminal_segments = None::<Vec<VisionSegmentDbus>>;
+    let mut terminal_detections = None::<Vec<VisionDetectionDbus>>;
     let mut request_done = false;
     loop {
         match stream_event_rx.recv() {
             Ok(event) => match event? {
-                VisionSegmentStreamEvent::Segments(value, done) => {
+                VisionDetectStreamEvent::Detections(value, done) => {
                     if done {
-                        terminal_segments = Some(value);
+                        terminal_detections = Some(value);
                     }
                 }
-                VisionSegmentStreamEvent::RequestDone(result) => {
+                VisionDetectStreamEvent::RequestDone(result) => {
                     result?;
                     request_done = true;
                 }
             },
             Err(std::sync::mpsc::RecvError) => {
-                anyhow::bail!("vision segment stream ended before the request completed");
+                anyhow::bail!("vision detect stream ended before the request completed");
             }
         }
-        if request_done && let Some(segments) = terminal_segments.take() {
-            return Ok(segments);
+        if request_done && let Some(detections) = terminal_detections.take() {
+            return Ok(detections);
         }
     }
 }
 
-enum VisionSegmentStreamEvent {
-    Segments(Vec<VisionSegmentDbus>, bool),
+enum VisionDetectStreamEvent {
+    Detections(Vec<VisionDetectionDbus>, bool),
+    RequestDone(anyhow::Result<()>),
+}
+
+fn stream_vision_masks(
+    session_handle: &OwnedObjectPath,
+    image: &[u8],
+    instructions: &str,
+    points: Vec<VisionPointPromptDbus>,
+) -> anyhow::Result<Vec<VisionMaskDbus>> {
+    let image_file = media_file_from_bytes(image)?;
+    let image_fd = Fd::from(&image_file);
+    let call_conn = portal_connection()?;
+    let signal_conn = call_conn.clone();
+    let proxy = zbus::blocking::Proxy::new(&call_conn, PORTAL_BUS, PORTAL_PATH, VISION_IFACE)?;
+    let sig_proxy =
+        zbus::blocking::Proxy::new(&signal_conn, PORTAL_BUS, PORTAL_PATH, VISION_IFACE)?;
+    let mut mask_iter = sig_proxy.receive_signal("VisionMasksReceived")?;
+    let mask_session_handle = session_handle.clone();
+    let (stream_event_tx, stream_event_rx) = std::sync::mpsc::channel();
+    let mask_event_tx = stream_event_tx.clone();
+
+    std::thread::spawn(move || {
+        let result = (|| -> anyhow::Result<()> {
+            for msg in &mut mask_iter {
+                let (_sig_request, sig_session, masks, done): (
+                    OwnedObjectPath,
+                    OwnedObjectPath,
+                    Vec<VisionMaskDbus>,
+                    bool,
+                ) = msg.body().deserialize()?;
+                if sig_session.as_str() != mask_session_handle.as_str() {
+                    continue;
+                }
+                mask_event_tx.send(Ok(VisionMaskStreamEvent::Masks(masks, done)))?;
+                if done {
+                    break;
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let _ = mask_event_tx.send(Err(error));
+        }
+    });
+
+    let stream_result: zbus::Result<OwnedObjectPath> = proxy.call(
+        "StreamSegment",
+        &(
+            session_handle,
+            image_fd,
+            instructions,
+            segment_options(points),
+        ),
+    );
+    let request_handle = stream_result?;
+    let response_request_handle = request_handle.clone();
+    std::thread::spawn(move || {
+        let result = wait_request_success(&response_request_handle);
+        let _ = stream_event_tx.send(Ok(VisionMaskStreamEvent::RequestDone(result)));
+    });
+
+    let mut terminal_masks = None::<Vec<VisionMaskDbus>>;
+    let mut request_done = false;
+    loop {
+        match stream_event_rx.recv() {
+            Ok(event) => match event? {
+                VisionMaskStreamEvent::Masks(value, done) => {
+                    if done {
+                        terminal_masks = Some(value);
+                    }
+                }
+                VisionMaskStreamEvent::RequestDone(result) => {
+                    result?;
+                    request_done = true;
+                }
+            },
+            Err(std::sync::mpsc::RecvError) => {
+                anyhow::bail!("vision mask stream ended before the request completed");
+            }
+        }
+        if request_done && let Some(masks) = terminal_masks.take() {
+            return Ok(masks);
+        }
+    }
+}
+
+enum VisionMaskStreamEvent {
+    Masks(Vec<VisionMaskDbus>, bool),
+    RequestDone(anyhow::Result<()>),
+}
+
+fn stream_vision_depth(
+    session_handle: &OwnedObjectPath,
+    image: &[u8],
+    instructions: &str,
+) -> anyhow::Result<VisionDepthMapDbus> {
+    let image_file = media_file_from_bytes(image)?;
+    let image_fd = Fd::from(&image_file);
+    let call_conn = portal_connection()?;
+    let signal_conn = call_conn.clone();
+    let proxy = zbus::blocking::Proxy::new(&call_conn, PORTAL_BUS, PORTAL_PATH, VISION_IFACE)?;
+    let sig_proxy =
+        zbus::blocking::Proxy::new(&signal_conn, PORTAL_BUS, PORTAL_PATH, VISION_IFACE)?;
+    let mut depth_iter = sig_proxy.receive_signal("VisionDepthReceived")?;
+    let depth_session_handle = session_handle.clone();
+    let (stream_event_tx, stream_event_rx) = std::sync::mpsc::channel();
+    let depth_event_tx = stream_event_tx.clone();
+
+    std::thread::spawn(move || {
+        let result = (|| -> anyhow::Result<()> {
+            for msg in &mut depth_iter {
+                let (_sig_request, sig_session, depth, done): (
+                    OwnedObjectPath,
+                    OwnedObjectPath,
+                    VisionDepthMapDbus,
+                    bool,
+                ) = msg.body().deserialize()?;
+                if sig_session.as_str() != depth_session_handle.as_str() {
+                    continue;
+                }
+                depth_event_tx.send(Ok(VisionDepthStreamEvent::Depth(depth, done)))?;
+                if done {
+                    break;
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let _ = depth_event_tx.send(Err(error));
+        }
+    });
+
+    let stream_result: zbus::Result<OwnedObjectPath> = proxy.call(
+        "StreamDepth",
+        &(session_handle, image_fd, instructions, execution_options()),
+    );
+    let request_handle = stream_result?;
+    let response_request_handle = request_handle.clone();
+    std::thread::spawn(move || {
+        let result = wait_request_success(&response_request_handle);
+        let _ = stream_event_tx.send(Ok(VisionDepthStreamEvent::RequestDone(result)));
+    });
+
+    let mut terminal_depth = None::<VisionDepthMapDbus>;
+    let mut request_done = false;
+    loop {
+        match stream_event_rx.recv() {
+            Ok(event) => match event? {
+                VisionDepthStreamEvent::Depth(value, done) => {
+                    if done {
+                        terminal_depth = Some(value);
+                    }
+                }
+                VisionDepthStreamEvent::RequestDone(result) => {
+                    result?;
+                    request_done = true;
+                }
+            },
+            Err(std::sync::mpsc::RecvError) => {
+                anyhow::bail!("vision depth stream ended before the request completed");
+            }
+        }
+        if request_done && let Some(depth) = terminal_depth.take() {
+            return Ok(depth);
+        }
+    }
+}
+
+enum VisionDepthStreamEvent {
+    Depth(VisionDepthMapDbus, bool),
     RequestDone(anyhow::Result<()>),
 }
 
@@ -2376,7 +2602,7 @@ fn ocr_image(
     Ok(())
 }
 
-fn segment_image(
+fn detect_image(
     image: &[u8],
     instructions: &str,
     tx: std::sync::mpsc::Sender<VisionEvent>,
@@ -2387,14 +2613,65 @@ fn segment_image(
     tx.send(VisionEvent::Phase(VisionPhase::CreatingSession))?;
     let session_handle = create_public_session(
         &proxy,
-        "vision.segment",
+        "vision.detect",
         "Identify visible objects and return normalized rectangular boxes.",
     )?;
 
     tx.send(VisionEvent::Phase(VisionPhase::LoadingModel))?;
+    tx.send(VisionEvent::Phase(VisionPhase::Detecting))?;
+    let detections = stream_vision_detections(&session_handle, image, instructions)?;
+    tx.send(VisionEvent::Detections(detections))?;
+
+    close_public_session(&session_handle)?;
+    tx.send(VisionEvent::Done)?;
+    Ok(())
+}
+
+fn segment_image(
+    image: &[u8],
+    instructions: &str,
+    points: Vec<VisionPointPromptDbus>,
+    tx: std::sync::mpsc::Sender<VisionEvent>,
+) -> anyhow::Result<()> {
+    let conn = portal_connection()?;
+    let proxy = zbus::blocking::Proxy::new(&conn, PORTAL_BUS, PORTAL_PATH, VISION_IFACE)?;
+
+    tx.send(VisionEvent::Phase(VisionPhase::CreatingSession))?;
+    let session_handle = create_public_session(
+        &proxy,
+        "vision.segment",
+        "Return instance masks for selected image regions.",
+    )?;
+
+    tx.send(VisionEvent::Phase(VisionPhase::LoadingModel))?;
     tx.send(VisionEvent::Phase(VisionPhase::Segmenting))?;
-    let segments = stream_vision_segments(&session_handle, image, instructions)?;
-    tx.send(VisionEvent::Segments(segments))?;
+    let masks = stream_vision_masks(&session_handle, image, instructions, points)?;
+    tx.send(VisionEvent::Masks(masks))?;
+
+    close_public_session(&session_handle)?;
+    tx.send(VisionEvent::Done)?;
+    Ok(())
+}
+
+fn depth_image(
+    image: &[u8],
+    instructions: &str,
+    tx: std::sync::mpsc::Sender<VisionEvent>,
+) -> anyhow::Result<()> {
+    let conn = portal_connection()?;
+    let proxy = zbus::blocking::Proxy::new(&conn, PORTAL_BUS, PORTAL_PATH, VISION_IFACE)?;
+
+    tx.send(VisionEvent::Phase(VisionPhase::CreatingSession))?;
+    let session_handle = create_public_session(
+        &proxy,
+        "vision.depth",
+        "Estimate a normalized dense depth map for the provided image.",
+    )?;
+
+    tx.send(VisionEvent::Phase(VisionPhase::LoadingModel))?;
+    tx.send(VisionEvent::Phase(VisionPhase::Depth))?;
+    let depth = stream_vision_depth(&session_handle, image, instructions)?;
+    tx.send(VisionEvent::Depth(depth))?;
 
     close_public_session(&session_handle)?;
     tx.send(VisionEvent::Done)?;
@@ -2422,28 +2699,69 @@ fn embed_text(text: &str, tx: std::sync::mpsc::Sender<EmbedEvent>) -> anyhow::Re
     Ok(())
 }
 
-fn format_segments(segments: &[VisionSegmentDbus]) -> String {
-    if segments.is_empty() {
+fn format_detections(detections: &[VisionDetectionDbus]) -> String {
+    if detections.is_empty() {
         return "No objects returned.".to_string();
     }
 
-    segments
+    detections
         .iter()
         .enumerate()
-        .map(|(idx, segment)| {
+        .map(|(idx, detection)| {
             format!(
                 "{}. {} ({:.0}%) x={:.3}, y={:.3}, w={:.3}, h={:.3}",
                 idx + 1,
-                segment.label,
-                segment.confidence * 100.0,
-                segment.x,
-                segment.y,
-                segment.width,
-                segment.height
+                detection.label,
+                detection.confidence * 100.0,
+                detection.x,
+                detection.y,
+                detection.width,
+                detection.height
             )
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn format_masks(masks: &[VisionMaskDbus]) -> String {
+    if masks.is_empty() {
+        return "No masks returned.".to_string();
+    }
+
+    masks
+        .iter()
+        .enumerate()
+        .map(|(idx, mask)| {
+            format!(
+                "{}. {} ({:.0}%) box=({:.3}, {:.3}, {:.3}, {:.3}) mask={}x{} {} bytes(base64)",
+                idx + 1,
+                mask.label,
+                mask.confidence * 100.0,
+                mask.x,
+                mask.y,
+                mask.width,
+                mask.height,
+                mask.mask_width,
+                mask.mask_height,
+                mask.mask_base64.len()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn format_depth(depth: &VisionDepthMapDbus) -> String {
+    let preview = depth
+        .values
+        .iter()
+        .take(16)
+        .map(|value| format!("{value:.2}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "{}x{} depth map, range {:.2}..{:.2}\nPreview: [{}]",
+        depth.width, depth.height, depth.minimum, depth.maximum, preview
+    )
 }
 
 fn format_embedding(vector: &[f64]) -> String {

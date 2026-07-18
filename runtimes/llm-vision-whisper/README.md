@@ -5,7 +5,7 @@ This runtime image contains the Rust llama.cpp text runtime, the Rust llama.cpp 
 | Artifacts under `/model` | Runtime binary |
 |---|---|
 | `model.bin` | Whisper speech transcription and translation |
-| `model.gguf` plus `mmproj.gguf` | llama.cpp vision, OCR, segmentation, and text operations |
+| `model.gguf` plus `mmproj.gguf` | llama.cpp vision, OCR, detection, and text operations |
 | `model.gguf` | llama.cpp text generation, structured output, completion, and embeddings |
 
 Model weights are not baked into the image. Model manifests download artifacts separately and reference this runtime by `runtime_id`.

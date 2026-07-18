@@ -14,7 +14,7 @@
     "language.analyze",
     "language.embed",
     "vision.describe",
-    "vision.segment",
+    "vision.detect",
     "vision.ocr"
   ],
   "artifacts": [

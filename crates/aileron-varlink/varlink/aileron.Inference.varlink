@@ -38,6 +38,27 @@ type VisionOptions (
   execution_mode: string
 )
 
+type VisionPointPrompt (
+  # Normalized image coordinates, 0.0..1.0.
+  x: float,
+  y: float,
+  positive: bool
+)
+
+type VisionBoxPrompt (
+  # Normalized rectangle, 0.0..1.0, relative to image dimensions.
+  x: float,
+  y: float,
+  width: float,
+  height: float
+)
+
+type VisionSegmentOptions (
+  execution_mode: string,
+  points: []VisionPointPrompt,
+  boxes: []VisionBoxPrompt
+)
+
 type GuidedField (
   name: string,
   kind: string,
@@ -64,13 +85,35 @@ type ToolResult (
   content_json: string
 )
 
-type VisionSegment (
+type VisionDetection (
   label: string,
   confidence: float,
   x: float,
   y: float,
   width: float,
   height: float
+)
+
+type VisionMask (
+  label: string,
+  confidence: float,
+  x: float,
+  y: float,
+  width: float,
+  height: float,
+  # Row-major alpha mask bytes for the normalized bounding rectangle, base64 encoded.
+  mask_base64: string,
+  mask_width: int,
+  mask_height: int
+)
+
+type VisionDepthMap (
+  width: int,
+  height: int,
+  # Row-major normalized depth values, 0.0 near to 1.0 far unless the model profile documents otherwise.
+  values: []float,
+  minimum: float,
+  maximum: float
 )
 
 # Return whether a profile is assigned and runnable for this use-case.
@@ -117,11 +160,22 @@ method StreamDescribe(session_id: string, image_path: string, instructions: stri
 # instructions: optional per-image instructions
 method StreamOcr(session_id: string, image_path: string, instructions: string, options: VisionOptions) -> (token: string)
 
-# Stream identified objects in an image. Session must have been created with vision.segment
+# Stream identified objects in an image. Session must have been created with vision.detect
 # Coordinates are normalized to 0.0..1.0, relative to the image dimensions.
 # image_path: readable path for PNG or JPEG bytes
 # instructions: optional per-image instructions
-method StreamSegment(session_id: string, image_path: string, instructions: string, options: VisionOptions) -> (segments: []VisionSegment)
+method StreamDetect(session_id: string, image_path: string, instructions: string, options: VisionOptions) -> (detections: []VisionDetection)
+
+# Stream instance masks for an image. Session must have been created with vision.segment
+# Coordinates and prompt geometry are normalized to 0.0..1.0, relative to image dimensions.
+# image_path: readable path for PNG or JPEG bytes
+# instructions: optional per-image instructions; use points/boxes for geometric object selection.
+method StreamSegment(session_id: string, image_path: string, instructions: string, options: VisionSegmentOptions) -> (masks: []VisionMask)
+
+# Stream a dense depth map for an image. Session must have been created with vision.depth
+# image_path: readable path for PNG or JPEG bytes
+# instructions: optional per-image instructions
+method StreamDepth(session_id: string, image_path: string, instructions: string, options: VisionOptions) -> (depth: VisionDepthMap)
 
 # End a session. The per-profile container remains pooled until idle timeout.
 method EndSession(session_id: string) -> ()

@@ -32,6 +32,10 @@ pub struct Request {
     #[serde(default)]
     pub image: Option<Value>,
     #[serde(default)]
+    pub points: Option<Vec<Value>>,
+    #[serde(default)]
+    pub boxes: Option<Vec<Value>>,
+    #[serde(default)]
     pub language_hint: Option<String>,
     #[serde(default)]
     pub task: Option<String>,

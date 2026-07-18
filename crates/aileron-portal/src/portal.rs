@@ -2,6 +2,7 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::convert::TryFrom;
 use std::os::fd::AsRawFd;
 use std::process::Command;
 use std::sync::{Arc, Mutex, RwLock, mpsc};
@@ -33,7 +34,13 @@ const LANGUAGE_USE_CASES: &[&str] = &[
     "language.embed",
 ];
 const SPEECH_USE_CASES: &[&str] = &["speech.transcribe", "speech.translate"];
-const VISION_USE_CASES: &[&str] = &["vision.describe", "vision.ocr", "vision.segment"];
+const VISION_USE_CASES: &[&str] = &[
+    "vision.describe",
+    "vision.ocr",
+    "vision.detect",
+    "vision.segment",
+    "vision.depth",
+];
 
 pub async fn run() -> Result<()> {
     info!("registering D-Bus portal backend");
@@ -228,13 +235,57 @@ struct ToolResultDbus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
-struct VisionSegmentDbus {
+struct VisionDetectionDbus {
     label: String,
     confidence: f64,
     x: f64,
     y: f64,
     width: f64,
     height: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+struct VisionPointPromptDbus {
+    x: f64,
+    y: f64,
+    positive: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+struct VisionBoxPromptDbus {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+struct VisionSegmentOptionsDbus {
+    execution_mode: String,
+    points: Vec<VisionPointPromptDbus>,
+    boxes: Vec<VisionBoxPromptDbus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+struct VisionMaskDbus {
+    label: String,
+    confidence: f64,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    mask_base64: String,
+    mask_width: i32,
+    mask_height: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+struct VisionDepthMapDbus {
+    width: i32,
+    height: i32,
+    values: Vec<f64>,
+    minimum: f64,
+    maximum: f64,
 }
 
 #[interface(name = "org.freedesktop.impl.portal.Request")]
@@ -1250,13 +1301,87 @@ impl VisionPortalBackend {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn stream_segment(
+    async fn stream_detect(
         &self,
         request_handle: OwnedObjectPath,
         session_handle: OwnedObjectPath,
         image_fd: OwnedFd,
         instructions: &str,
         options: VisionOptionsDbus,
+        #[zbus(connection)] conn: &zbus::Connection,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> zbus::fdo::Result<()> {
+        use aileron_varlink::aileron_Inference::VarlinkClientInterface;
+
+        ensure_portal_frontend(conn, &header).await?;
+        let request_id = request_handle.as_str();
+        let session_id = session_handle.as_str();
+        begin_request(conn, &self.state, request_id, Some(session_id)).await?;
+        let result = async {
+            let record = ensure_known_session(&self.state, session_id, PortalInterface::Vision)?;
+            ensure_exact_session_use_case(&record, "vision.detect", "StreamDetect")?;
+            ensure_request_active(&self.state, request_id)?;
+            self.emit_loading(&request_handle, &session_handle, &emitter)
+                .await?;
+            ensure_request_active(&self.state, request_id)?;
+            let daemon_session_id = record.daemon_session_id;
+            let image_path = fd_proc_path(&image_fd);
+            let ipc_conn = connect_request_daemon(&self.state, request_id)?;
+            let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(ipc_conn);
+            let mut call = client.stream_detect(
+                daemon_session_id,
+                image_path,
+                instructions.to_string(),
+                options.into_varlink(),
+            );
+            let iter = call
+                .more()
+                .map_err(|e| map_request_error(&self.state, request_id, e))?;
+
+            let mut last_detections = Vec::new();
+            for reply in iter {
+                ensure_request_active(&self.state, request_id)?;
+                last_detections = reply
+                    .map_err(|e| map_request_error(&self.state, request_id, e))?
+                    .detections
+                    .into_iter()
+                    .map(|detection| VisionDetectionDbus {
+                        label: detection.label,
+                        confidence: detection.confidence,
+                        x: detection.x,
+                        y: detection.y,
+                        width: detection.width,
+                        height: detection.height,
+                    })
+                    .collect();
+            }
+
+            ensure_request_active(&self.state, request_id)?;
+            VisionPortalBackend::vision_detections_received(
+                &emitter,
+                &request_handle,
+                &session_handle,
+                &last_detections,
+                true,
+            )
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            Ok(())
+        }
+        .await;
+        finish_request(conn, &self.state, request_id).await;
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn stream_segment(
+        &self,
+        request_handle: OwnedObjectPath,
+        session_handle: OwnedObjectPath,
+        image_fd: OwnedFd,
+        instructions: &str,
+        options: VisionSegmentOptionsDbus,
         #[zbus(connection)] conn: &zbus::Connection,
         #[zbus(header)] header: Header<'_>,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
@@ -1288,30 +1413,132 @@ impl VisionPortalBackend {
                 .more()
                 .map_err(|e| map_request_error(&self.state, request_id, e))?;
 
-            let mut last_segments = Vec::new();
+            let mut last_masks = Vec::new();
             for reply in iter {
                 ensure_request_active(&self.state, request_id)?;
-                last_segments = reply
+                last_masks = reply
                     .map_err(|e| map_request_error(&self.state, request_id, e))?
-                    .segments
+                    .masks
                     .into_iter()
-                    .map(|segment| VisionSegmentDbus {
-                        label: segment.label,
-                        confidence: segment.confidence,
-                        x: segment.x,
-                        y: segment.y,
-                        width: segment.width,
-                        height: segment.height,
+                    .map(|mask| {
+                        Ok(VisionMaskDbus {
+                            label: mask.label,
+                            confidence: mask.confidence,
+                            x: mask.x,
+                            y: mask.y,
+                            width: mask.width,
+                            height: mask.height,
+                            mask_base64: mask.mask_base64,
+                            mask_width: i32::try_from(mask.mask_width).map_err(|_| {
+                                zbus::fdo::Error::Failed(
+                                    "aileron.Inference.InvalidOutput: mask width exceeds D-Bus int32"
+                                        .to_string(),
+                                )
+                            })?,
+                            mask_height: i32::try_from(mask.mask_height).map_err(|_| {
+                                zbus::fdo::Error::Failed(
+                                    "aileron.Inference.InvalidOutput: mask height exceeds D-Bus int32"
+                                        .to_string(),
+                                )
+                            })?,
+                        })
                     })
-                    .collect();
+                    .collect::<zbus::fdo::Result<Vec<_>>>()?;
             }
 
             ensure_request_active(&self.state, request_id)?;
-            VisionPortalBackend::vision_segments_received(
+            VisionPortalBackend::vision_masks_received(
                 &emitter,
                 &request_handle,
                 &session_handle,
-                &last_segments,
+                &last_masks,
+                true,
+            )
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            Ok(())
+        }
+        .await;
+        finish_request(conn, &self.state, request_id).await;
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn stream_depth(
+        &self,
+        request_handle: OwnedObjectPath,
+        session_handle: OwnedObjectPath,
+        image_fd: OwnedFd,
+        instructions: &str,
+        options: VisionOptionsDbus,
+        #[zbus(connection)] conn: &zbus::Connection,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> zbus::fdo::Result<()> {
+        use aileron_varlink::aileron_Inference::VarlinkClientInterface;
+
+        ensure_portal_frontend(conn, &header).await?;
+        let request_id = request_handle.as_str();
+        let session_id = session_handle.as_str();
+        begin_request(conn, &self.state, request_id, Some(session_id)).await?;
+        let result = async {
+            let record = ensure_known_session(&self.state, session_id, PortalInterface::Vision)?;
+            ensure_exact_session_use_case(&record, "vision.depth", "StreamDepth")?;
+            ensure_request_active(&self.state, request_id)?;
+            self.emit_loading(&request_handle, &session_handle, &emitter)
+                .await?;
+            ensure_request_active(&self.state, request_id)?;
+            let daemon_session_id = record.daemon_session_id;
+            let image_path = fd_proc_path(&image_fd);
+            let ipc_conn = connect_request_daemon(&self.state, request_id)?;
+            let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(ipc_conn);
+            let mut call = client.stream_depth(
+                daemon_session_id,
+                image_path,
+                instructions.to_string(),
+                options.into_varlink(),
+            );
+            let iter = call
+                .more()
+                .map_err(|e| map_request_error(&self.state, request_id, e))?;
+
+            let mut last_depth = None;
+            for reply in iter {
+                ensure_request_active(&self.state, request_id)?;
+                let depth = reply
+                    .map_err(|e| map_request_error(&self.state, request_id, e))?
+                    .depth;
+                last_depth = Some(VisionDepthMapDbus {
+                    width: i32::try_from(depth.width).map_err(|_| {
+                        zbus::fdo::Error::Failed(
+                            "aileron.Inference.InvalidOutput: depth width exceeds D-Bus int32"
+                                .to_string(),
+                        )
+                    })?,
+                    height: i32::try_from(depth.height).map_err(|_| {
+                        zbus::fdo::Error::Failed(
+                            "aileron.Inference.InvalidOutput: depth height exceeds D-Bus int32"
+                                .to_string(),
+                        )
+                    })?,
+                    values: depth.values,
+                    minimum: depth.minimum,
+                    maximum: depth.maximum,
+                });
+            }
+
+            ensure_request_active(&self.state, request_id)?;
+            VisionPortalBackend::vision_depth_received(
+                &emitter,
+                &request_handle,
+                &session_handle,
+                &last_depth.unwrap_or(VisionDepthMapDbus {
+                    width: 1,
+                    height: 1,
+                    values: vec![0.0],
+                    minimum: 0.0,
+                    maximum: 0.0,
+                }),
                 true,
             )
             .await
@@ -1333,11 +1560,29 @@ impl VisionPortalBackend {
     ) -> zbus::Result<()>;
 
     #[zbus(signal)]
-    async fn vision_segments_received(
+    async fn vision_detections_received(
         emitter: &SignalEmitter<'_>,
         request_handle: &OwnedObjectPath,
         session_handle: &OwnedObjectPath,
-        segments: &[VisionSegmentDbus],
+        detections: &[VisionDetectionDbus],
+        done: bool,
+    ) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    async fn vision_masks_received(
+        emitter: &SignalEmitter<'_>,
+        request_handle: &OwnedObjectPath,
+        session_handle: &OwnedObjectPath,
+        masks: &[VisionMaskDbus],
+        done: bool,
+    ) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    async fn vision_depth_received(
+        emitter: &SignalEmitter<'_>,
+        request_handle: &OwnedObjectPath,
+        session_handle: &OwnedObjectPath,
+        depth: &VisionDepthMapDbus,
         done: bool,
     ) -> zbus::Result<()>;
 }
@@ -1818,7 +2063,7 @@ fn ensure_language_generation_session(record: &SessionRecord) -> zbus::fdo::Resu
     } else {
         Err(zbus::fdo::Error::Failed(format!(
             "aileron.Inference.InvalidInput: full text generation requires a language generation use-case, got {use_case}",
-            use_case = &record.use_case
+            use_case = record.use_case
         )))
     }
 }
@@ -1829,7 +2074,7 @@ fn ensure_speech_session_use_case(record: &SessionRecord, method: &str) -> zbus:
     } else {
         Err(zbus::fdo::Error::Failed(format!(
             "aileron.Inference.InvalidInput: {method} requires use-case speech.transcribe or speech.translate, got {use_case}",
-            use_case = &record.use_case
+            use_case = record.use_case
         )))
     }
 }
@@ -2192,6 +2437,45 @@ impl VisionOptionsDbus {
     }
 }
 
+impl VisionPointPromptDbus {
+    fn into_varlink(self) -> aileron_varlink::aileron_Inference::VisionPointPrompt {
+        aileron_varlink::aileron_Inference::VisionPointPrompt {
+            x: self.x,
+            y: self.y,
+            positive: self.positive,
+        }
+    }
+}
+
+impl VisionBoxPromptDbus {
+    fn into_varlink(self) -> aileron_varlink::aileron_Inference::VisionBoxPrompt {
+        aileron_varlink::aileron_Inference::VisionBoxPrompt {
+            x: self.x,
+            y: self.y,
+            width: self.width,
+            height: self.height,
+        }
+    }
+}
+
+impl VisionSegmentOptionsDbus {
+    fn into_varlink(self) -> aileron_varlink::aileron_Inference::VisionSegmentOptions {
+        aileron_varlink::aileron_Inference::VisionSegmentOptions {
+            execution_mode: self.execution_mode,
+            points: self
+                .points
+                .into_iter()
+                .map(VisionPointPromptDbus::into_varlink)
+                .collect(),
+            boxes: self
+                .boxes
+                .into_iter()
+                .map(VisionBoxPromptDbus::into_varlink)
+                .collect(),
+        }
+    }
+}
+
 impl GuidedFieldDbus {
     fn into_varlink(self) -> aileron_varlink::aileron_Inference::GuidedField {
         aileron_varlink::aileron_Inference::GuidedField {
@@ -2247,7 +2531,9 @@ mod tests {
             ("speech.transcribe", PortalInterface::Speech),
             ("speech.translate", PortalInterface::Speech),
             ("vision.describe", PortalInterface::Vision),
+            ("vision.detect", PortalInterface::Vision),
             ("vision.segment", PortalInterface::Vision),
+            ("vision.depth", PortalInterface::Vision),
         ]));
 
         assert!(ensure_interface_use_case(use_case, interface).is_ok());

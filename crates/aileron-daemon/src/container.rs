@@ -47,11 +47,23 @@
 /// Response (same as generate):
 ///   {"id":"<uuid>","token":"extracted text...","done":true}
 ///
+/// ### Image detection
+/// Request:
+///   {"id":"<uuid>","type":"detect","image":"<base64 PNG/JPEG>","prompt":"optional instructions"}
+/// Response (single line, no streaming):
+///   {"id":"<uuid>","result":"{\"detections\":[...]}","done":true}
+///
 /// ### Image segmentation
 /// Request:
-///   {"id":"<uuid>","type":"segment","image":"<base64 PNG/JPEG>","prompt":"optional instructions"}
+///   {"id":"<uuid>","type":"segment","image":"<base64 PNG/JPEG>","points":[...],"boxes":[...]}
 /// Response (single line, no streaming):
-///   {"id":"<uuid>","result":"{\"segments\":[...]}","done":true}
+///   {"id":"<uuid>","result":"{\"masks\":[...]}","done":true}
+///
+/// ### Image depth
+/// Request:
+///   {"id":"<uuid>","type":"depth","image":"<base64 PNG/JPEG>","prompt":"optional instructions"}
+/// Response (single line, no streaming):
+///   {"id":"<uuid>","result":"{\"depth\":{...}}","done":true}
 use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
@@ -146,13 +158,50 @@ struct RuntimeSpawnAttempt {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-pub struct VisionSegment {
+pub struct VisionDetection {
     pub label: String,
     pub confidence: f64,
     pub x: f64,
     pub y: f64,
     pub width: f64,
     pub height: f64,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct VisionPointPrompt {
+    pub x: f64,
+    pub y: f64,
+    pub positive: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct VisionBoxPrompt {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct VisionMask {
+    pub label: String,
+    pub confidence: f64,
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+    pub mask_base64: String,
+    pub mask_width: i64,
+    pub mask_height: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct VisionDepthMap {
+    pub width: i64,
+    pub height: i64,
+    pub values: Vec<f64>,
+    pub minimum: f64,
+    pub maximum: f64,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -655,16 +704,55 @@ impl Container {
         self.stream_vision_text("ocr", image, instructions, execution_mode, on_token)
     }
 
-    /// Send a vision segment request and return normalized object boxes.
+    /// Send a vision detect request and return normalized object boxes.
+    pub fn detect(
+        &mut self,
+        image: Vec<u8>,
+        instructions: &str,
+        execution_mode: &str,
+    ) -> Result<Vec<VisionDetection>> {
+        let id = Uuid::new_v4().to_string();
+        let schema = vision_detect_schema();
+        let req = vision_request(id.clone(), "detect", &image, instructions, execution_mode);
+        write_request_line(&mut self.stdin, &req)?;
+        self.last_used = std::time::Instant::now();
+
+        let mut buf = String::new();
+        loop {
+            buf.clear();
+            let n = self.stdout.read_line(&mut buf)?;
+            if n == 0 {
+                bail!("container stdout closed unexpectedly");
+            }
+            let resp: ContainerResponse = serde_json::from_str(buf.trim())?;
+            if resp.id != id {
+                continue;
+            }
+            if let Some(result) = structured_response_result(resp, &schema)? {
+                let value: VisionDetectResult = serde_json::from_str(&result)?;
+                return Ok(value.detections);
+            }
+        }
+    }
+
+    /// Send a vision segment request and return normalized instance masks.
     pub fn segment(
         &mut self,
         image: Vec<u8>,
         instructions: &str,
         execution_mode: &str,
-    ) -> Result<Vec<VisionSegment>> {
+        points: Vec<VisionPointPrompt>,
+        boxes: Vec<VisionBoxPrompt>,
+    ) -> Result<Vec<VisionMask>> {
         let id = Uuid::new_v4().to_string();
         let schema = vision_segment_schema();
-        let req = vision_request(id.clone(), "segment", &image, instructions, execution_mode);
+        let mut req = vision_request(id.clone(), "segment", &image, instructions, execution_mode);
+        req.points = if points.is_empty() {
+            None
+        } else {
+            Some(points)
+        };
+        req.boxes = if boxes.is_empty() { None } else { Some(boxes) };
         write_request_line(&mut self.stdin, &req)?;
         self.last_used = std::time::Instant::now();
 
@@ -681,7 +769,39 @@ impl Container {
             }
             if let Some(result) = structured_response_result(resp, &schema)? {
                 let value: VisionSegmentResult = serde_json::from_str(&result)?;
-                return Ok(value.segments);
+                return Ok(value.masks);
+            }
+        }
+    }
+
+    /// Send a vision depth request and return a normalized dense depth map.
+    pub fn depth(
+        &mut self,
+        image: Vec<u8>,
+        instructions: &str,
+        execution_mode: &str,
+    ) -> Result<VisionDepthMap> {
+        let id = Uuid::new_v4().to_string();
+        let schema = vision_depth_schema();
+        let req = vision_request(id.clone(), "depth", &image, instructions, execution_mode);
+        write_request_line(&mut self.stdin, &req)?;
+        self.last_used = std::time::Instant::now();
+
+        let mut buf = String::new();
+        loop {
+            buf.clear();
+            let n = self.stdout.read_line(&mut buf)?;
+            if n == 0 {
+                bail!("container stdout closed unexpectedly");
+            }
+            let resp: ContainerResponse = serde_json::from_str(buf.trim())?;
+            if resp.id != id {
+                continue;
+            }
+            if let Some(result) = structured_response_result(resp, &schema)? {
+                let value: VisionDepthResult = serde_json::from_str(&result)?;
+                validate_depth_map(&value.depth)?;
+                return Ok(value.depth);
             }
         }
     }
@@ -842,6 +962,15 @@ pub fn benchmark_read_response_for_use_case(use_case: &str, input: &[u8]) -> Res
             let resp = read_matching_response(&mut reader, "request-1")?;
             Ok(resp.embedding.unwrap_or_default().len())
         }
+        "vision.detect" => {
+            let schema = vision_detect_schema();
+            let resp = read_matching_response(&mut reader, "request-1")?;
+            let Some(result) = structured_response_result(resp, &schema)? else {
+                return Ok(0);
+            };
+            let value: VisionDetectResult = serde_json::from_str(&result)?;
+            Ok(value.detections.len())
+        }
         "vision.segment" => {
             let schema = vision_segment_schema();
             let resp = read_matching_response(&mut reader, "request-1")?;
@@ -849,7 +978,17 @@ pub fn benchmark_read_response_for_use_case(use_case: &str, input: &[u8]) -> Res
                 return Ok(0);
             };
             let value: VisionSegmentResult = serde_json::from_str(&result)?;
-            Ok(value.segments.len())
+            Ok(value.masks.len())
+        }
+        "vision.depth" => {
+            let schema = vision_depth_schema();
+            let resp = read_matching_response(&mut reader, "request-1")?;
+            let Some(result) = structured_response_result(resp, &schema)? else {
+                return Ok(0);
+            };
+            let value: VisionDepthResult = serde_json::from_str(&result)?;
+            validate_depth_map(&value.depth)?;
+            Ok(value.depth.values.len())
         }
         other => bail!("unsupported benchmark use-case: {other}"),
     }
@@ -966,12 +1105,37 @@ pub fn benchmark_write_request_for_use_case(
             );
             write_request_line(&mut output, &req)?;
         }
-        "vision.segment" => {
+        "vision.detect" => {
             let req = vision_request(
+                "request-1".to_string(),
+                "detect",
+                b"fake-image-bytes",
+                "detect objects",
+                "interactive",
+            );
+            write_request_line(&mut output, &req)?;
+        }
+        "vision.segment" => {
+            let mut req = vision_request(
                 "request-1".to_string(),
                 "segment",
                 b"fake-image-bytes",
-                "segment objects",
+                "segment selected objects",
+                "interactive",
+            );
+            req.points = Some(vec![VisionPointPrompt {
+                x: 0.5,
+                y: 0.5,
+                positive: true,
+            }]);
+            write_request_line(&mut output, &req)?;
+        }
+        "vision.depth" => {
+            let req = vision_request(
+                "request-1".to_string(),
+                "depth",
+                b"fake-image-bytes",
+                "estimate depth",
                 "interactive",
             );
             write_request_line(&mut output, &req)?;
@@ -1010,17 +1174,27 @@ fn response_error(resp: &ContainerResponse) -> Option<(String, String)> {
 }
 
 #[derive(Deserialize)]
-struct VisionSegmentResult {
-    segments: Vec<VisionSegment>,
+struct VisionDetectResult {
+    detections: Vec<VisionDetection>,
 }
 
-fn vision_segment_schema() -> Value {
+#[derive(Deserialize)]
+struct VisionSegmentResult {
+    masks: Vec<VisionMask>,
+}
+
+#[derive(Deserialize)]
+struct VisionDepthResult {
+    depth: VisionDepthMap,
+}
+
+fn vision_detect_schema() -> Value {
     serde_json::json!({
         "type": "object",
-        "required": ["segments"],
+        "required": ["detections"],
         "additionalProperties": false,
         "properties": {
-            "segments": {
+            "detections": {
                 "type": "array",
                 "items": {
                     "type": "object",
@@ -1038,6 +1212,87 @@ fn vision_segment_schema() -> Value {
             }
         }
     })
+}
+
+fn vision_segment_schema() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "required": ["masks"],
+        "additionalProperties": false,
+        "properties": {
+            "masks": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["label", "confidence", "x", "y", "width", "height", "mask_base64", "mask_width", "mask_height"],
+                    "additionalProperties": false,
+                    "properties": {
+                        "label": { "type": "string" },
+                        "confidence": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+                        "x": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+                        "y": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+                        "width": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+                        "height": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+                        "mask_base64": { "type": "string" },
+                        "mask_width": { "type": "integer", "minimum": 1 },
+                        "mask_height": { "type": "integer", "minimum": 1 }
+                    }
+                }
+            }
+        }
+    })
+}
+
+fn vision_depth_schema() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "required": ["depth"],
+        "additionalProperties": false,
+        "properties": {
+            "depth": {
+                "type": "object",
+                "required": ["width", "height", "values", "minimum", "maximum"],
+                "additionalProperties": false,
+                "properties": {
+                    "width": { "type": "integer", "minimum": 1 },
+                    "height": { "type": "integer", "minimum": 1 },
+                    "values": { "type": "array", "items": { "type": "number", "minimum": 0.0, "maximum": 1.0 } },
+                    "minimum": { "type": "number" },
+                    "maximum": { "type": "number" }
+                }
+            }
+        }
+    })
+}
+
+fn validate_depth_map(depth: &VisionDepthMap) -> Result<()> {
+    if depth.width < 1 || depth.height < 1 {
+        bail!("depth map dimensions must be positive");
+    }
+    let width = usize::try_from(depth.width).context("depth map width is too large")?;
+    let height = usize::try_from(depth.height).context("depth map height is too large")?;
+    let expected_len = width
+        .checked_mul(height)
+        .context("depth map dimensions overflow")?;
+    if depth.values.len() != expected_len {
+        bail!(
+            "depth map values length {} does not match dimensions {}x{}",
+            depth.values.len(),
+            depth.width,
+            depth.height
+        );
+    }
+    if !depth.minimum.is_finite() || !depth.maximum.is_finite() || depth.minimum > depth.maximum {
+        bail!("depth map minimum/maximum must be finite and ordered");
+    }
+    if depth
+        .values
+        .iter()
+        .any(|value| !value.is_finite() || !(0.0..=1.0).contains(value))
+    {
+        bail!("depth map values must be finite and normalized to 0.0..=1.0");
+    }
+    Ok(())
 }
 
 struct PreparedBundle {
@@ -2330,6 +2585,10 @@ struct ContainerRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     image: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    points: Option<Vec<VisionPointPrompt>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    boxes: Option<Vec<VisionBoxPrompt>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     language_hint: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     execution_mode: Option<String>,
@@ -2355,6 +2614,8 @@ impl ContainerRequest {
             audio: None,
             task: None,
             image: None,
+            points: None,
+            boxes: None,
             language_hint: None,
             execution_mode: None,
             response_format: None,
@@ -3698,10 +3959,20 @@ mod tests {
             .expect("ocr through container wrapper");
         assert!(!extracted.is_empty());
 
-        let segments = container
-            .segment(Vec::new(), "", "interactive")
+        let detections = container
+            .detect(Vec::new(), "", "interactive")
+            .expect("detect through container wrapper");
+        assert!(!detections.is_empty());
+
+        let masks = container
+            .segment(Vec::new(), "", "interactive", Vec::new(), Vec::new())
             .expect("segment through container wrapper");
-        assert!(!segments.is_empty());
+        assert!(!masks.is_empty());
+
+        let depth = container
+            .depth(Vec::new(), "", "interactive")
+            .expect("depth through container wrapper");
+        assert!(!depth.values.is_empty());
 
         let _ = std::fs::remove_dir_all(&artifact_path);
     }
