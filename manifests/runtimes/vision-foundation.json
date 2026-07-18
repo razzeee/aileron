@@ -1,0 +1,6 @@
+{
+  "runtime_id": "vision-foundation",
+  "images": {
+    "cpu": "ghcr.io/razzeee/aileron-runtime-vision-foundation:cpu"
+  }
+}

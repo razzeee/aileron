@@ -1,0 +1,10 @@
+{
+  "runtime_id": "vision-foundation",
+  "capabilities": ["detect", "segment", "depth"],
+  "variants": ["cpu"],
+  "artifact_layout": {
+    "yolo_model": "/model/model.pt or /model/model.onnx",
+    "sam2_model": "/model/model.pt with optional /model/config.yaml",
+    "depth_model": "/model/model/ or flat /model/{config.json,model.safetensors[,preprocessor_config.json]}"
+  }
+}

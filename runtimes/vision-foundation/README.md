@@ -1,0 +1,101 @@
+# Vision Foundation Runtime
+
+`vision-foundation` is a Torch-based Aileron runtime for single-image computer vision tasks that do not belong in the combined `llm-vision-whisper` llama.cpp/Whisper image.
+
+It implements the existing container stdio protocol for:
+
+- `detect` with YOLO artifacts at `/model/model.pt` or `/model/model.onnx`.
+- `segment` with SAM2 artifacts at `/model/model.pt` and `/model/config.yaml`.
+- `depth` with a local Hugging Face-style depth model directory at `/model/model/`.
+
+The runtime never downloads checkpoints during inference. Missing artifacts or optional Python loaders return structured `model_unavailable` responses.
+
+## Build
+
+Run from the repository root:
+
+```sh
+podman build -f runtimes/vision-foundation/Dockerfile -t docker.io/example/aileron-runtime-vision-foundation:cpu .
+```
+
+The first image is CPU-only. The Dockerfile keeps the runtime isolated so future CUDA/ROCm/Vulkan variants can use a different base image without changing the portal API.
+
+## Local Smoke Test
+
+Start the runtime directly:
+
+```sh
+PYTHONPATH=runtimes/vision-foundation python3 -m vision_foundation.runtime
+```
+
+It prints a stderr line containing `ready`, then accepts one newline-delimited JSON request per stdin line.
+
+With no mounted artifacts, a valid image request fails clearly:
+
+```json
+{"id":"req-1","type":"detect","image":"<base64-png-or-jpeg>"}
+```
+
+Response:
+
+```json
+{"id":"req-1","error":"model_unavailable","reason":"YOLO artifact /model/model.pt or /model/model.onnx is required","done":true}
+```
+
+## Artifact Layout
+
+Mount model artifacts read-only at `/model`.
+
+YOLO detection profile:
+
+```text
+/model/model.pt
+```
+
+or:
+
+```text
+/model/model.onnx
+```
+
+SAM2 promptable segmentation profile:
+
+```text
+/model/model.pt
+/model/config.yaml
+```
+
+The base CPU image bundles the `sam2` Python package for the curated tiny profile. If a different checkpoint requires a different package revision, build a derived image with that exact SAM2 package.
+
+Depth estimation profile:
+
+```text
+/model/model/
+  config.json
+  model.safetensors
+  preprocessor_config.json
+```
+
+For DA3 profiles, `config.json` and `model.safetensors` are sufficient. The runtime also accepts these files flat under `/model`. Curated manifests use the flat layout because Aileron's artifact installer stores each manifest artifact by filename within the profile artifact directory.
+
+The depth loader uses `depth-anything-3` for DA3 checkpoints and falls back to `transformers` with `local_files_only=True` and `trust_remote_code=True` for compatible Hugging Face depth directories. All custom code and weights must already be present in the mounted artifact directory.
+
+## Limitations
+
+- CPU inference can be slow, especially for SAM2 and depth models.
+- SAM2 video segmentation, memory state, and masklet tracking are intentionally out of scope.
+- Empty SAM2 prompts return `invalid_input` instead of running automatic mask generation.
+- Depth output is normalized relative monocular depth. Metric depth is not guaranteed.
+- The runtime does not add new portal or Varlink methods.
+
+## Manifests
+
+The runtime image manifest is `manifests/runtimes/vision-foundation.json`.
+
+Curated smoke-test model manifests are available under `manifests/models/`:
+
+- `yolov9-c-onnx-q8.json` for `vision.detect` using a GPL-3.0 YOLOv9-c ONNX artifact.
+- `sam2-hiera-tiny.json` for `vision.segment` using Apache-2.0 SAM2 tiny artifacts.
+- `depth-anything-3-small.json` for `vision.depth` using Apache-2.0 Depth Anything 3 small artifacts.
+
+The YOLOv9 curated profile is GPL-3.0, not permissive. It is included to make the target YOLOv9 path installable and testable; replace it with a permissive small detector when a suitable artifact with verified metadata is selected.
