@@ -3,8 +3,8 @@
   "capabilities": ["detect", "segment", "depth"],
   "variants": ["cpu"],
   "artifact_layout": {
-    "yolo_model": "/model/model.pt or /model/model.onnx",
+    "yolo_model": "/model/model.pt",
     "sam2_model": "/model/model.pt and /model/config.yaml; Hydra config selected by SAM2_CONFIG_NAME",
-    "depth_model": "/model/model/ or flat /model/{config.json,model.safetensors[,preprocessor_config.json]}"
+    "depth_model": "/model/model/ or flat /model/{config.json,model.safetensors}"
   }
 }

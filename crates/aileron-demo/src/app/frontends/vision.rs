@@ -8,10 +8,16 @@ use base64::Engine as _;
 use gtk4::prelude::*;
 use gtk4::{
     Align, AspectFrame, Box, Button, DrawingArea, FileDialog, GestureClick, Label, Orientation,
-    Overlay, Picture, ScrolledWindow, Spinner, TextBuffer, TextView, cairo, gdk,
+    ScrolledWindow, Spinner, TextBuffer, TextView, cairo, gdk,
 };
 use std::cell::RefCell;
 use std::rc::Rc;
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum PromptEditMode {
+    Add,
+    Remove,
+}
 
 pub(crate) fn build_page() -> gtk4::Widget {
     let vbox = Box::new(Orientation::Vertical, 12);
@@ -30,11 +36,13 @@ pub(crate) fn build_page() -> gtk4::Widget {
 
     let selected_image = Rc::new(RefCell::new(None::<Vec<u8>>));
     let selected_image_size = Rc::new(RefCell::new(None::<(i32, i32)>));
+    let selected_image_surface = Rc::new(RefCell::new(None::<cairo::ImageSurface>));
     let detections_overlay = Rc::new(RefCell::new(Vec::<VisionDetectionDbus>::new()));
     let masks_overlay = Rc::new(RefCell::new(Vec::<VisionMaskDbus>::new()));
     let mask_surfaces = Rc::new(RefCell::new(Vec::<Option<cairo::ImageSurface>>::new()));
     let depth_map = Rc::new(RefCell::new(None::<VisionDepthMapDbus>));
-    let segment_prompt = Rc::new(RefCell::new(None::<VisionPointPromptDbus>));
+    let segment_prompts = Rc::new(RefCell::new(Vec::<VisionPointPromptDbus>::new()));
+    let prompt_edit_mode = Rc::new(RefCell::new(PromptEditMode::Add));
 
     let button_row = Box::new(Orientation::Horizontal, 8);
     let choose_button = Button::with_label("Choose Image");
@@ -68,11 +76,34 @@ pub(crate) fn build_page() -> gtk4::Widget {
         .build();
     vbox.append(&selected_label);
 
-    let image_picture = Picture::builder()
-        .content_fit(gtk4::ContentFit::Contain)
-        .hexpand(true)
-        .vexpand(true)
+    let prompt_mode_row = Box::new(Orientation::Horizontal, 8);
+    let prompt_mode_label = Label::builder()
+        .label("Prompt mode: Add points")
+        .xalign(0.0)
         .build();
+    let add_prompt_button = Button::with_label("Add points");
+    let remove_prompt_button = Button::with_label("Remove points");
+    prompt_mode_row.append(&prompt_mode_label);
+    prompt_mode_row.append(&add_prompt_button);
+    prompt_mode_row.append(&remove_prompt_button);
+    vbox.append(&prompt_mode_row);
+    {
+        let prompt_edit_mode = prompt_edit_mode.clone();
+        let prompt_mode_label = prompt_mode_label.clone();
+        add_prompt_button.connect_clicked(move |_| {
+            *prompt_edit_mode.borrow_mut() = PromptEditMode::Add;
+            prompt_mode_label.set_text("Prompt mode: Add points");
+        });
+    }
+    {
+        let prompt_edit_mode = prompt_edit_mode.clone();
+        let prompt_mode_label = prompt_mode_label.clone();
+        remove_prompt_button.connect_clicked(move |_| {
+            *prompt_edit_mode.borrow_mut() = PromptEditMode::Remove;
+            prompt_mode_label.set_text("Prompt mode: Remove points");
+        });
+    }
+
     let overlay_area = DrawingArea::builder()
         .hexpand(true)
         .vexpand(true)
@@ -83,14 +114,27 @@ pub(crate) fn build_page() -> gtk4::Widget {
         let detections_overlay = detections_overlay.clone();
         let masks_overlay = masks_overlay.clone();
         let mask_surfaces = mask_surfaces.clone();
+        let selected_image_surface = selected_image_surface.clone();
         let selected_image_size = selected_image_size.clone();
-        let segment_prompt = segment_prompt.clone();
+        let segment_prompts = segment_prompts.clone();
         overlay_area.set_draw_func(move |_area, cr, width, height| {
             let (offset_x, offset_y, draw_width, draw_height) =
                 fitted_image_rect(width as f64, height as f64, *selected_image_size.borrow());
+            if let Some(surface) = selected_image_surface.borrow().as_ref() {
+                let _ = cr.save();
+                cr.translate(offset_x, offset_y);
+                cr.scale(
+                    draw_width / surface.width().max(1) as f64,
+                    draw_height / surface.height().max(1) as f64,
+                );
+                let _ = cr.set_source_surface(surface, 0.0, 0.0);
+                let _ = cr.paint();
+                let _ = cr.restore();
+            }
             cr.set_line_width(2.0);
-            for detection in detections_overlay.borrow().iter() {
-                cr.set_source_rgba(0.1, 0.55, 1.0, 0.9);
+            for (index, detection) in detections_overlay.borrow().iter().enumerate() {
+                let (red, green, blue) = detection_color(index);
+                cr.set_source_rgba(red, green, blue, 0.9);
                 cr.rectangle(
                     offset_x + detection.x * draw_width,
                     offset_y + detection.y * draw_height,
@@ -142,7 +186,7 @@ pub(crate) fn build_page() -> gtk4::Widget {
                     let _ = cr.stroke();
                 }
             }
-            if let Some(prompt) = segment_prompt.borrow().as_ref() {
+            for prompt in segment_prompts.borrow().iter() {
                 let x = offset_x + prompt.x * draw_width;
                 let y = offset_y + prompt.y * draw_height;
                 cr.set_line_width(2.0);
@@ -159,7 +203,8 @@ pub(crate) fn build_page() -> gtk4::Widget {
     }
     {
         let selected_image_size = selected_image_size.clone();
-        let segment_prompt = segment_prompt.clone();
+        let segment_prompts = segment_prompts.clone();
+        let prompt_edit_mode = prompt_edit_mode.clone();
         let click_area = overlay_area.clone();
         let draw_area = overlay_area.clone();
         let click = GestureClick::new();
@@ -184,21 +229,29 @@ pub(crate) fn build_page() -> gtk4::Widget {
                 y: ((y - offset_y) / draw_height).clamp(0.0, 1.0),
                 positive: true,
             };
-            *segment_prompt.borrow_mut() = Some(point);
+            match *prompt_edit_mode.borrow() {
+                PromptEditMode::Add => segment_prompts.borrow_mut().push(point),
+                PromptEditMode::Remove => {
+                    let mut prompts = segment_prompts.borrow_mut();
+                    if let Some((index, _)) = prompts.iter().enumerate().min_by(|(_, a), (_, b)| {
+                        prompt_distance_squared(&point, a)
+                            .total_cmp(&prompt_distance_squared(&point, b))
+                    }) {
+                        prompts.remove(index);
+                    }
+                }
+            }
             draw_area.queue_draw();
         });
         click_area.add_controller(click);
     }
-    let image_overlay = Overlay::new();
-    image_overlay.set_child(Some(&image_picture));
-    image_overlay.add_overlay(&overlay_area);
-    image_overlay.add_css_class("card");
+    overlay_area.add_css_class("card");
     let image_frame = AspectFrame::builder()
         .ratio(aspect_ratio(16, 9))
         .obey_child(false)
         .hexpand(true)
         .build();
-    image_frame.set_child(Some(&image_overlay));
+    image_frame.set_child(Some(&overlay_area));
     vbox.append(
         &Label::builder()
             .label("Image preview, prompt selection, and depth map")
@@ -397,7 +450,7 @@ pub(crate) fn build_page() -> gtk4::Widget {
         let selected_image = selected_image.clone();
         let selected_image_size = selected_image_size.clone();
         let selected_label = selected_label.clone();
-        let image_picture = image_picture.clone();
+        let selected_image_surface = selected_image_surface.clone();
         let overlay_area = overlay_area.clone();
         let image_frame = image_frame.clone();
         let depth_frame = depth_frame.clone();
@@ -406,7 +459,7 @@ pub(crate) fn build_page() -> gtk4::Widget {
         let masks_overlay = masks_overlay.clone();
         let mask_surfaces = mask_surfaces.clone();
         let depth_map = depth_map.clone();
-        let segment_prompt = segment_prompt.clone();
+        let segment_prompts = segment_prompts.clone();
         let status_title = status_title.clone();
         let status_detail = status_detail.clone();
         choose_button.connect_clicked(move |_| {
@@ -414,7 +467,7 @@ pub(crate) fn build_page() -> gtk4::Widget {
             let selected_image = selected_image.clone();
             let selected_image_size = selected_image_size.clone();
             let selected_label = selected_label.clone();
-            let image_picture = image_picture.clone();
+            let selected_image_surface = selected_image_surface.clone();
             let overlay_area = overlay_area.clone();
             let image_frame = image_frame.clone();
             let depth_frame = depth_frame.clone();
@@ -423,7 +476,7 @@ pub(crate) fn build_page() -> gtk4::Widget {
             let masks_overlay = masks_overlay.clone();
             let mask_surfaces = mask_surfaces.clone();
             let depth_map = depth_map.clone();
-            let segment_prompt = segment_prompt.clone();
+            let segment_prompts = segment_prompts.clone();
             let status_title = status_title.clone();
             let status_detail = status_detail.clone();
             dialog.open(
@@ -440,26 +493,34 @@ pub(crate) fn build_page() -> gtk4::Widget {
                     };
                     match std::fs::read(&path) {
                         Ok(bytes) => {
-                            match gdk::Texture::from_bytes(&glib::Bytes::from_owned(bytes.clone())) {
-                                Ok(texture) => {
-                                    *selected_image_size.borrow_mut() =
-                                        Some((texture.width(), texture.height()));
-                                    image_frame.set_ratio(aspect_ratio(texture.width(), texture.height()));
-                                    depth_frame.set_ratio(aspect_ratio(texture.width(), texture.height()));
-                                    image_picture.set_paintable(Some(&texture));
-                                }
-                                Err(e) => {
-                                    *selected_image_size.borrow_mut() = None;
-                                    status_title.set_text("Could not preview image");
-                                    status_detail.set_text(&e.to_string());
-                                }
-                            }
+                            let Some((surface, width, height)) = image_surface_from_bytes(&bytes)
+                            else {
+                                *selected_image.borrow_mut() = None;
+                                *selected_image_size.borrow_mut() = None;
+                                *selected_image_surface.borrow_mut() = None;
+                                detections_overlay.borrow_mut().clear();
+                                masks_overlay.borrow_mut().clear();
+                                mask_surfaces.borrow_mut().clear();
+                                *depth_map.borrow_mut() = None;
+                                segment_prompts.borrow_mut().clear();
+                                overlay_area.queue_draw();
+                                depth_canvas.queue_draw();
+                                selected_label.set_text("No file selected. Choose an image.");
+                                status_title.set_text("Could not preview image");
+                                status_detail
+                                    .set_text("Selected file could not be decoded as PNG or JPEG.");
+                                return;
+                            };
+                            *selected_image_size.borrow_mut() = Some((width, height));
+                            *selected_image_surface.borrow_mut() = Some(surface);
+                            image_frame.set_ratio(aspect_ratio(width, height));
+                            depth_frame.set_ratio(aspect_ratio(width, height));
                             *selected_image.borrow_mut() = Some(bytes);
                             detections_overlay.borrow_mut().clear();
                             masks_overlay.borrow_mut().clear();
                             mask_surfaces.borrow_mut().clear();
                             *depth_map.borrow_mut() = None;
-                            *segment_prompt.borrow_mut() = None;
+                            segment_prompts.borrow_mut().clear();
                             overlay_area.queue_draw();
                             depth_canvas.queue_draw();
                             selected_label.set_text(&format!("Selected: {}", path.display()));
@@ -745,7 +806,7 @@ pub(crate) fn build_page() -> gtk4::Widget {
         let masks_overlay = masks_overlay.clone();
         let mask_surfaces = mask_surfaces.clone();
         let overlay_area = overlay_area.clone();
-        let segment_prompt = segment_prompt.clone();
+        let segment_prompts = segment_prompts.clone();
         let action_buttons_for_click = action_buttons.clone();
         let status_spinner = status_spinner.clone();
         let status_title = status_title.clone();
@@ -764,7 +825,7 @@ pub(crate) fn build_page() -> gtk4::Widget {
             set_action_buttons_sensitive(&action_buttons_for_click, false);
             status_spinner.start();
             status_title.set_text("Creating vision session");
-            status_detail.set_text("Opening a vision.segment session with the selected point...");
+            status_detail.set_text("Opening a vision.segment session with selected points...");
 
             let (tx, rx) = std::sync::mpsc::channel::<VisionEvent>();
             let masks_buffer = masks_buffer.clone();
@@ -823,16 +884,19 @@ pub(crate) fn build_page() -> gtk4::Widget {
             });
 
             let error_tx = tx.clone();
-            let point = segment_prompt
-                .borrow()
-                .clone()
-                .unwrap_or(VisionPointPromptDbus {
-                    x: 0.5,
-                    y: 0.5,
-                    positive: true,
-                });
+            let points = {
+                let prompts = segment_prompts.borrow();
+                if prompts.is_empty() {
+                    vec![VisionPointPromptDbus {
+                        x: 0.5,
+                        y: 0.5,
+                        positive: true,
+                    }]
+                } else {
+                    prompts.clone()
+                }
+            };
             std::thread::spawn(move || {
-                let points = vec![point];
                 if let Err(e) = segment_image(&image, &instructions, points, tx) {
                     eprintln!("[aileron-demo] segment error: {e}");
                     let _ = error_tx.send(VisionEvent::Error(friendly_error(&e)));
@@ -954,11 +1018,44 @@ fn image_bytes_from_selection(
     Err("Choose an image file first.".to_string())
 }
 
+fn prompt_distance_squared(a: &VisionPointPromptDbus, b: &VisionPointPromptDbus) -> f64 {
+    let dx = a.x - b.x;
+    let dy = a.y - b.y;
+    dx * dx + dy * dy
+}
+
+fn image_surface_from_bytes(bytes: &[u8]) -> Option<(cairo::ImageSurface, i32, i32)> {
+    let texture = gdk::Texture::from_bytes(&glib::Bytes::from(bytes)).ok()?;
+    let width = texture.width();
+    let height = texture.height();
+    if width <= 0 || height <= 0 {
+        return None;
+    }
+
+    let mut surface = cairo::ImageSurface::create(cairo::Format::ARgb32, width, height).ok()?;
+    let stride = surface.stride() as usize;
+    {
+        let mut data = surface.data().ok()?;
+        texture.download(&mut data, stride);
+    }
+    surface.mark_dirty();
+    Some((surface, width, height))
+}
+
 fn mask_surface_from_base64(mask: &VisionMaskDbus) -> Option<cairo::ImageSurface> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(&mask.mask_base64)
         .ok()?;
     let image = image::load_from_memory(&bytes).ok()?.to_rgba8();
+    let (width, height) = image.dimensions();
+    if width == 0 || height == 0 {
+        return None;
+    }
+
+    surface_from_rgba_image(&image, 96)
+}
+
+fn surface_from_rgba_image(image: &image::RgbaImage, max_alpha: u8) -> Option<cairo::ImageSurface> {
     let (width, height) = image.dimensions();
     if width == 0 || height == 0 {
         return None;
@@ -972,16 +1069,22 @@ fn mask_surface_from_base64(mask: &VisionMaskDbus) -> Option<cairo::ImageSurface
         for y in 0..height as usize {
             for x in 0..width as usize {
                 let [red, green, blue, alpha] = image.get_pixel(x as u32, y as u32).0;
-                let coverage = if alpha < 255 {
+                let coverage = if max_alpha == 255 || alpha < 255 {
                     alpha
                 } else {
                     red.max(green).max(blue)
                 };
-                let overlay_alpha = ((coverage as u16 * 96) / 255) as u8;
+                let overlay_alpha = ((coverage as u16 * max_alpha as u16) / 255) as u8;
                 let offset = y * stride + x * 4;
-                data[offset] = ((255u16 * overlay_alpha as u16) / 255) as u8;
-                data[offset + 1] = ((64u16 * overlay_alpha as u16) / 255) as u8;
-                data[offset + 2] = ((179u16 * overlay_alpha as u16) / 255) as u8;
+                if max_alpha == 255 {
+                    data[offset] = ((blue as u16 * overlay_alpha as u16) / 255) as u8;
+                    data[offset + 1] = ((green as u16 * overlay_alpha as u16) / 255) as u8;
+                    data[offset + 2] = ((red as u16 * overlay_alpha as u16) / 255) as u8;
+                } else {
+                    data[offset] = ((255u16 * overlay_alpha as u16) / 255) as u8;
+                    data[offset + 1] = ((64u16 * overlay_alpha as u16) / 255) as u8;
+                    data[offset + 2] = ((179u16 * overlay_alpha as u16) / 255) as u8;
+                }
                 data[offset + 3] = overlay_alpha;
             }
         }
@@ -1011,6 +1114,21 @@ fn fitted_image_rect(
         draw_width,
         draw_height,
     )
+}
+
+fn detection_color(index: usize) -> (f64, f64, f64) {
+    const COLORS: [(f64, f64, f64); 8] = [
+        (0.10, 0.55, 1.00),
+        (1.00, 0.35, 0.20),
+        (0.20, 0.80, 0.35),
+        (0.85, 0.35, 1.00),
+        (1.00, 0.75, 0.10),
+        (0.10, 0.85, 0.85),
+        (1.00, 0.45, 0.75),
+        (0.65, 0.85, 0.20),
+    ];
+
+    COLORS[index % COLORS.len()]
 }
 
 fn aspect_ratio(width: i32, height: i32) -> f32 {

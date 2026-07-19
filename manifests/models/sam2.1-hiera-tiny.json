@@ -1,0 +1,29 @@
+{
+  "profile_id": "sam2.1-hiera-tiny",
+  "model_id": "facebook/sam2.1-hiera-tiny",
+  "runtime_id": "vision-foundation",
+  "runtime_options": {
+    "SAM2_CONFIG_NAME": "configs/sam2.1/sam2.1_hiera_t.yaml"
+  },
+  "tier": "small",
+  "disk_size_gb": 0.16,
+  "min_ram_gb": 4.0,
+  "use_cases": ["vision.segment"],
+  "specializations": ["promptable-segmentation", "sam2.1", "license:apache-2.0"],
+  "artifacts": [
+    {
+      "role": "model",
+      "url": "https://huggingface.co/facebook/sam2.1-hiera-tiny/resolve/main/sam2.1_hiera_tiny.pt",
+      "filename": "model.pt",
+      "sha256": "7402e0d864fa82708a20fbd15bc84245c2f26dff0eb43a4b5b93452deb34be69",
+      "size_bytes": 156008466
+    },
+    {
+      "role": "config",
+      "url": "https://huggingface.co/facebook/sam2.1-hiera-tiny/resolve/main/sam2.1_hiera_t.yaml",
+      "filename": "config.yaml",
+      "sha256": "43e114f609a1af7efede061f5c186119d498acd31f118f300c07acf57d4a5eca",
+      "size_bytes": 3855
+    }
+  ]
+}

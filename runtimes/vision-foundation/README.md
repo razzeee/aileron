@@ -4,7 +4,7 @@
 
 It implements the existing container stdio protocol for:
 
-- `detect` with YOLO artifacts at `/model/model.pt` or `/model/model.onnx`.
+- `detect` with YOLO artifacts at `/model/model.pt`.
 - `segment` with SAM2 artifacts at `/model/model.pt` and `/model/config.yaml`.
 - `depth` with a local Hugging Face-style depth model directory at `/model/model/`.
 
@@ -39,7 +39,7 @@ With no mounted artifacts, a valid image request fails clearly:
 Response:
 
 ```json
-{"id":"req-1","error":"model_unavailable","reason":"YOLO artifact /model/model.pt or /model/model.onnx is required","done":true}
+{"id":"req-1","error":"model_unavailable","reason":"YOLO artifact /model/model.pt is required","done":true}
 ```
 
 ## Artifact Layout
@@ -52,12 +52,6 @@ YOLO detection profile:
 /model/model.pt
 ```
 
-or:
-
-```text
-/model/model.onnx
-```
-
 SAM2 promptable segmentation profile:
 
 ```text
@@ -65,8 +59,8 @@ SAM2 promptable segmentation profile:
 /model/config.yaml
 ```
 
-The base CPU image bundles the `sam2` Python package for the curated tiny profile. If a different checkpoint requires a different package revision, build a derived image with that exact SAM2 package.
-`sam2.build_sam2` resolves configs through Hydra from the installed `sam2` package, so the runtime uses `SAM2_CONFIG_NAME` for the package config name and defaults to `configs/sam2/sam2_hiera_t.yaml`. `/model/config.yaml` is still required so installed artifacts remain self-describing and verifiable.
+The base CPU image bundles the `sam2` Python package for the curated SAM2.1 tiny profile. If a different checkpoint requires a different package revision, build a derived image with that exact SAM2 package.
+`sam2.build_sam2` resolves configs through Hydra from the installed `sam2` package, so the runtime uses `SAM2_CONFIG_NAME` for the package config name and defaults to `configs/sam2.1/sam2.1_hiera_t.yaml`. `/model/config.yaml` is still required so installed artifacts remain self-describing and verifiable.
 
 Depth estimation profile:
 
@@ -74,12 +68,11 @@ Depth estimation profile:
 /model/model/
   config.json
   model.safetensors
-  preprocessor_config.json
 ```
 
-For DA3 profiles, `config.json` and `model.safetensors` are sufficient. The runtime also accepts these files flat under `/model`. Curated manifests use the flat layout because Aileron's artifact installer stores each manifest artifact by filename within the profile artifact directory.
+The runtime also accepts these files flat under `/model`. Curated manifests use the flat layout because Aileron's artifact installer stores each manifest artifact by filename within the profile artifact directory.
 
-The depth loader uses `depth-anything-3` for DA3 checkpoints and falls back to `transformers` with `local_files_only=True` and `trust_remote_code=True` for compatible Hugging Face depth directories. All custom code and weights must already be present in the mounted artifact directory.
+The depth loader uses `depth-anything-3` for DA3 checkpoints. Generic Hugging Face Transformers depth directories are intentionally not supported by this image.
 
 ## Limitations
 
@@ -94,10 +87,10 @@ The depth loader uses `depth-anything-3` for DA3 checkpoints and falls back to `
 
 The runtime image manifest is `manifests/runtimes/vision-foundation.json`.
 
-Curated smoke-test model manifests are available under `manifests/models/`:
+Curated model manifests are available under `manifests/models/`:
 
-- `yolov9-c-onnx-q8.json` for `vision.detect` using a GPL-3.0 YOLOv9-c ONNX artifact.
-- `sam2-hiera-tiny.json` for `vision.segment` using Apache-2.0 SAM2 tiny artifacts.
-- `depth-anything-3-small.json` for `vision.depth` using Apache-2.0 Depth Anything 3 small artifacts.
+- `yolo26n.json` for `vision.detect` using an AGPL-3.0 Ultralytics YOLO26 nano PyTorch artifact.
+- `sam2.1-hiera-tiny.json` for `vision.segment` using Apache-2.0 SAM2.1 tiny artifacts.
+- `depth-anything-3-base.json` for `vision.depth` using Apache-2.0 Depth Anything 3 base artifacts.
 
-The YOLOv9 curated profile is GPL-3.0, not permissive. It is included to make the target YOLOv9 path installable and testable; replace it with a permissive small detector when a suitable artifact with verified metadata is selected.
+The YOLO26 curated profile is AGPL-3.0. `mudler/depth-anything.cpp-gguf` is not listed as an installable profile yet because this runtime does not load Depth Anything GGUF artifacts.

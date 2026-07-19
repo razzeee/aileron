@@ -1,5 +1,5 @@
 ARG PYTHON_IMAGE="python:3.12-slim-bookworm"
-FROM ${PYTHON_IMAGE}
+FROM ${PYTHON_IMAGE} AS python-deps
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -11,17 +11,32 @@ RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends ca-certificates build-essential libgl1 libglib2.0-0; \
     rm -rf /var/lib/apt/lists/*; \
-    pip install --no-cache-dir \
+    pip install --no-cache-dir --prefix=/install --index-url https://download.pytorch.org/whl/cpu \
+      torch \
+      torchvision; \
+    PYTHONPATH="$(python -c 'import sysconfig; print(sysconfig.get_path("purelib", vars={"base":"/install", "platbase":"/install"}))')" \
+      pip install --no-cache-dir --prefix=/install \
       numpy \
       pillow \
       depth-anything-3 \
       opencv-python-headless \
-      onnxruntime \
       sam2 \
-      torch \
-      torchvision \
-      transformers \
       ultralytics
+
+FROM ${PYTHON_IMAGE}
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    XDG_CACHE_HOME=/tmp
+
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends ca-certificates libgl1 libglib2.0-0; \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=python-deps /install /usr/local
 
 WORKDIR /app
 COPY runtimes/vision-foundation/vision_foundation ./vision_foundation

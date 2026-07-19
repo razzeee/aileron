@@ -1541,14 +1541,14 @@ mod tests {
     }
 
     #[test]
-    fn catalog_includes_explicit_profiles_without_llmfit_metadata() {
-        let profiles = list_catalog_profiles().expect("list catalog profiles");
+    fn profile_library_includes_explicit_profiles_without_llmfit_metadata() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../manifests/models");
+        let manifest = read_model_manifest_path(&dir.join("depth-anything-3-base.json"))
+            .expect("read explicit profile manifest");
 
-        assert!(profiles.iter().any(|profile| {
-            profile.profile_id == "depth-anything-3-small"
-                && profile.runtime_id == "vision-foundation"
-                && profile.llmfit_model_id.is_empty()
-        }));
+        assert_eq!(manifest.profile_id, "depth-anything-3-base");
+        assert_eq!(manifest.runtime_id, "vision-foundation");
+        assert!(manifest.llmfit_model_id.is_empty());
     }
 
     #[test]
