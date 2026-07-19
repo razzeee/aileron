@@ -544,7 +544,7 @@ Audio and image payloads are passed to the public portal as readable, sealable m
 | `VisionTextReceived` | `request_handle: o, session_handle: o, text: s, done: b` | Each text token during `StreamDescribe` or `StreamOcr` on `Vision` |
 | `VisionDetectionsReceived` | `request_handle: o, session_handle: o, detections: a(sddddd), done: b` | Detection result during `StreamDetect` on `Vision` |
 | `VisionMasksReceived` | `request_handle: o, session_handle: o, masks: a(sdddddsii), done: b` | Mask result during `StreamSegment` on `Vision` |
-| `VisionDepthReceived` | `request_handle: o, session_handle: o, depth: (iiadd), done: b` | Depth map result during `StreamDepth` on `Vision` |
+| `VisionDepthReceived` | `request_handle: o, session_handle: o, depth: (iiaddd), done: b` | Depth map result during `StreamDepth` on `Vision` |
 
 The implementation backend exposes the same task methods with implementation-oriented identifiers: `CreateSession` receives `handle: o`, `session_handle: o`, `app_id: s`, and `parent_window: s`; streaming methods receive `handle: o` and `session_handle: o`; and session close uses the shared `org.freedesktop.impl.portal.Session.Close` path. Public apps should not call the implementation interfaces directly.
 

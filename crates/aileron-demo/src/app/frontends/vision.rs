@@ -6,8 +6,8 @@ use super::super::{
 use super::scrollable_page;
 use gtk4::prelude::*;
 use gtk4::{
-    Align, Box, Button, DrawingArea, FileDialog, Label, Orientation, Overlay, Picture,
-    ScrolledWindow, Spinner, TextBuffer, TextView, gdk,
+    Align, AspectFrame, Box, Button, DrawingArea, FileDialog, GestureClick, Label, Orientation,
+    Overlay, Picture, ScrolledWindow, Spinner, TextBuffer, TextView, gdk,
 };
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -32,6 +32,7 @@ pub(crate) fn build_page() -> gtk4::Widget {
     let detections_overlay = Rc::new(RefCell::new(Vec::<VisionDetectionDbus>::new()));
     let masks_overlay = Rc::new(RefCell::new(Vec::<VisionMaskDbus>::new()));
     let depth_map = Rc::new(RefCell::new(None::<VisionDepthMapDbus>));
+    let segment_prompt = Rc::new(RefCell::new(None::<VisionPointPromptDbus>));
 
     let button_row = Box::new(Orientation::Horizontal, 8);
     let choose_button = Button::with_label("Choose Image");
@@ -80,6 +81,7 @@ pub(crate) fn build_page() -> gtk4::Widget {
         let detections_overlay = detections_overlay.clone();
         let masks_overlay = masks_overlay.clone();
         let selected_image_size = selected_image_size.clone();
+        let segment_prompt = segment_prompt.clone();
         overlay_area.set_draw_func(move |_area, cr, width, height| {
             let (offset_x, offset_y, draw_width, draw_height) =
                 fitted_image_rect(width as f64, height as f64, *selected_image_size.borrow());
@@ -106,19 +108,118 @@ pub(crate) fn build_page() -> gtk4::Widget {
                 cr.set_source_rgba(0.7, 0.25, 1.0, 0.85);
                 let _ = cr.stroke();
             }
+            if let Some(prompt) = segment_prompt.borrow().as_ref() {
+                let x = offset_x + prompt.x * draw_width;
+                let y = offset_y + prompt.y * draw_height;
+                cr.set_line_width(2.0);
+                cr.set_source_rgba(1.0, 0.75, 0.1, 0.95);
+                cr.arc(x, y, 7.0, 0.0, std::f64::consts::TAU);
+                let _ = cr.stroke();
+                cr.move_to(x - 11.0, y);
+                cr.line_to(x + 11.0, y);
+                cr.move_to(x, y - 11.0);
+                cr.line_to(x, y + 11.0);
+                let _ = cr.stroke();
+            }
         });
+    }
+    {
+        let selected_image_size = selected_image_size.clone();
+        let segment_prompt = segment_prompt.clone();
+        let click_area = overlay_area.clone();
+        let draw_area = overlay_area.clone();
+        let click = GestureClick::new();
+        click.connect_pressed(move |_gesture, _presses, x, y| {
+            let (offset_x, offset_y, draw_width, draw_height) = fitted_image_rect(
+                draw_area.width() as f64,
+                draw_area.height() as f64,
+                *selected_image_size.borrow(),
+            );
+            if draw_width <= 0.0
+                || draw_height <= 0.0
+                || x < offset_x
+                || y < offset_y
+                || x > offset_x + draw_width
+                || y > offset_y + draw_height
+            {
+                return;
+            }
+
+            let point = VisionPointPromptDbus {
+                x: ((x - offset_x) / draw_width).clamp(0.0, 1.0),
+                y: ((y - offset_y) / draw_height).clamp(0.0, 1.0),
+                positive: true,
+            };
+            *segment_prompt.borrow_mut() = Some(point);
+            draw_area.queue_draw();
+        });
+        click_area.add_controller(click);
     }
     let image_overlay = Overlay::new();
     image_overlay.set_child(Some(&image_picture));
     image_overlay.add_overlay(&overlay_area);
     image_overlay.add_css_class("card");
+    let image_frame = AspectFrame::builder()
+        .ratio(aspect_ratio(16, 9))
+        .obey_child(false)
+        .hexpand(true)
+        .build();
+    image_frame.set_child(Some(&image_overlay));
     vbox.append(
         &Label::builder()
-            .label("Image preview and overlays")
+            .label("Image preview, prompt selection, and depth map")
             .xalign(0.0)
             .build(),
     );
-    vbox.append(&image_overlay);
+
+    let depth_canvas = DrawingArea::builder()
+        .hexpand(true)
+        .vexpand(true)
+        .width_request(360)
+        .height_request(240)
+        .build();
+    {
+        let depth_map = depth_map.clone();
+        depth_canvas.set_draw_func(move |_area, cr, width, height| {
+            let Some(depth) = depth_map.borrow().clone() else {
+                cr.set_source_rgb(0.08, 0.08, 0.08);
+                let _ = cr.paint();
+                return;
+            };
+            let depth_width = depth.width.max(1) as usize;
+            let depth_height = depth.height.max(1) as usize;
+            let cell_width = width as f64 / depth_width as f64;
+            let cell_height = height as f64 / depth_height as f64;
+            for y in 0..depth_height {
+                for x in 0..depth_width {
+                    let value = depth
+                        .values
+                        .get(y * depth_width + x)
+                        .copied()
+                        .unwrap_or(0.0)
+                        .clamp(0.0, 1.0);
+                    cr.set_source_rgb(value, 0.25 + value * 0.5, 1.0 - value);
+                    cr.rectangle(
+                        x as f64 * cell_width,
+                        y as f64 * cell_height,
+                        cell_width.ceil(),
+                        cell_height.ceil(),
+                    );
+                    let _ = cr.fill();
+                }
+            }
+        });
+    }
+    let depth_frame = AspectFrame::builder()
+        .ratio(aspect_ratio(16, 9))
+        .obey_child(false)
+        .hexpand(true)
+        .build();
+    depth_frame.set_child(Some(&depth_canvas));
+    let preview_row = Box::new(Orientation::Horizontal, 12);
+    preview_row.append(&image_frame);
+    preview_row.append(&depth_frame);
+    vbox.append(&preview_row);
 
     let instructions_buffer = TextBuffer::new(None);
     let instructions_view = TextView::builder()
@@ -258,55 +359,19 @@ pub(crate) fn build_page() -> gtk4::Widget {
             .build(),
     );
 
-    let depth_canvas = DrawingArea::builder()
-        .hexpand(true)
-        .width_request(560)
-        .height_request(160)
-        .build();
-    {
-        let depth_map = depth_map.clone();
-        depth_canvas.set_draw_func(move |_area, cr, width, height| {
-            let Some(depth) = depth_map.borrow().clone() else {
-                cr.set_source_rgb(0.08, 0.08, 0.08);
-                let _ = cr.paint();
-                return;
-            };
-            let depth_width = depth.width.max(1) as usize;
-            let depth_height = depth.height.max(1) as usize;
-            let cell_width = width as f64 / depth_width as f64;
-            let cell_height = height as f64 / depth_height as f64;
-            for y in 0..depth_height {
-                for x in 0..depth_width {
-                    let value = depth
-                        .values
-                        .get(y * depth_width + x)
-                        .copied()
-                        .unwrap_or(0.0)
-                        .clamp(0.0, 1.0);
-                    cr.set_source_rgb(value, 0.25 + value * 0.5, 1.0 - value);
-                    cr.rectangle(
-                        x as f64 * cell_width,
-                        y as f64 * cell_height,
-                        cell_width.ceil(),
-                        cell_height.ceil(),
-                    );
-                    let _ = cr.fill();
-                }
-            }
-        });
-    }
-    vbox.append(&depth_canvas);
-
     {
         let selected_image = selected_image.clone();
         let selected_image_size = selected_image_size.clone();
         let selected_label = selected_label.clone();
         let image_picture = image_picture.clone();
         let overlay_area = overlay_area.clone();
+        let image_frame = image_frame.clone();
+        let depth_frame = depth_frame.clone();
         let depth_canvas = depth_canvas.clone();
         let detections_overlay = detections_overlay.clone();
         let masks_overlay = masks_overlay.clone();
         let depth_map = depth_map.clone();
+        let segment_prompt = segment_prompt.clone();
         let status_title = status_title.clone();
         let status_detail = status_detail.clone();
         choose_button.connect_clicked(move |_| {
@@ -316,10 +381,13 @@ pub(crate) fn build_page() -> gtk4::Widget {
             let selected_label = selected_label.clone();
             let image_picture = image_picture.clone();
             let overlay_area = overlay_area.clone();
+            let image_frame = image_frame.clone();
+            let depth_frame = depth_frame.clone();
             let depth_canvas = depth_canvas.clone();
             let detections_overlay = detections_overlay.clone();
             let masks_overlay = masks_overlay.clone();
             let depth_map = depth_map.clone();
+            let segment_prompt = segment_prompt.clone();
             let status_title = status_title.clone();
             let status_detail = status_detail.clone();
             dialog.open(
@@ -340,6 +408,8 @@ pub(crate) fn build_page() -> gtk4::Widget {
                                 Ok(texture) => {
                                     *selected_image_size.borrow_mut() =
                                         Some((texture.width(), texture.height()));
+                                    image_frame.set_ratio(aspect_ratio(texture.width(), texture.height()));
+                                    depth_frame.set_ratio(aspect_ratio(texture.width(), texture.height()));
                                     image_picture.set_paintable(Some(&texture));
                                 }
                                 Err(e) => {
@@ -352,12 +422,13 @@ pub(crate) fn build_page() -> gtk4::Widget {
                             detections_overlay.borrow_mut().clear();
                             masks_overlay.borrow_mut().clear();
                             *depth_map.borrow_mut() = None;
+                            *segment_prompt.borrow_mut() = None;
                             overlay_area.queue_draw();
                             depth_canvas.queue_draw();
                             selected_label.set_text(&format!("Selected: {}", path.display()));
                             status_title.set_text("Image selected");
                             status_detail.set_text(
-                                "Use Describe Image or Segment Objects to send it through the vision portal.",
+                                "Click the preview to choose a segmentation point, or use the center default.",
                             );
                         }
                         Err(e) => {
@@ -636,6 +707,7 @@ pub(crate) fn build_page() -> gtk4::Widget {
         let masks_buffer = masks_buffer.clone();
         let masks_overlay = masks_overlay.clone();
         let overlay_area = overlay_area.clone();
+        let segment_prompt = segment_prompt.clone();
         let action_buttons_for_click = action_buttons.clone();
         let status_spinner = status_spinner.clone();
         let status_title = status_title.clone();
@@ -654,8 +726,7 @@ pub(crate) fn build_page() -> gtk4::Widget {
             set_action_buttons_sensitive(&action_buttons_for_click, false);
             status_spinner.start();
             status_title.set_text("Creating vision session");
-            status_detail
-                .set_text("Opening a vision.segment session with a center positive point...");
+            status_detail.set_text("Opening a vision.segment session with the selected point...");
 
             let (tx, rx) = std::sync::mpsc::channel::<VisionEvent>();
             let masks_buffer = masks_buffer.clone();
@@ -711,12 +782,16 @@ pub(crate) fn build_page() -> gtk4::Widget {
             });
 
             let error_tx = tx.clone();
-            std::thread::spawn(move || {
-                let points = vec![VisionPointPromptDbus {
+            let point = segment_prompt
+                .borrow()
+                .clone()
+                .unwrap_or(VisionPointPromptDbus {
                     x: 0.5,
                     y: 0.5,
                     positive: true,
-                }];
+                });
+            std::thread::spawn(move || {
+                let points = vec![point];
                 if let Err(e) = segment_image(&image, &instructions, points, tx) {
                     eprintln!("[aileron-demo] segment error: {e}");
                     let _ = error_tx.send(VisionEvent::Error(friendly_error(&e)));
@@ -730,6 +805,7 @@ pub(crate) fn build_page() -> gtk4::Widget {
         let instructions_buffer = instructions_buffer.clone();
         let depth_buffer = depth_buffer.clone();
         let depth_map = depth_map.clone();
+        let depth_frame = depth_frame.clone();
         let depth_canvas = depth_canvas.clone();
         let action_buttons_for_click = action_buttons.clone();
         let status_spinner = status_spinner.clone();
@@ -754,6 +830,7 @@ pub(crate) fn build_page() -> gtk4::Widget {
             let (tx, rx) = std::sync::mpsc::channel::<VisionEvent>();
             let depth_buffer = depth_buffer.clone();
             let depth_map = depth_map.clone();
+            let depth_frame = depth_frame.clone();
             let depth_canvas = depth_canvas.clone();
             let action_buttons = action_buttons_for_click.clone();
             let status_spinner = status_spinner.clone();
@@ -769,6 +846,7 @@ pub(crate) fn build_page() -> gtk4::Widget {
                         }
                         Ok(VisionEvent::Depth(depth)) => {
                             depth_buffer.set_text(&format_depth(&depth));
+                            depth_frame.set_ratio(aspect_ratio(depth.width, depth.height));
                             *depth_map.borrow_mut() = Some(depth);
                             depth_canvas.queue_draw();
                         }
@@ -856,6 +934,14 @@ fn fitted_image_rect(
         draw_width,
         draw_height,
     )
+}
+
+fn aspect_ratio(width: i32, height: i32) -> f32 {
+    if width <= 0 || height <= 0 {
+        return 16.0 / 9.0;
+    }
+
+    width as f32 / height as f32
 }
 
 fn set_action_buttons_sensitive(buttons: &Rc<Vec<Button>>, sensitive: bool) {

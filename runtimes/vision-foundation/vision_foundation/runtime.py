@@ -16,6 +16,8 @@ from PIL import Image
 
 
 MODEL_DIR = Path(os.environ.get("MODEL_DIR", "/model"))
+MAX_DEPTH_PIXELS = int(os.environ.get("MAX_DEPTH_PIXELS", "65536"))
+SAM2_CONFIG_NAME = os.environ.get("SAM2_CONFIG_NAME", "configs/sam2/sam2_hiera_t.yaml")
 
 
 class RuntimeErrorCode(Exception):
@@ -130,6 +132,44 @@ def normalize_depth(values: np.ndarray) -> tuple[list[float], float, float]:
     return [float(v) for v in normalized.reshape(-1)], minimum, maximum
 
 
+def downsample_depth(values: np.ndarray, max_pixels: int = MAX_DEPTH_PIXELS) -> np.ndarray:
+    arr = np.asarray(values, dtype=np.float32)
+    if arr.ndim != 2:
+        raise RuntimeErrorCode("inference_failed", "depth output must be a 2D array")
+    height, width = arr.shape
+    if height * width <= max_pixels:
+        return arr
+    scale = (max_pixels / float(height * width)) ** 0.5
+    target_height = max(1, int(height * scale))
+    target_width = max(1, int(width * scale))
+    y_indices = np.linspace(0, height - 1, target_height).astype(np.int64)
+    x_indices = np.linspace(0, width - 1, target_width).astype(np.int64)
+    return arr[np.ix_(y_indices, x_indices)]
+
+
+def prepare_depth_response(values: np.ndarray, max_pixels: int = MAX_DEPTH_PIXELS) -> dict[str, Any]:
+    arr = np.asarray(values, dtype=np.float32)
+    if arr.ndim != 2:
+        raise RuntimeErrorCode("inference_failed", "depth output must be a 2D array")
+    if arr.size == 0 or not np.isfinite(arr).all():
+        raise RuntimeErrorCode("inference_failed", "depth output must be finite and non-empty")
+    minimum = float(arr.min())
+    maximum = float(arr.max())
+    downsampled = downsample_depth(arr, max_pixels=max_pixels)
+    if maximum > minimum:
+        normalized_arr = (downsampled - minimum) / (maximum - minimum)
+    else:
+        normalized_arr = np.zeros_like(downsampled, dtype=np.float32)
+    height, width = downsampled.shape
+    return {
+        "width": int(width),
+        "height": int(height),
+        "values": [float(v) for v in normalized_arr.reshape(-1)],
+        "minimum": minimum,
+        "maximum": maximum,
+    }
+
+
 def yolo_model_path() -> Path | None:
     for filename in ("model.pt", "model.onnx"):
         path = MODEL_DIR / filename
@@ -144,12 +184,14 @@ def handle_detect(request: dict[str, Any]) -> dict[str, Any]:
     if model_path is None:
         raise RuntimeErrorCode("model_unavailable", "YOLO artifact /model/model.pt or /model/model.onnx is required")
     try:
-        from ultralytics import YOLO
+        with contextlib.redirect_stdout(sys.stderr):
+            from ultralytics import YOLO
     except Exception as exc:  # noqa: BLE001
         raise RuntimeErrorCode("model_unavailable", "Ultralytics YOLO is not installed in this runtime image") from exc
     try:
-        model = YOLO(str(model_path))
-        results = model.predict(np.asarray(decoded.image), verbose=False)
+        with contextlib.redirect_stdout(sys.stderr):
+            model = YOLO(str(model_path))
+            results = model.predict(np.asarray(decoded.image), verbose=False)
     except Exception as exc:  # noqa: BLE001
         raise RuntimeErrorCode("inference_failed", f"YOLO inference failed: {exc}") from exc
 
@@ -183,20 +225,22 @@ def handle_segment(request: dict[str, Any]) -> dict[str, Any]:
     if not config.is_file():
         raise RuntimeErrorCode("model_unavailable", "SAM2 config /model/config.yaml is required")
     try:
-        from sam2.build_sam import build_sam2
-        from sam2.sam2_image_predictor import SAM2ImagePredictor
+        with contextlib.redirect_stdout(sys.stderr):
+            from sam2.build_sam import build_sam2
+            from sam2.sam2_image_predictor import SAM2ImagePredictor
     except Exception as exc:  # noqa: BLE001
         raise RuntimeErrorCode("model_unavailable", "SAM2 Python package is not installed in this runtime image") from exc
     try:
-        model = build_sam2(str(config), str(checkpoint), device="cpu")
-        predictor = SAM2ImagePredictor(model)
-        predictor.set_image(np.asarray(decoded.image))
-        masks, scores, _ = predictor.predict(
-            point_coords=point_coords if len(point_coords) else None,
-            point_labels=point_labels if len(point_labels) else None,
-            box=boxes[0] if len(boxes) == 1 else None,
-            multimask_output=False,
-        )
+        with contextlib.redirect_stdout(sys.stderr):
+            model = build_sam2(SAM2_CONFIG_NAME, str(checkpoint), device="cpu")
+            predictor = SAM2ImagePredictor(model)
+            predictor.set_image(np.asarray(decoded.image))
+            masks, scores, _ = predictor.predict(
+                point_coords=point_coords if len(point_coords) else None,
+                point_labels=point_labels if len(point_labels) else None,
+                box=boxes[0] if len(boxes) == 1 else None,
+                multimask_output=False,
+            )
     except Exception as exc:  # noqa: BLE001
         raise RuntimeErrorCode("inference_failed", f"SAM2 inference failed: {exc}") from exc
 
@@ -242,9 +286,7 @@ def handle_da3_depth(request: dict[str, Any], decoded: DecodedImage, model_path:
         predicted = np.asarray(prediction.depth)[0]
     except Exception as exc:  # noqa: BLE001
         raise RuntimeErrorCode("inference_failed", f"DA3 inference failed: {exc}") from exc
-    values, minimum, maximum = normalize_depth(predicted)
-    height, width = predicted.shape
-    return result_response(str(request.get("id", "unknown")), {"depth": {"width": int(width), "height": int(height), "values": values, "minimum": minimum, "maximum": maximum}})
+    return result_response(str(request.get("id", "unknown")), {"depth": prepare_depth_response(predicted)})
 
 
 def handle_transformers_depth(request: dict[str, Any], decoded: DecodedImage, model_path: Path) -> dict[str, Any]:
@@ -262,9 +304,7 @@ def handle_transformers_depth(request: dict[str, Any], decoded: DecodedImage, mo
         predicted = outputs.predicted_depth.detach().cpu().numpy()[0]
     except Exception as exc:  # noqa: BLE001
         raise RuntimeErrorCode("inference_failed", f"depth inference failed: {exc}") from exc
-    values, minimum, maximum = normalize_depth(predicted)
-    height, width = predicted.shape
-    return result_response(str(request.get("id", "unknown")), {"depth": {"width": int(width), "height": int(height), "values": values, "minimum": minimum, "maximum": maximum}})
+    return result_response(str(request.get("id", "unknown")), {"depth": prepare_depth_response(predicted)})
 
 
 def depth_model_path() -> Path | None:

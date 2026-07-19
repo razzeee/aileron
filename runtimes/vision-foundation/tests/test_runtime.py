@@ -1,6 +1,8 @@
 import base64
 import io
 import json
+import sys
+import types
 import unittest
 import unittest.mock
 
@@ -49,6 +51,18 @@ class RuntimeHelpersTest(unittest.TestCase):
         self.assertEqual(maximum, 10.0)
         self.assertEqual(values, [0.0, 0.25, 0.5, 1.0])
 
+    def test_prepare_depth_response_downsamples_large_maps(self):
+        response = runtime.prepare_depth_response(
+            np.arange(100, dtype=np.float32).reshape(10, 10),
+            max_pixels=16,
+        )
+
+        self.assertEqual(response["width"], 4)
+        self.assertEqual(response["height"], 4)
+        self.assertEqual(len(response["values"]), 16)
+        self.assertEqual(response["minimum"], 0.0)
+        self.assertEqual(response["maximum"], 99.0)
+
     def test_result_response_wraps_result_as_json_string(self):
         response = runtime.result_response("req-1", {"detections": []})
 
@@ -88,6 +102,67 @@ class RuntimeHelpersTest(unittest.TestCase):
 
         self.assertEqual(raised.exception.code, "invalid_input")
 
+    def test_detect_redirects_model_stdout_away_from_protocol(self):
+        class FakeYolo:
+            names = {}
+
+            def __init__(self, _path):
+                print("noisy detector init")
+
+            def predict(self, _image, verbose=False):
+                print("noisy detector predict")
+                return []
+
+        ultralytics = types.ModuleType("ultralytics")
+        ultralytics.YOLO = FakeYolo
+        path = self.create_temp_model_dir(("model.onnx",))
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with unittest.mock.patch.dict(sys.modules, {"ultralytics": ultralytics}):
+            with unittest.mock.patch.object(runtime, "MODEL_DIR", path):
+                with unittest.mock.patch("sys.stdout", stdout), unittest.mock.patch("sys.stderr", stderr):
+                    response = runtime.handle_detect({"id": "req-1", "type": "detect", "image": tiny_png_base64()})
+
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("noisy detector init", stderr.getvalue())
+        self.assertEqual(json.loads(response["result"]), {"detections": []})
+
+    def test_segment_uses_hydra_config_name_not_mounted_path(self):
+        calls = []
+
+        def build_sam2(config_name, checkpoint, device="cpu"):
+            calls.append((config_name, checkpoint, device))
+            return object()
+
+        class FakePredictor:
+            def __init__(self, _model):
+                pass
+
+            def set_image(self, _image):
+                pass
+
+            def predict(self, **_kwargs):
+                return np.asarray([[[True, False], [False, False]]]), np.asarray([0.75]), None
+
+        build_sam = types.ModuleType("sam2.build_sam")
+        build_sam.build_sam2 = build_sam2
+        predictor = types.ModuleType("sam2.sam2_image_predictor")
+        predictor.SAM2ImagePredictor = FakePredictor
+        path = self.create_temp_model_dir(("model.pt", "config.yaml"))
+        with unittest.mock.patch.dict(sys.modules, {"sam2.build_sam": build_sam, "sam2.sam2_image_predictor": predictor}):
+            with unittest.mock.patch.object(runtime, "MODEL_DIR", path):
+                response = runtime.handle_segment(
+                    {
+                        "id": "req-1",
+                        "type": "segment",
+                        "image": tiny_png_base64(),
+                        "points": [{"x": 0.5, "y": 0.5, "positive": True}],
+                    }
+                )
+
+        self.assertEqual(calls, [(runtime.SAM2_CONFIG_NAME, str(path / "model.pt"), "cpu")])
+        self.assertEqual(len(json.loads(response["result"])["masks"]), 1)
+
     def create_temp_depth_dir(self):
         import tempfile
 
@@ -95,6 +170,16 @@ class RuntimeHelpersTest(unittest.TestCase):
         self.addCleanup(temp.cleanup)
         path = runtime.Path(temp.name)
         for filename in ("config.json", "model.safetensors", "preprocessor_config.json"):
+            (path / filename).write_bytes(b"stub")
+        return path
+
+    def create_temp_model_dir(self, filenames):
+        import tempfile
+
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        path = runtime.Path(temp.name)
+        for filename in filenames:
             (path / filename).write_bytes(b"stub")
         return path
 

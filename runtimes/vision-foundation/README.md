@@ -66,6 +66,7 @@ SAM2 promptable segmentation profile:
 ```
 
 The base CPU image bundles the `sam2` Python package for the curated tiny profile. If a different checkpoint requires a different package revision, build a derived image with that exact SAM2 package.
+`sam2.build_sam2` resolves configs through Hydra from the installed `sam2` package, so the runtime uses `SAM2_CONFIG_NAME` for the package config name and defaults to `configs/sam2/sam2_hiera_t.yaml`. `/model/config.yaml` is still required so installed artifacts remain self-describing and verifiable.
 
 Depth estimation profile:
 
@@ -83,6 +84,7 @@ The depth loader uses `depth-anything-3` for DA3 checkpoints and falls back to `
 ## Limitations
 
 - CPU inference can be slow, especially for SAM2 and depth models.
+- Depth responses are downsampled to at most 65,536 values before JSON serialization. Set `MAX_DEPTH_PIXELS` in the runtime environment to tune this cap.
 - SAM2 video segmentation, memory state, and masklet tracking are intentionally out of scope.
 - Empty SAM2 prompts return `invalid_input` instead of running automatic mask generation.
 - Depth output is normalized relative monocular depth. Metric depth is not guaranteed.
