@@ -1,0 +1,26 @@
+{
+  "profile_id": "depth-anything-3-base",
+  "model_id": "depth-anything/DA3-BASE",
+  "runtime_id": "vision-foundation",
+  "tier": "balanced",
+  "disk_size_gb": 0.51,
+  "min_ram_gb": 6.0,
+  "use_cases": ["vision.depth"],
+  "specializations": ["relative-depth", "depth-anything-3", "license:apache-2.0"],
+  "artifacts": [
+    {
+      "role": "config",
+      "url": "https://huggingface.co/depth-anything/DA3-BASE/resolve/main/config.json",
+      "filename": "config.json",
+      "sha256": "5e34115ebc17bd2d8d43033c5f72e9446ac8833fd61d3fa160b7e67e0bb5b7b5",
+      "size_bytes": 1205
+    },
+    {
+      "role": "model",
+      "url": "https://huggingface.co/depth-anything/DA3-BASE/resolve/main/model.safetensors",
+      "filename": "model.safetensors",
+      "sha256": "e01067dc1659613083d9145a9a2547ccdbe6ccbbf83c4fe7b3e8a4e2bdae78b5",
+      "size_bytes": 541518028
+    }
+  ]
+}

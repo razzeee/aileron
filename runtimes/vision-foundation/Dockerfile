@@ -11,16 +11,16 @@ RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends ca-certificates build-essential libgl1 libglib2.0-0; \
     rm -rf /var/lib/apt/lists/*; \
-    pip install --no-cache-dir --prefix=/install \
+    pip install --no-cache-dir --prefix=/install --index-url https://download.pytorch.org/whl/cpu \
+      torch \
+      torchvision; \
+    PYTHONPATH="$(python -c 'import sysconfig; print(sysconfig.get_path("purelib", vars={"base":"/install", "platbase":"/install"}))')" \
+      pip install --no-cache-dir --prefix=/install \
       numpy \
       pillow \
       depth-anything-3 \
       opencv-python-headless \
-      onnxruntime \
       sam2 \
-      torch \
-      torchvision \
-      transformers \
       ultralytics
 
 FROM ${PYTHON_IMAGE}
