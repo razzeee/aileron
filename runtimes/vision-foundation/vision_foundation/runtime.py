@@ -18,6 +18,19 @@ from PIL import Image
 MODEL_DIR = Path(os.environ.get("MODEL_DIR", "/model"))
 MAX_DEPTH_PIXELS = int(os.environ.get("MAX_DEPTH_PIXELS", "65536"))
 SAM2_CONFIG_NAME = os.environ.get("SAM2_CONFIG_NAME", "configs/sam2/sam2_hiera_t.yaml")
+YOLO_INPUT_SIZE = int(os.environ.get("YOLO_INPUT_SIZE", "640"))
+YOLO_CONFIDENCE_THRESHOLD = float(os.environ.get("YOLO_CONFIDENCE_THRESHOLD", "0.25"))
+YOLO_IOU_THRESHOLD = float(os.environ.get("YOLO_IOU_THRESHOLD", "0.45"))
+COCO_LABELS = (
+    "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat", "traffic light",
+    "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat", "dog", "horse", "sheep", "cow",
+    "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella", "handbag", "tie", "suitcase", "frisbee",
+    "skis", "snowboard", "sports ball", "kite", "baseball bat", "baseball glove", "skateboard", "surfboard", "tennis racket", "bottle",
+    "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana", "apple", "sandwich", "orange",
+    "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair", "couch", "potted plant", "bed",
+    "dining table", "toilet", "tv", "laptop", "mouse", "remote", "keyboard", "cell phone", "microwave", "oven",
+    "toaster", "sink", "refrigerator", "book", "clock", "vase", "scissors", "teddy bear", "hair drier", "toothbrush",
+)
 
 
 class RuntimeErrorCode(Exception):
@@ -183,6 +196,8 @@ def handle_detect(request: dict[str, Any]) -> dict[str, Any]:
     model_path = yolo_model_path()
     if model_path is None:
         raise RuntimeErrorCode("model_unavailable", "YOLO artifact /model/model.pt or /model/model.onnx is required")
+    if model_path.suffix == ".onnx":
+        return handle_detect_onnx(request, decoded, model_path)
     try:
         with contextlib.redirect_stdout(sys.stderr):
             from ultralytics import YOLO
@@ -208,6 +223,113 @@ def handle_detect(request: dict[str, Any]) -> dict[str, Any]:
             confidence = float(box.conf[0].item()) if getattr(box, "conf", None) is not None else 0.0
             detections.append({"label": label, "confidence": clamp01(confidence), **normalize_box(*xyxy, decoded.width, decoded.height)})
     return result_response(str(request.get("id", "unknown")), {"detections": detections})
+
+
+def handle_detect_onnx(request: dict[str, Any], decoded: DecodedImage, model_path: Path) -> dict[str, Any]:
+    try:
+        with contextlib.redirect_stdout(sys.stderr):
+            import onnxruntime as ort
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeErrorCode("model_unavailable", "ONNX Runtime is not installed in this runtime image") from exc
+    try:
+        tensor, scale, pad_x, pad_y = prepare_yolo_input(decoded.image, YOLO_INPUT_SIZE)
+        with contextlib.redirect_stdout(sys.stderr):
+            session = ort.InferenceSession(str(model_path), providers=["CPUExecutionProvider"])
+            input_name = session.get_inputs()[0].name
+            outputs = session.run(None, {input_name: tensor})
+        detections = parse_yolo_output(outputs[0], decoded.width, decoded.height, scale, pad_x, pad_y)
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeErrorCode("inference_failed", f"YOLO ONNX inference failed: {exc}") from exc
+    return result_response(str(request.get("id", "unknown")), {"detections": detections})
+
+
+def prepare_yolo_input(image: Image.Image, size: int) -> tuple[np.ndarray, float, float, float]:
+    width, height = image.size
+    scale = min(size / float(width), size / float(height))
+    resized_width = max(1, int(round(width * scale)))
+    resized_height = max(1, int(round(height * scale)))
+    pad_x = (size - resized_width) / 2.0
+    pad_y = (size - resized_height) / 2.0
+    canvas = Image.new("RGB", (size, size), (114, 114, 114))
+    resized = image.resize((resized_width, resized_height), Image.Resampling.BILINEAR)
+    canvas.paste(resized, (int(round(pad_x)), int(round(pad_y))))
+    arr = np.asarray(canvas, dtype=np.float32) / 255.0
+    return np.transpose(arr, (2, 0, 1))[None, ...], scale, pad_x, pad_y
+
+
+def parse_yolo_output(output: Any, image_width: int, image_height: int, scale: float, pad_x: float, pad_y: float) -> list[dict[str, Any]]:
+    predictions = np.asarray(output, dtype=np.float32)
+    if predictions.ndim == 3:
+        predictions = predictions[0]
+    if predictions.ndim != 2:
+        raise RuntimeErrorCode("inference_failed", f"YOLO output must be 2D or batched 2D, got shape {predictions.shape}")
+    if predictions.shape[0] in (84, 85):
+        predictions = predictions.T
+    if predictions.shape[1] < 6:
+        raise RuntimeErrorCode("inference_failed", f"YOLO output has too few columns: {predictions.shape}")
+
+    candidates: list[dict[str, Any]] = []
+    for row in predictions:
+        x_center, y_center, width, height = [float(v) for v in row[:4]]
+        scores = row[4:]
+        if scores.size == 2 and 0.0 <= scores[1] <= len(COCO_LABELS) - 1:
+            confidence = float(scores[0])
+            class_id = int(scores[1])
+        else:
+            if scores.size == len(COCO_LABELS) + 1:
+                objectness = float(scores[0])
+                class_scores = scores[1:]
+            else:
+                objectness = 1.0
+                class_scores = scores
+            class_id = int(np.argmax(class_scores))
+            confidence = objectness * float(class_scores[class_id])
+        if confidence < YOLO_CONFIDENCE_THRESHOLD:
+            continue
+        x1 = (x_center - width / 2.0 - pad_x) / scale
+        y1 = (y_center - height / 2.0 - pad_y) / scale
+        x2 = (x_center + width / 2.0 - pad_x) / scale
+        y2 = (y_center + height / 2.0 - pad_y) / scale
+        x1 = max(0.0, min(float(image_width), x1))
+        y1 = max(0.0, min(float(image_height), y1))
+        x2 = max(0.0, min(float(image_width), x2))
+        y2 = max(0.0, min(float(image_height), y2))
+        if x2 <= x1 or y2 <= y1:
+            continue
+        candidates.append({
+            "class_id": class_id,
+            "label": COCO_LABELS[class_id] if 0 <= class_id < len(COCO_LABELS) else str(class_id),
+            "confidence": clamp01(confidence),
+            "x1": x1,
+            "y1": y1,
+            "x2": x2,
+            "y2": y2,
+        })
+
+    return [
+        {"label": candidate["label"], "confidence": candidate["confidence"], **normalize_box(candidate["x1"], candidate["y1"], candidate["x2"], candidate["y2"], image_width, image_height)}
+        for candidate in non_max_suppression(candidates, YOLO_IOU_THRESHOLD)
+    ]
+
+
+def non_max_suppression(candidates: list[dict[str, Any]], iou_threshold: float) -> list[dict[str, Any]]:
+    kept: list[dict[str, Any]] = []
+    for candidate in sorted(candidates, key=lambda item: item["confidence"], reverse=True):
+        if all(candidate["class_id"] != kept_candidate["class_id"] or box_iou(candidate, kept_candidate) <= iou_threshold for kept_candidate in kept):
+            kept.append(candidate)
+    return kept[:100]
+
+
+def box_iou(a: dict[str, Any], b: dict[str, Any]) -> float:
+    x1 = max(float(a["x1"]), float(b["x1"]))
+    y1 = max(float(a["y1"]), float(b["y1"]))
+    x2 = min(float(a["x2"]), float(b["x2"]))
+    y2 = min(float(a["y2"]), float(b["y2"]))
+    intersection = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+    area_a = max(0.0, float(a["x2"]) - float(a["x1"])) * max(0.0, float(a["y2"]) - float(a["y1"]))
+    area_b = max(0.0, float(b["x2"]) - float(b["x1"])) * max(0.0, float(b["y2"]) - float(b["y1"]))
+    union = area_a + area_b - intersection
+    return intersection / union if union > 0.0 else 0.0
 
 
 def handle_segment(request: dict[str, Any]) -> dict[str, Any]:
@@ -246,18 +368,25 @@ def handle_segment(request: dict[str, Any]) -> dict[str, Any]:
 
     response_masks: list[dict[str, Any]] = []
     for index, mask in enumerate(masks):
-        ys, xs = np.where(np.asarray(mask).astype(bool))
+        mask_arr = np.asarray(mask).astype(bool)
+        ys, xs = np.where(mask_arr)
         if xs.size == 0 or ys.size == 0:
             box = {"x": 0.0, "y": 0.0, "width": 0.0, "height": 0.0}
+            cropped_mask = mask_arr[:1, :1]
         else:
-            box = normalize_box(float(xs.min()), float(ys.min()), float(xs.max() + 1), float(ys.max() + 1), decoded.width, decoded.height)
+            x1 = int(xs.min())
+            y1 = int(ys.min())
+            x2 = int(xs.max() + 1)
+            y2 = int(ys.max() + 1)
+            box = normalize_box(float(x1), float(y1), float(x2), float(y2), decoded.width, decoded.height)
+            cropped_mask = mask_arr[y1:y2, x1:x2]
         response_masks.append({
             "label": "mask",
             "confidence": clamp01(float(scores[index]) if index < len(scores) else 0.0),
             **box,
-            "mask_base64": encode_mask_png(mask),
-            "mask_width": int(np.asarray(mask).shape[1]),
-            "mask_height": int(np.asarray(mask).shape[0]),
+            "mask_base64": encode_mask_png(cropped_mask),
+            "mask_width": int(cropped_mask.shape[1]),
+            "mask_height": int(cropped_mask.shape[0]),
         })
     return result_response(str(request.get("id", "unknown")), {"masks": response_masks})
 

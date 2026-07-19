@@ -4,10 +4,11 @@ use super::super::{
     friendly_error, ocr_image, segment_image,
 };
 use super::scrollable_page;
+use base64::Engine as _;
 use gtk4::prelude::*;
 use gtk4::{
     Align, AspectFrame, Box, Button, DrawingArea, FileDialog, GestureClick, Label, Orientation,
-    Overlay, Picture, ScrolledWindow, Spinner, TextBuffer, TextView, gdk,
+    Overlay, Picture, ScrolledWindow, Spinner, TextBuffer, TextView, cairo, gdk,
 };
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -31,6 +32,7 @@ pub(crate) fn build_page() -> gtk4::Widget {
     let selected_image_size = Rc::new(RefCell::new(None::<(i32, i32)>));
     let detections_overlay = Rc::new(RefCell::new(Vec::<VisionDetectionDbus>::new()));
     let masks_overlay = Rc::new(RefCell::new(Vec::<VisionMaskDbus>::new()));
+    let mask_surfaces = Rc::new(RefCell::new(Vec::<Option<cairo::ImageSurface>>::new()));
     let depth_map = Rc::new(RefCell::new(None::<VisionDepthMapDbus>));
     let segment_prompt = Rc::new(RefCell::new(None::<VisionPointPromptDbus>));
 
@@ -80,6 +82,7 @@ pub(crate) fn build_page() -> gtk4::Widget {
     {
         let detections_overlay = detections_overlay.clone();
         let masks_overlay = masks_overlay.clone();
+        let mask_surfaces = mask_surfaces.clone();
         let selected_image_size = selected_image_size.clone();
         let segment_prompt = segment_prompt.clone();
         overlay_area.set_draw_func(move |_area, cr, width, height| {
@@ -96,17 +99,48 @@ pub(crate) fn build_page() -> gtk4::Widget {
                 );
                 let _ = cr.stroke();
             }
-            for mask in masks_overlay.borrow().iter() {
-                cr.set_source_rgba(0.7, 0.25, 1.0, 0.25);
-                cr.rectangle(
-                    offset_x + mask.x * draw_width,
-                    offset_y + mask.y * draw_height,
-                    mask.width * draw_width,
-                    mask.height * draw_height,
-                );
-                let _ = cr.fill_preserve();
-                cr.set_source_rgba(0.7, 0.25, 1.0, 0.85);
-                let _ = cr.stroke();
+            let masks = masks_overlay.borrow();
+            let decoded_masks = mask_surfaces.borrow();
+            for (index, mask) in masks.iter().enumerate() {
+                if let Some(Some(surface)) = decoded_masks.get(index) {
+                    let _ = cr.save();
+                    let full_image_mask =
+                        selected_image_size
+                            .borrow()
+                            .is_some_and(|(image_width, image_height)| {
+                                surface.width() == image_width && surface.height() == image_height
+                            });
+                    if full_image_mask {
+                        cr.translate(offset_x, offset_y);
+                        cr.scale(
+                            draw_width / surface.width().max(1) as f64,
+                            draw_height / surface.height().max(1) as f64,
+                        );
+                    } else {
+                        cr.translate(
+                            offset_x + mask.x * draw_width,
+                            offset_y + mask.y * draw_height,
+                        );
+                        cr.scale(
+                            mask.width * draw_width / surface.width().max(1) as f64,
+                            mask.height * draw_height / surface.height().max(1) as f64,
+                        );
+                    }
+                    let _ = cr.set_source_surface(surface, 0.0, 0.0);
+                    let _ = cr.paint();
+                    let _ = cr.restore();
+                } else {
+                    cr.set_source_rgba(0.7, 0.25, 1.0, 0.25);
+                    cr.rectangle(
+                        offset_x + mask.x * draw_width,
+                        offset_y + mask.y * draw_height,
+                        mask.width * draw_width,
+                        mask.height * draw_height,
+                    );
+                    let _ = cr.fill_preserve();
+                    cr.set_source_rgba(0.7, 0.25, 1.0, 0.85);
+                    let _ = cr.stroke();
+                }
             }
             if let Some(prompt) = segment_prompt.borrow().as_ref() {
                 let x = offset_x + prompt.x * draw_width;
@@ -370,6 +404,7 @@ pub(crate) fn build_page() -> gtk4::Widget {
         let depth_canvas = depth_canvas.clone();
         let detections_overlay = detections_overlay.clone();
         let masks_overlay = masks_overlay.clone();
+        let mask_surfaces = mask_surfaces.clone();
         let depth_map = depth_map.clone();
         let segment_prompt = segment_prompt.clone();
         let status_title = status_title.clone();
@@ -386,6 +421,7 @@ pub(crate) fn build_page() -> gtk4::Widget {
             let depth_canvas = depth_canvas.clone();
             let detections_overlay = detections_overlay.clone();
             let masks_overlay = masks_overlay.clone();
+            let mask_surfaces = mask_surfaces.clone();
             let depth_map = depth_map.clone();
             let segment_prompt = segment_prompt.clone();
             let status_title = status_title.clone();
@@ -421,6 +457,7 @@ pub(crate) fn build_page() -> gtk4::Widget {
                             *selected_image.borrow_mut() = Some(bytes);
                             detections_overlay.borrow_mut().clear();
                             masks_overlay.borrow_mut().clear();
+                            mask_surfaces.borrow_mut().clear();
                             *depth_map.borrow_mut() = None;
                             *segment_prompt.borrow_mut() = None;
                             overlay_area.queue_draw();
@@ -706,6 +743,7 @@ pub(crate) fn build_page() -> gtk4::Widget {
         let instructions_buffer = instructions_buffer.clone();
         let masks_buffer = masks_buffer.clone();
         let masks_overlay = masks_overlay.clone();
+        let mask_surfaces = mask_surfaces.clone();
         let overlay_area = overlay_area.clone();
         let segment_prompt = segment_prompt.clone();
         let action_buttons_for_click = action_buttons.clone();
@@ -731,6 +769,7 @@ pub(crate) fn build_page() -> gtk4::Widget {
             let (tx, rx) = std::sync::mpsc::channel::<VisionEvent>();
             let masks_buffer = masks_buffer.clone();
             let masks_overlay = masks_overlay.clone();
+            let mask_surfaces = mask_surfaces.clone();
             let overlay_area = overlay_area.clone();
             let action_buttons = action_buttons_for_click.clone();
             let status_spinner = status_spinner.clone();
@@ -746,6 +785,8 @@ pub(crate) fn build_page() -> gtk4::Widget {
                         }
                         Ok(VisionEvent::Masks(masks)) => {
                             masks_buffer.set_text(&format_masks(&masks));
+                            *mask_surfaces.borrow_mut() =
+                                masks.iter().map(mask_surface_from_base64).collect();
                             *masks_overlay.borrow_mut() = masks;
                             overlay_area.queue_draw();
                         }
@@ -911,6 +952,42 @@ fn image_bytes_from_selection(
     }
 
     Err("Choose an image file first.".to_string())
+}
+
+fn mask_surface_from_base64(mask: &VisionMaskDbus) -> Option<cairo::ImageSurface> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&mask.mask_base64)
+        .ok()?;
+    let image = image::load_from_memory(&bytes).ok()?.to_rgba8();
+    let (width, height) = image.dimensions();
+    if width == 0 || height == 0 {
+        return None;
+    }
+
+    let mut surface =
+        cairo::ImageSurface::create(cairo::Format::ARgb32, width as i32, height as i32).ok()?;
+    let stride = surface.stride() as usize;
+    {
+        let mut data = surface.data().ok()?;
+        for y in 0..height as usize {
+            for x in 0..width as usize {
+                let [red, green, blue, alpha] = image.get_pixel(x as u32, y as u32).0;
+                let coverage = if alpha < 255 {
+                    alpha
+                } else {
+                    red.max(green).max(blue)
+                };
+                let overlay_alpha = ((coverage as u16 * 96) / 255) as u8;
+                let offset = y * stride + x * 4;
+                data[offset] = ((255u16 * overlay_alpha as u16) / 255) as u8;
+                data[offset + 1] = ((64u16 * overlay_alpha as u16) / 255) as u8;
+                data[offset + 2] = ((179u16 * overlay_alpha as u16) / 255) as u8;
+                data[offset + 3] = overlay_alpha;
+            }
+        }
+    }
+    surface.mark_dirty();
+    Some(surface)
 }
 
 fn fitted_image_rect(

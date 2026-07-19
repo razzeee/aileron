@@ -115,7 +115,7 @@ class RuntimeHelpersTest(unittest.TestCase):
 
         ultralytics = types.ModuleType("ultralytics")
         ultralytics.YOLO = FakeYolo
-        path = self.create_temp_model_dir(("model.onnx",))
+        path = self.create_temp_model_dir(("model.pt",))
         stdout = io.StringIO()
         stderr = io.StringIO()
         with unittest.mock.patch.dict(sys.modules, {"ultralytics": ultralytics}):
@@ -126,6 +126,43 @@ class RuntimeHelpersTest(unittest.TestCase):
         self.assertEqual(stdout.getvalue(), "")
         self.assertIn("noisy detector init", stderr.getvalue())
         self.assertEqual(json.loads(response["result"]), {"detections": []})
+
+    def test_detect_onnx_parses_yolo_output_without_ultralytics(self):
+        class FakeInput:
+            name = "images"
+
+        class FakeSession:
+            def __init__(self, _path, providers):
+                self.providers = providers
+
+            def get_inputs(self):
+                return [FakeInput()]
+
+            def run(self, _names, inputs):
+                self.seen_inputs = inputs
+                output = np.zeros((1, 84, 2), dtype=np.float32)
+                output[0, 0, :] = [320.0, 320.0]
+                output[0, 1, :] = [320.0, 320.0]
+                output[0, 2, :] = [320.0, 320.0]
+                output[0, 3, :] = [320.0, 320.0]
+                output[0, 4 + 2, :] = [0.9, 0.8]
+                return [output]
+
+        ort = types.ModuleType("onnxruntime")
+        ort.InferenceSession = FakeSession
+        path = self.create_temp_model_dir(("model.onnx",))
+        with unittest.mock.patch.dict(sys.modules, {"onnxruntime": ort}):
+            with unittest.mock.patch.object(runtime, "MODEL_DIR", path):
+                response = runtime.handle_detect({"id": "req-1", "type": "detect", "image": tiny_png_base64()})
+
+        detections = json.loads(response["result"])["detections"]
+        self.assertEqual(len(detections), 1)
+        self.assertEqual(detections[0]["label"], "car")
+        self.assertAlmostEqual(detections[0]["confidence"], 0.9)
+        self.assertAlmostEqual(detections[0]["x"], 0.25)
+        self.assertAlmostEqual(detections[0]["y"], 0.25)
+        self.assertAlmostEqual(detections[0]["width"], 0.5)
+        self.assertAlmostEqual(detections[0]["height"], 0.5)
 
     def test_segment_uses_hydra_config_name_not_mounted_path(self):
         calls = []
@@ -161,7 +198,14 @@ class RuntimeHelpersTest(unittest.TestCase):
                 )
 
         self.assertEqual(calls, [(runtime.SAM2_CONFIG_NAME, str(path / "model.pt"), "cpu")])
-        self.assertEqual(len(json.loads(response["result"])["masks"]), 1)
+        masks = json.loads(response["result"])["masks"]
+        self.assertEqual(len(masks), 1)
+        self.assertEqual(masks[0]["mask_width"], 1)
+        self.assertEqual(masks[0]["mask_height"], 1)
+        self.assertEqual(masks[0]["x"], 0.0)
+        self.assertEqual(masks[0]["y"], 0.0)
+        self.assertEqual(masks[0]["width"], 0.5)
+        self.assertEqual(masks[0]["height"], 0.5)
 
     def create_temp_depth_dir(self):
         import tempfile

@@ -46,3 +46,5 @@ sha2 = "0.11"
 tar = "0.4"
 ocirender = "0.2.1"
 hegeltest = "0.23.2"
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["png"] }
