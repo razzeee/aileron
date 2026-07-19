@@ -89,8 +89,9 @@ pub(crate) fn build_page() -> gtk4::Widget {
             let (offset_x, offset_y, draw_width, draw_height) =
                 fitted_image_rect(width as f64, height as f64, *selected_image_size.borrow());
             cr.set_line_width(2.0);
-            for detection in detections_overlay.borrow().iter() {
-                cr.set_source_rgba(0.1, 0.55, 1.0, 0.9);
+            for (index, detection) in detections_overlay.borrow().iter().enumerate() {
+                let (red, green, blue) = detection_color(index);
+                cr.set_source_rgba(red, green, blue, 0.9);
                 cr.rectangle(
                     offset_x + detection.x * draw_width,
                     offset_y + detection.y * draw_height,
@@ -1011,6 +1012,21 @@ fn fitted_image_rect(
         draw_width,
         draw_height,
     )
+}
+
+fn detection_color(index: usize) -> (f64, f64, f64) {
+    const COLORS: [(f64, f64, f64); 8] = [
+        (0.10, 0.55, 1.00),
+        (1.00, 0.35, 0.20),
+        (0.20, 0.80, 0.35),
+        (0.85, 0.35, 1.00),
+        (1.00, 0.75, 0.10),
+        (0.10, 0.85, 0.85),
+        (1.00, 0.45, 0.75),
+        (0.65, 0.85, 0.20),
+    ];
+
+    COLORS[index % COLORS.len()]
 }
 
 fn aspect_ratio(width: i32, height: i32) -> f32 {
