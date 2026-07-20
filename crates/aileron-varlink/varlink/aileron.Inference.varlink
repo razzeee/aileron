@@ -122,8 +122,9 @@ method GetUseCaseAvailability(app_id: string, use_case: string) -> (availability
 # Create an inference session with stable system instructions.
 method CreateSession(app_id: string, use_case: string, instructions: string) -> (session_id: string, profile_id: string)
 
-# Optionally start the backing container before the first user-visible response.
-# First inference also starts it on demand; Prewarm only moves that latency earlier.
+# Optionally start the container for the session's assigned profile before the
+# first user-visible response. First inference also starts it on demand; Prewarm
+# only moves that latency earlier and does not warm a specific method or payload.
 method Prewarm(session_id: string) -> ()
 
 # Stream response tokens. Session must have been created with a language generation use_case.

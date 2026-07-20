@@ -498,7 +498,7 @@ Apps call the public interfaces on `org.freedesktop.portal.Desktop`. The public 
 |---|---|---|---|
 | `GetUseCaseAvailability` | `use_case: s, options: a{sv}` | `(is_available: b, code: s, reason: s)` | Checks whether an assigned profile has local artifacts and a runtime image; `code` is a stable availability status string for app control flow |
 | `CreateSession` | `parent_window: s, use_case: s, instructions: s, options: a{sv}` | `handle: o` | Creates a session bound to the assigned profile; the request response contains `session_handle: o` |
-| `Prewarm` | `session_handle: o, options: a{sv}` | `handle: o` | Optional latency optimization that starts the backing container before the first user-visible operation; first inference starts it on demand if skipped; close the request to stop waiting for completion |
+| `Prewarm` | `session_handle: o, options: a{sv}` | `handle: o` | Optional latency optimization that starts the container for the session's assigned profile before the first user-visible operation; first inference starts it on demand if skipped; close the request to stop waiting for completion |
 
 ### Language Methods
 
@@ -676,6 +676,7 @@ The daemon sends a `response_format` object containing the caller's JSON Schema.
 ## Container lifecycle
 
 - Containers start on demand when `Prewarm` or the first inference call needs an assigned profile runtime. `Prewarm` is optional; it only moves startup latency earlier in the flow.
+- `Prewarm` warms the profile assigned to the session's use case, not a specific stream method or request payload. Other sessions and use cases assigned to the same profile may reuse that warm container until idle eviction.
 - The daemon waits for the container to signal `ready` on stderr before using it.
 - The portal emits `ModelLoading(request_handle, session_handle, "preparing model")` before language, speech, or vision operations that may touch the backing runtime.
 - One container runs per profile, shared across all sessions bound to that profile.
