@@ -108,15 +108,6 @@ impl SinkWorker {
         }
     }
 
-    fn send(&self, message: SinkMessage) -> Result<()> {
-        if let Ok(error) = self.errors.try_recv() {
-            return Err(error);
-        }
-        self.sender
-            .send(message)
-            .map_err(|_| anyhow::anyhow!("PCM sink stopped unexpectedly"))
-    }
-
     fn send_cancellable(&self, mut message: SinkMessage, cancel: &CancellationToken) -> Result<()> {
         loop {
             if cancel.is_cancelled() {
@@ -149,6 +140,10 @@ impl SinkWorker {
             Err(_) => Ok(()),
         }
     }
+
+    fn is_finished(&self) -> bool {
+        self.thread.as_ref().is_none_or(JoinHandle::is_finished)
+    }
 }
 
 pub(crate) struct PcmFanout {
@@ -174,26 +169,13 @@ impl PcmFanout {
         pcm: Arc<[u8]>,
         cancel: &CancellationToken,
     ) -> Result<()> {
-        self.write_inner(format, pcm, Some(cancel))
-    }
-
-    fn write_inner(
-        &mut self,
-        format: AudioFormat,
-        pcm: Arc<[u8]>,
-        cancel: Option<&CancellationToken>,
-    ) -> Result<()> {
         format.validate_chunk(&pcm)?;
         match &self.format {
             Some(active) if active != &format => bail!("PCM metadata changed during synthesis"),
             None => {
                 for worker in &self.workers {
                     let message = SinkMessage::Start(format.clone());
-                    if let Some(cancel) = cancel {
-                        worker.send_cancellable(message, cancel)?;
-                    } else {
-                        worker.send(message)?;
-                    }
+                    worker.send_cancellable(message, cancel)?;
                 }
                 self.format = Some(format);
             }
@@ -201,18 +183,31 @@ impl PcmFanout {
         }
         for worker in &self.workers {
             let message = SinkMessage::Chunk(Arc::clone(&pcm));
-            if let Some(cancel) = cancel {
-                worker.send_cancellable(message, cancel)?;
-            } else {
-                worker.send(message)?;
-            }
+            worker.send_cancellable(message, cancel)?;
         }
         Ok(())
     }
 
-    pub(crate) fn finish(&mut self) -> Result<()> {
+    pub(crate) fn finish_cancellable(
+        &mut self,
+        cancel: &CancellationToken,
+        keep_partial: bool,
+    ) -> Result<()> {
         for worker in &self.workers {
-            worker.send(SinkMessage::Finish)?;
+            if let Err(error) = worker.send_cancellable(SinkMessage::Finish, cancel) {
+                let _ = self.cancel(keep_partial);
+                return Err(error);
+            }
+        }
+        loop {
+            if cancel.is_cancelled() {
+                let _ = self.cancel(keep_partial);
+                bail!("speech synthesis cancelled");
+            }
+            if self.workers.iter().all(SinkWorker::is_finished) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
         for worker in &mut self.workers {
             worker.join()?;
@@ -224,7 +219,17 @@ impl PcmFanout {
         for worker in &self.workers {
             let _ = worker.cancel_sender.send(keep_partial);
         }
-        for worker in &mut self.workers {
+        let deadline = std::time::Instant::now() + Duration::from_millis(250);
+        while self.workers.iter().any(|worker| !worker.is_finished())
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        for worker in self
+            .workers
+            .iter_mut()
+            .filter(|worker| worker.is_finished())
+        {
             worker.join()?;
         }
         Ok(())
@@ -516,7 +521,7 @@ mod tests {
         fanout
             .write_cancellable(format(), Arc::from([5, 6]), &cancel)
             .unwrap();
-        fanout.finish().unwrap();
+        fanout.finish_cancellable(&cancel, false).unwrap();
         assert_eq!(*first.lock().unwrap(), [1, 2, 3, 4, 5, 6]);
         assert_eq!(*first.lock().unwrap(), *second.lock().unwrap());
     }
@@ -554,6 +559,42 @@ mod tests {
 
         assert_eq!(*pcm.lock().unwrap(), [1, 2]);
         assert_eq!(*cancelled.lock().unwrap(), Some(true));
+    }
+
+    #[test]
+    fn cancellation_interrupts_finalization_with_a_stalled_sink() {
+        let pcm = Arc::new(Mutex::new(Vec::new()));
+        let cancelled = Arc::new(Mutex::new(None));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let mut fanout = PcmFanout::new(
+            vec![Box::new(SlowSink {
+                pcm,
+                cancelled,
+                started: started_tx,
+                release: release_rx,
+            })],
+            1,
+        );
+        let cancel = CancellationToken::default();
+        fanout
+            .write_cancellable(format(), Arc::from([1, 2]), &cancel)
+            .unwrap();
+        started_rx.recv().unwrap();
+        let cancel_from_thread = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            cancel_from_thread.cancel();
+        });
+
+        let started = std::time::Instant::now();
+        let error = fanout
+            .finish_cancellable(&cancel, false)
+            .expect_err("cancellation should interrupt finalization");
+
+        assert!(error.to_string().contains("cancelled"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        release_tx.send(()).unwrap();
     }
 
     #[test]

@@ -55,7 +55,7 @@ pub(crate) fn run_ordered_synthesis(
         if cancel.is_cancelled() {
             bail!("speech synthesis cancelled");
         }
-        fanout.finish()
+        fanout.finish_cancellable(&cancel, keep_partial)
     })();
 
     if let Err(error) = result {
