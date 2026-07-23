@@ -63,6 +63,7 @@ Reusable runtime images live in `runtimes/`. Model artifacts are installed separ
 | Directory | Description |
 |---|---|
 | `runtimes/llm-vision-whisper/` | combined Rust llama.cpp and whisper.cpp runtime for text, vision, and speech |
+| `runtimes/tts-vits/` | offline CPU Transformers runtime for generated VITS text-to-speech profiles |
 | `runtimes/stub/` | no-ML test runtime implementing the stdio protocol |
 
 ## Building
@@ -191,6 +192,7 @@ Runtime images can be built with any OCI/Docker-compatible builder. The daemon p
 | Runtime | Details |
 |---|---|
 | `runtimes/llm-vision-whisper/` | [LLM, vision, and Whisper runtime README](runtimes/llm-vision-whisper/README.md) |
+| `runtimes/tts-vits/` | [VITS text-to-speech runtime README](runtimes/tts-vits/README.md) |
 | `runtimes/stub/` | [Stub runtime README](runtimes/stub/README.md) |
 
 Runtime manifests provide explicit runtime image refs per variant such as `cpu`, `cuda`, `rocm`, or `vulkan`; see [Hardware variant selection](#hardware-variant-selection). Model manifests reference a `runtime_id` and the repository catalog is curated so every shipped model manifest has llmfit fit metadata.
@@ -218,7 +220,7 @@ Model manifests live under `models/`. A compact single-artifact text GGUF manife
 }
 ```
 
-For manifests loaded from disk, Aileron derives `profile_id` and `model_id` from the JSON filename when those fields are omitted. For example, `models/llama3.2-3b-instruct-q4-k-m.json` becomes `llama3.2-3b-instruct-q4-k-m`. For ad-hoc JSON without a filename, Aileron falls back to `llmfit_model_id` by lowercasing it and replacing every character outside `[a-z0-9._-]` with `_`, without collapsing repeated underscores. Single GGUF artifacts default to `role: "model"`, `filename: "model.gguf"`, `runtime_id: "llm-vision-whisper"`, and conservative language use-cases derived from llmfit metadata when available.
+For manifests loaded from disk, Aileron derives `profile_id` and `model_id` from the JSON filename when those fields are omitted. For example, `models/llama3.2-3b-instruct-q4-k-m.json` becomes `llama3.2-3b-instruct-q4-k-m`. For ad-hoc JSON without a filename, Aileron falls back to `llmfit_model_id` by lowercasing it and replacing every character outside `[a-z0-9._-]` with `_`, without collapsing repeated underscores. Single GGUF artifacts default to `role: "model"`, `filename: "model.gguf"`, `runtime_id: "llm-vision-whisper"`, and conservative language use-cases derived from llmfit metadata when available. Compatible llmfit VITS Safetensors entries are generated separately with `runtime_id: "tts-vits"` and only `speech.synthesize`; installation resolves a revision-pinned, root-level Transformers snapshot containing `config.json`, `vocab.json`, and one complete Safetensors weight layout.
 
 Fully explicit manifests are still supported and are required when a runtime, filename, or use-case choice cannot be inferred safely:
 

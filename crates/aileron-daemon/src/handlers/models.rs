@@ -316,16 +316,17 @@ impl VarlinkInterface for ModelsHandler {
                 let has_recommended_memory = memory_gb
                     .map(|gb| recommended_ram_gb <= 0.0 || gb >= recommended_ram_gb)
                     .unwrap_or(recommended_ram_gb <= 0.0);
-                let fit_level = fit_analysis.as_ref().map_or_else(
-                    || {
-                        fit_level(
-                            has_enough_memory,
-                            has_recommended_memory,
-                            has_fit_metadata,
-                            metadata.is_some(),
-                        )
-                    },
-                    catalog_fit_level_from_llmfit,
+                let is_tts = profile
+                    .use_cases
+                    .iter()
+                    .any(|use_case| use_case == "speech.synthesize");
+                let fit_level = catalog_fit_level_for_profile(
+                    is_tts,
+                    fit_analysis.as_ref(),
+                    has_enough_memory,
+                    has_recommended_memory,
+                    has_fit_metadata,
+                    metadata.is_some(),
                 );
                 let recommended = fit_level == "recommended";
                 let installing = installing_profiles.contains(&profile.profile_id);
@@ -341,23 +342,29 @@ impl VarlinkInterface for ModelsHandler {
                             .and_then(|_| fit_analysis.as_ref().map(|fit| fit.score))
                             .unwrap_or(0.0)
                     });
-                let recommendation_reason = fit_analysis.as_ref().map_or_else(
-                    || {
-                        recommendation_reason(CatalogFit {
-                            has_enough_memory,
-                            has_recommended_memory,
-                            has_fit_metadata,
-                            has_llmfit_metadata: metadata.is_some(),
-                            tier: &tier,
-                            memory_gb,
-                            min_ram_gb,
-                            recommended_ram_gb,
-                            min_vram_gb: metadata.and_then(|model| model.min_vram_gb),
-                            variant,
+                let manifest_recommendation_reason = || {
+                    recommendation_reason(CatalogFit {
+                        has_enough_memory,
+                        has_recommended_memory,
+                        has_fit_metadata,
+                        has_llmfit_metadata: metadata.is_some(),
+                        tier: &tier,
+                        memory_gb,
+                        min_ram_gb,
+                        recommended_ram_gb,
+                        min_vram_gb: metadata.and_then(|model| model.min_vram_gb),
+                        variant,
+                    })
+                };
+                let recommendation_reason = if is_tts {
+                    manifest_recommendation_reason()
+                } else {
+                    fit_analysis
+                        .as_ref()
+                        .map_or_else(manifest_recommendation_reason, |fit| {
+                            llmfit_recommendation_reason(fit, false)
                         })
-                    },
-                    llmfit_recommendation_reason,
-                );
+                };
                 CatalogProfileInfo {
                     profile_id: profile.profile_id,
                     model_id: profile.model_id,
@@ -384,24 +391,40 @@ impl VarlinkInterface for ModelsHandler {
                     use_case_fit_scores,
                     fit_level: fit_level.to_string(),
                     run_mode: fit_analysis.as_ref().map(llmfit_run_mode_id),
-                    inference_runtime: fit_analysis.as_ref().map(llmfit_inference_runtime_id),
+                    inference_runtime: (!is_tts)
+                        .then(|| fit_analysis.as_ref().map(llmfit_inference_runtime_id))
+                        .flatten(),
                     memory_required_gb: fit_analysis
                         .as_ref()
                         .map(|fit| finite_or_zero(fit.memory_required_gb)),
-                    memory_available_gb: fit_analysis
-                        .as_ref()
-                        .map(|fit| finite_or_zero(fit.memory_available_gb)),
+                    memory_available_gb: if is_tts {
+                        memory_gb
+                    } else {
+                        fit_analysis
+                            .as_ref()
+                            .map(|fit| finite_or_zero(fit.memory_available_gb))
+                    },
                     utilization_pct: fit_analysis
                         .as_ref()
                         .map(|fit| finite_or_zero(fit.utilization_pct)),
-                    estimated_tps: fit_analysis
-                        .as_ref()
-                        .map(|fit| finite_or_zero(fit.estimated_tps)),
+                    estimated_tps: (!is_tts)
+                        .then(|| {
+                            fit_analysis
+                                .as_ref()
+                                .map(|fit| finite_or_zero(fit.estimated_tps))
+                        })
+                        .flatten(),
                     best_quant: fit_analysis.as_ref().map(|fit| fit.best_quant.clone()),
-                    effective_context_length: fit_analysis
-                        .as_ref()
-                        .map(|fit| i64::from(fit.usable_context)),
-                    fit_notes: fit_analysis.as_ref().map(|fit| fit.notes.clone()),
+                    effective_context_length: (!is_tts)
+                        .then(|| {
+                            fit_analysis
+                                .as_ref()
+                                .map(|fit| i64::from(fit.usable_context))
+                        })
+                        .flatten(),
+                    fit_notes: (!is_tts)
+                        .then(|| fit_analysis.as_ref().map(|fit| fit.notes.clone()))
+                        .flatten(),
                     score_components: fit_analysis.as_ref().map(llmfit_score_components),
                     recommended,
                     installing,
@@ -611,6 +634,35 @@ fn catalog_fit_level_from_llmfit(fit: &llmfit_core::ModelFit) -> &'static str {
     }
 }
 
+fn catalog_fit_level_for_profile(
+    is_tts: bool,
+    fit_analysis: Option<&llmfit_core::ModelFit>,
+    has_enough_memory: bool,
+    has_recommended_memory: bool,
+    has_fit_metadata: bool,
+    has_llmfit_metadata: bool,
+) -> &'static str {
+    if is_tts {
+        return fit_level(
+            has_enough_memory,
+            has_recommended_memory,
+            has_fit_metadata,
+            has_llmfit_metadata,
+        );
+    }
+    fit_analysis.map_or_else(
+        || {
+            fit_level(
+                has_enough_memory,
+                has_recommended_memory,
+                has_fit_metadata,
+                has_llmfit_metadata,
+            )
+        },
+        catalog_fit_level_from_llmfit,
+    )
+}
+
 fn llmfit_run_mode_id(fit: &llmfit_core::ModelFit) -> String {
     match fit.run_mode {
         llmfit_core::RunMode::Gpu => "gpu",
@@ -657,7 +709,7 @@ fn finite_or_zero(value: f64) -> f64 {
     if value.is_finite() { value } else { 0.0 }
 }
 
-fn llmfit_recommendation_reason(fit: &llmfit_core::ModelFit) -> String {
+fn llmfit_recommendation_reason(fit: &llmfit_core::ModelFit, is_tts: bool) -> String {
     let mut reason = format!(
         "llmfit estimates {} fit via {} on {}: {:.1} GB required of {:.1} GB available",
         fit.fit_text(),
@@ -666,14 +718,14 @@ fn llmfit_recommendation_reason(fit: &llmfit_core::ModelFit) -> String {
         finite_or_zero(fit.memory_required_gb),
         finite_or_zero(fit.memory_available_gb)
     );
-    if !fit.best_quant.trim().is_empty() {
+    if !is_tts && !fit.best_quant.trim().is_empty() {
         reason.push_str(&format!(" at {}", fit.best_quant));
     }
     let estimated_tps = finite_or_zero(fit.estimated_tps);
-    if estimated_tps > 0.0 {
+    if !is_tts && estimated_tps > 0.0 {
         reason.push_str(&format!(", about {:.1} tok/s", estimated_tps));
     }
-    if fit.usable_context > 0 {
+    if !is_tts && fit.usable_context > 0 {
         reason.push_str(&format!(
             ", estimated at {} usable context tokens",
             fit.usable_context
@@ -1414,12 +1466,16 @@ fn generated_model_id(runtime_id: &str, filename: &str, sha256: &str) -> String 
 #[derive(Debug, Clone, Deserialize)]
 struct HfModelInfo {
     #[serde(default)]
+    sha: String,
+    #[serde(default)]
     siblings: Vec<HfSibling>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 struct HfSibling {
     rfilename: String,
+    #[serde(default)]
+    size: Option<u64>,
     #[serde(default)]
     lfs: Option<HfLfs>,
 }
@@ -1445,6 +1501,11 @@ async fn install_generated_llmfit_manifest(
 async fn resolve_llmfit_hf_artifacts(
     model: &llmfit_core::LlmModel,
 ) -> anyhow::Result<Vec<ManifestArtifact>> {
+    if crate::llmfit_metadata::is_supported_vits_tts(model) {
+        let info = fetch_hf_model_info(&model.name).await?;
+        return vits_artifacts_from_model_info(&model.name, &info).await;
+    }
+
     let mut last_error = None;
     for source in &model.gguf_sources {
         match fetch_hf_model_info(&source.repo)
@@ -1462,6 +1523,192 @@ async fn resolve_llmfit_hf_artifacts(
         )),
         None => anyhow::bail!("{} has no GGUF source repositories", model.name),
     }
+}
+
+const MAX_HF_METADATA_FILE_BYTES: usize = 8 * 1024 * 1024;
+const VITS_REQUIRED_METADATA: &[(&str, &str)] =
+    &[("config.json", "config"), ("vocab.json", "vocab")];
+const VITS_OPTIONAL_METADATA: &[(&str, &str)] = &[
+    ("tokenizer_config.json", "tokenizer_config"),
+    ("special_tokens_map.json", "special_tokens_map"),
+    ("preprocessor_config.json", "preprocessor_config"),
+    ("generation_config.json", "generation_config"),
+];
+
+async fn vits_artifacts_from_model_info(
+    repo: &str,
+    info: &HfModelInfo,
+) -> anyhow::Result<Vec<ManifestArtifact>> {
+    if info.sha.trim().is_empty() {
+        anyhow::bail!("Hugging Face model metadata is missing a repository revision");
+    }
+
+    let recognized_names = VITS_REQUIRED_METADATA
+        .iter()
+        .chain(VITS_OPTIONAL_METADATA)
+        .map(|(filename, _)| *filename)
+        .chain(["model.safetensors", "model.safetensors.index.json"])
+        .collect::<HashSet<_>>();
+    let mut siblings = HashMap::new();
+    for sibling in &info.siblings {
+        if sibling.rfilename.contains('/') {
+            if sibling
+                .rfilename
+                .rsplit('/')
+                .next()
+                .is_some_and(|name| recognized_names.contains(name))
+            {
+                anyhow::bail!(
+                    "VITS snapshot files must be root-level: {}",
+                    sibling.rfilename
+                );
+            }
+            continue;
+        }
+        if sibling.rfilename == "." || sibling.rfilename == ".." || sibling.rfilename.contains('\\')
+        {
+            anyhow::bail!("unsafe Hugging Face filename: {}", sibling.rfilename);
+        }
+        if siblings
+            .insert(sibling.rfilename.as_str(), sibling)
+            .is_some()
+        {
+            anyhow::bail!("duplicate Hugging Face filename: {}", sibling.rfilename);
+        }
+    }
+
+    let mut selected = Vec::new();
+    for (filename, role) in VITS_REQUIRED_METADATA {
+        let sibling = siblings
+            .get(filename)
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("VITS snapshot is missing {filename}"))?;
+        selected.push((sibling, (*role).to_string()));
+    }
+    for (filename, role) in VITS_OPTIONAL_METADATA {
+        if let Some(sibling) = siblings.get(filename).copied() {
+            selected.push((sibling, (*role).to_string()));
+        }
+    }
+
+    if let Some(model) = siblings.get("model.safetensors").copied() {
+        selected.push((model, "model".to_string()));
+    } else {
+        let index = siblings
+            .get("model.safetensors.index.json")
+            .copied()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "VITS snapshot requires model.safetensors or model.safetensors.index.json"
+                )
+            })?;
+        let index_bytes = fetch_bounded_hf_file(repo, &info.sha, index).await?;
+        selected.push((index, "model_index".to_string()));
+        let shard_names = safetensors_shard_names(&index_bytes)?;
+        for (index, shard_name) in shard_names.into_iter().enumerate() {
+            if shard_name.contains('/')
+                || shard_name.contains('\\')
+                || !shard_name.ends_with(".safetensors")
+            {
+                anyhow::bail!("unsafe Safetensors shard filename: {shard_name}");
+            }
+            let shard = siblings
+                .get(shard_name.as_str())
+                .copied()
+                .ok_or_else(|| anyhow::anyhow!("VITS snapshot is missing shard {shard_name}"))?;
+            selected.push((shard, format!("model_shard_{:05}", index + 1)));
+        }
+    }
+
+    let mut artifacts = Vec::with_capacity(selected.len());
+    for (sibling, role) in selected {
+        artifacts.push(hf_snapshot_artifact(repo, &info.sha, sibling, role).await?);
+    }
+    Ok(artifacts)
+}
+
+#[derive(Deserialize)]
+struct SafetensorsIndex {
+    #[serde(default)]
+    weight_map: HashMap<String, String>,
+}
+
+fn safetensors_shard_names(index_bytes: &[u8]) -> anyhow::Result<Vec<String>> {
+    let index: SafetensorsIndex =
+        serde_json::from_slice(index_bytes).context("parse model.safetensors.index.json")?;
+    if index.weight_map.is_empty() {
+        anyhow::bail!("model.safetensors.index.json has an empty weight_map");
+    }
+    let mut shard_names = index.weight_map.into_values().collect::<Vec<_>>();
+    shard_names.sort();
+    shard_names.dedup();
+    Ok(shard_names)
+}
+
+async fn hf_snapshot_artifact(
+    repo: &str,
+    revision: &str,
+    sibling: &HfSibling,
+    role: String,
+) -> anyhow::Result<ManifestArtifact> {
+    use sha2::{Digest, Sha256};
+
+    let (sha256, size_bytes) = if let Some(lfs) = &sibling.lfs {
+        if lfs.sha256.len() != 64 || !lfs.sha256.chars().all(|c| c.is_ascii_hexdigit()) {
+            anyhow::bail!("{} has an invalid LFS SHA-256", sibling.rfilename);
+        }
+        (lfs.sha256.clone(), lfs.size)
+    } else {
+        let bytes = fetch_bounded_hf_file(repo, revision, sibling).await?;
+        (hex_digest(&Sha256::digest(&bytes)), bytes.len() as u64)
+    };
+    Ok(ManifestArtifact {
+        role,
+        url: hf_resolve_url_at_revision(repo, revision, &sibling.rfilename),
+        filename: sibling.rfilename.clone(),
+        sha256,
+        size_bytes,
+    })
+}
+
+async fn fetch_bounded_hf_file(
+    repo: &str,
+    revision: &str,
+    sibling: &HfSibling,
+) -> anyhow::Result<Vec<u8>> {
+    if sibling
+        .size
+        .is_some_and(|size| size > MAX_HF_METADATA_FILE_BYTES as u64)
+        || sibling
+            .lfs
+            .as_ref()
+            .is_some_and(|lfs| lfs.size > MAX_HF_METADATA_FILE_BYTES as u64)
+    {
+        anyhow::bail!(
+            "{} exceeds the {} byte metadata limit",
+            sibling.rfilename,
+            MAX_HF_METADATA_FILE_BYTES
+        );
+    }
+    let mut response = reqwest::get(hf_resolve_url_at_revision(
+        repo,
+        revision,
+        &sibling.rfilename,
+    ))
+    .await?
+    .error_for_status()?;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if bytes.len().saturating_add(chunk.len()) > MAX_HF_METADATA_FILE_BYTES {
+            anyhow::bail!(
+                "{} exceeds the {} byte metadata limit",
+                sibling.rfilename,
+                MAX_HF_METADATA_FILE_BYTES
+            );
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }
 
 async fn fetch_hf_model_info(repo: &str) -> anyhow::Result<HfModelInfo> {
@@ -1566,9 +1813,14 @@ fn hf_match_key(value: &str) -> String {
 }
 
 fn hf_resolve_url(repo: &str, filename: &str) -> String {
+    hf_resolve_url_at_revision(repo, "main", filename)
+}
+
+fn hf_resolve_url_at_revision(repo: &str, revision: &str, filename: &str) -> String {
     format!(
-        "https://huggingface.co/{}/resolve/main/{}",
+        "https://huggingface.co/{}/resolve/{}/{}",
         hf_path(repo),
+        percent_encode_path_segment(revision),
         hf_path(filename)
     )
 }
@@ -2630,7 +2882,11 @@ async fn artifacts_match(
 
     for artifact in artifacts {
         let path = target_dir.join(&artifact.filename);
-        if !path.exists() {
+        if !path.is_file() {
+            return Ok(false);
+        }
+
+        if artifact.size_bytes > 0 && std::fs::metadata(&path)?.len() != artifact.size_bytes {
             return Ok(false);
         }
 
@@ -2681,12 +2937,30 @@ async fn download_artifacts_to_temp(
         let mut response = reqwest::get(&artifact.url).await?.error_for_status()?;
         let mut file = tokio::fs::File::create(&dest).await?;
         let mut hasher = Sha256::new();
+        let mut downloaded = 0_u64;
 
         while let Some(chunk) = response.chunk().await? {
             ensure_install_not_cancelled(state, profile_id).await?;
+            downloaded = downloaded.saturating_add(chunk.len() as u64);
+            if artifact.size_bytes > 0 && downloaded > artifact.size_bytes {
+                anyhow::bail!(
+                    "size mismatch for {}: expected {} bytes, received more",
+                    artifact.filename,
+                    artifact.size_bytes
+                );
+            }
             file.write_all(&chunk).await?;
             hasher.update(&chunk);
             add_install_bytes(state, profile_id, chunk.len() as u64).await?;
+        }
+
+        if artifact.size_bytes > 0 && downloaded != artifact.size_bytes {
+            anyhow::bail!(
+                "size mismatch for {}: expected {} bytes, got {}",
+                artifact.filename,
+                artifact.size_bytes,
+                downloaded
+            );
         }
 
         file.flush().await?;
@@ -2762,6 +3036,7 @@ mod tests {
             has_gpu: false,
             gpu_vram_gb: None,
             total_gpu_vram_gb: None,
+            gpu_available_gb: None,
             gpu_name: None,
             gpu_count: 0,
             unified_memory: false,
@@ -2770,6 +3045,21 @@ mod tests {
             cluster_mode: false,
             cluster_node_count: 1,
         }
+    }
+
+    #[test]
+    fn tts_catalog_fit_uses_aileron_memory_instead_of_unsupported_runtime_result() {
+        let model = crate::llmfit_metadata::all()
+            .iter()
+            .find(|model| crate::llmfit_metadata::is_supported_vits_tts(model))
+            .expect("supported VITS metadata exists");
+        let fit = llmfit_core::ModelFit::analyze(model, &cpu_only_system_specs());
+
+        assert_eq!(catalog_fit_level_from_llmfit(&fit), "too_large");
+        assert_eq!(
+            catalog_fit_level_for_profile(true, Some(&fit), true, true, true, true),
+            "recommended"
+        );
     }
 
     #[test]
@@ -3911,6 +4201,7 @@ Writing manifest to image destination\n";
     #[test]
     fn hf_artifact_selection_prefers_matching_unsplit_quantized_file() {
         let info = HfModelInfo {
+            sha: String::new(),
             siblings: vec![
                 hf_sibling(
                     "Qwen2.5-7B-Instruct-Q8_0.gguf",
@@ -3954,8 +4245,10 @@ Writing manifest to image destination\n";
     #[test]
     fn hf_artifact_selection_requires_lfs_checksum() {
         let info = HfModelInfo {
+            sha: String::new(),
             siblings: vec![HfSibling {
                 rfilename: "model-Q4_K_M.gguf".to_string(),
+                size: None,
                 lfs: None,
             }],
         };
@@ -3997,9 +4290,79 @@ Writing manifest to image destination\n";
         assert_eq!(artifacts[0].size_bytes, 26776320);
     }
 
+    #[tokio::test]
+    async fn vits_snapshot_resolves_root_level_single_file_layout() {
+        let info = HfModelInfo {
+            sha: "0123456789abcdef".to_string(),
+            siblings: vec![
+                hf_sibling("config.json", &"a".repeat(64), 10),
+                hf_sibling("vocab.json", &"b".repeat(64), 20),
+                hf_sibling("model.safetensors", &"c".repeat(64), 30),
+                hf_sibling("tokenizer_config.json", &"d".repeat(64), 40),
+                hf_sibling("pytorch_model.bin", &"e".repeat(64), 50),
+            ],
+        };
+
+        let artifacts = vits_artifacts_from_model_info("owner/vits", &info)
+            .await
+            .expect("valid VITS snapshot");
+
+        assert_eq!(
+            artifacts
+                .iter()
+                .map(|artifact| artifact.filename.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "config.json",
+                "vocab.json",
+                "tokenizer_config.json",
+                "model.safetensors"
+            ]
+        );
+        assert!(
+            artifacts
+                .iter()
+                .all(|artifact| artifact.url.contains("/resolve/0123456789abcdef/"))
+        );
+    }
+
+    #[test]
+    fn safetensors_index_returns_sorted_unique_shards() {
+        let shards = safetensors_shard_names(
+            br#"{"weight_map":{"b":"model-00002-of-00002.safetensors","a":"model-00001-of-00002.safetensors","c":"model-00002-of-00002.safetensors"}}"#,
+        )
+        .expect("valid index");
+
+        assert_eq!(
+            shards,
+            vec![
+                "model-00001-of-00002.safetensors",
+                "model-00002-of-00002.safetensors"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn vits_snapshot_rejects_nested_recognized_files() {
+        let info = HfModelInfo {
+            sha: "0123456789abcdef".to_string(),
+            siblings: vec![
+                hf_sibling("nested/config.json", &"a".repeat(64), 10),
+                hf_sibling("vocab.json", &"b".repeat(64), 20),
+                hf_sibling("model.safetensors", &"c".repeat(64), 30),
+            ],
+        };
+
+        let error = vits_artifacts_from_model_info("owner/vits", &info)
+            .await
+            .expect_err("nested recognized file must fail");
+        assert!(error.to_string().contains("root-level"));
+    }
+
     fn hf_sibling(filename: &str, oid: &str, size: u64) -> HfSibling {
         HfSibling {
             rfilename: filename.to_string(),
+            size: Some(size),
             lfs: Some(HfLfs {
                 sha256: oid.to_string(),
                 size,

@@ -384,6 +384,7 @@ pub(crate) fn generated_llmfit_catalog_profiles() -> Vec<CatalogProfileInfo> {
 pub(crate) fn find_generated_llmfit_catalog_model(profile_id: &str) -> Option<&'static LlmModel> {
     crate::llmfit_metadata::all()
         .iter()
+        .filter(|model| generated_profile_runtime_id(model).is_some())
         .find(|model| generated_llmfit_profile_id(model).as_deref() == Some(profile_id))
 }
 
@@ -407,8 +408,10 @@ pub(crate) fn generated_llmfit_model_manifest(
         profile_id: profile_id.to_string(),
         model_id: profile_id.to_string(),
         llmfit_model_id: model.name.clone(),
-        runtime_id: ML_RUNTIME_ID.to_string(),
-        runtime_options: HashMap::new(),
+        runtime_id: generated_profile_runtime_id(model)
+            .expect("generated model compatibility was checked")
+            .to_string(),
+        runtime_options: generated_runtime_options(model),
         tier: generated_catalog_tier(model).to_string(),
         disk_size_gb,
         min_ram_gb: model.min_ram_gb,
@@ -419,33 +422,60 @@ pub(crate) fn generated_llmfit_model_manifest(
     };
     validate_use_cases(&manifest.use_cases)?;
     let mut artifact_roles = HashSet::new();
+    let mut artifact_filenames = HashSet::new();
     for artifact in &manifest.artifacts {
         validate_artifact(artifact)?;
         if !artifact.role.is_empty() && !artifact_roles.insert(artifact.role.as_str()) {
             bail!("duplicate artifact role: {}", artifact.role);
+        }
+        if !artifact_filenames.insert(artifact.filename.as_str()) {
+            bail!("duplicate artifact filename: {}", artifact.filename);
         }
     }
     Ok(manifest)
 }
 
 fn generated_catalog_profile_from_model(model: &LlmModel) -> Option<CatalogProfileInfo> {
-    if model.format != ModelFormat::Gguf || model.gguf_sources.is_empty() {
-        return None;
-    }
+    let runtime_id = generated_profile_runtime_id(model)?;
     let profile_id = generated_llmfit_profile_id(model)?;
     let disk_size_gb = model.estimate_disk_gb(&model.quantization);
     Some(CatalogProfileInfo {
         profile_id: profile_id.clone(),
         model_id: profile_id,
         llmfit_model_id: model.name.clone(),
-        runtime_id: ML_RUNTIME_ID.to_string(),
-        runtime_options: HashMap::new(),
+        runtime_id: runtime_id.to_string(),
+        runtime_options: generated_runtime_options(model),
         tier: generated_catalog_tier(model).to_string(),
         disk_size_gb,
         min_ram_gb: model.min_ram_gb,
         use_cases: generated_llmfit_use_cases(model),
         specializations: Vec::new(),
     })
+}
+
+fn generated_profile_runtime_id(model: &LlmModel) -> Option<&'static str> {
+    if crate::llmfit_metadata::is_supported_vits_tts(model) {
+        Some(crate::llmfit_metadata::VITS_RUNTIME_ID)
+    } else if Capability::infer(model).contains(&Capability::Tts) {
+        None
+    } else if model.format == ModelFormat::Gguf && !model.gguf_sources.is_empty() {
+        Some(ML_RUNTIME_ID)
+    } else {
+        None
+    }
+}
+
+fn generated_runtime_options(model: &LlmModel) -> HashMap<String, String> {
+    let mut options = HashMap::new();
+    if crate::llmfit_metadata::is_supported_vits_tts(model)
+        && let Some(languages) = crate::llmfit_metadata::supported_languages_option(model)
+    {
+        options.insert(
+            crate::llmfit_metadata::SUPPORTED_LANGUAGES_OPTION.to_string(),
+            languages,
+        );
+    }
+    options
 }
 
 fn generated_llmfit_profile_id(model: &LlmModel) -> Option<String> {
@@ -466,6 +496,9 @@ fn generated_catalog_tier(model: &LlmModel) -> &'static str {
 }
 
 fn generated_llmfit_use_cases(model: &LlmModel) -> Vec<String> {
+    if crate::llmfit_metadata::is_supported_vits_tts(model) {
+        return vec!["speech.synthesize".to_string()];
+    }
     let use_cases = match UseCase::from_model(model) {
         UseCase::Embedding => vec!["language.embed"],
         UseCase::Coding => vec!["language.extract", "language.analyze"],
@@ -523,10 +556,14 @@ fn parse_model_manifest_json_with_profile_id_hint(
         validate_non_empty("runtime_images[].image_ref", &image.image_ref)?;
     }
     let mut artifact_roles = HashSet::new();
+    let mut artifact_filenames = HashSet::new();
     for artifact in &manifest.artifacts {
         validate_artifact(artifact)?;
         if !artifact.role.is_empty() && !artifact_roles.insert(artifact.role.as_str()) {
             bail!("duplicate artifact role: {}", artifact.role);
+        }
+        if !artifact_filenames.insert(artifact.filename.as_str()) {
+            bail!("duplicate artifact filename: {}", artifact.filename);
         }
     }
     Ok(manifest)
@@ -643,9 +680,12 @@ fn derive_runtime_id(
     if !runtime_id.trim().is_empty() {
         return Ok(runtime_id.to_string());
     }
+    if metadata.is_some_and(crate::llmfit_metadata::is_supported_vits_tts) {
+        return Ok(crate::llmfit_metadata::VITS_RUNTIME_ID.to_string());
+    }
     if use_cases
         .iter()
-        .all(|use_case| use_case.starts_with("speech."))
+        .all(|use_case| matches!(use_case.as_str(), "speech.transcribe" | "speech.translate"))
         && !use_cases.is_empty()
     {
         return Ok(ML_RUNTIME_ID.to_string());
@@ -690,6 +730,9 @@ fn derive_use_cases(
         ]);
     }
     if let Some(model) = metadata {
+        if crate::llmfit_metadata::is_supported_vits_tts(model) {
+            return Ok(vec!["speech.synthesize".to_string()]);
+        }
         let use_case = UseCase::from_model(model);
         let mut use_cases = match use_case {
             UseCase::Embedding => vec!["language.embed"],
@@ -871,7 +914,12 @@ fn validate_artifact(artifact: &ManifestArtifact) -> Result<()> {
     }
     validate_non_empty("artifacts[].url", &artifact.url)?;
     validate_non_empty("artifacts[].filename", &artifact.filename)?;
-    if artifact.filename.contains('/') || artifact.filename.contains('\\') {
+    if artifact.filename == "."
+        || artifact.filename == ".."
+        || artifact.filename.contains('/')
+        || artifact.filename.contains('\\')
+        || artifact.filename.chars().any(char::is_control)
+    {
         bail!(
             "artifact filename must not contain path separators: {}",
             artifact.filename
@@ -1551,6 +1599,56 @@ mod tests {
     }
 
     #[test]
+    fn generated_vits_profiles_only_synthesize_with_the_vits_runtime() {
+        let model = crate::llmfit_metadata::all()
+            .iter()
+            .find(|model| crate::llmfit_metadata::is_supported_vits_tts(model))
+            .expect("supported VITS metadata exists");
+        let profile = generated_catalog_profile_from_model(model)
+            .expect("supported VITS profile should be generated");
+
+        assert_eq!(profile.runtime_id, crate::llmfit_metadata::VITS_RUNTIME_ID);
+        assert_eq!(profile.use_cases, vec!["speech.synthesize"]);
+        assert_eq!(profile.llmfit_model_id, model.name);
+        if !model.languages.is_empty() {
+            assert!(
+                profile
+                    .runtime_options
+                    .contains_key(crate::llmfit_metadata::SUPPORTED_LANGUAGES_OPTION)
+            );
+        }
+    }
+
+    #[test]
+    fn compact_vits_manifest_derives_runtime_and_synthesis_use_case() {
+        let model = crate::llmfit_metadata::all()
+            .iter()
+            .find(|model| crate::llmfit_metadata::is_supported_vits_tts(model))
+            .expect("supported VITS metadata exists");
+        let data = serde_json::json!({ "llmfit_model_id": model.name }).to_string();
+
+        let manifest = parse_model_manifest_json(&data).expect("compact VITS manifest");
+
+        assert_eq!(manifest.runtime_id, crate::llmfit_metadata::VITS_RUNTIME_ID);
+        assert_eq!(manifest.use_cases, vec!["speech.synthesize"]);
+    }
+
+    #[test]
+    fn unsupported_tts_architectures_are_not_generated() {
+        for model in crate::llmfit_metadata::all().iter().filter(|model| {
+            Capability::infer(model).contains(&Capability::Tts)
+                && !crate::llmfit_metadata::is_supported_vits_tts(model)
+        }) {
+            assert!(
+                generated_catalog_profile_from_model(model).is_none(),
+                "unsupported TTS architecture was generated: {} {:?}",
+                model.name,
+                model.architecture
+            );
+        }
+    }
+
+    #[test]
     fn validates_profile_library_model_manifests() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../manifests/models");
         let mut count = 0;
@@ -1722,6 +1820,35 @@ mod tests {
         let err = parse_model_manifest_json(data).expect_err("duplicate role should fail");
 
         assert!(err.to_string().contains("duplicate artifact role"));
+    }
+
+    #[test]
+    fn rejects_duplicate_artifact_filenames() {
+        let data = r#"
+        {
+            "profile_id": "bad",
+            "model_id": "bad",
+            "runtime_id": "stub",
+            "use_cases": ["speech.synthesize"],
+            "artifacts": [
+                {
+                    "role": "config",
+                    "url": "https://example.invalid/config.json",
+                    "filename": "same.json",
+                    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                },
+                {
+                    "role": "vocab",
+                    "url": "https://example.invalid/vocab.json",
+                    "filename": "same.json",
+                    "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                }
+            ]
+        }
+        "#;
+
+        let err = parse_model_manifest_json(data).expect_err("duplicate filename should fail");
+        assert!(err.to_string().contains("duplicate artifact filename"));
     }
 
     #[test]

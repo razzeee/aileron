@@ -31,3 +31,11 @@ updates:
     labels:
       - "dependencies"
       - "container-images"
+
+  - package-ecosystem: "docker"
+    directory: "/runtimes/tts-vits"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "dependencies"
+      - "container-images"

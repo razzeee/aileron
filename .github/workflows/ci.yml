@@ -67,6 +67,11 @@ jobs:
           -p aileron-portal
           -- -D warnings
 
+      - name: VITS runtime unit tests
+        run: |
+          python3 -m pip install --user numpy==2.3.1 pycountry==26.2.16
+          PYTHONPATH=runtimes/tts-vits python3 -m unittest discover -s runtimes/tts-vits/tests
+
   # ── GTK crates ──────────────────────────────────────────────────────────────
   # Runs inside Fedora because Ubuntu 24.04 only ships libadwaita 1.5, while the
   # UI uses newer libadwaita APIs. Tests are skipped because they need a display.
