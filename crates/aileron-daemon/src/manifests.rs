@@ -127,6 +127,7 @@ pub struct CatalogProfileInfo {
     pub model_id: String,
     pub llmfit_model_id: String,
     pub runtime_id: String,
+    pub runtime_options: HashMap<String, String>,
     pub tier: String,
     pub disk_size_gb: f64,
     pub min_ram_gb: f64,
@@ -351,6 +352,7 @@ pub fn list_catalog_profiles() -> Result<Vec<CatalogProfileInfo>> {
                 model_id: manifest.model_id,
                 llmfit_model_id: manifest.llmfit_model_id,
                 runtime_id: manifest.runtime_id,
+                runtime_options: manifest.runtime_options,
                 tier: manifest.tier,
                 disk_size_gb,
                 min_ram_gb: manifest.min_ram_gb,
@@ -437,6 +439,7 @@ fn generated_catalog_profile_from_model(model: &LlmModel) -> Option<CatalogProfi
         model_id: profile_id,
         llmfit_model_id: model.name.clone(),
         runtime_id: ML_RUNTIME_ID.to_string(),
+        runtime_options: HashMap::new(),
         tier: generated_catalog_tier(model).to_string(),
         disk_size_gb,
         min_ram_gb: model.min_ram_gb,
@@ -699,14 +702,14 @@ fn derive_use_cases(
             || artifacts.iter().any(|artifact| artifact.role == "mmproj")
             || model_capabilities(model).contains(&Capability::Vision)
         {
-            use_cases.extend(["vision.describe", "vision.ocr"]);
+            use_cases.extend(["vision.describe", "vision.detect", "vision.ocr"]);
         }
         return Ok(dedup_use_cases(use_cases));
     }
     if runtime_id == ML_RUNTIME_ID {
         let mut use_cases = default_language_use_cases();
         if artifacts.iter().any(|artifact| artifact.role == "mmproj") {
-            use_cases.extend(["vision.describe", "vision.ocr"]);
+            use_cases.extend(["vision.describe", "vision.detect", "vision.ocr"]);
         }
         return Ok(dedup_use_cases(use_cases));
     }
@@ -1354,6 +1357,33 @@ mod tests {
         assert_eq!(manifest.runtime_id, ML_RUNTIME_ID);
         assert_eq!(manifest.artifacts[0].filename, "model.gguf");
         assert_eq!(manifest.artifacts[1].filename, "mmproj.gguf");
+    }
+
+    #[test]
+    fn derives_multimodal_use_cases_without_segmentation() {
+        let data = r#"
+        {
+            "artifacts": [
+                {
+                    "role": "model",
+                    "url": "https://example.invalid/model.gguf",
+                    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                },
+                {
+                    "role": "mmproj",
+                    "url": "https://example.invalid/mmproj.gguf",
+                    "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                }
+            ]
+        }
+        "#;
+
+        let manifest = parse_model_manifest_json(data).expect("mmproj use-cases should derive");
+
+        assert!(manifest.use_cases.contains(&"vision.describe".to_string()));
+        assert!(manifest.use_cases.contains(&"vision.detect".to_string()));
+        assert!(manifest.use_cases.contains(&"vision.ocr".to_string()));
+        assert!(!manifest.use_cases.contains(&"vision.segment".to_string()));
     }
 
     #[test]

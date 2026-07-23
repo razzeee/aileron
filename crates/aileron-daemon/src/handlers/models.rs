@@ -287,6 +287,7 @@ impl VarlinkInterface for ModelsHandler {
         let profiles = manifests::list_catalog_profiles().unwrap_or_default();
         let profiles = profiles
             .into_iter()
+            .filter(catalog_profile_is_compatible)
             .map(|profile| {
                 let metadata = if profile.llmfit_model_id.is_empty() {
                     None
@@ -687,7 +688,56 @@ fn llmfit_recommendation_reason(fit: &llmfit_core::ModelFit) -> String {
 }
 
 fn profile_supports_use_case(profile: &Profile, use_case: &str) -> bool {
-    profile.supports_use_case(use_case)
+    profile.supports_use_case(use_case) && profile_can_handle_use_case(profile, use_case)
+}
+
+fn catalog_profile_is_compatible(profile: &manifests::CatalogProfileInfo) -> bool {
+    if !profile
+        .use_cases
+        .iter()
+        .any(|use_case| use_case == "vision.segment")
+    {
+        return true;
+    }
+
+    profile.runtime_id == "vision-foundation"
+        && profile.runtime_options.contains_key("SAM2_CONFIG_NAME")
+}
+
+fn validate_profile_use_case_compatibility(profile: &Profile) -> anyhow::Result<()> {
+    for use_case in profile.effective_use_cases() {
+        if !profile_can_handle_use_case(profile, &use_case) {
+            anyhow::bail!(
+                "profile {} cannot provide {use_case}: vision.segment requires a promptable segmentation profile with model.pt and config.yaml artifacts",
+                profile.profile_id
+            );
+        }
+    }
+    Ok(())
+}
+
+fn profile_can_handle_use_case(profile: &Profile, use_case: &str) -> bool {
+    if use_case == "vision.detect" && profile.runtime_id == "vision-foundation" {
+        return profile
+            .artifact_hashes
+            .iter()
+            .any(|artifact| artifact.filename == "model.pt");
+    }
+
+    if use_case != "vision.segment" {
+        return true;
+    }
+
+    profile.runtime_id == "vision-foundation"
+        && profile
+            .artifact_hashes
+            .iter()
+            .any(|artifact| artifact.filename == "model.pt")
+        && profile
+            .artifact_hashes
+            .iter()
+            .any(|artifact| artifact.filename == "config.yaml")
+        && profile.runtime_options.contains_key("SAM2_CONFIG_NAME")
 }
 
 struct CatalogFit<'a> {
@@ -1585,6 +1635,7 @@ async fn install_manifest_data_inner(
     manifests::validate_use_cases(&manifest.use_cases)?;
     let artifact_dir = crate::profiles::model_dir(&manifest.model_id);
     let profile = manifest.clone().into_profile(artifact_dir.clone());
+    validate_profile_use_case_compatibility(&profile)?;
 
     let runtime_images = {
         let guard = state.0.lock().await;
@@ -2736,6 +2787,164 @@ mod tests {
             profile_with_runtime_and_use_cases("llm-vision-whisper", &["speech.transcribe"]);
 
         assert!(profile_supports_use_case(&profile, "speech.translate"));
+    }
+
+    #[test]
+    fn multimodal_profile_can_use_detect_but_not_segment() {
+        let profile = profile_with_runtime_and_use_cases(
+            "llm-vision-whisper",
+            &[
+                "vision.describe",
+                "vision.detect",
+                "vision.segment",
+                "vision.ocr",
+            ],
+        );
+
+        assert!(profile_supports_use_case(&profile, "vision.detect"));
+        assert!(!profile_supports_use_case(&profile, "vision.segment"));
+        assert!(validate_profile_use_case_compatibility(&profile).is_err());
+    }
+
+    #[test]
+    fn vision_foundation_detect_requires_model_pt() {
+        let mut profile =
+            profile_with_runtime_and_use_cases("vision-foundation", &["vision.detect"]);
+        profile.artifact_hashes = vec![crate::profiles::ArtifactHash {
+            role: "model".to_string(),
+            filename: "model.onnx".to_string(),
+            sha256: "hash".to_string(),
+        }];
+
+        assert!(!profile_supports_use_case(&profile, "vision.detect"));
+        assert!(validate_profile_use_case_compatibility(&profile).is_err());
+
+        profile.artifact_hashes[0].filename = "model.pt".to_string();
+
+        assert!(profile_supports_use_case(&profile, "vision.detect"));
+        assert!(validate_profile_use_case_compatibility(&profile).is_ok());
+    }
+
+    #[test]
+    fn sam2_profile_can_use_segment() {
+        let mut profile =
+            profile_with_runtime_and_use_cases("vision-foundation", &["vision.segment"]);
+        profile.specializations = vec!["promptable-segmentation".to_string(), "sam2.1".to_string()];
+        profile.runtime_options.insert(
+            "SAM2_CONFIG_NAME".to_string(),
+            "configs/sam2.1/sam2.1_hiera_t.yaml".to_string(),
+        );
+        profile.artifact_hashes = vec![
+            crate::profiles::ArtifactHash {
+                role: "model".to_string(),
+                filename: "model.pt".to_string(),
+                sha256: "hash".to_string(),
+            },
+            crate::profiles::ArtifactHash {
+                role: "config".to_string(),
+                filename: "config.yaml".to_string(),
+                sha256: "hash".to_string(),
+            },
+        ];
+
+        assert!(profile_supports_use_case(&profile, "vision.segment"));
+        assert!(validate_profile_use_case_compatibility(&profile).is_ok());
+    }
+
+    #[test]
+    fn legacy_sam2_profile_cannot_use_segment_with_sam21_runtime() {
+        let mut profile =
+            profile_with_runtime_and_use_cases("vision-foundation", &["vision.segment"]);
+        profile.specializations = vec!["promptable-segmentation".to_string(), "sam2".to_string()];
+        profile.artifact_hashes = vec![
+            crate::profiles::ArtifactHash {
+                role: "model".to_string(),
+                filename: "model.pt".to_string(),
+                sha256: "hash".to_string(),
+            },
+            crate::profiles::ArtifactHash {
+                role: "config".to_string(),
+                filename: "config.yaml".to_string(),
+                sha256: "hash".to_string(),
+            },
+        ];
+
+        assert!(!profile_supports_use_case(&profile, "vision.segment"));
+        assert!(validate_profile_use_case_compatibility(&profile).is_err());
+    }
+
+    #[test]
+    fn sam21_runtime_option_profile_can_use_segment() {
+        let mut profile =
+            profile_with_runtime_and_use_cases("vision-foundation", &["vision.segment"]);
+        profile.model_id = "custom-segmenter".to_string();
+        profile.runtime_options.insert(
+            "SAM2_CONFIG_NAME".to_string(),
+            "configs/sam2.1/sam2.1_hiera_t.yaml".to_string(),
+        );
+        profile.specializations = vec!["promptable-segmentation".to_string()];
+        profile.artifact_hashes = vec![
+            crate::profiles::ArtifactHash {
+                role: "model".to_string(),
+                filename: "model.pt".to_string(),
+                sha256: "hash".to_string(),
+            },
+            crate::profiles::ArtifactHash {
+                role: "config".to_string(),
+                filename: "config.yaml".to_string(),
+                sha256: "hash".to_string(),
+            },
+        ];
+
+        assert!(profile_supports_use_case(&profile, "vision.segment"));
+        assert!(validate_profile_use_case_compatibility(&profile).is_ok());
+    }
+
+    #[test]
+    fn legacy_sam2_catalog_profile_is_not_compatible() {
+        let mut manifest = sam2_catalog_manifest("sam2-hiera-tiny", "facebook/sam2-hiera-tiny");
+        manifest.specializations = vec!["promptable-segmentation".to_string(), "sam2".to_string()];
+
+        assert!(!catalog_profile_is_compatible(&manifest));
+    }
+
+    #[test]
+    fn sam21_catalog_profile_is_compatible() {
+        let mut manifest = sam2_catalog_manifest("sam2.1-hiera-tiny", "facebook/sam2.1-hiera-tiny");
+        manifest.specializations =
+            vec!["promptable-segmentation".to_string(), "sam2.1".to_string()];
+        manifest.runtime_options.insert(
+            "SAM2_CONFIG_NAME".to_string(),
+            "configs/sam2.1/sam2.1_hiera_t.yaml".to_string(),
+        );
+
+        assert!(catalog_profile_is_compatible(&manifest));
+    }
+
+    #[test]
+    fn sam21_runtime_option_catalog_profile_is_compatible() {
+        let mut manifest = sam2_catalog_manifest("custom-sam2", "custom-sam2");
+        manifest.runtime_options.insert(
+            "SAM2_CONFIG_NAME".to_string(),
+            "configs/sam2.1/sam2.1_hiera_t.yaml".to_string(),
+        );
+
+        assert!(catalog_profile_is_compatible(&manifest));
+    }
+
+    fn sam2_catalog_manifest(profile_id: &str, model_id: &str) -> manifests::CatalogProfileInfo {
+        manifests::CatalogProfileInfo {
+            profile_id: profile_id.to_string(),
+            model_id: model_id.to_string(),
+            llmfit_model_id: String::new(),
+            runtime_id: "vision-foundation".to_string(),
+            runtime_options: HashMap::new(),
+            tier: "small".to_string(),
+            disk_size_gb: 0.16,
+            min_ram_gb: 4.0,
+            use_cases: vec!["vision.segment".to_string()],
+            specializations: Vec::new(),
+        }
     }
 
     #[test]

@@ -179,6 +179,13 @@ impl VarlinkInterface for InferenceHandler {
                         });
                     }
                 };
+                if let Err(reason) = validate_runtime_profile_compatibility(&use_case, profile) {
+                    return call.reply(ModelAvailability {
+                        is_available: false,
+                        code: "artifact_missing".to_string(),
+                        reason,
+                    });
+                }
                 let candidates = resolve_runtime_candidates(&guard, profile);
                 if candidates.is_empty() {
                     return call.reply(ModelAvailability {
@@ -1688,7 +1695,7 @@ async fn resolve_session_runtime(
                 image_refs,
                 artifact_path,
                 runtime_options,
-            ) = profile_runtime(&guard, &session.profile_id)
+            ) = profile_runtime(&guard, &session.profile_id, &session.use_case)
                 .map_err(ResolveSessionError::ModelUnavailable)?;
             ResolvedSessionRuntime {
                 app_id: session.app_id.clone(),
@@ -2581,6 +2588,7 @@ fn apply_translation_hints(
 fn profile_runtime(
     guard: &crate::state::Inner,
     profile_id: &str,
+    use_case: &str,
 ) -> Result<ProfileRuntime, String> {
     let profile = guard
         .profiles
@@ -2600,6 +2608,7 @@ fn profile_runtime(
             profile.artifact_path.display()
         ));
     }
+    validate_runtime_profile_compatibility(use_case, profile)?;
     let runtime_options = profile_runtime_options(profile);
     Ok((
         profile.profile_id.clone(),
@@ -2616,6 +2625,57 @@ fn profile_runtime(
         profile.artifact_path.clone(),
         runtime_options,
     ))
+}
+
+fn validate_runtime_profile_compatibility(
+    use_case: &str,
+    profile: &crate::profiles::Profile,
+) -> Result<(), String> {
+    if profile.runtime_id != "vision-foundation" {
+        return Ok(());
+    }
+
+    match use_case {
+        "vision.detect" => {
+            if !profile_has_artifact(profile, "model.pt") {
+                return Err(format!(
+                    "profile {} is incompatible with vision-foundation detection: YOLO artifact model.pt is required",
+                    profile.profile_id
+                ));
+            }
+        }
+        "vision.segment" => {
+            if !profile_has_artifact(profile, "model.pt") {
+                return Err(format!(
+                    "profile {} is incompatible with vision-foundation segmentation: SAM2 artifact model.pt is required",
+                    profile.profile_id
+                ));
+            }
+            if !profile_has_artifact(profile, "config.yaml") {
+                return Err(format!(
+                    "profile {} is incompatible with vision-foundation segmentation: SAM2 config.yaml is required",
+                    profile.profile_id
+                ));
+            }
+            if !profile.runtime_options.contains_key("SAM2_CONFIG_NAME") {
+                return Err(format!(
+                    "profile {} is incompatible with vision-foundation segmentation: SAM2_CONFIG_NAME is required so the runtime uses the checkpoint's matching packaged config",
+                    profile.profile_id
+                ));
+            }
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
+fn profile_has_artifact(profile: &crate::profiles::Profile, filename: &str) -> bool {
+    profile
+        .artifact_hashes
+        .iter()
+        .any(|artifact| artifact.filename == filename)
+        || profile.artifact_path.join(filename).is_file()
 }
 
 fn embedding_pipeline_id(resolved: &ResolvedSessionRuntime, container: &Container) -> String {
@@ -3136,6 +3196,85 @@ mod tests {
 
         assert!(!runtime_options.contains_key("N_CTX"));
         assert!(!runtime_options.contains_key("N_GPU_LAYERS"));
+    }
+
+    #[test]
+    fn vision_foundation_detect_requires_pytorch_yolo_artifact() {
+        let mut profile = test_vision_profile("yolov9-c-onnx-q8", "Xenova/yolov9-c");
+        profile.artifact_hashes = vec![ArtifactHash {
+            role: "model".to_string(),
+            filename: "model.onnx".to_string(),
+            sha256: "hash".to_string(),
+        }];
+
+        assert_eq!(
+            validate_runtime_profile_compatibility("vision.detect", &profile),
+            Err("profile yolov9-c-onnx-q8 is incompatible with vision-foundation detection: YOLO artifact model.pt is required".to_string())
+        );
+    }
+
+    #[test]
+    fn vision_foundation_segment_rejects_legacy_sam2_profile() {
+        let mut profile = test_vision_profile("sam2-hiera-tiny", "facebook/sam2-hiera-tiny");
+        profile.specializations = vec!["sam2".to_string()];
+        profile.artifact_hashes = vec![
+            ArtifactHash {
+                role: "model".to_string(),
+                filename: "model.pt".to_string(),
+                sha256: "hash".to_string(),
+            },
+            ArtifactHash {
+                role: "config".to_string(),
+                filename: "config.yaml".to_string(),
+                sha256: "hash".to_string(),
+            },
+        ];
+
+        assert_eq!(
+            validate_runtime_profile_compatibility("vision.segment", &profile),
+            Err("profile sam2-hiera-tiny is incompatible with vision-foundation segmentation: SAM2_CONFIG_NAME is required so the runtime uses the checkpoint's matching packaged config".to_string())
+        );
+    }
+
+    #[test]
+    fn vision_foundation_segment_accepts_curated_sam21_profile() {
+        let mut profile = test_vision_profile("sam2.1-hiera-tiny", "facebook/sam2.1-hiera-tiny");
+        profile.specializations = vec!["sam2.1".to_string()];
+        profile.runtime_options.insert(
+            "SAM2_CONFIG_NAME".to_string(),
+            "configs/sam2.1/sam2.1_hiera_t.yaml".to_string(),
+        );
+        profile.artifact_hashes = vec![
+            ArtifactHash {
+                role: "model".to_string(),
+                filename: "model.pt".to_string(),
+                sha256: "hash".to_string(),
+            },
+            ArtifactHash {
+                role: "config".to_string(),
+                filename: "config.yaml".to_string(),
+                sha256: "hash".to_string(),
+            },
+        ];
+
+        assert!(validate_runtime_profile_compatibility("vision.segment", &profile).is_ok());
+    }
+
+    fn test_vision_profile(profile_id: &str, model_id: &str) -> crate::profiles::Profile {
+        crate::profiles::Profile {
+            profile_id: profile_id.to_string(),
+            model_id: model_id.to_string(),
+            llmfit_model_id: String::new(),
+            runtime_id: "vision-foundation".to_string(),
+            runtime_options: std::collections::HashMap::new(),
+            artifact_path: PathBuf::from("/tmp/test-model"),
+            runtime_images: Vec::new(),
+            use_cases: Vec::new(),
+            specializations: Vec::new(),
+            artifact_hashes: Vec::new(),
+            installed_at: "2026-01-01T00:00:00Z".to_string(),
+            source: "test".to_string(),
+        }
     }
 
     #[hegel::test]
