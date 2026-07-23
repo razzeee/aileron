@@ -1,5 +1,8 @@
-use aileron_runtime::{ContentPart, Request, select_tool_name, send, send_unsupported};
+use aileron_runtime::{
+    ContentPart, Request, select_tool_name, send, send_unsupported, stub_synthesis_chunks,
+};
 use anyhow::Result;
+use base64::Engine;
 use serde_json::json;
 
 fn main() -> Result<()> {
@@ -17,6 +20,7 @@ fn handle_request(req: Request) -> Result<()> {
             "done": true,
         })),
         "transcribe" => handle_transcribe(&req),
+        "synthesize" => handle_synthesize(&req),
         "describe" => send(json!({
             "id": req.id,
             "token": "Stub description: an image was received.",
@@ -32,6 +36,43 @@ fn handle_request(req: Request) -> Result<()> {
         "depth" => handle_depth(&req),
         _ => send_unsupported(&req, false),
     }
+}
+
+fn handle_synthesize(req: &Request) -> Result<()> {
+    for response in synthesis_responses(req)? {
+        send(response)?;
+    }
+    Ok(())
+}
+
+fn synthesis_responses(req: &Request) -> Result<Vec<serde_json::Value>> {
+    let text = req
+        .text
+        .as_deref()
+        .filter(|text| !text.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("synthesis text must not be empty"))?;
+    if !matches!(
+        req.execution_mode.as_deref(),
+        None | Some("") | Some("interactive") | Some("background")
+    ) {
+        anyhow::bail!("unsupported execution mode");
+    }
+
+    let mut responses = Vec::new();
+    for (index, pcm) in stub_synthesis_chunks(text).into_iter().enumerate() {
+        let mut response = json!({
+            "id": req.id,
+            "audio": base64::engine::general_purpose::STANDARD.encode(pcm),
+        });
+        if index == 0 {
+            response["sample_rate"] = 24_000.into();
+            response["channels"] = 1.into();
+            response["sample_format"] = "s16le".into();
+        }
+        responses.push(response);
+    }
+    responses.push(json!({"id": req.id, "audio": "", "done": true}));
+    Ok(responses)
 }
 
 fn handle_generate(req: &Request) -> Result<()> {
@@ -233,4 +274,51 @@ fn handle_depth(req: &Request) -> Result<()> {
         "result": serde_json::to_string(&result)?,
         "done": true,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn synthesis_responses_preserve_id_emit_multiple_chunks_and_terminate() {
+        let request: Request = serde_json::from_value(json!({
+            "id": "request-1",
+            "type": "synthesize",
+            "text": "Hello there",
+            "voice_id": "",
+            "language_hint": "en",
+            "execution_mode": "interactive"
+        }))
+        .unwrap();
+
+        let responses = synthesis_responses(&request).unwrap();
+
+        assert!(responses.len() > 2);
+        assert!(
+            responses
+                .iter()
+                .all(|response| response["id"] == "request-1")
+        );
+        assert_eq!(responses[0]["sample_rate"], 24_000);
+        assert_eq!(responses[0]["channels"], 1);
+        assert_eq!(responses[0]["sample_format"], "s16le");
+        assert_eq!(responses.last().unwrap()["audio"], "");
+        assert_eq!(responses.last().unwrap()["done"], true);
+    }
+
+    #[test]
+    fn synthesis_responses_reject_empty_text_and_unknown_execution_mode() {
+        let mut request: Request = serde_json::from_value(json!({
+            "id": "request-1",
+            "type": "synthesize",
+            "text": "  "
+        }))
+        .unwrap();
+        assert!(synthesis_responses(&request).is_err());
+
+        request.text = Some("hello".to_string());
+        request.execution_mode = Some("urgent".to_string());
+        assert!(synthesis_responses(&request).is_err());
+    }
 }

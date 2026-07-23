@@ -857,6 +857,7 @@ pub const SUPPORTED_USE_CASES: &[&str] = &[
     "language.embed",
     "speech.transcribe",
     "speech.translate",
+    "speech.synthesize",
     "vision.describe",
     "vision.detect",
     "vision.segment",
@@ -1246,6 +1247,22 @@ mod tests {
         "#;
 
         parse_model_manifest_json(data).expect("valid model manifest");
+    }
+
+    #[test]
+    fn validates_speech_synthesis_model_manifest() {
+        let data = r#"
+        {
+            "profile_id": "stub-tts",
+            "model_id": "stub-tts",
+            "runtime_id": "stub",
+            "use_cases": ["speech.synthesize"],
+            "artifacts": []
+        }
+        "#;
+
+        let manifest = parse_model_manifest_json(data).expect("synthesis manifest should parse");
+        assert_eq!(manifest.use_cases, ["speech.synthesize"]);
     }
 
     #[test]

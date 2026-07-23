@@ -245,6 +245,33 @@ Response uses the same token stream shape as text generation. ASR runtimes may e
 {"id":"request-id","token":"world","done":true}
 ```
 
+## Speech Synthesis
+
+Request:
+
+```json
+{
+  "id": "request-id",
+  "type": "synthesize",
+  "text": "Hello there,",
+  "voice_id": "",
+  "language_hint": "en",
+  "execution_mode": "interactive"
+}
+```
+
+`text` must be non-empty and is limited to 16 KiB of UTF-8. `voice_id` and `language_hint` may be empty to select the profile defaults. The initial protocol supports `interactive` and `background` execution modes.
+
+Response is base64-encoded interleaved PCM. The first non-empty event declares the format; later events may omit unchanged metadata. A successful request emits at least one non-empty chunk and a terminal `done=true` event.
+
+```json
+{"id":"request-id","audio":"<base64 PCM>","sample_rate":24000,"channels":1,"sample_format":"s16le"}
+{"id":"request-id","audio":"<base64 PCM>"}
+{"id":"request-id","audio":"","done":true}
+```
+
+The first version accepts `s16le`, one or two channels, sample rates from 8 kHz through 192 kHz, and at most 256 KiB of decoded PCM per event. Every chunk must end on a complete interleaved sample frame. Metadata changes, malformed base64, oversized chunks, empty successful output, and EOF before the terminal event are runtime failures and are not forwarded to applications.
+
 ## Image Description
 
 Request:

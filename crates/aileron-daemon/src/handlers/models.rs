@@ -2787,6 +2787,15 @@ mod tests {
             profile_with_runtime_and_use_cases("llm-vision-whisper", &["speech.transcribe"]);
 
         assert!(profile_supports_use_case(&profile, "speech.translate"));
+        assert!(!profile_supports_use_case(&profile, "speech.synthesize"));
+    }
+
+    #[test]
+    fn synthesis_requires_an_explicit_profile_use_case() {
+        let profile = profile_with_runtime_and_use_cases("stub", &["speech.synthesize"]);
+
+        assert!(profile_supports_use_case(&profile, "speech.synthesize"));
+        assert!(!profile_supports_use_case(&profile, "speech.transcribe"));
     }
 
     #[test]

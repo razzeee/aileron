@@ -35,6 +35,7 @@ Current tokens:
 - `language.embed`
 - `speech.transcribe`
 - `speech.translate`
+- `speech.synthesize`
 - `vision.describe`
 - `vision.ocr`
 - `vision.detect`
@@ -123,6 +124,12 @@ Use `speech.transcribe` for verbatim speech-to-text and `speech.translate` to tr
 
 Live microphone chunking is app behavior in the current API. Apps that want interim text can keep recording locally, periodically send sufficiently large aligned PCM chunks through `StreamTranscribe`, and run one final `StreamTranscribe` pass over the complete recording when capture stops.
 
+Use `speech.synthesize` with `StreamSynthesize` for speech output. Submit one stable, non-empty phrase per request and serialize requests on a speech session to preserve phrase order. For generated text, buffer token fragments until punctuation, a safe word boundary after a short timeout, a size limit, or the language stream's terminal event; never split a UTF-8 code point. `voice_id` and `language_hint` are optional strings, and the empty voice selects the profile default.
+
+`AudioReceived` carries the request handle, session handle, PCM bytes, sample rate, channel count, `s16le` format, and terminal flag. Subscribe before invoking `StreamSynthesize`, correlate both handles, and wait for both the terminal audio signal and the Request response. The final signal may have no audio bytes. Play and record the same immutable PCM chunks rather than synthesizing twice. A WAV recorder can write a placeholder 44-byte header, append PCM in order, and patch RIFF/data lengths after the last phrase drains.
+
+Keep playback and phrase queues bounded. Closing the active request cancels that phrase; closing the speech session cancels active work. On language cancellation, stop accepting tokens, close active speech requests, clear queued phrases, stop playback, and delete incomplete recordings unless the user explicitly requested partial output.
+
 Use `vision.describe` with `StreamDescribe`, `vision.ocr` with `StreamOcr`, `vision.detect` with `StreamDetect`, mask-capable `vision.segment` with `StreamSegment`, and `vision.depth` with `StreamDepth`. Description and OCR stream text; detection emits normalized rectangular boxes; segmentation emits masks selected by point/box prompts; depth emits a dense normalized map. Images are passed to the portal as readable, sealable memfds containing PNG or JPEG bytes. Each Vision stream method also accepts an `instructions` string for per-image guidance; pass an empty string when unspecified.
 
 Large media inputs can be expensive even when transported by fd. Prefer user-initiated actions, visible progress, resized images, app-side audio chunking, and cancellation-friendly UI.
@@ -154,7 +161,7 @@ Handle specific inference errors when useful. In the current prototype, portal/b
 
 ## Development And Testing
 
-Use the stub runtime for end-to-end development when model quality is irrelevant. It returns deterministic fake responses for text generation, structured generation, transcription, and image description.
+Use the stub runtime for end-to-end development when model quality is irrelevant. It returns deterministic fake responses for text generation, structured generation, transcription, multi-chunk `s16le` synthesis, and image description.
 
 The stub path exercises the same daemon, manifest, container, and IPC layers without requiring a model download.
 

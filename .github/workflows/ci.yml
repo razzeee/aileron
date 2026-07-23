@@ -119,6 +119,9 @@ jobs:
           -p aileron-demo
           -- -D warnings
 
+      - name: cargo test (display-independent demo tests)
+        run: cargo test -p aileron-demo
+
   # ── Stub container image ────────────────────────────────────────────────────
   # Verifies the stub Dockerfile builds successfully, then smoke-tests the
   # daemon container wrapper and the protocol by piping requests directly to it.
@@ -196,3 +199,28 @@ jobs:
           OUTPUT=$(echo "$REQUEST" | podman run --rm -i aileron/stub:ci)
           echo "Output: $OUTPUT"
           echo "$OUTPUT" | grep -Eq '"done"[[:space:]]*:[[:space:]]*true'
+
+      - name: Protocol smoke test — synthesize
+        run: |
+          REQUEST='{"id":"test-4","type":"synthesize","text":"Hello from CI.","voice_id":"","language_hint":"en","execution_mode":"interactive"}'
+          OUTPUT=$(echo "$REQUEST" | podman run --rm -i aileron/stub:ci)
+          echo "Output: $OUTPUT"
+          OUTPUT="$OUTPUT" python3 - <<'PY'
+          import base64
+          import json
+          import os
+
+          events = [json.loads(line) for line in os.environ["OUTPUT"].splitlines()]
+          chunks = [event for event in events if event.get("audio")]
+          assert len(chunks) >= 2
+          assert events[-1].get("done") is True
+          metadata = (
+              chunks[0]["sample_rate"],
+              chunks[0]["channels"],
+              chunks[0]["sample_format"],
+          )
+          assert metadata == (24000, 1, "s16le")
+          for event in chunks:
+              pcm = base64.b64decode(event["audio"], validate=True)
+              assert pcm and len(pcm) % (metadata[1] * 2) == 0
+          PY

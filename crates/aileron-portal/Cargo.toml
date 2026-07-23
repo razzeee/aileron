@@ -20,6 +20,7 @@ tracing         = { workspace = true }
 tracing-subscriber = { workspace = true }
 zbus            = { workspace = true }
 varlink         = { workspace = true }
+base64          = { workspace = true }
 
 [dev-dependencies]
 hegeltest       = { workspace = true }
