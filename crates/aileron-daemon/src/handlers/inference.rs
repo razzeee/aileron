@@ -11,7 +11,10 @@ use std::sync::{
 use std::time::Duration;
 use uuid::Uuid;
 
-use crate::container::{Container, ContainerHandle, InputMessage, InputPart};
+use crate::container::{
+    AudioChunk as RuntimeAudioChunk, Container, ContainerHandle, InputMessage, InputPart,
+    MAX_SYNTHESIS_LANGUAGE_HINT_BYTES, MAX_SYNTHESIS_TEXT_BYTES, MAX_SYNTHESIS_VOICE_ID_BYTES,
+};
 use crate::observability::{self, ObservabilityFailure};
 use crate::profiles::{ArtifactHash, RuntimeCandidate};
 use crate::request_execution::{self, ActiveContainerRequest, RequestCancellation};
@@ -19,11 +22,12 @@ use crate::state::SharedState;
 #[allow(unused_imports)]
 // VarlinkCallError is a supertrait; its methods reach us via Call_* dyn objects.
 use aileron_varlink::aileron_Inference::{
-    Call_CreateSession, Call_EndSession, Call_GetUseCaseAvailability, Call_Prewarm,
-    Call_StreamDepth, Call_StreamDescribe, Call_StreamDetect, Call_StreamEmbed, Call_StreamOcr,
-    Call_StreamRespondGuided, Call_StreamResponse, Call_StreamSegment,
-    Call_StreamSubmitToolResultsGuided, Call_StreamTranscribe, EmbedOptions, GuidedField,
-    GuidedOptions, ModelAvailability, ResponseOptions, SpeechOptions, ToolCall, ToolDefinition,
+    AudioChunk, Call_CancelActiveRequest, Call_CreateSession, Call_EndSession,
+    Call_GetUseCaseAvailability, Call_Prewarm, Call_StreamDepth, Call_StreamDescribe,
+    Call_StreamDetect, Call_StreamEmbed, Call_StreamOcr, Call_StreamRespondGuided,
+    Call_StreamResponse, Call_StreamSegment, Call_StreamSubmitToolResultsGuided,
+    Call_StreamSynthesize, Call_StreamTranscribe, EmbedOptions, GuidedField, GuidedOptions,
+    ModelAvailability, ResponseOptions, SpeechOptions, SynthesisOptions, ToolCall, ToolDefinition,
     ToolResult, VarlinkCallError, VarlinkInterface, VisionBoxPrompt, VisionDepthMap,
     VisionDetection, VisionMask, VisionOptions, VisionPointPrompt, VisionSegmentOptions,
 };
@@ -352,6 +356,25 @@ impl VarlinkInterface for InferenceHandler {
         })
     }
 
+    fn stream_synthesize(
+        &self,
+        call: &mut dyn Call_StreamSynthesize,
+        session_id: String,
+        text: String,
+        options: SynthesisOptions,
+    ) -> varlink::Result<()> {
+        self.rt.block_on(async {
+            match stream_synthesis(&self.state, call, session_id, text, options).await {
+                Ok(()) => Ok(()),
+                Err(SpeechError::SessionNotFound(id)) => call.reply_session_not_found(id),
+                Err(SpeechError::ModelUnavailable(reason)) => call.reply_model_unavailable(reason),
+                Err(SpeechError::InvalidInput(reason)) => call.reply_invalid_input(reason),
+                Err(SpeechError::Failed(reason)) => reply_generation_failure(call, reason),
+                Err(SpeechError::Reply(e)) => Err(e),
+            }
+        })
+    }
+
     fn stream_describe(
         &self,
         call: &mut dyn Call_StreamDescribe,
@@ -607,6 +630,29 @@ impl VarlinkInterface for InferenceHandler {
             call.reply()
         })
     }
+
+    fn cancel_active_request(
+        &self,
+        call: &mut dyn Call_CancelActiveRequest,
+        session_id: String,
+    ) -> varlink::Result<()> {
+        self.rt.block_on(async {
+            let profile_id = {
+                let guard = self.state.0.lock().await;
+                let Some(session) = guard.sessions.get(&session_id) else {
+                    return call.reply_session_not_found(session_id);
+                };
+                session.profile_id.clone()
+            };
+            request_execution::terminate_active_container_handles_for_session(
+                &self.state,
+                &profile_id,
+                &session_id,
+            )
+            .await;
+            call.reply()
+        })
+    }
 }
 
 enum CreateSessionError {
@@ -794,6 +840,139 @@ async fn stream_transcription(
         },
     )
     .await
+}
+
+async fn stream_synthesis(
+    state: &SharedState,
+    call: &mut dyn Call_StreamSynthesize,
+    session_id: String,
+    text: String,
+    options: SynthesisOptions,
+) -> Result<(), SpeechError> {
+    let execution_mode =
+        parse_execution_mode(&options.execution_mode).map_err(SpeechError::InvalidInput)?;
+    validate_synthesis_input(&text, &options).map_err(SpeechError::InvalidInput)?;
+    let resolved = resolve_session_runtime(state, &session_id, |use_case| {
+        ensure_exact_use_case(use_case, "speech.synthesize", "StreamSynthesize")
+    })
+    .await
+    .map_err(SpeechError::from)?;
+
+    with_locked_container(
+        "StreamSynthesize",
+        state,
+        &session_id,
+        resolved.clone(),
+        execution_mode,
+        SpeechError::Failed,
+        |container, _handle, _spawned| {
+            let wants_more = call.wants_more();
+            let mut pending_chunk: Option<AudioChunk> = None;
+            let mut terminal_metadata: Option<(i64, i64, String)> = None;
+            let mut reply_error: Option<varlink::Error> = None;
+            let mut cancelled = false;
+            let result = container.stream_synthesize(
+                &text,
+                &options.voice_id,
+                &options.language_hint,
+                execution_mode.as_str(),
+                |chunk: RuntimeAudioChunk| {
+                    if RequestCancellation::for_session(state, &session_id).is_cancelled() {
+                        cancelled = true;
+                        anyhow::bail!(request_execution::request_cancelled_reason());
+                    }
+                    terminal_metadata = Some((
+                        chunk.sample_rate,
+                        chunk.channels,
+                        chunk.sample_format.clone(),
+                    ));
+                    let chunk = AudioChunk {
+                        audio_base64: chunk.audio_base64,
+                        sample_rate: chunk.sample_rate,
+                        channels: chunk.channels,
+                        sample_format: chunk.sample_format,
+                    };
+                    if wants_more {
+                        call.set_continues(true);
+                        if let Err(error) = call.reply(chunk) {
+                            reply_error = Some(error);
+                            anyhow::bail!("failed to send synthesis stream reply");
+                        }
+                    } else {
+                        pending_chunk = Some(chunk);
+                    }
+                    Ok(())
+                },
+            );
+
+            if let Some(error) = reply_error {
+                return Err(SpeechError::Reply(error));
+            }
+            if cancelled || RequestCancellation::for_session(state, &session_id).is_cancelled() {
+                if wants_more {
+                    call.set_continues(false);
+                }
+                return Err(SpeechError::Failed(
+                    request_execution::request_cancelled_reason(),
+                ));
+            }
+            if let Err(error) = result {
+                if wants_more {
+                    call.set_continues(false);
+                }
+                return Err(SpeechError::Failed(error.to_string()));
+            }
+
+            if wants_more {
+                let (sample_rate, channels, sample_format) = terminal_metadata
+                    .expect("validated synthesis stream has at least one audio chunk");
+                call.set_continues(false);
+                call.reply(AudioChunk {
+                    audio_base64: String::new(),
+                    sample_rate,
+                    channels,
+                    sample_format,
+                })
+                .map_err(SpeechError::Reply)
+            } else {
+                call.reply(pending_chunk.expect("validated synthesis stream has audio"))
+                    .map_err(SpeechError::Reply)
+            }
+        },
+    )
+    .await
+}
+
+fn validate_synthesis_input(text: &str, options: &SynthesisOptions) -> Result<(), String> {
+    if text.trim().is_empty() {
+        return Err("synthesis text must not be empty".to_string());
+    }
+    if text.len() > MAX_SYNTHESIS_TEXT_BYTES {
+        return Err(format!(
+            "synthesis text exceeds maximum size of {MAX_SYNTHESIS_TEXT_BYTES} UTF-8 bytes"
+        ));
+    }
+    if text.contains('\0') {
+        return Err("synthesis text must not contain NUL characters".to_string());
+    }
+    validate_synthesis_option("voice_id", &options.voice_id, MAX_SYNTHESIS_VOICE_ID_BYTES)?;
+    validate_synthesis_option(
+        "language_hint",
+        &options.language_hint,
+        MAX_SYNTHESIS_LANGUAGE_HINT_BYTES,
+    )
+}
+
+fn validate_synthesis_option(name: &str, value: &str, max_bytes: usize) -> Result<(), String> {
+    if value.len() > max_bytes {
+        return Err(format!(
+            "{name} exceeds maximum size of {max_bytes} UTF-8 bytes"
+        ));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(format!("{name} must not contain control characters"));
+    }
+    Ok(())
 }
 
 async fn stream_vision_text<C: TextStreamCall + ?Sized>(
@@ -3110,6 +3289,7 @@ mod tests {
     fn supported_use_case_catalog_accepts_public_tokens() {
         assert!(is_supported_use_case("language.summarize"));
         assert!(is_supported_use_case("speech.translate"));
+        assert!(is_supported_use_case("speech.synthesize"));
         assert!(is_supported_use_case("vision.detect"));
         assert!(is_supported_use_case("vision.segment"));
         assert!(is_supported_use_case("vision.depth"));
@@ -3167,6 +3347,58 @@ mod tests {
         );
         assert_eq!(ensure_speech_use_case("speech.translate"), Ok("translate"));
         assert!(ensure_speech_use_case("language.extract").is_err());
+    }
+
+    #[test]
+    fn synthesis_requires_exact_use_case() {
+        assert!(
+            ensure_exact_use_case("speech.synthesize", "speech.synthesize", "StreamSynthesize")
+                .is_ok()
+        );
+        assert_eq!(
+            ensure_exact_use_case("speech.transcribe", "speech.synthesize", "StreamSynthesize"),
+            Err(
+                "StreamSynthesize requires use-case speech.synthesize, got speech.transcribe"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn synthesis_input_accepts_phrase_and_default_options() {
+        let options = SynthesisOptions {
+            voice_id: String::new(),
+            language_hint: "en".to_string(),
+            execution_mode: "interactive".to_string(),
+        };
+
+        assert!(validate_synthesis_input("Hello there.", &options).is_ok());
+    }
+
+    #[test]
+    fn synthesis_input_rejects_empty_oversized_and_control_values() {
+        let mut options = SynthesisOptions {
+            voice_id: String::new(),
+            language_hint: String::new(),
+            execution_mode: "interactive".to_string(),
+        };
+
+        assert!(
+            validate_synthesis_input(" \n", &options)
+                .unwrap_err()
+                .contains("not be empty")
+        );
+        assert!(
+            validate_synthesis_input(&"a".repeat(MAX_SYNTHESIS_TEXT_BYTES + 1), &options)
+                .unwrap_err()
+                .contains("maximum size")
+        );
+        options.voice_id = "bad\nvoice".to_string();
+        assert!(
+            validate_synthesis_input("hello", &options)
+                .unwrap_err()
+                .contains("control characters")
+        );
     }
 
     #[test]

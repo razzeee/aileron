@@ -20,6 +20,8 @@ pub struct Request {
     #[serde(default)]
     pub prompt: Option<String>,
     #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
     pub input: Option<Vec<Message>>,
     #[serde(default)]
     pub max_tokens: Option<u32>,
@@ -37,6 +39,8 @@ pub struct Request {
     pub boxes: Option<Vec<Value>>,
     #[serde(default)]
     pub language_hint: Option<String>,
+    #[serde(default)]
+    pub voice_id: Option<String>,
     #[serde(default)]
     pub task: Option<String>,
     #[serde(default)]
@@ -223,6 +227,24 @@ pub fn send_unsupported(req: &Request, done: bool) -> Result<()> {
     send(response)
 }
 
+/// Deterministic framed s16le PCM used by the contract stub.
+pub fn stub_synthesis_chunks(text: &str) -> Vec<Vec<u8>> {
+    const FRAMES_PER_CHUNK: usize = 480;
+    let frames = (text.chars().count().max(1) * 240).max(FRAMES_PER_CHUNK + 1);
+    let seed = text.bytes().fold(0_u16, |value, byte| {
+        value.wrapping_mul(31).wrapping_add(byte as u16)
+    });
+    let pcm = (0..frames)
+        .flat_map(|frame| {
+            let sample = seed.wrapping_add((frame as u16).wrapping_mul(257)) as i16;
+            sample.to_le_bytes()
+        })
+        .collect::<Vec<_>>();
+    pcm.chunks(FRAMES_PER_CHUNK * size_of::<i16>())
+        .map(<[u8]>::to_vec)
+        .collect()
+}
+
 pub fn stub_value_for_schema(schema: &Value) -> Value {
     match schema_type(schema) {
         Some("object") => {
@@ -352,6 +374,36 @@ pub fn default_threads_for_device(device: &str) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn synthesis_request_fields_deserialize() {
+        let request: Request = serde_json::from_value(json!({
+            "id": "request-1",
+            "type": "synthesize",
+            "text": "Hello",
+            "voice_id": "",
+            "language_hint": "en",
+            "execution_mode": "interactive"
+        }))
+        .unwrap();
+
+        assert_eq!(request.text.as_deref(), Some("Hello"));
+        assert_eq!(request.voice_id.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn stub_synthesis_is_deterministic_multichunk_framed_pcm() {
+        let first = stub_synthesis_chunks("H");
+        let second = stub_synthesis_chunks("H");
+
+        assert_eq!(first, second);
+        assert!(first.len() > 1);
+        assert!(
+            first
+                .iter()
+                .all(|chunk| !chunk.is_empty() && chunk.len() % 2 == 0)
+        );
+    }
 
     #[test]
     fn stub_value_satisfies_required_object_shape() {

@@ -10,11 +10,11 @@ llama = ["dep:encoding_rs", "dep:llama-cpp-2"]
 llama-cuda = ["llama", "llama-cpp-2/cuda"]
 llama-rocm = ["llama", "llama-cpp-2/rocm"]
 llama-vulkan = ["llama", "llama-cpp-2/vulkan"]
-vision = ["llama", "dep:base64", "llama-cpp-2/mtmd"]
+vision = ["llama", "llama-cpp-2/mtmd"]
 vision-cuda = ["vision", "llama-cuda"]
 vision-rocm = ["vision", "llama-rocm"]
 vision-vulkan = ["vision", "llama-vulkan"]
-whisper = ["dep:base64", "dep:whisper-rs"]
+whisper = ["dep:whisper-rs"]
 whisper-cuda = ["whisper", "whisper-rs/cuda"]
 whisper-rocm = ["whisper", "whisper-rs/hipblas"]
 whisper-vulkan = ["whisper", "whisper-rs/vulkan"]
@@ -23,7 +23,7 @@ whisper-vulkan = ["whisper", "whisper-rs/vulkan"]
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-base64 = { version = "0.22", optional = true }
+base64 = { workspace = true }
 encoding_rs = { version = "0.8.35", optional = true }
 llama-cpp-2 = { version = "0.1.150", optional = true }
 whisper-rs = { version = "0.16.0", optional = true }

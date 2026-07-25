@@ -14,6 +14,8 @@ finish-args:
   - --share=ipc
   # Network access for fetching article URLs only.
   - --share=network
+  # pw-play streams synthesized PCM to the user's PipeWire graph.
+  - --filesystem=xdg-run/pipewire-0
   # Required portals — AI portal grants access to aileron-daemon.
   - --talk-name=org.freedesktop.portal.Desktop
   # No access to $XDG_RUNTIME_DIR of the host session (no direct socket access).

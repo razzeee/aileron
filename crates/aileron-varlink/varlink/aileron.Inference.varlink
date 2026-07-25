@@ -34,6 +34,19 @@ type SpeechOptions (
   execution_mode: string
 )
 
+type SynthesisOptions (
+  voice_id: string,
+  language_hint: string,
+  execution_mode: string
+)
+
+type AudioChunk (
+  audio_base64: string,
+  sample_rate: int,
+  channels: int,
+  sample_format: string
+)
+
 type VisionOptions (
   execution_mode: string
 )
@@ -151,6 +164,10 @@ method StreamEmbed(session_id: string, text: string, options: EmbedOptions) -> (
 # The final reply has continues=false.
 method StreamTranscribe(session_id: string, audio_path: string, options: SpeechOptions) -> (token: string)
 
+# Stream validated interleaved PCM chunks. Session must have been created with
+# use_case: speech.synthesize. The final reply has continues=false.
+method StreamSynthesize(session_id: string, text: string, options: SynthesisOptions) -> (chunk: AudioChunk)
+
 # Stream image description tokens. Session must have been created with vision.describe
 # image_path: readable path for PNG or JPEG bytes
 # instructions: optional per-image instructions
@@ -177,6 +194,9 @@ method StreamSegment(session_id: string, image_path: string, instructions: strin
 # image_path: readable path for PNG or JPEG bytes
 # instructions: optional per-image instructions
 method StreamDepth(session_id: string, image_path: string, instructions: string, options: VisionOptions) -> (depth: VisionDepthMap)
+
+# Stop the active container request for a session without ending the session.
+method CancelActiveRequest(session_id: string) -> ()
 
 # End a session. The per-profile container remains pooled until idle timeout.
 method EndSession(session_id: string) -> ()

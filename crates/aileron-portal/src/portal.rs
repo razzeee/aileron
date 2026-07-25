@@ -1,5 +1,6 @@
 /// D-Bus portal backend for task-oriented local model capabilities.
 use anyhow::Result;
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::convert::TryFrom;
@@ -16,6 +17,13 @@ const BUS_NAME: &str = "org.freedesktop.impl.portal.desktop.aileron";
 const OBJECT_PATH: &str = "/org/freedesktop/portal/desktop";
 const FRONTEND_BUS_NAME: &str = "org.freedesktop.portal.Desktop";
 const MAX_PREWARM_WORKERS: usize = 4;
+const MAX_SYNTHESIS_TEXT_BYTES: usize = 16 * 1024;
+const MAX_SYNTHESIS_VOICE_ID_BYTES: usize = 128;
+const MAX_SYNTHESIS_LANGUAGE_HINT_BYTES: usize = 64;
+const MAX_AUDIO_CHUNK_BYTES: usize = 256 * 1024;
+const MIN_AUDIO_SAMPLE_RATE: u32 = 8_000;
+const MAX_AUDIO_SAMPLE_RATE: u32 = 192_000;
+const MAX_AUDIO_CHANNELS: u32 = 2;
 const LANGUAGE_GENERATION_USE_CASES: &[&str] = &[
     "language.summarize",
     "language.translate",
@@ -33,7 +41,7 @@ const LANGUAGE_USE_CASES: &[&str] = &[
     "language.analyze",
     "language.embed",
 ];
-const SPEECH_USE_CASES: &[&str] = &["speech.transcribe", "speech.translate"];
+const SPEECH_USE_CASES: &[&str] = &["speech.transcribe", "speech.translate", "speech.synthesize"];
 const VISION_USE_CASES: &[&str] = &[
     "vision.describe",
     "vision.ocr",
@@ -63,11 +71,13 @@ pub async fn run() -> Result<()> {
 struct PortalState {
     sessions: Mutex<HashMap<String, SessionRecord>>,
     requests: Mutex<HashMap<String, RequestRecord>>,
+    active_synthesis_requests: Mutex<HashMap<String, String>>,
     prewarm_workers: Mutex<usize>,
 }
 
 struct RequestRecord {
     session_handle: Option<String>,
+    daemon_session_id: Option<String>,
     cancelled: bool,
     active_connection: Option<Arc<RwLock<varlink::Connection>>>,
 }
@@ -201,6 +211,25 @@ struct SpeechOptionsDbus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
+struct SynthesisOptionsDbus {
+    voice_id: String,
+    language_hint: String,
+    execution_mode: String,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct AudioMetadata {
+    sample_rate: u32,
+    channels: u32,
+    sample_format: String,
+}
+
+struct DecodedAudioChunk {
+    audio: Vec<u8>,
+    metadata: AudioMetadata,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
 struct VisionOptionsDbus {
     execution_mode: String,
 }
@@ -296,7 +325,7 @@ impl RequestPortalBackend {
         #[zbus(header)] header: Header<'_>,
     ) -> zbus::fdo::Result<()> {
         ensure_portal_frontend(conn, &header).await?;
-        cancel_request(&self.state, &self.request_id);
+        cancel_request(&self.state, &self.request_id).await;
         Ok(())
     }
 }
@@ -835,10 +864,11 @@ impl LanguagePortalBackend {
 }
 
 #[interface(name = "org.freedesktop.impl.portal.Speech")]
+#[allow(clippy::too_many_arguments)]
 impl SpeechPortalBackend {
     #[zbus(property, name = "version")]
     fn version(&self) -> u32 {
-        1
+        2
     }
 
     #[zbus(out_args("availability"))]
@@ -1027,6 +1057,96 @@ impl SpeechPortalBackend {
         request_handle: &OwnedObjectPath,
         session_handle: &OwnedObjectPath,
         text: &str,
+        done: bool,
+    ) -> zbus::Result<()>;
+
+    #[allow(clippy::too_many_arguments)]
+    async fn stream_synthesize(
+        &self,
+        request_handle: OwnedObjectPath,
+        session_handle: OwnedObjectPath,
+        text: &str,
+        options: SynthesisOptionsDbus,
+        #[zbus(connection)] conn: &zbus::Connection,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> zbus::fdo::Result<()> {
+        use aileron_varlink::aileron_Inference::VarlinkClientInterface;
+
+        ensure_portal_frontend(conn, &header).await?;
+        validate_synthesis_input(text, &options)?;
+        let request_id = request_handle.as_str();
+        let session_id = session_handle.as_str();
+        begin_request(conn, &self.state, request_id, Some(session_id)).await?;
+        let result = async {
+            let record = ensure_known_session(&self.state, session_id, PortalInterface::Speech)?;
+            ensure_exact_session_use_case(&record, "speech.synthesize", "StreamSynthesize")?;
+            begin_synthesis_request(&self.state, session_id, request_id)?;
+            attach_request_daemon_session(&self.state, request_id, &record.daemon_session_id)?;
+            ensure_request_active(&self.state, request_id)?;
+            self.emit_loading(&request_handle, &session_handle, &emitter)
+                .await?;
+            ensure_request_active(&self.state, request_id)?;
+            let ipc_conn = connect_request_daemon(&self.state, request_id)?;
+            let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(ipc_conn);
+            let mut call = client.stream_synthesize(
+                record.daemon_session_id,
+                text.to_string(),
+                options.into_varlink(),
+            );
+            let iter = call
+                .more()
+                .map_err(|e| map_request_error(&self.state, request_id, e))?;
+
+            let mut metadata = None;
+            let mut received_audio = false;
+            let mut terminal_seen = false;
+            for reply in iter {
+                ensure_request_active(&self.state, request_id)?;
+                let chunk = reply
+                    .map_err(|e| map_request_error(&self.state, request_id, e))?
+                    .chunk;
+                let decoded = decode_audio_chunk(chunk, metadata.as_ref())?;
+                metadata = Some(decoded.metadata.clone());
+                let done = decoded.audio.is_empty();
+                if terminal_seen {
+                    return Err(invalid_audio_output("received data after terminal chunk"));
+                }
+                received_audio |= !done;
+                terminal_seen = done;
+                emit_audio_chunk(&emitter, &request_handle, &session_handle, &decoded, done)
+                    .await?;
+            }
+
+            ensure_request_active(&self.state, request_id)?;
+            if !received_audio {
+                return Err(invalid_audio_output(
+                    "synthesis returned no non-empty audio chunk",
+                ));
+            }
+            if !terminal_seen {
+                return Err(invalid_audio_output(
+                    "synthesis returned no terminal audio chunk",
+                ));
+            }
+            Ok(())
+        }
+        .await;
+        finish_synthesis_request(&self.state, session_id, request_id);
+        finish_request(conn, &self.state, request_id).await;
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[zbus(signal)]
+    async fn audio_received(
+        emitter: &SignalEmitter<'_>,
+        request_handle: &OwnedObjectPath,
+        session_handle: &OwnedObjectPath,
+        audio: &[u8],
+        sample_rate: u32,
+        channels: u32,
+        sample_format: &str,
         done: bool,
     ) -> zbus::Result<()>;
 }
@@ -1654,6 +1774,7 @@ async fn begin_request(
             request_id.to_string(),
             RequestRecord {
                 session_handle: session_handle.map(str::to_string),
+                daemon_session_id: None,
                 cancelled: false,
                 active_connection: None,
             },
@@ -1699,18 +1820,87 @@ fn finish_request_record(state: &PortalState, request_id: &str) {
     state.requests.lock().unwrap().remove(request_id);
 }
 
-fn cancel_request(state: &PortalState, request_id: &str) {
-    let connection = {
+async fn cancel_request(state: &PortalState, request_id: &str) {
+    let (connection, daemon_session_id, session_handle) = {
         let mut requests = state.requests.lock().unwrap();
         let Some(record) = requests.get_mut(request_id) else {
             return;
         };
         record.cancelled = true;
-        record.active_connection.clone()
+        (
+            record.active_connection.clone(),
+            record.daemon_session_id.clone(),
+            record.session_handle.clone(),
+        )
     };
 
     if let Some(connection) = connection {
         shutdown_request_connection(&connection);
+    }
+    if let Some(session_id) = daemon_session_id {
+        let result = tokio::task::spawn_blocking(move || {
+            use aileron_varlink::aileron_Inference::VarlinkClientInterface;
+
+            aileron_ipc::client::connect().and_then(|connection| {
+                let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(connection);
+                client
+                    .cancel_active_request(session_id)
+                    .call()
+                    .map(|_| ())
+                    .map_err(anyhow::Error::from)
+            })
+        })
+        .await;
+        if let Err(error) = result
+            .map_err(anyhow::Error::from)
+            .and_then(|result| result)
+        {
+            warn!("failed to cancel active daemon request: {error}");
+        }
+    }
+    if let Some(session_handle) = session_handle {
+        finish_synthesis_request(state, &session_handle, request_id);
+    }
+}
+
+fn attach_request_daemon_session(
+    state: &PortalState,
+    request_id: &str,
+    daemon_session_id: &str,
+) -> zbus::fdo::Result<()> {
+    let mut requests = state.requests.lock().unwrap();
+    let record = requests
+        .get_mut(request_id)
+        .ok_or_else(request_cancelled_error)?;
+    if record.cancelled {
+        return Err(request_cancelled_error());
+    }
+    record.daemon_session_id = Some(daemon_session_id.to_string());
+    Ok(())
+}
+
+fn begin_synthesis_request(
+    state: &PortalState,
+    session_id: &str,
+    request_id: &str,
+) -> zbus::fdo::Result<()> {
+    let mut active = state.active_synthesis_requests.lock().unwrap();
+    if let Some(existing) = active.get(session_id) {
+        return Err(zbus::fdo::Error::Failed(format!(
+            "aileron.Inference.InvalidInput: speech synthesis session already has active request {existing}"
+        )));
+    }
+    active.insert(session_id.to_string(), request_id.to_string());
+    Ok(())
+}
+
+fn finish_synthesis_request(state: &PortalState, session_id: &str, request_id: &str) {
+    let mut active = state.active_synthesis_requests.lock().unwrap();
+    if active
+        .get(session_id)
+        .is_some_and(|active| active == request_id)
+    {
+        active.remove(session_id);
     }
 }
 
@@ -2069,7 +2259,10 @@ fn ensure_language_generation_session(record: &SessionRecord) -> zbus::fdo::Resu
 }
 
 fn ensure_speech_session_use_case(record: &SessionRecord, method: &str) -> zbus::fdo::Result<()> {
-    if SPEECH_USE_CASES.contains(&record.use_case.as_str()) {
+    if matches!(
+        record.use_case.as_str(),
+        "speech.transcribe" | "speech.translate"
+    ) {
         Ok(())
     } else {
         Err(zbus::fdo::Error::Failed(format!(
@@ -2092,6 +2285,121 @@ fn ensure_exact_session_use_case(
             record.use_case
         )))
     }
+}
+
+fn validate_synthesis_input(text: &str, options: &SynthesisOptionsDbus) -> zbus::fdo::Result<()> {
+    if text.trim().is_empty() {
+        return Err(zbus::fdo::Error::Failed(
+            "aileron.Inference.InvalidInput: synthesis text must not be empty".to_string(),
+        ));
+    }
+    if text.len() > MAX_SYNTHESIS_TEXT_BYTES {
+        return Err(zbus::fdo::Error::Failed(format!(
+            "aileron.Inference.InvalidInput: synthesis text exceeds {MAX_SYNTHESIS_TEXT_BYTES} UTF-8 bytes"
+        )));
+    }
+    if options.voice_id.len() > MAX_SYNTHESIS_VOICE_ID_BYTES {
+        return Err(zbus::fdo::Error::Failed(format!(
+            "aileron.Inference.InvalidInput: voice ID exceeds {MAX_SYNTHESIS_VOICE_ID_BYTES} UTF-8 bytes"
+        )));
+    }
+    if options.language_hint.len() > MAX_SYNTHESIS_LANGUAGE_HINT_BYTES {
+        return Err(zbus::fdo::Error::Failed(format!(
+            "aileron.Inference.InvalidInput: language hint exceeds {MAX_SYNTHESIS_LANGUAGE_HINT_BYTES} UTF-8 bytes"
+        )));
+    }
+    if !matches!(
+        options.execution_mode.as_str(),
+        "interactive" | "background"
+    ) {
+        return Err(zbus::fdo::Error::Failed(format!(
+            "aileron.Inference.InvalidInput: unsupported execution mode {}",
+            options.execution_mode
+        )));
+    }
+    Ok(())
+}
+
+fn invalid_audio_output(reason: impl Into<String>) -> zbus::fdo::Error {
+    zbus::fdo::Error::Failed(format!(
+        "aileron.Inference.GenerationFailed: invalid synthesized audio: {}",
+        reason.into()
+    ))
+}
+
+fn decode_audio_chunk(
+    chunk: aileron_varlink::aileron_Inference::AudioChunk,
+    expected: Option<&AudioMetadata>,
+) -> zbus::fdo::Result<DecodedAudioChunk> {
+    let sample_rate = u32::try_from(chunk.sample_rate)
+        .ok()
+        .filter(|rate| (MIN_AUDIO_SAMPLE_RATE..=MAX_AUDIO_SAMPLE_RATE).contains(rate))
+        .ok_or_else(|| invalid_audio_output("sample rate is outside the supported range"))?;
+    let channels = u32::try_from(chunk.channels)
+        .ok()
+        .filter(|channels| (1..=MAX_AUDIO_CHANNELS).contains(channels))
+        .ok_or_else(|| invalid_audio_output("channel count is outside the supported range"))?;
+    if chunk.sample_format != "s16le" {
+        return Err(invalid_audio_output(format!(
+            "unsupported sample format {}",
+            chunk.sample_format
+        )));
+    }
+
+    let metadata = AudioMetadata {
+        sample_rate,
+        channels,
+        sample_format: chunk.sample_format,
+    };
+    if expected.is_some_and(|expected| expected != &metadata) {
+        return Err(invalid_audio_output(
+            "sample metadata changed during synthesis",
+        ));
+    }
+
+    let max_encoded_len = MAX_AUDIO_CHUNK_BYTES.div_ceil(3) * 4;
+    if chunk.audio_base64.len() > max_encoded_len {
+        return Err(invalid_audio_output(format!(
+            "audio chunk exceeds {MAX_AUDIO_CHUNK_BYTES} decoded bytes"
+        )));
+    }
+    let audio = base64::engine::general_purpose::STANDARD
+        .decode(chunk.audio_base64)
+        .map_err(|_| invalid_audio_output("audio chunk is not valid base64"))?;
+    if audio.len() > MAX_AUDIO_CHUNK_BYTES {
+        return Err(invalid_audio_output(format!(
+            "audio chunk exceeds {MAX_AUDIO_CHUNK_BYTES} decoded bytes"
+        )));
+    }
+    let frame_size = usize::try_from(channels).unwrap() * 2;
+    if audio.len() % frame_size != 0 {
+        return Err(invalid_audio_output(
+            "audio chunk ends partway through a sample frame",
+        ));
+    }
+
+    Ok(DecodedAudioChunk { audio, metadata })
+}
+
+async fn emit_audio_chunk(
+    emitter: &SignalEmitter<'_>,
+    request_handle: &OwnedObjectPath,
+    session_handle: &OwnedObjectPath,
+    chunk: &DecodedAudioChunk,
+    done: bool,
+) -> zbus::fdo::Result<()> {
+    SpeechPortalBackend::audio_received(
+        emitter,
+        request_handle,
+        session_handle,
+        &chunk.audio,
+        chunk.metadata.sample_rate,
+        chunk.metadata.channels,
+        &chunk.metadata.sample_format,
+        done,
+    )
+    .await
+    .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))
 }
 
 fn acquire_prewarm_worker(state: &PortalState) -> zbus::fdo::Result<()> {
@@ -2429,6 +2737,16 @@ impl SpeechOptionsDbus {
     }
 }
 
+impl SynthesisOptionsDbus {
+    fn into_varlink(self) -> aileron_varlink::aileron_Inference::SynthesisOptions {
+        aileron_varlink::aileron_Inference::SynthesisOptions {
+            voice_id: self.voice_id,
+            language_hint: self.language_hint,
+            execution_mode: self.execution_mode,
+        }
+    }
+}
+
 impl VisionOptionsDbus {
     fn into_varlink(self) -> aileron_varlink::aileron_Inference::VisionOptions {
         aileron_varlink::aileron_Inference::VisionOptions {
@@ -2530,6 +2848,7 @@ mod tests {
             ("language.embed", PortalInterface::Language),
             ("speech.transcribe", PortalInterface::Speech),
             ("speech.translate", PortalInterface::Speech),
+            ("speech.synthesize", PortalInterface::Speech),
             ("vision.describe", PortalInterface::Vision),
             ("vision.detect", PortalInterface::Vision),
             ("vision.segment", PortalInterface::Vision),
@@ -2575,6 +2894,87 @@ mod tests {
         assert_eq!(converted.source_language_hint, "en");
         assert_eq!(converted.target_language_hint, "es");
         assert_eq!(converted.execution_mode, "background");
+    }
+
+    #[test]
+    fn synthesis_options_conversion_preserves_generated_fields() {
+        let converted = SynthesisOptionsDbus {
+            voice_id: "default".to_string(),
+            language_hint: "en".to_string(),
+            execution_mode: "interactive".to_string(),
+        }
+        .into_varlink();
+
+        assert_eq!(converted.voice_id, "default");
+        assert_eq!(converted.language_hint, "en");
+        assert_eq!(converted.execution_mode, "interactive");
+    }
+
+    #[test]
+    fn synthesis_input_rejects_empty_oversized_and_unknown_mode() {
+        let mut options = SynthesisOptionsDbus {
+            voice_id: String::new(),
+            language_hint: String::new(),
+            execution_mode: "interactive".to_string(),
+        };
+
+        assert!(validate_synthesis_input("Hello", &options).is_ok());
+        assert!(validate_synthesis_input("  ", &options).is_err());
+        assert!(
+            validate_synthesis_input(&"x".repeat(MAX_SYNTHESIS_TEXT_BYTES + 1), &options).is_err()
+        );
+        options.voice_id = "x".repeat(MAX_SYNTHESIS_VOICE_ID_BYTES + 1);
+        assert!(validate_synthesis_input("Hello", &options).is_err());
+        options.voice_id.clear();
+        options.language_hint = "x".repeat(MAX_SYNTHESIS_LANGUAGE_HINT_BYTES + 1);
+        assert!(validate_synthesis_input("Hello", &options).is_err());
+        options.language_hint.clear();
+        options.execution_mode = "urgent".to_string();
+        assert!(validate_synthesis_input("Hello", &options).is_err());
+    }
+
+    #[test]
+    fn audio_chunk_decode_enforces_framing_limits_and_stable_metadata() {
+        let valid = aileron_varlink::aileron_Inference::AudioChunk {
+            audio_base64: "AQACAA==".to_string(),
+            sample_rate: 24_000,
+            channels: 1,
+            sample_format: "s16le".to_string(),
+        };
+        let decoded = decode_audio_chunk(valid, None).expect("valid PCM should decode");
+        assert_eq!(decoded.audio, [1, 0, 2, 0]);
+
+        let changed = aileron_varlink::aileron_Inference::AudioChunk {
+            audio_base64: String::new(),
+            sample_rate: 48_000,
+            channels: 1,
+            sample_format: "s16le".to_string(),
+        };
+        assert!(decode_audio_chunk(changed, Some(&decoded.metadata)).is_err());
+
+        let partial_frame = aileron_varlink::aileron_Inference::AudioChunk {
+            audio_base64: "AQ==".to_string(),
+            sample_rate: 24_000,
+            channels: 1,
+            sample_format: "s16le".to_string(),
+        };
+        assert!(decode_audio_chunk(partial_frame, None).is_err());
+
+        let malformed = aileron_varlink::aileron_Inference::AudioChunk {
+            audio_base64: "not-base64".to_string(),
+            sample_rate: 24_000,
+            channels: 1,
+            sample_format: "s16le".to_string(),
+        };
+        assert!(decode_audio_chunk(malformed, None).is_err());
+
+        let oversized = aileron_varlink::aileron_Inference::AudioChunk {
+            audio_base64: "A".repeat(MAX_AUDIO_CHUNK_BYTES.div_ceil(3) * 4 + 1),
+            sample_rate: 24_000,
+            channels: 1,
+            sample_format: "s16le".to_string(),
+        };
+        assert!(decode_audio_chunk(oversized, None).is_err());
     }
 
     #[hegel::test]
@@ -2780,12 +3180,15 @@ mod tests {
             "request-1".to_string(),
             RequestRecord {
                 session_handle: None,
+                daemon_session_id: None,
                 cancelled: false,
                 active_connection: Some(connection),
             },
         );
 
-        cancel_request(&state, "request-1");
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(cancel_request(&state, "request-1"));
 
         assert_eq!(
             reader.join().expect("reader thread should finish"),
@@ -2802,13 +3205,16 @@ mod tests {
             "request-1".to_string(),
             RequestRecord {
                 session_handle: None,
+                daemon_session_id: None,
                 cancelled: false,
                 active_connection: None,
             },
         );
 
         assert!(ensure_request_active(&state, "request-1").is_ok());
-        cancel_request(&state, "request-1");
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(cancel_request(&state, "request-1"));
 
         let err =
             ensure_request_active(&state, "request-1").expect_err("cancelled request should fail");
@@ -2819,12 +3225,33 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_synthesis_request_releases_session_slot() {
+        let state = PortalState::default();
+        state.requests.lock().unwrap().insert(
+            "request-1".to_string(),
+            RequestRecord {
+                session_handle: Some("session-1".to_string()),
+                daemon_session_id: None,
+                cancelled: true,
+                active_connection: None,
+            },
+        );
+        begin_synthesis_request(&state, "session-1", "request-1").unwrap();
+
+        finish_synthesis_request(&state, "session-1", "request-1");
+
+        assert!(state.active_synthesis_requests.lock().unwrap().is_empty());
+        assert!(begin_synthesis_request(&state, "session-1", "request-2").is_ok());
+    }
+
+    #[test]
     fn session_cancellation_marks_only_matching_requests() {
         let state = PortalState::default();
         state.requests.lock().unwrap().insert(
             "request-1".to_string(),
             RequestRecord {
                 session_handle: Some("session-1".to_string()),
+                daemon_session_id: None,
                 cancelled: false,
                 active_connection: None,
             },
@@ -2833,6 +3260,7 @@ mod tests {
             "request-2".to_string(),
             RequestRecord {
                 session_handle: Some("session-2".to_string()),
+                daemon_session_id: None,
                 cancelled: false,
                 active_connection: None,
             },
