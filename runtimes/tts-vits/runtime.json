@@ -1,0 +1,8 @@
+{
+  "runtime_id": "tts-vits",
+  "capabilities": ["synthesize"],
+  "variants": ["cpu"],
+  "artifact_layout": {
+    "model": "/model/config.json, /model/vocab.json, and a complete Safetensors weight layout"
+  }
+}

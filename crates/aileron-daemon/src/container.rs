@@ -35,6 +35,13 @@
 /// Response (streamed tokens, same as generate):
 ///   {"id":"<uuid>","token":"Hello world","done":true}
 ///
+/// ### Speech synthesis
+/// Request:
+///   {"id":"<uuid>","type":"synthesize","text":"Hello","voice_id":"","language_hint":"en","execution_mode":"interactive"}
+/// Response (base64 interleaved PCM; final line is terminal only):
+///   {"id":"<uuid>","audio":"...","sample_rate":24000,"channels":1,"sample_format":"s16le"}
+///   {"id":"<uuid>","audio":"","done":true}
+///
 /// ### Image description
 /// Request:
 ///   {"id":"<uuid>","type":"describe","image":"<base64 PNG/JPEG>","prompt":"optional instructions"}
@@ -74,6 +81,7 @@ use std::sync::{Arc, LockResult, Mutex, MutexGuard, TryLockError, TryLockResult}
 use std::thread;
 
 use anyhow::{Context, Result, bail};
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::{info, warn};
@@ -86,6 +94,13 @@ use crate::profiles::RuntimeCandidate;
 const NVIDIA_LIBRARY_DIR: &str = "/usr/local/nvidia/lib64";
 const ML_RUNTIME_ID: &str = "llm-vision-whisper";
 const VULKAN_ICD_DIR: &str = "/usr/share/vulkan/icd.d";
+pub const MAX_SYNTHESIS_TEXT_BYTES: usize = 16 * 1024;
+pub const MAX_SYNTHESIS_VOICE_ID_BYTES: usize = 128;
+pub const MAX_SYNTHESIS_LANGUAGE_HINT_BYTES: usize = 64;
+pub const MAX_AUDIO_CHUNK_DECODED_BYTES: usize = 256 * 1024;
+pub const MAX_AUDIO_CHANNELS: i64 = 2;
+pub const MAX_AUDIO_SAMPLE_RATE: i64 = 192_000;
+const MIN_AUDIO_SAMPLE_RATE: i64 = 8_000;
 const NVIDIA_DRIVER_LIBRARIES: &[&str] = &[
     "libcuda.so.1",
     "libcuda.so",
@@ -229,6 +244,14 @@ pub struct ToolResult {
 pub struct GuidedToolResponse {
     pub content: String,
     pub tool_calls: Vec<ToolCall>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AudioChunk {
+    pub audio_base64: String,
+    pub sample_rate: i64,
+    pub channels: i64,
+    pub sample_format: String,
 }
 
 impl Container {
@@ -664,6 +687,25 @@ impl Container {
         read_text_stream_response(&mut self.stdout, &id, on_token)
     }
 
+    pub fn stream_synthesize(
+        &mut self,
+        text: &str,
+        voice_id: &str,
+        language_hint: &str,
+        execution_mode: &str,
+        on_chunk: impl FnMut(AudioChunk) -> Result<()>,
+    ) -> Result<()> {
+        let id = Uuid::new_v4().to_string();
+        let mut req = ContainerRequest::new(id.clone(), "synthesize");
+        req.text = Some(text.to_string());
+        req.voice_id = Some(voice_id.to_string());
+        req.language_hint = (!language_hint.is_empty()).then(|| language_hint.to_string());
+        req.execution_mode = Some(execution_mode.to_string());
+        write_request_line(&mut self.stdin, &req)?;
+        self.last_used = std::time::Instant::now();
+        read_synthesis_stream_response(&mut self.stdout, &id, on_chunk)
+    }
+
     /// Send a vision describe request and return the full description.
     pub fn describe(&mut self, image: Vec<u8>, instructions: &str) -> Result<String> {
         let mut result = String::new();
@@ -930,6 +972,139 @@ fn read_text_stream_response(
         }
     }
     Ok(())
+}
+
+fn read_synthesis_stream_response(
+    reader: &mut impl BufRead,
+    id: &str,
+    mut on_chunk: impl FnMut(AudioChunk) -> Result<()>,
+) -> Result<()> {
+    let mut buf = String::new();
+    let mut metadata: Option<(i64, i64, String)> = None;
+    let mut saw_audio = false;
+    loop {
+        buf.clear();
+        if reader.read_line(&mut buf)? == 0 {
+            bail!("container stdout closed before terminal synthesis response");
+        }
+        let resp: ContainerResponse = serde_json::from_str(buf.trim())?;
+        if resp.id != id {
+            continue;
+        }
+        if let Some((error, reason)) = response_error(&resp) {
+            bail!("container returned error {error}: {reason}");
+        }
+
+        let done = resp.done.unwrap_or(false);
+        let audio_base64 = resp
+            .audio
+            .ok_or_else(|| anyhow::anyhow!("synthesis response is missing audio"))?;
+        if audio_base64.is_empty() {
+            if !done {
+                bail!("synthesis response contains empty audio before terminal response");
+            }
+            if !saw_audio {
+                bail!("container completed synthesis without audio output");
+            }
+            if let Some(expected) = &metadata {
+                validate_stable_audio_metadata(
+                    expected,
+                    resp.sample_rate,
+                    resp.channels,
+                    resp.sample_format.as_deref(),
+                )?;
+            }
+            break;
+        }
+        if done {
+            bail!("terminal synthesis response must not contain audio");
+        }
+        if audio_base64.len() > MAX_AUDIO_CHUNK_DECODED_BYTES.div_ceil(3) * 4 {
+            bail!(
+                "synthesis audio chunk exceeds maximum decoded size of {MAX_AUDIO_CHUNK_DECODED_BYTES} bytes"
+            );
+        }
+        let audio = base64::engine::general_purpose::STANDARD
+            .decode(&audio_base64)
+            .context("synthesis audio is not valid base64")?;
+        if audio.is_empty() {
+            bail!("synthesis response contains empty decoded audio");
+        }
+        if audio.len() > MAX_AUDIO_CHUNK_DECODED_BYTES {
+            bail!(
+                "synthesis audio chunk exceeds maximum decoded size of {MAX_AUDIO_CHUNK_DECODED_BYTES} bytes"
+            );
+        }
+
+        let current = match &metadata {
+            None => validate_initial_audio_metadata(
+                resp.sample_rate,
+                resp.channels,
+                resp.sample_format.as_deref(),
+            )?,
+            Some(expected) => validate_stable_audio_metadata(
+                expected,
+                resp.sample_rate,
+                resp.channels,
+                resp.sample_format.as_deref(),
+            )?,
+        };
+        let frame_bytes = usize::try_from(current.1)? * size_of::<i16>();
+        if audio.len() % frame_bytes != 0 {
+            bail!(
+                "synthesis audio chunk length {} is not a complete {}-byte sample frame",
+                audio.len(),
+                frame_bytes
+            );
+        }
+        metadata.get_or_insert_with(|| current.clone());
+        saw_audio = true;
+        on_chunk(AudioChunk {
+            audio_base64,
+            sample_rate: current.0,
+            channels: current.1,
+            sample_format: current.2,
+        })?;
+    }
+    Ok(())
+}
+
+fn validate_initial_audio_metadata(
+    sample_rate: Option<i64>,
+    channels: Option<i64>,
+    sample_format: Option<&str>,
+) -> Result<(i64, i64, String)> {
+    let sample_rate = sample_rate.context("first synthesis audio chunk is missing sample_rate")?;
+    let channels = channels.context("first synthesis audio chunk is missing channels")?;
+    let sample_format =
+        sample_format.context("first synthesis audio chunk is missing sample_format")?;
+    if !(MIN_AUDIO_SAMPLE_RATE..=MAX_AUDIO_SAMPLE_RATE).contains(&sample_rate) {
+        bail!(
+            "synthesis sample_rate must be between {MIN_AUDIO_SAMPLE_RATE} and {MAX_AUDIO_SAMPLE_RATE}"
+        );
+    }
+    if !(1..=MAX_AUDIO_CHANNELS).contains(&channels) {
+        bail!("synthesis channels must be between 1 and {MAX_AUDIO_CHANNELS}");
+    }
+    if sample_format != "s16le" {
+        bail!("unsupported synthesis sample_format {sample_format}");
+    }
+    Ok((sample_rate, channels, sample_format.to_string()))
+}
+
+fn validate_stable_audio_metadata(
+    expected: &(i64, i64, String),
+    sample_rate: Option<i64>,
+    channels: Option<i64>,
+    sample_format: Option<&str>,
+) -> Result<(i64, i64, String)> {
+    if sample_rate.is_some_and(|value| value != expected.0)
+        || channels.is_some_and(|value| value != expected.1)
+        || sample_format.is_some_and(|value| value != expected.2.as_str())
+    {
+        bail!("synthesis audio metadata changed between chunks");
+    }
+    Ok(expected.clone())
 }
 
 #[doc(hidden)]
@@ -2571,6 +2746,8 @@ struct ContainerRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     prompt: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     input: Option<Vec<InputMessage>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
@@ -2591,6 +2768,8 @@ struct ContainerRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     language_hint: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    voice_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     execution_mode: Option<String>,
     /// Present only for `generate_structured` requests.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2608,6 +2787,7 @@ impl ContainerRequest {
             r#type: request_type.to_string(),
             system: None,
             prompt: None,
+            text: None,
             input: None,
             max_tokens: None,
             temperature: None,
@@ -2617,6 +2797,7 @@ impl ContainerRequest {
             points: None,
             boxes: None,
             language_hint: None,
+            voice_id: None,
             execution_mode: None,
             response_format: None,
             tools: None,
@@ -2664,6 +2845,11 @@ struct ContainerResponse {
     tool_calls: Option<Vec<ToolCall>>,
     /// Present in embedding responses.
     embedding: Option<Vec<f32>>,
+    /// Present in synthesis responses as base64 interleaved PCM.
+    audio: Option<String>,
+    sample_rate: Option<i64>,
+    channels: Option<i64>,
+    sample_format: Option<String>,
     error: Option<String>,
     reason: Option<String>,
     prompt_tokens: Option<u64>,
@@ -2678,6 +2864,127 @@ mod tests {
     use super::*;
     use hegel::TestCase;
     use hegel::generators as gs;
+
+    fn synthesis_response(lines: &[&str]) -> Result<Vec<AudioChunk>> {
+        let input = lines.join("\n") + "\n";
+        let mut reader = BufReader::new(std::io::Cursor::new(input));
+        let mut chunks = Vec::new();
+        read_synthesis_stream_response(&mut reader, "request-1", |chunk| {
+            chunks.push(chunk);
+            Ok(())
+        })?;
+        Ok(chunks)
+    }
+
+    #[test]
+    fn synthesis_parser_accepts_ordered_multichunk_pcm_and_terminal_response() {
+        let chunks = synthesis_response(&[
+            r#"{"id":"request-1","audio":"AQACAAMABAA=","sample_rate":24000,"channels":1,"sample_format":"s16le"}"#,
+            r#"{"id":"request-1","audio":"BQAGAA=="}"#,
+            r#"{"id":"request-1","audio":"","done":true}"#,
+        ])
+        .unwrap();
+
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].audio_base64, "AQACAAMABAA=");
+        assert_eq!(chunks[1].audio_base64, "BQAGAA==");
+        assert!(chunks.iter().all(|chunk| chunk.sample_rate == 24_000));
+    }
+
+    #[test]
+    fn synthesis_parser_rejects_malformed_base64() {
+        let error = synthesis_response(&[
+            r#"{"id":"request-1","audio":"%%%","sample_rate":24000,"channels":1,"sample_format":"s16le"}"#,
+            r#"{"id":"request-1","audio":"","done":true}"#,
+        ])
+        .unwrap_err();
+
+        assert!(error.to_string().contains("valid base64"));
+    }
+
+    #[test]
+    fn synthesis_parser_rejects_partial_sample_frames() {
+        let error = synthesis_response(&[
+            r#"{"id":"request-1","audio":"AQID","sample_rate":24000,"channels":1,"sample_format":"s16le"}"#,
+            r#"{"id":"request-1","audio":"","done":true}"#,
+        ])
+        .unwrap_err();
+
+        assert!(error.to_string().contains("complete 2-byte sample frame"));
+    }
+
+    #[test]
+    fn synthesis_parser_rejects_metadata_changes() {
+        let error = synthesis_response(&[
+            r#"{"id":"request-1","audio":"AQACAA==","sample_rate":24000,"channels":1,"sample_format":"s16le"}"#,
+            r#"{"id":"request-1","audio":"AwAEAA==","sample_rate":48000}"#,
+            r#"{"id":"request-1","audio":"","done":true}"#,
+        ])
+        .unwrap_err();
+
+        assert!(error.to_string().contains("metadata changed"));
+    }
+
+    #[test]
+    fn synthesis_parser_rejects_invalid_initial_metadata() {
+        for (sample_rate, channels, sample_format, expected) in [
+            (7_999, 1, "s16le", "sample_rate"),
+            (24_000, 3, "s16le", "channels"),
+            (24_000, 1, "f32le", "sample_format"),
+        ] {
+            let line = serde_json::json!({
+                "id": "request-1",
+                "audio": "AQACAA==",
+                "sample_rate": sample_rate,
+                "channels": channels,
+                "sample_format": sample_format
+            })
+            .to_string();
+
+            let error = synthesis_response(&[&line]).unwrap_err();
+            assert!(error.to_string().contains(expected), "{error:#}");
+        }
+    }
+
+    #[test]
+    fn synthesis_parser_rejects_metadata_changes_on_terminal_response() {
+        let error = synthesis_response(&[
+            r#"{"id":"request-1","audio":"AQACAA==","sample_rate":24000,"channels":1,"sample_format":"s16le"}"#,
+            r#"{"id":"request-1","audio":"","sample_rate":48000,"done":true}"#,
+        ])
+        .unwrap_err();
+
+        assert!(error.to_string().contains("metadata changed"));
+    }
+
+    #[test]
+    fn synthesis_parser_rejects_empty_output_and_missing_terminal_response() {
+        let empty =
+            synthesis_response(&[r#"{"id":"request-1","audio":"","done":true}"#]).unwrap_err();
+        let unterminated = synthesis_response(&[r#"{"id":"request-1","audio":"AQACAA==","sample_rate":24000,"channels":1,"sample_format":"s16le"}"#])
+            .unwrap_err();
+
+        assert!(empty.to_string().contains("without audio output"));
+        assert!(unterminated.to_string().contains("before terminal"));
+    }
+
+    #[test]
+    fn synthesis_parser_rejects_oversized_decoded_chunks_before_forwarding() {
+        let audio =
+            base64::engine::general_purpose::STANDARD
+                .encode(vec![0_u8; MAX_AUDIO_CHUNK_DECODED_BYTES + 2]);
+        let line = serde_json::json!({
+            "id": "request-1",
+            "audio": audio,
+            "sample_rate": 24_000,
+            "channels": 1,
+            "sample_format": "s16le"
+        })
+        .to_string();
+        let error = synthesis_response(&[&line]).unwrap_err();
+
+        assert!(error.to_string().contains("maximum decoded size"));
+    }
 
     #[test]
     fn oci_config_preserves_core_sandbox_settings() {
@@ -3633,6 +3940,10 @@ mod tests {
             snapshot: None,
             tool_calls: None,
             embedding: None,
+            audio: None,
+            sample_rate: None,
+            channels: None,
+            sample_format: None,
             error: Some("schema_validation_failed".to_string()),
             reason: Some("expected object".to_string()),
             prompt_tokens: None,
@@ -3657,6 +3968,10 @@ mod tests {
             snapshot: None,
             tool_calls: None,
             embedding: None,
+            audio: None,
+            sample_rate: None,
+            channels: None,
+            sample_format: None,
             error: None,
             reason: None,
             prompt_tokens: None,
@@ -3938,6 +4253,27 @@ mod tests {
             })
             .expect("stream transcribe through container wrapper");
         assert!(!streamed_transcript.is_empty());
+
+        let mut synthesis_chunks = Vec::new();
+        container
+            .stream_synthesize("Hello from the stub.", "", "en", "interactive", |chunk| {
+                synthesis_chunks.push(chunk);
+                Ok(())
+            })
+            .expect("synthesize through container wrapper");
+        assert!(synthesis_chunks.len() >= 2);
+        assert!(
+            synthesis_chunks
+                .iter()
+                .all(|chunk| !chunk.audio_base64.is_empty())
+        );
+        assert!(
+            synthesis_chunks
+                .iter()
+                .all(|chunk| chunk.sample_rate == 24_000
+                    && chunk.channels == 1
+                    && chunk.sample_format == "s16le")
+        );
 
         let translation = container
             .transcribe(Vec::new(), None, "translate")

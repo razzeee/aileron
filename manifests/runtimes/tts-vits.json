@@ -1,0 +1,6 @@
+{
+  "runtime_id": "tts-vits",
+  "images": {
+    "cpu": "ghcr.io/razzeee/aileron-runtime-tts-vits:cpu"
+  }
+}

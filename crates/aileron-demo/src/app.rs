@@ -1,6 +1,7 @@
 /// aileron-demo — sandboxed GTK4 article summarizer.
 mod frontends;
 pub(crate) mod tool_demo;
+mod tts;
 
 use gtk4::prelude::*;
 use gtk4::{Button, DropDown, Label};
@@ -14,8 +15,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tts::phrase_buffer::{PhraseBuffer, PhraseBufferConfig};
+use tts::{
+    AudioFormat, CancellationToken, PcmFanout, PhraseSynthesizer, PwPlayback, WavSink,
+    run_ordered_synthesis,
+};
 use zbus::zvariant::{Fd, OwnedFd, OwnedObjectPath, OwnedValue, Type, Value};
 
 const PORTAL_BUS: &str = "org.freedesktop.portal.Desktop";
@@ -129,15 +135,24 @@ fn create_public_session(
     instructions: &str,
 ) -> anyhow::Result<OwnedObjectPath> {
     let conn = portal_connection()?;
+    create_public_session_on_connection(proxy, &conn, use_case, instructions)
+}
+
+fn create_public_session_on_connection(
+    proxy: &zbus::blocking::Proxy<'_>,
+    conn: &zbus::blocking::Connection,
+    use_case: &str,
+    instructions: &str,
+) -> anyhow::Result<OwnedObjectPath> {
     let token_suffix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
     let handle_token = format!("create_{token_suffix}");
     let session_handle_token = format!("session_{token_suffix}");
-    let request_path = portal_request_path(&conn, &handle_token)?;
+    let request_path = portal_request_path(conn, &handle_token)?;
     let request_proxy =
-        zbus::blocking::Proxy::new(&conn, PORTAL_BUS, request_path.as_str(), REQUEST_IFACE)?;
+        zbus::blocking::Proxy::new(conn, PORTAL_BUS, request_path.as_str(), REQUEST_IFACE)?;
     let mut response_iter = request_proxy.receive_signal("Response")?;
     let mut options = empty_options();
     options.insert(
@@ -214,8 +229,29 @@ fn wait_request_success(request_handle: &OwnedObjectPath) -> anyhow::Result<()> 
 
 fn close_public_session(session_handle: &OwnedObjectPath) -> zbus::Result<()> {
     let conn = portal_connection()?;
+    close_public_session_on_connection(&conn, session_handle)
+}
+
+fn close_public_session_on_connection(
+    conn: &zbus::blocking::Connection,
+    session_handle: &OwnedObjectPath,
+) -> zbus::Result<()> {
     let proxy =
-        zbus::blocking::Proxy::new(&conn, PORTAL_BUS, session_handle.as_str(), SESSION_IFACE)?;
+        zbus::blocking::Proxy::new(conn, PORTAL_BUS, session_handle.as_str(), SESSION_IFACE)?;
+    proxy.call("Close", &())
+}
+
+fn close_public_request(request_handle: &OwnedObjectPath) -> zbus::Result<()> {
+    let conn = portal_connection()?;
+    close_public_request_on_connection(&conn, request_handle)
+}
+
+fn close_public_request_on_connection(
+    conn: &zbus::blocking::Connection,
+    request_handle: &OwnedObjectPath,
+) -> zbus::Result<()> {
+    let proxy =
+        zbus::blocking::Proxy::new(conn, PORTAL_BUS, request_handle.as_str(), REQUEST_IFACE)?;
     proxy.call("Close", &())
 }
 
@@ -574,6 +610,76 @@ enum DemoEvent {
     Text(String),
     Error(String),
     Done,
+}
+
+#[derive(Clone)]
+struct SpeechOutput {
+    wav_path: Option<PathBuf>,
+    keep_partial: bool,
+}
+
+struct CancelOnDrop {
+    token: CancellationToken,
+    armed: bool,
+}
+
+struct PortalOperationGuard {
+    connection: zbus::blocking::Connection,
+    request: OwnedObjectPath,
+    session: OwnedObjectPath,
+    armed: bool,
+}
+
+struct ConnectionCloseGuard {
+    connection: zbus::blocking::Connection,
+    armed: bool,
+}
+
+impl ConnectionCloseGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ConnectionCloseGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.connection.clone().close();
+        }
+    }
+}
+
+impl PortalOperationGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PortalOperationGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = close_public_request_on_connection(&self.connection, &self.request);
+            let _ = close_public_session_on_connection(&self.connection, &self.session);
+        }
+    }
+}
+
+impl CancelOnDrop {
+    fn new(token: CancellationToken) -> Self {
+        Self { token, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            self.token.cancel();
+        }
+    }
 }
 
 enum ChatEvent {
@@ -1047,7 +1153,13 @@ fn concise_error(message: &str) -> String {
 }
 
 /// Call `StreamResponse` on the portal and forward token signals via `tx`.
-fn summarize_streaming(text: &str, tx: std::sync::mpsc::Sender<DemoEvent>) -> anyhow::Result<()> {
+fn summarize_streaming(
+    text: &str,
+    tx: std::sync::mpsc::Sender<DemoEvent>,
+    speech_output: Option<SpeechOutput>,
+    cancel: CancellationToken,
+) -> anyhow::Result<()> {
+    let mut cancel_on_drop = CancelOnDrop::new(cancel.clone());
     let call_conn = portal_connection()?;
     let signal_conn = call_conn.clone();
 
@@ -1089,7 +1201,7 @@ fn summarize_streaming(text: &str, tx: std::sync::mpsc::Sender<DemoEvent>) -> an
     let mut token_iter = sig_proxy.receive_signal("TokenReceived")?;
     let token_session_handle = session_handle.clone();
     let tx_tokens = tx.clone();
-    let (stream_event_tx, stream_event_rx) = std::sync::mpsc::channel();
+    let (stream_event_tx, stream_event_rx) = std::sync::mpsc::sync_channel(64);
     let token_event_tx = stream_event_tx.clone();
     std::thread::spawn(move || {
         let result = (|| -> anyhow::Result<()> {
@@ -1116,6 +1228,37 @@ fn summarize_streaming(text: &str, tx: std::sync::mpsc::Sender<DemoEvent>) -> an
         }
     });
 
+    let speech_worker = speech_output.map(|output| {
+        let (phrase_tx, phrase_rx) = std::sync::mpsc::sync_channel::<String>(8);
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let speech_cancel = cancel.clone();
+        let speech_status = tx.clone();
+        std::thread::spawn(move || {
+            let result = (|| -> anyhow::Result<()> {
+                speech_status.send(DemoEvent::Status(
+                    "Opening speech.synthesize and loading the speech model...".into(),
+                ))?;
+                let synthesizer = PortalPhraseSynthesizer::new()?;
+                let mut sinks: Vec<Box<dyn tts::PcmSink>> = vec![Box::new(PwPlayback::new())];
+                if let Some(path) = output.wav_path {
+                    sinks.push(Box::new(WavSink::new(path)));
+                }
+                speech_status.send(DemoEvent::Status(
+                    "Speech is ready; waiting for the first stable phrase...".into(),
+                ))?;
+                run_ordered_synthesis(
+                    phrase_rx,
+                    synthesizer,
+                    PcmFanout::new(sinks, 8),
+                    speech_cancel,
+                    output.keep_partial,
+                )
+            })();
+            let _ = result_tx.send(result);
+        });
+        (phrase_tx, result_rx)
+    });
+
     let options = generation_options(512, "", "");
     tx.send(DemoEvent::Phase(DemoPhase::RequestingStream))?;
     let stream_result: zbus::Result<OwnedObjectPath> = proxy.call(
@@ -1129,19 +1272,55 @@ fn summarize_streaming(text: &str, tx: std::sync::mpsc::Sender<DemoEvent>) -> an
             return Err(error.into());
         }
     };
+    let mut operation_guard = PortalOperationGuard {
+        connection: call_conn.clone(),
+        request: request_handle.clone(),
+        session: session_handle.clone(),
+        armed: true,
+    };
     let response_request_handle = request_handle.clone();
     std::thread::spawn(move || {
         let result = wait_request_success(&response_request_handle);
         let _ = stream_event_tx.send(Ok(TokenStreamEvent::RequestDone(result)));
     });
 
+    let mut phrase_buffer = speech_worker
+        .as_ref()
+        .map(|_| PhraseBuffer::new(PhraseBufferConfig::default()));
     let mut terminal_seen = false;
     let mut request_done = false;
     loop {
-        match stream_event_rx.recv() {
+        if cancel.is_cancelled() {
+            let _ = close_public_request(&request_handle);
+            drop(speech_worker);
+            let _ = close_public_session(&session_handle);
+            anyhow::bail!("language and speech request cancelled");
+        }
+        let wait = phrase_buffer
+            .as_ref()
+            .and_then(PhraseBuffer::deadline)
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+            .unwrap_or(Duration::from_millis(50))
+            .min(Duration::from_millis(50));
+        match stream_event_rx.recv_timeout(wait) {
             Ok(event) => match event? {
                 TokenStreamEvent::Token(token, done) => {
-                    tx_tokens.send(DemoEvent::Token(token))?;
+                    tx_tokens.send(DemoEvent::Token(token.clone()))?;
+                    if let (Some(buffer), Some((phrase_tx, _))) =
+                        (phrase_buffer.as_mut(), speech_worker.as_ref())
+                    {
+                        let phrases = if done {
+                            let now = Instant::now();
+                            let mut phrases = buffer.push(&token, now);
+                            phrases.extend(buffer.finish(now));
+                            phrases
+                        } else {
+                            buffer.push(&token, Instant::now())
+                        };
+                        for phrase in phrases {
+                            send_phrase(phrase_tx, phrase.text, &cancel)?;
+                        }
+                    }
                     if done {
                         terminal_seen = true;
                     }
@@ -1151,7 +1330,16 @@ fn summarize_streaming(text: &str, tx: std::sync::mpsc::Sender<DemoEvent>) -> an
                     request_done = true;
                 }
             },
-            Err(std::sync::mpsc::RecvError) => {
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if let (Some(buffer), Some((phrase_tx, _))) =
+                    (phrase_buffer.as_mut(), speech_worker.as_ref())
+                {
+                    for phrase in buffer.flush_due(Instant::now()) {
+                        send_phrase(phrase_tx, phrase.text, &cancel)?;
+                    }
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 anyhow::bail!("token stream ended before the request completed");
             }
         }
@@ -1160,9 +1348,228 @@ fn summarize_streaming(text: &str, tx: std::sync::mpsc::Sender<DemoEvent>) -> an
         }
     }
 
+    if let Some((phrase_tx, result_rx)) = speech_worker {
+        drop(phrase_tx);
+        result_rx
+            .recv()
+            .map_err(|_| anyhow::anyhow!("speech worker ended without a result"))??;
+    }
     close_public_session(&session_handle)?;
+    operation_guard.disarm();
+    cancel_on_drop.disarm();
     tx.send(DemoEvent::Done)?;
     Ok(())
+}
+
+fn send_phrase(
+    sender: &std::sync::mpsc::SyncSender<String>,
+    mut phrase: String,
+    cancel: &CancellationToken,
+) -> anyhow::Result<()> {
+    loop {
+        if cancel.is_cancelled() {
+            anyhow::bail!("language and speech request cancelled");
+        }
+        match sender.try_send(phrase) {
+            Ok(()) => return Ok(()),
+            Err(std::sync::mpsc::TrySendError::Full(returned)) => {
+                phrase = returned;
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                anyhow::bail!("speech worker stopped");
+            }
+        }
+    }
+}
+
+struct PortalPhraseSynthesizer {
+    connection: zbus::blocking::Connection,
+    session_handle: OwnedObjectPath,
+    active_request: Arc<Mutex<Option<OwnedObjectPath>>>,
+}
+
+impl PortalPhraseSynthesizer {
+    fn new() -> anyhow::Result<Self> {
+        let conn = zbus::blocking::Connection::session()?;
+        let proxy = zbus::blocking::Proxy::new(&conn, PORTAL_BUS, PORTAL_PATH, SPEECH_IFACE)?;
+        let session_handle = create_public_session_on_connection(
+            &proxy,
+            &conn,
+            "speech.synthesize",
+            "Speak submitted text clearly using the default voice.",
+        )?;
+        Ok(Self {
+            connection: conn,
+            session_handle,
+            active_request: Arc::new(Mutex::new(None)),
+        })
+    }
+}
+
+impl PhraseSynthesizer for PortalPhraseSynthesizer {
+    fn synthesize(
+        &mut self,
+        phrase: &str,
+        cancel: &CancellationToken,
+        receive: &mut dyn FnMut(AudioFormat, Arc<[u8]>) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        let call_conn = self.connection.clone();
+        let signal_conn = call_conn.clone();
+        let proxy = zbus::blocking::Proxy::new(&call_conn, PORTAL_BUS, PORTAL_PATH, SPEECH_IFACE)?;
+        let signal_proxy =
+            zbus::blocking::Proxy::new(&signal_conn, PORTAL_BUS, PORTAL_PATH, SPEECH_IFACE)?;
+        let mut audio_iter = signal_proxy.receive_signal("AudioReceived")?;
+        let expected_session = self.session_handle.clone();
+        let (event_tx, event_rx) = std::sync::mpsc::channel();
+        let audio_tx = event_tx.clone();
+        std::thread::spawn(move || {
+            let result = (|| -> anyhow::Result<()> {
+                for message in &mut audio_iter {
+                    let (request, session, audio, sample_rate, channels, sample_format, done): (
+                        OwnedObjectPath,
+                        OwnedObjectPath,
+                        Vec<u8>,
+                        u32,
+                        u32,
+                        String,
+                        bool,
+                    ) = message.body().deserialize()?;
+                    if session.as_str() != expected_session.as_str() {
+                        continue;
+                    }
+                    audio_tx.send(Ok(AudioStreamEvent::Audio {
+                        request,
+                        audio,
+                        format: AudioFormat {
+                            sample_rate,
+                            channels,
+                            sample_format,
+                        },
+                        done,
+                    }))?;
+                    if done {
+                        break;
+                    }
+                }
+                Ok(())
+            })();
+            if let Err(error) = result {
+                let _ = audio_tx.send(Err(error));
+            }
+        });
+
+        let mut options = execution_options();
+        options.insert("voice_id".into(), string_option_value(""));
+        options.insert("language_hint".into(), string_option_value(""));
+        let token_suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let handle_token = format!("synthesize_{token_suffix}");
+        let request_path = portal_request_path(&call_conn, &handle_token)?;
+        let request_proxy = zbus::blocking::Proxy::new(
+            &call_conn,
+            PORTAL_BUS,
+            request_path.as_str(),
+            REQUEST_IFACE,
+        )?;
+        let mut response_iter = request_proxy.receive_signal("Response")?;
+        options.insert("handle_token".into(), string_option_value(&handle_token));
+        let request_handle: OwnedObjectPath =
+            proxy.call("StreamSynthesize", &(&self.session_handle, phrase, options))?;
+        if request_handle.as_str() != request_path {
+            anyhow::bail!(
+                "StreamSynthesize returned unexpected request handle: {}",
+                request_handle.as_str()
+            );
+        }
+        *self.active_request.lock().unwrap() = Some(request_handle.clone());
+        std::thread::spawn(move || {
+            let result = wait_request_response_from_iter(&mut response_iter).map(|_| ());
+            let _ = event_tx.send(Ok(AudioStreamEvent::RequestDone(result)));
+        });
+        let mut operation_guard = PortalOperationGuard {
+            connection: call_conn.clone(),
+            request: request_handle.clone(),
+            session: self.session_handle.clone(),
+            armed: true,
+        };
+        let mut connection_guard = ConnectionCloseGuard {
+            connection: call_conn.clone(),
+            armed: true,
+        };
+
+        let mut terminal_seen = false;
+        let mut request_done = false;
+        let mut received_audio = false;
+        while !(terminal_seen && request_done) {
+            if cancel.is_cancelled() {
+                let _ = close_public_request_on_connection(&call_conn, &request_handle);
+                *self.active_request.lock().unwrap() = None;
+                anyhow::bail!("speech synthesis cancelled");
+            }
+            match event_rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(event) => match event? {
+                    AudioStreamEvent::Audio {
+                        request,
+                        audio,
+                        format,
+                        done,
+                    } => {
+                        if request.as_str() != request_handle.as_str() {
+                            continue;
+                        }
+                        if !audio.is_empty() {
+                            receive(format, Arc::from(audio))?;
+                            received_audio = true;
+                        }
+                        terminal_seen = done;
+                    }
+                    AudioStreamEvent::RequestDone(result) => {
+                        result?;
+                        request_done = true;
+                    }
+                },
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    anyhow::bail!("audio stream ended before request completion");
+                }
+            }
+        }
+        *self.active_request.lock().unwrap() = None;
+        if !received_audio {
+            anyhow::bail!("speech synthesis completed without audio");
+        }
+        operation_guard.disarm();
+        connection_guard.disarm();
+        Ok(())
+    }
+
+    fn cancel(&mut self) -> anyhow::Result<()> {
+        if let Some(request) = self.active_request.lock().unwrap().take() {
+            close_public_request_on_connection(&self.connection, &request)?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for PortalPhraseSynthesizer {
+    fn drop(&mut self) {
+        let _ = self.cancel();
+        let _ = close_public_session_on_connection(&self.connection, &self.session_handle);
+        let _ = self.connection.clone().close();
+    }
+}
+
+enum AudioStreamEvent {
+    Audio {
+        request: OwnedObjectPath,
+        audio: Vec<u8>,
+        format: AudioFormat,
+        done: bool,
+    },
+    RequestDone(anyhow::Result<()>),
 }
 
 fn stream_language_text(

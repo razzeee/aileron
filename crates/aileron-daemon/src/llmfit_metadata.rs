@@ -7,7 +7,12 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-use llmfit_core::{LlmModel, ModelDatabase, ModelFit, ModelFormat, RunMode, SystemSpecs};
+use llmfit_core::{
+    Capability, LlmModel, ModelDatabase, ModelFit, ModelFormat, RunMode, SystemSpecs,
+};
+
+pub const VITS_RUNTIME_ID: &str = "tts-vits";
+pub const SUPPORTED_LANGUAGES_OPTION: &str = "SUPPORTED_LANGUAGES";
 
 static DATABASE: OnceLock<ModelDatabase> = OnceLock::new();
 
@@ -42,6 +47,27 @@ pub fn fit_score_for_category(model: &LlmModel, system: &SystemSpecs, category: 
     let mut model = model.clone();
     model.use_case = category.to_string();
     ModelFit::analyze(&model, system).score
+}
+
+pub fn is_supported_vits_tts(model: &LlmModel) -> bool {
+    model.format == ModelFormat::Safetensors
+        && model
+            .architecture
+            .as_deref()
+            .is_some_and(|architecture| architecture.eq_ignore_ascii_case("vits"))
+        && Capability::infer(model).contains(&Capability::Tts)
+}
+
+pub fn supported_languages_option(model: &LlmModel) -> Option<String> {
+    let mut languages = model
+        .languages
+        .iter()
+        .map(|language| language.trim().to_ascii_lowercase())
+        .filter(|language| !language.is_empty())
+        .collect::<Vec<_>>();
+    languages.sort();
+    languages.dedup();
+    (!languages.is_empty()).then(|| languages.join(","))
 }
 
 pub fn apply_llama_runtime_options(
@@ -97,5 +123,39 @@ mod tests {
         let model = find("google/gemma-4-E4B-it").expect("deduplicated metadata exists");
 
         assert_eq!(canonical_slug(&model.name), "gemma4e4bit");
+    }
+
+    #[test]
+    fn finds_supported_vits_tts_metadata() {
+        let model = all()
+            .iter()
+            .find(|model| is_supported_vits_tts(model))
+            .expect("llmfit should include a supported VITS model");
+
+        assert_eq!(model.format, ModelFormat::Safetensors);
+        assert!(
+            model
+                .architecture
+                .as_deref()
+                .is_some_and(|architecture| architecture.eq_ignore_ascii_case("vits"))
+        );
+        assert!(Capability::infer(model).contains(&Capability::Tts));
+    }
+
+    #[test]
+    fn supported_languages_are_normalized_and_stable() {
+        let model = all()
+            .iter()
+            .find(|model| is_supported_vits_tts(model) && !model.languages.is_empty())
+            .expect("supported VITS language metadata exists");
+        let option = supported_languages_option(model).expect("language option");
+        let values = option.split(',').collect::<Vec<_>>();
+
+        assert!(values.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(
+            values
+                .iter()
+                .all(|value| *value == value.to_ascii_lowercase())
+        );
     }
 }
