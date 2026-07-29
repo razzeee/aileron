@@ -1971,11 +1971,79 @@ fn compare_candidates(
     assigned: &HashSet<&str>,
     use_case: &str,
 ) -> std::cmp::Ordering {
+    let desktop_language = desktop_language();
+    compare_candidates_with_language(a, b, assigned, use_case, desktop_language)
+}
+
+fn compare_candidates_with_language(
+    a: &aileron_varlink::aileron_Models::CatalogProfileInfo,
+    b: &aileron_varlink::aileron_Models::CatalogProfileInfo,
+    assigned: &HashSet<&str>,
+    use_case: &str,
+    desktop_language: Option<isolang::Language>,
+) -> std::cmp::Ordering {
     candidate_rank(a, assigned, use_case)
         .cmp(&candidate_rank(b, assigned, use_case))
+        .then_with(|| {
+            preferred_language_rank(a, use_case, desktop_language).cmp(&preferred_language_rank(
+                b,
+                use_case,
+                desktop_language,
+            ))
+        })
         .then_with(|| compare_fit_score(task_fit_score(a, use_case), task_fit_score(b, use_case)))
         .then_with(|| compare_asr_quality(a, b, use_case))
         .then_with(|| a.disk_size_gb.total_cmp(&b.disk_size_gb))
+}
+
+fn preferred_language_rank(
+    profile: &aileron_varlink::aileron_Models::CatalogProfileInfo,
+    use_case: &str,
+    desktop_language: Option<isolang::Language>,
+) -> u8 {
+    if use_case != "speech.synthesize" {
+        return 0;
+    }
+    if desktop_language.is_some_and(|language| profile_supports_language(profile, language)) {
+        0
+    } else if profile_supports_language(profile, isolang::Language::Eng) {
+        1
+    } else if profile
+        .supported_languages
+        .as_ref()
+        .is_none_or(Vec::is_empty)
+    {
+        3
+    } else {
+        2
+    }
+}
+
+fn desktop_language() -> Option<isolang::Language> {
+    ["LC_ALL", "LC_MESSAGES", "LANG"]
+        .into_iter()
+        .filter_map(|key| std::env::var(key).ok())
+        .find_map(|locale| isolang::Language::from_locale(&locale))
+}
+
+fn profile_supports_language(
+    profile: &aileron_varlink::aileron_Models::CatalogProfileInfo,
+    expected: isolang::Language,
+) -> bool {
+    profile
+        .supported_languages
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|value| {
+            let code = value
+                .split(['-', '_'])
+                .next()
+                .unwrap_or(value)
+                .to_ascii_lowercase();
+            isolang::Language::from_639_1(&code).or_else(|| isolang::Language::from_639_3(&code))
+        })
+        .any(|language| language == expected)
 }
 
 fn task_fit_score(
@@ -2359,6 +2427,28 @@ mod tests {
 
         assert_eq!(
             compare_candidates(&turbo, &medium, &assigned, "speech.transcribe"),
+            std::cmp::Ordering::Less
+        );
+    }
+
+    #[test]
+    fn tts_recommendation_prefers_english_fallback_over_smaller_unrelated_language() {
+        let assigned = HashSet::new();
+        let mut english = catalog_profile("facebook_mms-tts-eng-f16", "small", 0.08);
+        english.use_cases = vec!["speech.synthesize".to_string()];
+        english.supported_languages = Some(vec!["eng".to_string()]);
+        let mut russian = catalog_profile("tts-ru", "small", 0.03);
+        russian.use_cases = vec!["speech.synthesize".to_string()];
+        russian.supported_languages = Some(vec!["ru".to_string()]);
+
+        assert_eq!(
+            compare_candidates_with_language(
+                &english,
+                &russian,
+                &assigned,
+                "speech.synthesize",
+                Some(isolang::Language::Eng),
+            ),
             std::cmp::Ordering::Less
         );
     }

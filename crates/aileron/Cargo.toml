@@ -25,6 +25,7 @@ gio             = { workspace = true }
 relm4           = { workspace = true }
 varlink         = { workspace = true }
 chrono          = { workspace = true }
+isolang         = { workspace = true }
 
 [dev-dependencies]
 hegeltest       = { workspace = true }
