@@ -48,3 +48,4 @@ ocirender = "0.2.1"
 hegeltest = "0.28.0"
 base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["png"] }
+isolang = "2.4"
