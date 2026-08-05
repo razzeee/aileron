@@ -1,0 +1,19 @@
+{
+  "profile_id": "yolo26n-depth",
+  "model_id": "Ultralytics/YOLO26n-depth",
+  "runtime_id": "vision-foundation",
+  "tier": "small",
+  "disk_size_gb": 0.013,
+  "min_ram_gb": 3.0,
+  "use_cases": ["vision.depth"],
+  "specializations": ["metric-depth", "yolo26", "ultralytics", "license:agpl-3.0"],
+  "artifacts": [
+    {
+      "role": "model",
+      "url": "https://github.com/ultralytics/assets/releases/download/v8.4.0/yolo26n-depth.pt",
+      "filename": "model.pt",
+      "sha256": "befed1b8561d8b2eaa66274b070cdfc9c44853bda6d6d62a04759f9383af74e9",
+      "size_bytes": 12998295
+    }
+  ]
+}

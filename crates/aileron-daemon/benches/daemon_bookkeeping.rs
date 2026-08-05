@@ -130,7 +130,7 @@ fn response_fixture(use_case: &str) -> Vec<u8> {
         }),
         "vision.depth" => serde_json::json!({
             "id": "request-1",
-            "result": r#"{"depth":{"width":2,"height":2,"values":[0.0,0.3,0.6,1.0],"minimum":0.0,"maximum":1.0}}"#,
+            "result": r#"{"depth":{"width":2,"height":2,"values":[0.5,1.5,3.0,7.0],"unit":"meter","minimum":0.5,"maximum":7.0}}"#,
             "done": true,
         }),
         other => panic!("unsupported benchmark use-case: {other}"),

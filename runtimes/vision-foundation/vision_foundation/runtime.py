@@ -17,7 +17,6 @@ from PIL import Image
 
 MODEL_DIR = Path(os.environ.get("MODEL_DIR", "/model"))
 MAX_DEPTH_PIXELS = int(os.environ.get("MAX_DEPTH_PIXELS", "65536"))
-SAM2_CONFIG_NAME = os.environ.get("SAM2_CONFIG_NAME", "configs/sam2.1/sam2.1_hiera_t.yaml")
 
 
 class RuntimeErrorCode(Exception):
@@ -119,19 +118,6 @@ def encode_mask_png(mask: np.ndarray) -> str:
     return base64.b64encode(out.getvalue()).decode("ascii")
 
 
-def normalize_depth(values: np.ndarray) -> tuple[list[float], float, float]:
-    arr = np.asarray(values, dtype=np.float32)
-    if arr.size == 0 or not np.isfinite(arr).all():
-        raise RuntimeErrorCode("inference_failed", "depth output must be finite and non-empty")
-    minimum = float(arr.min())
-    maximum = float(arr.max())
-    if maximum > minimum:
-        normalized = (arr - minimum) / (maximum - minimum)
-    else:
-        normalized = np.zeros_like(arr, dtype=np.float32)
-    return [float(v) for v in normalized.reshape(-1)], minimum, maximum
-
-
 def downsample_depth(values: np.ndarray, max_pixels: int = MAX_DEPTH_PIXELS) -> np.ndarray:
     arr = np.asarray(values, dtype=np.float32)
     if arr.ndim != 2:
@@ -151,20 +137,17 @@ def prepare_depth_response(values: np.ndarray, max_pixels: int = MAX_DEPTH_PIXEL
     arr = np.asarray(values, dtype=np.float32)
     if arr.ndim != 2:
         raise RuntimeErrorCode("inference_failed", "depth output must be a 2D array")
-    if arr.size == 0 or not np.isfinite(arr).all():
-        raise RuntimeErrorCode("inference_failed", "depth output must be finite and non-empty")
-    minimum = float(arr.min())
-    maximum = float(arr.max())
+    if arr.size == 0 or not np.isfinite(arr).all() or np.any(arr < 0.0):
+        raise RuntimeErrorCode("inference_failed", "depth output must be finite, nonnegative and non-empty")
     downsampled = downsample_depth(arr, max_pixels=max_pixels)
-    if maximum > minimum:
-        normalized_arr = (downsampled - minimum) / (maximum - minimum)
-    else:
-        normalized_arr = np.zeros_like(downsampled, dtype=np.float32)
+    minimum = float(downsampled.min())
+    maximum = float(downsampled.max())
     height, width = downsampled.shape
     return {
         "width": int(width),
         "height": int(height),
-        "values": [float(v) for v in normalized_arr.reshape(-1)],
+        "values": [float(v) for v in downsampled.reshape(-1)],
+        "unit": "meter",
         "minimum": minimum,
         "maximum": maximum,
     }
@@ -188,7 +171,7 @@ def handle_detect(request: dict[str, Any]) -> dict[str, Any]:
     try:
         with contextlib.redirect_stdout(sys.stderr):
             model = YOLO(str(model_path))
-            results = model.predict(np.asarray(decoded.image), verbose=False)
+            results = model.predict(decoded.image, verbose=False)
     except Exception as exc:  # noqa: BLE001
         raise RuntimeErrorCode("inference_failed", f"YOLO inference failed: {exc}") from exc
 
@@ -212,38 +195,57 @@ def handle_segment(request: dict[str, Any]) -> dict[str, Any]:
     point_coords, point_labels = point_prompts(request.get("points"), decoded.width, decoded.height)
     boxes = box_prompts(request.get("boxes"), decoded.width, decoded.height)
     if len(point_coords) == 0 and len(boxes) == 0:
-        raise RuntimeErrorCode("invalid_input", "SAM2 segmentation requires at least one point or box prompt")
+        raise RuntimeErrorCode("invalid_input", "SAM segmentation requires at least one point or box prompt")
     if len(boxes) > 1:
-        raise RuntimeErrorCode("invalid_input", "SAM2 segmentation currently accepts at most one box prompt")
+        raise RuntimeErrorCode("invalid_input", "SAM segmentation accepts at most one box prompt")
     checkpoint = MODEL_DIR / "model.pt"
     if not checkpoint.is_file():
-        raise RuntimeErrorCode("model_unavailable", "SAM2 artifact /model/model.pt is required")
-    config = MODEL_DIR / "config.yaml"
-    if not config.is_file():
-        raise RuntimeErrorCode("model_unavailable", "SAM2 config /model/config.yaml is required")
+        raise RuntimeErrorCode("model_unavailable", "SAM artifact /model/model.pt is required")
     try:
         with contextlib.redirect_stdout(sys.stderr):
-            from sam2.build_sam import build_sam2
-            from sam2.sam2_image_predictor import SAM2ImagePredictor
+            from ultralytics import SAM
     except Exception as exc:  # noqa: BLE001
-        raise RuntimeErrorCode("model_unavailable", "SAM2 Python package is not installed in this runtime image") from exc
+        raise RuntimeErrorCode("model_unavailable", "Ultralytics SAM is not installed in this runtime image") from exc
     try:
         with contextlib.redirect_stdout(sys.stderr):
-            model = build_sam2(SAM2_CONFIG_NAME, str(checkpoint), device="cpu")
-            predictor = SAM2ImagePredictor(model)
-            predictor.set_image(np.asarray(decoded.image))
-            masks, scores, _ = predictor.predict(
-                point_coords=point_coords if len(point_coords) else None,
-                point_labels=point_labels if len(point_labels) else None,
-                box=boxes[0] if len(boxes) == 1 else None,
-                multimask_output=False,
+            model = SAM(str(checkpoint))
+            # Ultralytics selects SAM2Predictor from the checkpoint path stem, but
+            # Aileron intentionally mounts every task artifact as model.pt.
+            model.is_sam2 = True
+            results = model.predict(
+                decoded.image,
+                points=[point_coords.tolist()] if len(point_coords) else None,
+                labels=[point_labels.tolist()] if len(point_labels) else None,
+                bboxes=boxes[0].tolist() if len(boxes) == 1 else None,
+                conf=0.0,
+                verbose=False,
             )
     except Exception as exc:  # noqa: BLE001
-        raise RuntimeErrorCode("inference_failed", f"SAM2 inference failed: {exc}") from exc
+        raise RuntimeErrorCode("inference_failed", f"SAM inference failed: {exc}") from exc
+
+    if len(results) != 1:
+        raise RuntimeErrorCode("inference_failed", "SAM returned an unexpected result count")
+    result = results[0]
+    masks = getattr(getattr(result, "masks", None), "data", None)
+    scores = getattr(getattr(result, "boxes", None), "conf", None)
+    if masks is None or scores is None:
+        raise RuntimeErrorCode("inference_failed", "SAM result is missing masks or mask scores")
+    mask_values = tensor_to_numpy(masks)
+    score_values = tensor_to_numpy(scores).reshape(-1)
+    if mask_values.ndim != 3 or mask_values.shape[0] == 0 or len(mask_values) != len(score_values):
+        raise RuntimeErrorCode("inference_failed", "SAM returned inconsistent masks and mask scores")
+    if len(mask_values) != 1 or not np.isfinite(score_values).all():
+        raise RuntimeErrorCode("inference_failed", "SAM must return one mask with a finite score")
 
     response_masks: list[dict[str, Any]] = []
-    for index, mask in enumerate(masks):
-        mask_arr = np.asarray(mask).astype(bool)
+    for mask, score in zip(mask_values, score_values, strict=True):
+        mask_arr = np.asarray(mask) > 0.5
+        if mask_arr.shape != (decoded.height, decoded.width):
+            resized = Image.fromarray(mask_arr.astype(np.uint8)).resize(
+                (decoded.width, decoded.height),
+                resample=Image.Resampling.NEAREST,
+            )
+            mask_arr = np.asarray(resized).astype(bool)
         ys, xs = np.where(mask_arr)
         if xs.size == 0 or ys.size == 0:
             box = {"x": 0.0, "y": 0.0, "width": 0.0, "height": 0.0}
@@ -257,7 +259,7 @@ def handle_segment(request: dict[str, Any]) -> dict[str, Any]:
             cropped_mask = mask_arr[y1:y2, x1:x2]
         response_masks.append({
             "label": "mask",
-            "confidence": clamp01(float(scores[index]) if index < len(scores) else 0.0),
+            "confidence": clamp01(float(score)),
             **box,
             "mask_base64": encode_mask_png(cropped_mask),
             "mask_width": int(cropped_mask.shape[1]),
@@ -268,54 +270,39 @@ def handle_segment(request: dict[str, Any]) -> dict[str, Any]:
 
 def handle_depth(request: dict[str, Any]) -> dict[str, Any]:
     decoded = decode_image(request.get("image"))
-    model_path = depth_model_path()
+    model_path = yolo_model_path()
     if model_path is None:
-        raise RuntimeErrorCode("model_unavailable", "DA3 depth artifacts config.json and model.safetensors are required under /model/model/ or flat in /model")
-    return handle_da3_depth(request, decoded, model_path)
-
-
-def handle_da3_depth(request: dict[str, Any], decoded: DecodedImage, model_path: Path) -> dict[str, Any]:
+        raise RuntimeErrorCode("model_unavailable", "YOLO depth artifact /model/model.pt is required")
     try:
         with contextlib.redirect_stdout(sys.stderr):
-            import torch
-            from depth_anything_3.api import DepthAnything3
+            from ultralytics import YOLO
     except Exception as exc:  # noqa: BLE001
-        raise RuntimeErrorCode("model_unavailable", "depth-anything-3 is required for DA3 inference") from exc
+        raise RuntimeErrorCode("model_unavailable", "Ultralytics YOLO is not installed in this runtime image") from exc
     try:
         with contextlib.redirect_stdout(sys.stderr):
-            model = DepthAnything3.from_pretrained(str(model_path)).to(device=torch.device("cpu"))
-            prediction = model.inference([np.asarray(decoded.image)], export_dir=None)
-        predicted = np.asarray(prediction.depth)[0]
+            model = YOLO(str(model_path))
+            results = model.predict(decoded.image, verbose=False)
     except Exception as exc:  # noqa: BLE001
-        raise RuntimeErrorCode("inference_failed", f"DA3 inference failed: {exc}") from exc
-    return result_response(str(request.get("id", "unknown")), {"depth": prepare_depth_response(predicted)})
-
-
-def depth_model_path() -> Path | None:
-    nested = MODEL_DIR / "model"
-    if nested.is_dir() and is_da3_model(nested) and (nested / "model.safetensors").is_file():
-        return nested
-    da3_required = ("config.json", "model.safetensors")
-    if all((MODEL_DIR / filename).is_file() for filename in da3_required) and is_da3_model(MODEL_DIR):
-        return MODEL_DIR
-    return None
-
-
-def is_da3_model(model_path: Path) -> bool:
-    config_path = model_path / "config.json"
-    if not config_path.is_file():
-        return False
-    try:
-        config = json.loads(config_path.read_text(encoding="utf-8"))
-    except Exception:  # noqa: BLE001
-        return False
-    serialized = json.dumps(config)
-    return (
-        config.get("model_type") in {"depth-anything-3", "depth_anything_3"}
-        or config.get("model_name", "").startswith("da3-")
-        or "depth_anything_3" in serialized
-        or "DepthAnything3" in serialized
+        raise RuntimeErrorCode("inference_failed", f"YOLO depth inference failed: {exc}") from exc
+    if len(results) != 1:
+        raise RuntimeErrorCode("inference_failed", "YOLO depth returned an unexpected result count")
+    depth = getattr(getattr(results[0], "depth", None), "data", None)
+    if depth is None:
+        raise RuntimeErrorCode("inference_failed", "YOLO depth result is missing depth.data")
+    return result_response(
+        str(request.get("id", "unknown")),
+        {"depth": prepare_depth_response(tensor_to_numpy(depth))},
     )
+
+
+def tensor_to_numpy(value: Any) -> np.ndarray:
+    if hasattr(value, "detach"):
+        value = value.detach()
+    if hasattr(value, "cpu"):
+        value = value.cpu()
+    if hasattr(value, "numpy"):
+        value = value.numpy()
+    return np.asarray(value)
 
 
 def handle_request(request: dict[str, Any]) -> dict[str, Any]:

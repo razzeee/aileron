@@ -1688,10 +1688,10 @@ mod tests {
     #[test]
     fn profile_library_includes_explicit_profiles_without_llmfit_metadata() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../manifests/models");
-        let manifest = read_model_manifest_path(&dir.join("depth-anything-3-base.json"))
+        let manifest = read_model_manifest_path(&dir.join("yolo26n-depth.json"))
             .expect("read explicit profile manifest");
 
-        assert_eq!(manifest.profile_id, "depth-anything-3-base");
+        assert_eq!(manifest.profile_id, "yolo26n-depth");
         assert_eq!(manifest.runtime_id, "vision-foundation");
         assert!(manifest.llmfit_model_id.is_empty());
     }

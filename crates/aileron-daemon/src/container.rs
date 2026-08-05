@@ -215,6 +215,7 @@ pub struct VisionDepthMap {
     pub width: i64,
     pub height: i64,
     pub values: Vec<f64>,
+    pub unit: String,
     pub minimum: f64,
     pub maximum: f64,
 }
@@ -816,7 +817,7 @@ impl Container {
         }
     }
 
-    /// Send a vision depth request and return a normalized dense depth map.
+    /// Send a vision depth request and return estimated distances in meters.
     pub fn depth(
         &mut self,
         image: Vec<u8>,
@@ -1426,12 +1427,13 @@ fn vision_depth_schema() -> Value {
         "properties": {
             "depth": {
                 "type": "object",
-                "required": ["width", "height", "values", "minimum", "maximum"],
+                "required": ["width", "height", "values", "unit", "minimum", "maximum"],
                 "additionalProperties": false,
                 "properties": {
                     "width": { "type": "integer", "minimum": 1 },
                     "height": { "type": "integer", "minimum": 1 },
-                    "values": { "type": "array", "items": { "type": "number", "minimum": 0.0, "maximum": 1.0 } },
+                    "values": { "type": "array", "items": { "type": "number", "minimum": 0.0 } },
+                    "unit": { "type": "string", "enum": ["meter"] },
                     "minimum": { "type": "number" },
                     "maximum": { "type": "number" }
                 }
@@ -1460,12 +1462,24 @@ fn validate_depth_map(depth: &VisionDepthMap) -> Result<()> {
     if !depth.minimum.is_finite() || !depth.maximum.is_finite() || depth.minimum > depth.maximum {
         bail!("depth map minimum/maximum must be finite and ordered");
     }
+    if depth.unit != "meter" {
+        bail!("depth map unit must be meter");
+    }
     if depth
         .values
         .iter()
-        .any(|value| !value.is_finite() || !(0.0..=1.0).contains(value))
+        .any(|value| !value.is_finite() || *value < 0.0)
     {
-        bail!("depth map values must be finite and normalized to 0.0..=1.0");
+        bail!("depth map values must be finite and nonnegative");
+    }
+    let emitted_minimum = depth.values.iter().copied().fold(f64::INFINITY, f64::min);
+    let emitted_maximum = depth
+        .values
+        .iter()
+        .copied()
+        .fold(f64::NEG_INFINITY, f64::max);
+    if depth.minimum != emitted_minimum || depth.maximum != emitted_maximum {
+        bail!("depth map minimum/maximum must match the emitted values");
     }
     Ok(())
 }
@@ -2864,6 +2878,37 @@ mod tests {
     use super::*;
     use hegel::TestCase;
     use hegel::generators as gs;
+
+    #[test]
+    fn metric_depth_schema_accepts_values_above_one_and_requires_meter_unit() {
+        let schema = vision_depth_schema();
+        let valid = r#"{"depth":{"width":2,"height":1,"values":[0.5,12.0],"unit":"meter","minimum":0.5,"maximum":12.0}}"#;
+        assert!(validate_json_schema(valid, &schema).is_ok());
+
+        let normalized_unit = r#"{"depth":{"width":1,"height":1,"values":[0.5],"unit":"normalized","minimum":0.5,"maximum":0.5}}"#;
+        assert!(validate_json_schema(normalized_unit, &schema).is_err());
+        let negative = r#"{"depth":{"width":1,"height":1,"values":[-0.5],"unit":"meter","minimum":-0.5,"maximum":-0.5}}"#;
+        assert!(validate_json_schema(negative, &schema).is_err());
+    }
+
+    #[test]
+    fn metric_depth_validation_rejects_nonfinite_and_inaccurate_extrema() {
+        let mut depth = VisionDepthMap {
+            width: 2,
+            height: 1,
+            values: vec![0.5, 12.0],
+            unit: "meter".to_string(),
+            minimum: 0.5,
+            maximum: 12.0,
+        };
+        assert!(validate_depth_map(&depth).is_ok());
+
+        depth.maximum = 10.0;
+        assert!(validate_depth_map(&depth).is_err());
+        depth.maximum = 12.0;
+        depth.values[1] = f64::NAN;
+        assert!(validate_depth_map(&depth).is_err());
+    }
 
     fn synthesis_response(lines: &[&str]) -> Result<Vec<AudioChunk>> {
         let input = lines.join("\n") + "\n";

@@ -1054,6 +1054,7 @@ struct VisionDepthMapDbus {
     width: i32,
     height: i32,
     values: Vec<f64>,
+    unit: String,
     minimum: f64,
     maximum: f64,
 }
@@ -3098,7 +3099,7 @@ fn depth_image(
     let session_handle = create_public_session(
         &proxy,
         "vision.depth",
-        "Estimate a normalized dense depth map for the provided image.",
+        "Estimate a dense distance map in meters for the provided image.",
     )?;
 
     tx.send(VisionEvent::Phase(VisionPhase::LoadingModel))?;
@@ -3188,13 +3189,21 @@ fn format_depth(depth: &VisionDepthMapDbus) -> String {
         .values
         .iter()
         .take(16)
-        .map(|value| format!("{value:.2}"))
+        .map(|value| format!("{value:.2} {}", depth.unit))
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "{}x{} depth map, range {:.2}..{:.2}\nPreview: [{}]",
-        depth.width, depth.height, depth.minimum, depth.maximum, preview
+        "{}x{} estimated depth map, range {:.2}..{:.2} {}\nPreview: [{}]",
+        depth.width, depth.height, depth.minimum, depth.maximum, depth.unit, preview
     )
+}
+
+fn normalize_depth_for_display(value: f64, minimum: f64, maximum: f64) -> f64 {
+    if maximum > minimum {
+        ((value - minimum) / (maximum - minimum)).clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
 }
 
 fn format_embedding(vector: &[f64]) -> String {
@@ -3260,9 +3269,31 @@ fn media_file_from_bytes(bytes: &[u8]) -> anyhow::Result<std::fs::File> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DemoMode, concise_error, guided_chat_answer_draft, is_session_not_found_message};
+    use super::{
+        DemoMode, VisionDepthMapDbus, concise_error, format_depth, guided_chat_answer_draft,
+        is_session_not_found_message, normalize_depth_for_display,
+    };
     use hegel::TestCase;
     use hegel::generators as gs;
+
+    #[test]
+    fn metric_depth_is_normalized_only_for_display() {
+        assert_eq!(normalize_depth_for_display(2.0, 2.0, 10.0), 0.0);
+        assert_eq!(normalize_depth_for_display(6.0, 2.0, 10.0), 0.5);
+        assert_eq!(normalize_depth_for_display(10.0, 2.0, 10.0), 1.0);
+        assert_eq!(normalize_depth_for_display(4.0, 4.0, 4.0), 0.0);
+
+        let text = format_depth(&VisionDepthMapDbus {
+            width: 2,
+            height: 1,
+            values: vec![2.0, 10.0],
+            unit: "meter".to_string(),
+            minimum: 2.0,
+            maximum: 10.0,
+        });
+        assert!(text.contains("2.00..10.00 meter"));
+        assert!(text.contains("2.00 meter, 10.00 meter"));
+    }
 
     #[test]
     fn explains_missing_portal_systemd_unit() {

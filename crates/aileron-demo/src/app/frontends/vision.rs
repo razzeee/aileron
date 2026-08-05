@@ -1,7 +1,7 @@
 use super::super::{
     VisionDepthMapDbus, VisionDetectionDbus, VisionEvent, VisionMaskDbus, VisionPointPromptDbus,
     depth_image, describe_image, detect_image, format_depth, format_detections, format_masks,
-    friendly_error, ocr_image, segment_image,
+    friendly_error, normalize_depth_for_display, ocr_image, segment_image,
 };
 use super::scrollable_page;
 use base64::Engine as _;
@@ -279,12 +279,13 @@ pub(crate) fn build_page() -> gtk4::Widget {
             let cell_height = height as f64 / depth_height as f64;
             for y in 0..depth_height {
                 for x in 0..depth_width {
-                    let value = depth
+                    let metric_value = depth
                         .values
                         .get(y * depth_width + x)
                         .copied()
-                        .unwrap_or(0.0)
-                        .clamp(0.0, 1.0);
+                        .unwrap_or(depth.minimum);
+                    let value =
+                        normalize_depth_for_display(metric_value, depth.minimum, depth.maximum);
                     cr.set_source_rgb(value, 0.25 + value * 0.5, 1.0 - value);
                     cr.rectangle(
                         x as f64 * cell_width,
@@ -969,7 +970,8 @@ pub(crate) fn build_page() -> gtk4::Widget {
                         Ok(VisionEvent::Done) => {
                             status_spinner.stop();
                             status_title.set_text("Depth complete");
-                            status_detail.set_text("Vision returned a normalized depth map.");
+                            status_detail
+                                .set_text("Vision returned estimated distances in meters.");
                             set_action_buttons_sensitive(&action_buttons, true);
                             return glib::ControlFlow::Break;
                         }

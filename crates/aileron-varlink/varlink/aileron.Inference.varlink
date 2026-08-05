@@ -123,8 +123,10 @@ type VisionMask (
 type VisionDepthMap (
   width: int,
   height: int,
-  # Row-major normalized depth values, 0.0 near to 1.0 far unless the model profile documents otherwise.
+  # Row-major nonnegative estimated distances. Smaller values are nearer.
   values: []float,
+  # Distance unit. vision.depth currently returns the literal "meter".
+  unit: string,
   minimum: float,
   maximum: float
 )
