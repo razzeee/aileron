@@ -452,7 +452,10 @@ impl VarlinkInterface for ModelsHandler {
                 Ok(filename) => filename,
                 Err(e) => return call.reply_install_failed(url, e.to_string()),
             };
-            let filename = installed_artifact_filename(&runtime_id, source_filename);
+            let filename = match installed_artifact_filename(&runtime_id, source_filename) {
+                Ok(filename) => filename,
+                Err(e) => return call.reply_install_failed(url, e.to_string()),
+            };
             let mut artifacts = vec![ManifestArtifact {
                 role: "model".to_string(),
                 url,
@@ -1430,11 +1433,20 @@ fn filename_from_url(url: &str) -> anyhow::Result<String> {
     Ok(filename.to_string())
 }
 
-fn installed_artifact_filename(runtime_id: &str, source_filename: String) -> String {
+fn installed_artifact_filename(
+    runtime_id: &str,
+    source_filename: String,
+) -> anyhow::Result<String> {
     if runtime_id == "vision-foundation" {
-        "model.pt".to_string()
+        if !source_filename.ends_with(".pt") {
+            anyhow::bail!(
+                "Vision Foundation source filename must end with .pt: {}",
+                source_filename
+            );
+        }
+        Ok("model.pt".to_string())
     } else {
-        source_filename
+        Ok(source_filename)
     }
 }
 
@@ -2986,12 +2998,15 @@ mod tests {
     #[test]
     fn vision_foundation_url_artifacts_use_runtime_layout() {
         assert_eq!(
-            installed_artifact_filename("vision-foundation", "sam2.1_t.pt".to_string()),
+            installed_artifact_filename("vision-foundation", "sam2.1_t.pt".to_string()).unwrap(),
             "model.pt"
         );
         assert_eq!(
-            installed_artifact_filename("llama-cpp", "model.gguf".to_string()),
+            installed_artifact_filename("llama-cpp", "model.gguf".to_string()).unwrap(),
             "model.gguf"
+        );
+        assert!(
+            installed_artifact_filename("vision-foundation", "sam2.1_t.bin".to_string()).is_err()
         );
     }
     #[cfg(unix)]
