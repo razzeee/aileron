@@ -1,0 +1,19 @@
+{
+  "profile_id": "sam2.1-tiny-ultralytics",
+  "model_id": "Ultralytics/SAM2.1-tiny",
+  "runtime_id": "vision-foundation",
+  "tier": "small",
+  "disk_size_gb": 0.073,
+  "min_ram_gb": 4.0,
+  "use_cases": ["vision.segment"],
+  "specializations": ["promptable-segmentation", "sam2.1", "ultralytics", "license:apache-2.0", "license:agpl-3.0"],
+  "artifacts": [
+    {
+      "role": "model",
+      "url": "https://github.com/ultralytics/assets/releases/download/v8.4.0/sam2.1_t.pt",
+      "filename": "model.pt",
+      "sha256": "3c1e81ca9b037dd39d70a014ddb9a813d6c4c4e12555420db7eaff31689bd4e3",
+      "size_bytes": 78105722
+    }
+  ]
+}

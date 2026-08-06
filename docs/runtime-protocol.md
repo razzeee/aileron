@@ -371,10 +371,10 @@ Request:
 }
 ```
 
-Response is a single line containing a JSON string of normalized row-major depth values:
+Response is a single line containing a JSON string of row-major, nonnegative estimated distances. `unit` is currently always `"meter"`; `minimum` and `maximum` are the extrema of the emitted values, including after any runtime downsampling. Smaller values are nearer and larger values are farther.
 
 ```json
-{"id":"request-id","result":"{\"depth\":{\"width\":2,\"height\":2,\"values\":[0.0,0.3,0.6,1.0],\"minimum\":0.0,\"maximum\":1.0}}","done":true}
+{"id":"request-id","result":"{\"depth\":{\"width\":2,\"height\":2,\"values\":[0.5,1.5,3.0,7.0],\"unit\":\"meter\",\"minimum\":0.5,\"maximum\":7.0}}","done":true}
 ```
 
 ## Error Responses

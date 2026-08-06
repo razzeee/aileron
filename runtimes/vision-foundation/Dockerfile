@@ -18,10 +18,8 @@ RUN set -eux; \
       pip install --no-cache-dir --prefix=/install \
       numpy \
       pillow \
-      depth-anything-3 \
       opencv-python-headless \
-      sam2 \
-      ultralytics
+      ultralytics==8.4.115
 
 FROM ${PYTHON_IMAGE}
 
@@ -47,6 +45,6 @@ LABEL org.aileron.runtime="true" \
       org.aileron.runtime_id="vision-foundation" \
       org.aileron.variant="cpu" \
       org.opencontainers.image.description="Aileron Torch-based vision foundation runtime for detection, segmentation, and depth." \
-      org.opencontainers.image.licenses="GPL-3.0-or-later"
+      org.opencontainers.image.licenses="GPL-3.0-or-later AND AGPL-3.0-only"
 
 ENTRYPOINT ["/entrypoint"]

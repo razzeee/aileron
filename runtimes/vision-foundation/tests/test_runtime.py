@@ -5,6 +5,7 @@ import sys
 import types
 import unittest
 import unittest.mock
+from pathlib import Path
 
 import numpy as np
 from PIL import Image
@@ -13,7 +14,11 @@ from vision_foundation import runtime
 
 
 def tiny_png_base64() -> str:
-    image = Image.new("RGB", (2, 2), (255, 0, 0))
+    return png_base64(2, 2)
+
+
+def png_base64(width: int, height: int) -> str:
+    image = Image.new("RGB", (width, height), (255, 0, 0))
     out = io.BytesIO()
     image.save(out, format="PNG")
     return base64.b64encode(out.getvalue()).decode("ascii")
@@ -44,13 +49,6 @@ class RuntimeHelpersTest(unittest.TestCase):
         raw = base64.b64decode(encoded)
         self.assertTrue(raw.startswith(b"\x89PNG\r\n\x1a\n"))
 
-    def test_normalize_depth_preserves_raw_range(self):
-        values, minimum, maximum = runtime.normalize_depth(np.asarray([[2.0, 4.0], [6.0, 10.0]], dtype=np.float32))
-
-        self.assertEqual(minimum, 2.0)
-        self.assertEqual(maximum, 10.0)
-        self.assertEqual(values, [0.0, 0.25, 0.5, 1.0])
-
     def test_prepare_depth_response_downsamples_large_maps(self):
         response = runtime.prepare_depth_response(
             np.arange(100, dtype=np.float32).reshape(10, 10),
@@ -60,8 +58,16 @@ class RuntimeHelpersTest(unittest.TestCase):
         self.assertEqual(response["width"], 4)
         self.assertEqual(response["height"], 4)
         self.assertEqual(len(response["values"]), 16)
+        self.assertEqual(response["unit"], "meter")
         self.assertEqual(response["minimum"], 0.0)
         self.assertEqual(response["maximum"], 99.0)
+        self.assertEqual(response["values"][-1], 99.0)
+
+    def test_prepare_depth_response_rejects_negative_values(self):
+        with self.assertRaises(runtime.RuntimeErrorCode) as raised:
+            runtime.prepare_depth_response(np.asarray([[1.0, -0.1]], dtype=np.float32))
+
+        self.assertEqual(raised.exception.code, "inference_failed")
 
     def test_result_response_wraps_result_as_json_string(self):
         response = runtime.result_response("req-1", {"detections": []})
@@ -69,16 +75,6 @@ class RuntimeHelpersTest(unittest.TestCase):
         self.assertEqual(response["id"], "req-1")
         self.assertTrue(response["done"])
         self.assertEqual(json.loads(response["result"]), {"detections": []})
-
-    def test_depth_model_path_accepts_flat_installed_artifacts(self):
-        with unittest.mock.patch.object(runtime, "MODEL_DIR", self.create_temp_depth_dir()):
-            self.assertIsNotNone(runtime.depth_model_path())
-
-    def test_da3_model_detection_reads_config(self):
-        path = self.create_temp_depth_dir()
-        (path / "config.json").write_text('{"model_type":"depth-anything-3"}', encoding="utf-8")
-
-        self.assertTrue(runtime.is_da3_model(path))
 
     def test_unknown_request_uses_stable_error(self):
         with self.assertRaises(runtime.RuntimeErrorCode) as raised:
@@ -127,59 +123,123 @@ class RuntimeHelpersTest(unittest.TestCase):
         self.assertIn("noisy detector init", stderr.getvalue())
         self.assertEqual(json.loads(response["result"]), {"detections": []})
 
-    def test_segment_uses_hydra_config_name_not_mounted_path(self):
+    def test_segment_passes_pixel_prompts_and_resizes_mask(self):
         calls = []
 
-        def build_sam2(config_name, checkpoint, device="cpu"):
-            calls.append((config_name, checkpoint, device))
-            return object()
+        class FakeSam:
+            def __init__(self, path):
+                alias = Path(path)
+                resolved = alias.resolve()
+                assert alias.name == "sam2.1_t.pt"
+                assert alias.name != "model.pt"
+                assert alias.exists()
+                assert resolved.name == "model.pt"
+                assert resolved.is_file()
+                self.is_sam2 = False
+                calls.append(("init", path))
 
-        class FakePredictor:
-            def __init__(self, _model):
-                pass
+            def predict(self, image, **kwargs):
+                calls.append(("predict", image.size, kwargs, self.is_sam2))
+                return [types.SimpleNamespace(
+                    masks=types.SimpleNamespace(data=np.asarray([[[0.0, 1.0], [0.0, 0.0]]])),
+                    boxes=types.SimpleNamespace(conf=np.asarray([0.75])),
+                )]
 
-            def set_image(self, _image):
-                pass
-
-            def predict(self, **_kwargs):
-                return np.asarray([[[True, False], [False, False]]]), np.asarray([0.75]), None
-
-        build_sam = types.ModuleType("sam2.build_sam")
-        build_sam.build_sam2 = build_sam2
-        predictor = types.ModuleType("sam2.sam2_image_predictor")
-        predictor.SAM2ImagePredictor = FakePredictor
-        path = self.create_temp_model_dir(("model.pt", "config.yaml"))
-        with unittest.mock.patch.dict(sys.modules, {"sam2.build_sam": build_sam, "sam2.sam2_image_predictor": predictor}):
+        ultralytics = types.ModuleType("ultralytics")
+        ultralytics.SAM = FakeSam
+        path = self.create_temp_model_dir(("model.pt",))
+        with unittest.mock.patch.dict(sys.modules, {"ultralytics": ultralytics}):
             with unittest.mock.patch.object(runtime, "MODEL_DIR", path):
                 response = runtime.handle_segment(
                     {
                         "id": "req-1",
                         "type": "segment",
-                        "image": tiny_png_base64(),
-                        "points": [{"x": 0.5, "y": 0.5, "positive": True}],
+                        "image": png_base64(4, 2),
+                        "points": [
+                            {"x": 0.25, "y": 0.5, "positive": True},
+                            {"x": 0.75, "y": 0.5, "positive": False},
+                        ],
+                        "boxes": [{"x": 0.25, "y": 0.0, "width": 0.5, "height": 1.0}],
                     }
                 )
 
-        self.assertEqual(calls, [(runtime.SAM2_CONFIG_NAME, str(path / "model.pt"), "cpu")])
+        self.assertEqual(Path(calls[0][1]).name, "sam2.1_t.pt")
+        self.assertNotEqual(Path(calls[0][1]).name, "model.pt")
+        self.assertEqual(calls[1][1], (4, 2))
+        self.assertEqual(calls[1][2]["points"], [[[1.0, 1.0], [3.0, 1.0]]])
+        self.assertEqual(calls[1][2]["labels"], [[1, 0]])
+        self.assertEqual(calls[1][2]["bboxes"], [1.0, 0.0, 3.0, 2.0])
+        self.assertEqual(calls[1][2]["conf"], 0.0)
+        self.assertTrue(calls[1][3])
         masks = json.loads(response["result"])["masks"]
         self.assertEqual(len(masks), 1)
-        self.assertEqual(masks[0]["mask_width"], 1)
+        self.assertEqual(masks[0]["confidence"], 0.75)
+        self.assertEqual(masks[0]["mask_width"], 2)
         self.assertEqual(masks[0]["mask_height"], 1)
-        self.assertEqual(masks[0]["x"], 0.0)
+        self.assertEqual(masks[0]["x"], 0.5)
         self.assertEqual(masks[0]["y"], 0.0)
         self.assertEqual(masks[0]["width"], 0.5)
         self.assertEqual(masks[0]["height"], 0.5)
 
-    def create_temp_depth_dir(self):
-        import tempfile
+    def test_segment_rejects_missing_or_inconsistent_scores(self):
+        for scores in (None, np.asarray([0.5, 0.6]), np.asarray([np.nan])):
+            class FakeSam:
+                def __init__(self, _path):
+                    pass
 
-        temp = tempfile.TemporaryDirectory()
-        self.addCleanup(temp.cleanup)
-        path = runtime.Path(temp.name)
-        for filename in ("config.json", "model.safetensors"):
-            (path / filename).write_bytes(b"stub")
-        (path / "config.json").write_text('{"model_type":"depth-anything-3"}', encoding="utf-8")
-        return path
+                def predict(self, _image, **_kwargs):
+                    boxes = None if scores is None else types.SimpleNamespace(conf=scores)
+                    return [types.SimpleNamespace(
+                        masks=types.SimpleNamespace(data=np.ones((1, 2, 2))),
+                        boxes=boxes,
+                    )]
+
+            ultralytics = types.ModuleType("ultralytics")
+            ultralytics.SAM = FakeSam
+            path = self.create_temp_model_dir(("model.pt",))
+            with unittest.mock.patch.dict(sys.modules, {"ultralytics": ultralytics}):
+                with unittest.mock.patch.object(runtime, "MODEL_DIR", path):
+                    with self.assertRaises(runtime.RuntimeErrorCode) as raised:
+                        runtime.handle_segment({
+                            "id": "req-1",
+                            "type": "segment",
+                            "image": tiny_png_base64(),
+                            "points": [{"x": 0.5, "y": 0.5}],
+                        })
+            self.assertEqual(raised.exception.code, "inference_failed")
+
+    def test_depth_reads_ultralytics_depth_data_and_preserves_meters(self):
+        calls = []
+
+        class FakeYolo:
+            def __init__(self, path):
+                calls.append(("init", path))
+
+            def predict(self, image, verbose=False):
+                calls.append(("predict", image.size, verbose))
+                return [types.SimpleNamespace(
+                    depth=types.SimpleNamespace(data=np.asarray([[0.5, 2.5], [4.0, 8.0]]))
+                )]
+
+        ultralytics = types.ModuleType("ultralytics")
+        ultralytics.YOLO = FakeYolo
+        path = self.create_temp_model_dir(("model.pt",))
+        with unittest.mock.patch.dict(sys.modules, {"ultralytics": ultralytics}):
+            with unittest.mock.patch.object(runtime, "MODEL_DIR", path):
+                response = runtime.handle_depth({
+                    "id": "req-1",
+                    "type": "depth",
+                    "image": tiny_png_base64(),
+                })
+
+        self.assertEqual(calls[0], ("init", str(path / "model.pt")))
+        self.assertEqual(calls[1], ("predict", (2, 2), False))
+        depth = json.loads(response["result"])["depth"]
+        self.assertEqual(depth["width"], 2)
+        self.assertEqual(depth["height"], 2)
+        self.assertEqual(depth["values"], [0.5, 2.5, 4.0, 8.0])
+        self.assertEqual(depth["unit"], "meter")
+        self.assertEqual((depth["minimum"], depth["maximum"]), (0.5, 8.0))
 
     def create_temp_model_dir(self, filenames):
         import tempfile
