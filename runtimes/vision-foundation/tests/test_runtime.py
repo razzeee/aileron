@@ -128,8 +128,13 @@ class RuntimeHelpersTest(unittest.TestCase):
 
         class FakeSam:
             def __init__(self, path):
-                assert Path(path).name == "sam2.1_t.pt"
-                assert Path(path).name != "model.pt"
+                alias = Path(path)
+                resolved = alias.resolve()
+                assert alias.name == "sam2.1_t.pt"
+                assert alias.name != "model.pt"
+                assert alias.exists()
+                assert resolved.name == "model.pt"
+                assert resolved.is_file()
                 self.is_sam2 = False
                 calls.append(("init", path))
 
