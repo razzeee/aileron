@@ -6,6 +6,7 @@ import io
 import json
 import os
 import sys
+import tempfile
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
@@ -208,18 +209,19 @@ def handle_segment(request: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeErrorCode("model_unavailable", "Ultralytics SAM is not installed in this runtime image") from exc
     try:
         with contextlib.redirect_stdout(sys.stderr):
-            model = SAM(str(checkpoint))
-            # Ultralytics selects SAM2Predictor from the checkpoint path stem, but
-            # Aileron intentionally mounts every task artifact as model.pt.
-            model.is_sam2 = True
-            results = model.predict(
-                decoded.image,
-                points=[point_coords.tolist()] if len(point_coords) else None,
-                labels=[point_labels.tolist()] if len(point_labels) else None,
-                bboxes=boxes[0].tolist() if len(boxes) == 1 else None,
-                conf=0.0,
-                verbose=False,
-            )
+            with tempfile.TemporaryDirectory() as tempdir:
+                alias = Path(tempdir) / "sam2.1_t.pt"
+                alias.symlink_to(checkpoint)
+                model = SAM(str(alias))
+                model.is_sam2 = True
+                results = model.predict(
+                    decoded.image,
+                    points=[point_coords.tolist()] if len(point_coords) else None,
+                    labels=[point_labels.tolist()] if len(point_labels) else None,
+                    bboxes=boxes[0].tolist() if len(boxes) == 1 else None,
+                    conf=0.0,
+                    verbose=False,
+                )
     except Exception as exc:  # noqa: BLE001
         raise RuntimeErrorCode("inference_failed", f"SAM inference failed: {exc}") from exc
 

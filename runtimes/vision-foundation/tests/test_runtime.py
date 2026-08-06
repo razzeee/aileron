@@ -5,6 +5,7 @@ import sys
 import types
 import unittest
 import unittest.mock
+from pathlib import Path
 
 import numpy as np
 from PIL import Image
@@ -127,6 +128,8 @@ class RuntimeHelpersTest(unittest.TestCase):
 
         class FakeSam:
             def __init__(self, path):
+                assert Path(path).name == "sam2.1_t.pt"
+                assert Path(path).name != "model.pt"
                 self.is_sam2 = False
                 calls.append(("init", path))
 
@@ -155,7 +158,8 @@ class RuntimeHelpersTest(unittest.TestCase):
                     }
                 )
 
-        self.assertEqual(calls[0], ("init", str(path / "model.pt")))
+        self.assertEqual(Path(calls[0][1]).name, "sam2.1_t.pt")
+        self.assertNotEqual(Path(calls[0][1]).name, "model.pt")
         self.assertEqual(calls[1][1], (4, 2))
         self.assertEqual(calls[1][2]["points"], [[[1.0, 1.0], [3.0, 1.0]]])
         self.assertEqual(calls[1][2]["labels"], [[1, 0]])

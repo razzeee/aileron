@@ -5,7 +5,7 @@
 It implements the existing container stdio protocol for:
 
 - `detect` with Ultralytics YOLO26 at `/model/model.pt`.
-- `segment` with Ultralytics SAM2.1 at `/model/model.pt`.
+- `segment` with Ultralytics SAM2.1 via a writable `sam2.1_t.pt` alias that targets `/model/model.pt`.
 - `depth` with Ultralytics YOLO26 depth at `/model/model.pt`.
 
 The runtime never downloads checkpoints during inference. Missing artifacts or optional Python loaders return structured `model_unavailable` responses.
@@ -52,7 +52,7 @@ Every task-specific profile mounts one checkpoint:
 /model/model.pt
 ```
 
-The assigned use case and profile specialization select the loader; filenames are never used to infer a task. Detection and depth use `ultralytics.YOLO`, while promptable segmentation uses `ultralytics.SAM`. The image pins `ultralytics==8.4.115` because YOLO26 depth result support is version-sensitive.
+The assigned use case and profile specialization select the loader; filenames are never used to infer a task. Detection and depth use `ultralytics.YOLO`, while promptable segmentation creates a writable `sam2.1_t.pt` alias that targets `/model/model.pt` and passes that alias to `ultralytics.SAM`. The image pins `ultralytics==8.4.115` because YOLO26 depth result support is version-sensitive.
 
 ## Limitations
 
