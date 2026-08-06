@@ -313,6 +313,7 @@ struct VisionDepthMapDbus {
     width: i32,
     height: i32,
     values: Vec<f64>,
+    unit: String,
     minimum: f64,
     maximum: f64,
 }
@@ -1628,23 +1629,7 @@ impl VisionPortalBackend {
                 let depth = reply
                     .map_err(|e| map_request_error(&self.state, request_id, e))?
                     .depth;
-                last_depth = Some(VisionDepthMapDbus {
-                    width: i32::try_from(depth.width).map_err(|_| {
-                        zbus::fdo::Error::Failed(
-                            "aileron.Inference.InvalidOutput: depth width exceeds D-Bus int32"
-                                .to_string(),
-                        )
-                    })?,
-                    height: i32::try_from(depth.height).map_err(|_| {
-                        zbus::fdo::Error::Failed(
-                            "aileron.Inference.InvalidOutput: depth height exceeds D-Bus int32"
-                                .to_string(),
-                        )
-                    })?,
-                    values: depth.values,
-                    minimum: depth.minimum,
-                    maximum: depth.maximum,
-                });
+                last_depth = Some(depth_map_into_dbus(depth)?);
             }
 
             ensure_request_active(&self.state, request_id)?;
@@ -1656,6 +1641,7 @@ impl VisionPortalBackend {
                     width: 1,
                     height: 1,
                     values: vec![0.0],
+                    unit: "meter".to_string(),
                     minimum: 0.0,
                     maximum: 0.0,
                 }),
@@ -1705,6 +1691,27 @@ impl VisionPortalBackend {
         depth: &VisionDepthMapDbus,
         done: bool,
     ) -> zbus::Result<()>;
+}
+
+fn depth_map_into_dbus(
+    depth: aileron_varlink::aileron_Inference::VisionDepthMap,
+) -> zbus::fdo::Result<VisionDepthMapDbus> {
+    Ok(VisionDepthMapDbus {
+        width: i32::try_from(depth.width).map_err(|_| {
+            zbus::fdo::Error::Failed(
+                "aileron.Inference.InvalidOutput: depth width exceeds D-Bus int32".to_string(),
+            )
+        })?,
+        height: i32::try_from(depth.height).map_err(|_| {
+            zbus::fdo::Error::Failed(
+                "aileron.Inference.InvalidOutput: depth height exceeds D-Bus int32".to_string(),
+            )
+        })?,
+        values: depth.values,
+        unit: depth.unit,
+        minimum: depth.minimum,
+        maximum: depth.maximum,
+    })
 }
 
 async fn ensure_portal_frontend(
@@ -2840,6 +2847,23 @@ mod tests {
     use super::*;
     use hegel::TestCase;
     use hegel::generators as gs;
+
+    #[test]
+    fn depth_conversion_preserves_metric_values_and_unit() {
+        let converted = depth_map_into_dbus(aileron_varlink::aileron_Inference::VisionDepthMap {
+            width: 2,
+            height: 1,
+            values: vec![0.5, 12.0],
+            unit: "meter".to_string(),
+            minimum: 0.5,
+            maximum: 12.0,
+        })
+        .expect("valid depth map");
+
+        assert_eq!(converted.values, [0.5, 12.0]);
+        assert_eq!(converted.unit, "meter");
+        assert_eq!((converted.minimum, converted.maximum), (0.5, 12.0));
+    }
 
     #[hegel::test]
     fn interface_use_case_accepts_supported_tokens(tc: TestCase) {

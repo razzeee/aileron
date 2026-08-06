@@ -448,7 +448,11 @@ impl VarlinkInterface for ModelsHandler {
         use_cases: Vec<String>,
     ) -> varlink::Result<()> {
         self.rt.block_on(async {
-            let filename = match filename_from_url(&url) {
+            let source_filename = match filename_from_url(&url) {
+                Ok(filename) => filename,
+                Err(e) => return call.reply_install_failed(url, e.to_string()),
+            };
+            let filename = match installed_artifact_filename(&runtime_id, source_filename) {
                 Ok(filename) => filename,
                 Err(e) => return call.reply_install_failed(url, e.to_string()),
             };
@@ -744,23 +748,18 @@ fn profile_supports_use_case(profile: &Profile, use_case: &str) -> bool {
 }
 
 fn catalog_profile_is_compatible(profile: &manifests::CatalogProfileInfo) -> bool {
-    if !profile
-        .use_cases
-        .iter()
-        .any(|use_case| use_case == "vision.segment")
-    {
-        return true;
-    }
-
     profile.runtime_id == "vision-foundation"
-        && profile.runtime_options.contains_key("SAM2_CONFIG_NAME")
+        || !profile
+            .use_cases
+            .iter()
+            .any(|use_case| use_case == "vision.segment")
 }
 
 fn validate_profile_use_case_compatibility(profile: &Profile) -> anyhow::Result<()> {
     for use_case in profile.effective_use_cases() {
         if !profile_can_handle_use_case(profile, &use_case) {
             anyhow::bail!(
-                "profile {} cannot provide {use_case}: vision.segment requires a promptable segmentation profile with model.pt and config.yaml artifacts",
+                "profile {} cannot provide {use_case}: vision-foundation requires a task-matched Ultralytics model.pt artifact",
                 profile.profile_id
             );
         }
@@ -769,27 +768,19 @@ fn validate_profile_use_case_compatibility(profile: &Profile) -> anyhow::Result<
 }
 
 fn profile_can_handle_use_case(profile: &Profile, use_case: &str) -> bool {
-    if use_case == "vision.detect" && profile.runtime_id == "vision-foundation" {
-        return profile
-            .artifact_hashes
-            .iter()
-            .any(|artifact| artifact.filename == "model.pt");
-    }
-
-    if use_case != "vision.segment" {
+    if !matches!(
+        use_case,
+        "vision.detect" | "vision.segment" | "vision.depth"
+    ) {
         return true;
     }
+    if profile.runtime_id != "vision-foundation" {
+        return use_case != "vision.segment";
+    }
 
-    profile.runtime_id == "vision-foundation"
-        && profile
-            .artifact_hashes
-            .iter()
-            .any(|artifact| artifact.filename == "model.pt")
-        && profile
-            .artifact_hashes
-            .iter()
-            .any(|artifact| artifact.filename == "config.yaml")
-        && profile.runtime_options.contains_key("SAM2_CONFIG_NAME")
+    profile.artifact_hashes.len() == 1
+        && profile.artifact_hashes[0].role == "model"
+        && profile.artifact_hashes[0].filename == "model.pt"
 }
 
 struct CatalogFit<'a> {
@@ -1440,6 +1431,23 @@ fn filename_from_url(url: &str) -> anyhow::Result<String> {
         anyhow::bail!("model file URL must end with a filename");
     }
     Ok(filename.to_string())
+}
+
+fn installed_artifact_filename(
+    runtime_id: &str,
+    source_filename: String,
+) -> anyhow::Result<String> {
+    if runtime_id == "vision-foundation" {
+        if !source_filename.ends_with(".pt") {
+            anyhow::bail!(
+                "Vision Foundation source filename must end with .pt: {}",
+                source_filename
+            );
+        }
+        Ok("model.pt".to_string())
+    } else {
+        Ok(source_filename)
+    }
 }
 
 fn generated_model_id(runtime_id: &str, filename: &str, sha256: &str) -> String {
@@ -2986,6 +2994,21 @@ mod tests {
     use super::*;
     use hegel::TestCase;
     use hegel::generators as gs;
+
+    #[test]
+    fn vision_foundation_url_artifacts_use_runtime_layout() {
+        assert_eq!(
+            installed_artifact_filename("vision-foundation", "sam2.1_t.pt".to_string()).unwrap(),
+            "model.pt"
+        );
+        assert_eq!(
+            installed_artifact_filename("llama-cpp", "model.gguf".to_string()).unwrap(),
+            "model.gguf"
+        );
+        assert!(
+            installed_artifact_filename("vision-foundation", "sam2.1_t.bin".to_string()).is_err()
+        );
+    }
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
 
@@ -3114,6 +3137,7 @@ mod tests {
             filename: "model.onnx".to_string(),
             sha256: "hash".to_string(),
         }];
+        profile.specializations = vec!["object-detection".to_string(), "ultralytics".to_string()];
 
         assert!(!profile_supports_use_case(&profile, "vision.detect"));
         assert!(validate_profile_use_case_compatibility(&profile).is_err());
@@ -3125,26 +3149,33 @@ mod tests {
     }
 
     #[test]
-    fn sam2_profile_can_use_segment() {
+    fn vision_foundation_rejects_cross_task_assignment() {
         let mut profile =
             profile_with_runtime_and_use_cases("vision-foundation", &["vision.segment"]);
-        profile.specializations = vec!["promptable-segmentation".to_string(), "sam2.1".to_string()];
-        profile.runtime_options.insert(
-            "SAM2_CONFIG_NAME".to_string(),
-            "configs/sam2.1/sam2.1_hiera_t.yaml".to_string(),
-        );
-        profile.artifact_hashes = vec![
-            crate::profiles::ArtifactHash {
-                role: "model".to_string(),
-                filename: "model.pt".to_string(),
-                sha256: "hash".to_string(),
-            },
-            crate::profiles::ArtifactHash {
-                role: "config".to_string(),
-                filename: "config.yaml".to_string(),
-                sha256: "hash".to_string(),
-            },
+        profile.artifact_hashes = vec![crate::profiles::ArtifactHash {
+            role: "model".to_string(),
+            filename: "model.pt".to_string(),
+            sha256: "hash".to_string(),
+        }];
+
+        assert!(!profile_supports_use_case(&profile, "vision.depth"));
+        assert!(profile_supports_use_case(&profile, "vision.segment"));
+    }
+
+    #[test]
+    fn ultralytics_sam_profile_can_use_segment() {
+        let mut profile =
+            profile_with_runtime_and_use_cases("vision-foundation", &["vision.segment"]);
+        profile.specializations = vec![
+            "promptable-segmentation".to_string(),
+            "sam2.1".to_string(),
+            "ultralytics".to_string(),
         ];
+        profile.artifact_hashes = vec![crate::profiles::ArtifactHash {
+            role: "model".to_string(),
+            filename: "model.pt".to_string(),
+            sha256: "hash".to_string(),
+        }];
 
         assert!(profile_supports_use_case(&profile, "vision.segment"));
         assert!(validate_profile_use_case_compatibility(&profile).is_ok());
@@ -3173,60 +3204,44 @@ mod tests {
     }
 
     #[test]
-    fn sam21_runtime_option_profile_can_use_segment() {
+    fn segment_profile_with_legacy_extra_artifact_is_rejected() {
         let mut profile =
             profile_with_runtime_and_use_cases("vision-foundation", &["vision.segment"]);
         profile.model_id = "custom-segmenter".to_string();
-        profile.runtime_options.insert(
-            "SAM2_CONFIG_NAME".to_string(),
-            "configs/sam2.1/sam2.1_hiera_t.yaml".to_string(),
-        );
-        profile.specializations = vec!["promptable-segmentation".to_string()];
-        profile.artifact_hashes = vec![
-            crate::profiles::ArtifactHash {
-                role: "model".to_string(),
-                filename: "model.pt".to_string(),
-                sha256: "hash".to_string(),
-            },
-            crate::profiles::ArtifactHash {
-                role: "config".to_string(),
-                filename: "config.yaml".to_string(),
-                sha256: "hash".to_string(),
-            },
-        ];
+        profile.artifact_hashes.push(crate::profiles::ArtifactHash {
+            role: "config".to_string(),
+            filename: "config.yaml".to_string(),
+            sha256: "hash2".to_string(),
+        });
 
-        assert!(profile_supports_use_case(&profile, "vision.segment"));
-        assert!(validate_profile_use_case_compatibility(&profile).is_ok());
+        assert!(!profile_supports_use_case(&profile, "vision.segment"));
+        assert!(validate_profile_use_case_compatibility(&profile).is_err());
     }
 
     #[test]
-    fn legacy_sam2_catalog_profile_is_not_compatible() {
+    fn vision_foundation_catalog_profile_is_compatible() {
         let mut manifest = sam2_catalog_manifest("sam2-hiera-tiny", "facebook/sam2-hiera-tiny");
         manifest.specializations = vec!["promptable-segmentation".to_string(), "sam2".to_string()];
-
-        assert!(!catalog_profile_is_compatible(&manifest));
-    }
-
-    #[test]
-    fn sam21_catalog_profile_is_compatible() {
-        let mut manifest = sam2_catalog_manifest("sam2.1-hiera-tiny", "facebook/sam2.1-hiera-tiny");
-        manifest.specializations =
-            vec!["promptable-segmentation".to_string(), "sam2.1".to_string()];
-        manifest.runtime_options.insert(
-            "SAM2_CONFIG_NAME".to_string(),
-            "configs/sam2.1/sam2.1_hiera_t.yaml".to_string(),
-        );
 
         assert!(catalog_profile_is_compatible(&manifest));
     }
 
     #[test]
-    fn sam21_runtime_option_catalog_profile_is_compatible() {
+    fn sam21_catalog_profile_is_compatible() {
+        let mut manifest = sam2_catalog_manifest("sam2.1-hiera-tiny", "facebook/sam2.1-hiera-tiny");
+        manifest.specializations = vec![
+            "promptable-segmentation".to_string(),
+            "sam2.1".to_string(),
+            "ultralytics".to_string(),
+        ];
+
+        assert!(catalog_profile_is_compatible(&manifest));
+    }
+
+    #[test]
+    fn catalog_compatibility_does_not_depend_on_optional_specializations() {
         let mut manifest = sam2_catalog_manifest("custom-sam2", "custom-sam2");
-        manifest.runtime_options.insert(
-            "SAM2_CONFIG_NAME".to_string(),
-            "configs/sam2.1/sam2.1_hiera_t.yaml".to_string(),
-        );
+        manifest.specializations = vec!["promptable-segmentation".to_string()];
 
         assert!(catalog_profile_is_compatible(&manifest));
     }

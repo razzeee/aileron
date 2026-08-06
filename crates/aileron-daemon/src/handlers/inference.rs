@@ -1273,6 +1273,7 @@ async fn vision_depth(
                     width: depth.width,
                     height: depth.height,
                     values: depth.values,
+                    unit: depth.unit,
                     minimum: depth.minimum,
                     maximum: depth.maximum,
                 })
@@ -2814,47 +2815,20 @@ fn validate_runtime_profile_compatibility(
         return Ok(());
     }
 
-    match use_case {
-        "vision.detect" => {
-            if !profile_has_artifact(profile, "model.pt") {
-                return Err(format!(
-                    "profile {} is incompatible with vision-foundation detection: YOLO artifact model.pt is required",
-                    profile.profile_id
-                ));
-            }
-        }
-        "vision.segment" => {
-            if !profile_has_artifact(profile, "model.pt") {
-                return Err(format!(
-                    "profile {} is incompatible with vision-foundation segmentation: SAM2 artifact model.pt is required",
-                    profile.profile_id
-                ));
-            }
-            if !profile_has_artifact(profile, "config.yaml") {
-                return Err(format!(
-                    "profile {} is incompatible with vision-foundation segmentation: SAM2 config.yaml is required",
-                    profile.profile_id
-                ));
-            }
-            if !profile.runtime_options.contains_key("SAM2_CONFIG_NAME") {
-                return Err(format!(
-                    "profile {} is incompatible with vision-foundation segmentation: SAM2_CONFIG_NAME is required so the runtime uses the checkpoint's matching packaged config",
-                    profile.profile_id
-                ));
-            }
-        }
-        _ => {}
+    if matches!(
+        use_case,
+        "vision.detect" | "vision.segment" | "vision.depth"
+    ) && (profile.artifact_hashes.len() != 1
+        || profile.artifact_hashes[0].role != "model"
+        || profile.artifact_hashes[0].filename != "model.pt")
+    {
+        return Err(format!(
+            "profile {} is incompatible with vision-foundation {use_case}: exactly one model artifact named model.pt is required",
+            profile.profile_id
+        ));
     }
 
     Ok(())
-}
-
-fn profile_has_artifact(profile: &crate::profiles::Profile, filename: &str) -> bool {
-    profile
-        .artifact_hashes
-        .iter()
-        .any(|artifact| artifact.filename == filename)
-        || profile.artifact_path.join(filename).is_file()
 }
 
 fn embedding_pipeline_id(resolved: &ResolvedSessionRuntime, container: &Container) -> String {
@@ -3438,10 +3412,11 @@ mod tests {
             filename: "model.onnx".to_string(),
             sha256: "hash".to_string(),
         }];
+        profile.specializations = vec!["object-detection".to_string(), "ultralytics".to_string()];
 
         assert_eq!(
             validate_runtime_profile_compatibility("vision.detect", &profile),
-            Err("profile yolov9-c-onnx-q8 is incompatible with vision-foundation detection: YOLO artifact model.pt is required".to_string())
+            Err("profile yolov9-c-onnx-q8 is incompatible with vision-foundation vision.detect: exactly one model artifact named model.pt is required".to_string())
         );
     }
 
@@ -3464,30 +3439,23 @@ mod tests {
 
         assert_eq!(
             validate_runtime_profile_compatibility("vision.segment", &profile),
-            Err("profile sam2-hiera-tiny is incompatible with vision-foundation segmentation: SAM2_CONFIG_NAME is required so the runtime uses the checkpoint's matching packaged config".to_string())
+            Err("profile sam2-hiera-tiny is incompatible with vision-foundation vision.segment: exactly one model artifact named model.pt is required".to_string())
         );
     }
 
     #[test]
     fn vision_foundation_segment_accepts_curated_sam21_profile() {
         let mut profile = test_vision_profile("sam2.1-hiera-tiny", "facebook/sam2.1-hiera-tiny");
-        profile.specializations = vec!["sam2.1".to_string()];
-        profile.runtime_options.insert(
-            "SAM2_CONFIG_NAME".to_string(),
-            "configs/sam2.1/sam2.1_hiera_t.yaml".to_string(),
-        );
-        profile.artifact_hashes = vec![
-            ArtifactHash {
-                role: "model".to_string(),
-                filename: "model.pt".to_string(),
-                sha256: "hash".to_string(),
-            },
-            ArtifactHash {
-                role: "config".to_string(),
-                filename: "config.yaml".to_string(),
-                sha256: "hash".to_string(),
-            },
+        profile.specializations = vec![
+            "sam2.1".to_string(),
+            "promptable-segmentation".to_string(),
+            "ultralytics".to_string(),
         ];
+        profile.artifact_hashes = vec![ArtifactHash {
+            role: "model".to_string(),
+            filename: "model.pt".to_string(),
+            sha256: "hash".to_string(),
+        }];
 
         assert!(validate_runtime_profile_compatibility("vision.segment", &profile).is_ok());
     }
