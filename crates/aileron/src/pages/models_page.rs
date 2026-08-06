@@ -1,12 +1,15 @@
 /// Profiles page — list installed profiles, add profiles, assign use-cases, delete.
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::rc::Rc;
 
 use aileron_varlink::aileron_Models::InstallStatus;
 use gtk4::pango;
 use gtk4::prelude::*;
-use gtk4::{Box, Button, CheckButton, Label, ListBox, Orientation, ProgressBar, ScrolledWindow};
+use gtk4::{
+    Box, Button, CheckButton, DropDown, Label, ListBox, Orientation, ProgressBar, ScrolledWindow,
+    SearchEntry,
+};
 use libadwaita::prelude::*;
 use libadwaita::{
     ActionRow, AlertDialog, EntryRow, PreferencesGroup, ViewStack, ViewSwitcher, ViewSwitcherPolicy,
@@ -135,6 +138,20 @@ fn build_widget(runtime_images_changed: Rc<dyn Fn()>) -> gtk4::Widget {
     library_box.set_selection_mode(gtk4::SelectionMode::None);
     library_box.add_css_class("boxed-list");
 
+    let library_search = SearchEntry::new();
+    library_search.set_placeholder_text(Some("Search profiles"));
+    library_search.set_hexpand(true);
+
+    let library_type = DropDown::from_strings(&["All", "Text", "Vision", "Speech", "Runtime"]);
+    library_type.set_tooltip_text(Some("Filter profiles by type"));
+
+    let library_filters = Box::new(Orientation::Horizontal, 12);
+    library_filters.append(&library_search);
+    let type_label = Label::new(Some("Type"));
+    type_label.set_mnemonic_widget(Some(&library_type));
+    library_filters.append(&type_label);
+    library_filters.append(&library_type);
+
     let downloads_box = ListBox::new();
     downloads_box.set_selection_mode(gtk4::SelectionMode::None);
     downloads_box.add_css_class("boxed-list");
@@ -143,6 +160,10 @@ fn build_widget(runtime_images_changed: Rc<dyn Fn()>) -> gtk4::Widget {
         profiles: list_box.clone(),
         readiness: readiness_box.clone(),
         library: library_box.clone(),
+        library_profiles: Rc::new(RefCell::new(None)),
+        library_query: Rc::new(RefCell::new(String::new())),
+        library_type_filter: Rc::new(Cell::new(LibraryTypeFilter::All)),
+        library_refresh_generation: Rc::new(Cell::new(0)),
         downloads: downloads_box.clone(),
         install_poll_active: Rc::new(Cell::new(false)),
         runtime_images_changed,
@@ -168,6 +189,24 @@ fn build_widget(runtime_images_changed: Rc<dyn Fn()>) -> gtk4::Widget {
         });
     }
 
+    {
+        let lists = lists.clone();
+        library_search.connect_search_changed(move |search| {
+            *lists.library_query.borrow_mut() = search.text().to_string();
+            render_cached_library_list(&lists);
+        });
+    }
+
+    {
+        let lists = lists.clone();
+        library_type.connect_selected_notify(move |dropdown| {
+            lists
+                .library_type_filter
+                .set(LibraryTypeFilter::from_selected(dropdown.selected()));
+            render_cached_library_list(&lists);
+        });
+    }
+
     let readiness_scroll = ScrolledWindow::builder()
         .hexpand(true)
         .vexpand(true)
@@ -183,7 +222,10 @@ fn build_widget(runtime_images_changed: Rc<dyn Fn()>) -> gtk4::Widget {
         .hscrollbar_policy(gtk4::PolicyType::Never)
         .child(&library_box)
         .build();
-    library_group.add(&library_scroll);
+    let library_content = Box::new(Orientation::Vertical, 12);
+    library_content.append(&library_filters);
+    library_content.append(&library_scroll);
+    library_group.add(&library_content);
     library_page.append(&library_group);
 
     let scroll = ScrolledWindow::builder()
@@ -217,6 +259,10 @@ struct ModelLists {
     profiles: ListBox,
     readiness: ListBox,
     library: ListBox,
+    library_profiles: Rc<RefCell<Option<Vec<aileron_varlink::aileron_Models::CatalogProfileInfo>>>>,
+    library_query: Rc<RefCell<String>>,
+    library_type_filter: Rc<Cell<LibraryTypeFilter>>,
+    library_refresh_generation: Rc<Cell<u64>>,
     downloads: ListBox,
     install_poll_active: Rc<Cell<bool>>,
     runtime_images_changed: Rc<dyn Fn()>,
@@ -393,6 +439,9 @@ fn show_url_install_dialog(window: Option<&gtk4::Window>, lists: ModelLists) {
 
 fn refresh_library_list(lists: &ModelLists) {
     let library = &lists.library;
+    let generation = lists.library_refresh_generation.get().wrapping_add(1);
+    lists.library_refresh_generation.set(generation);
+    *lists.library_profiles.borrow_mut() = None;
     while let Some(child) = library.first_child() {
         library.remove(&child);
     }
@@ -417,7 +466,9 @@ fn refresh_library_list(lists: &ModelLists) {
         .map_err(|_| "Profile library task failed".to_string())
         .and_then(|result| result);
 
-        render_library_list(&lists, profiles);
+        if lists.library_refresh_generation.get() == generation {
+            render_library_list(&lists, profiles);
+        }
     });
 }
 
@@ -433,6 +484,7 @@ fn render_library_list(
     let profiles = match profiles {
         Ok(reply) => reply.profiles,
         Err(reason) => {
+            *lists.library_profiles.borrow_mut() = None;
             let row = ActionRow::new();
             row.set_title("Profile library unavailable");
             row.set_subtitle(&reason);
@@ -441,6 +493,20 @@ fn render_library_list(
         }
     };
 
+    *lists.library_profiles.borrow_mut() = Some(profiles);
+    render_cached_library_list(lists);
+}
+
+fn render_cached_library_list(lists: &ModelLists) {
+    let Some(profiles) = lists.library_profiles.borrow().clone() else {
+        return;
+    };
+
+    let library = &lists.library;
+    while let Some(child) = library.first_child() {
+        library.remove(&child);
+    }
+
     if profiles.is_empty() {
         let row = ActionRow::new();
         row.set_title("No profiles found");
@@ -448,9 +514,25 @@ fn render_library_list(
             "Install llmfit-backed model manifests under a manifests/models directory.",
         );
         library.append(&row);
+        return;
     }
 
-    for profile in profiles {
+    let type_filter = lists.library_type_filter.get();
+    let query = lists.library_query.borrow();
+    let matching_profiles = profiles
+        .into_iter()
+        .filter(|profile| library_profile_matches(profile, type_filter, &query))
+        .collect::<Vec<_>>();
+
+    if matching_profiles.is_empty() {
+        let row = ActionRow::new();
+        row.set_title("No matching profiles");
+        row.set_subtitle("Try a different search or profile type.");
+        library.append(&row);
+        return;
+    }
+
+    for profile in matching_profiles {
         let row = ActionRow::new();
         row.set_title(&profile.profile_id);
         let recommendation_reason = profile.recommendation_reason.clone();
@@ -753,6 +835,80 @@ fn model_kind(runtime_id: &str, use_cases: &[String]) -> &'static str {
     } else {
         "Runtime"
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LibraryTypeFilter {
+    All,
+    Text,
+    Vision,
+    Speech,
+    Runtime,
+}
+
+impl LibraryTypeFilter {
+    fn from_selected(selected: u32) -> Self {
+        match selected {
+            1 => Self::Text,
+            2 => Self::Vision,
+            3 => Self::Speech,
+            4 => Self::Runtime,
+            _ => Self::All,
+        }
+    }
+}
+
+fn library_profile_matches(
+    profile: &aileron_varlink::aileron_Models::CatalogProfileInfo,
+    type_filter: LibraryTypeFilter,
+    query: &str,
+) -> bool {
+    let type_matches = match type_filter {
+        LibraryTypeFilter::All => true,
+        LibraryTypeFilter::Text => model_kind(&profile.runtime_id, &profile.use_cases) == "Text",
+        LibraryTypeFilter::Vision => {
+            model_kind(&profile.runtime_id, &profile.use_cases) == "Vision"
+        }
+        LibraryTypeFilter::Speech => {
+            model_kind(&profile.runtime_id, &profile.use_cases) == "Speech"
+        }
+        LibraryTypeFilter::Runtime => {
+            model_kind(&profile.runtime_id, &profile.use_cases) == "Runtime"
+        }
+    };
+    if !type_matches {
+        return false;
+    }
+
+    let query = query.trim().to_lowercase();
+    query.is_empty()
+        || [
+            Some(profile.profile_id.as_str()),
+            Some(profile.model_id.as_str()),
+            Some(profile.llmfit_model_id.as_str()),
+            profile.llmfit_provider.as_deref(),
+            Some(profile.runtime_id.as_str()),
+        ]
+        .into_iter()
+        .flatten()
+        .chain(
+            profile
+                .capabilities
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(String::as_str),
+        )
+        .chain(
+            profile
+                .supported_languages
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(String::as_str),
+        )
+        .chain(profile.use_cases.iter().map(String::as_str))
+        .any(|value| value.to_lowercase().contains(&query))
 }
 
 fn fit_label(fit_level: &str, recommended: bool) -> &'static str {
@@ -2576,6 +2732,103 @@ mod tests {
             ),
             "Vision"
         );
+    }
+
+    #[test]
+    fn library_filter_matches_each_profile_type() {
+        let mut profile = catalog_profile("profile", "balanced", 1.0);
+
+        profile.use_cases = vec!["language.summarize".to_string()];
+        assert!(library_profile_matches(
+            &profile,
+            LibraryTypeFilter::Text,
+            ""
+        ));
+
+        profile.use_cases = vec!["speech.transcribe".to_string()];
+        assert!(library_profile_matches(
+            &profile,
+            LibraryTypeFilter::Speech,
+            ""
+        ));
+
+        profile.use_cases = vec![
+            "language.summarize".to_string(),
+            "vision.describe".to_string(),
+        ];
+        assert!(library_profile_matches(
+            &profile,
+            LibraryTypeFilter::Vision,
+            ""
+        ));
+
+        profile.runtime_id = "custom-runtime".to_string();
+        profile.use_cases.clear();
+        assert!(library_profile_matches(
+            &profile,
+            LibraryTypeFilter::Runtime,
+            ""
+        ));
+        assert!(library_profile_matches(
+            &profile,
+            LibraryTypeFilter::All,
+            ""
+        ));
+    }
+
+    #[test]
+    fn library_search_matches_names_and_metadata_case_insensitively() {
+        let mut profile = catalog_profile("acme-profile", "balanced", 1.0);
+        profile.model_id = "Model-One".to_string();
+        profile.llmfit_model_id = "Canonical/Model-One".to_string();
+        profile.llmfit_provider = Some("Example Labs".to_string());
+        profile.runtime_id = "custom-runtime".to_string();
+        profile.capabilities = Some(vec!["Tool_Use".to_string()]);
+        profile.supported_languages = Some(vec!["Finnish".to_string()]);
+        profile.use_cases = vec!["language.translate".to_string()];
+
+        for query in [
+            "ACME",
+            "model-one",
+            "canonical/model-one",
+            "example labs",
+            "CUSTOM-RUNTIME",
+            "tool_use",
+            "FINNISH",
+            "LANGUAGE.TRANSLATE",
+        ] {
+            assert!(
+                library_profile_matches(&profile, LibraryTypeFilter::All, query),
+                "query {query:?} should match"
+            );
+        }
+    }
+
+    #[test]
+    fn library_filter_combines_type_and_trimmed_text_query() {
+        let mut profile = catalog_profile("caption-model", "balanced", 1.0);
+        profile.use_cases = vec!["vision.describe".to_string()];
+
+        assert!(library_profile_matches(
+            &profile,
+            LibraryTypeFilter::Vision,
+            "  CAPTION  "
+        ));
+        assert!(!library_profile_matches(
+            &profile,
+            LibraryTypeFilter::Text,
+            "caption"
+        ));
+        assert!(!library_profile_matches(
+            &profile,
+            LibraryTypeFilter::Vision,
+            "transcribe"
+        ));
+        assert!(library_profile_matches(
+            &profile,
+            LibraryTypeFilter::Vision,
+            "   "
+        ));
     }
 
     #[hegel::test]
