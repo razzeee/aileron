@@ -228,7 +228,10 @@ class RuntimeHelpersTest(unittest.TestCase):
                 })
 
         self.assertEqual(calls[0], ("init", str(path / "model.pt")))
+        self.assertEqual(calls[1], ("predict", (2, 2), False))
         depth = json.loads(response["result"])["depth"]
+        self.assertEqual(depth["width"], 2)
+        self.assertEqual(depth["height"], 2)
         self.assertEqual(depth["values"], [0.5, 2.5, 4.0, 8.0])
         self.assertEqual(depth["unit"], "meter")
         self.assertEqual((depth["minimum"], depth["maximum"]), (0.5, 8.0))
