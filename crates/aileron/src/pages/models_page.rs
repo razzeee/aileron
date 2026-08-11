@@ -3,7 +3,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::rc::Rc;
 
-use aileron_varlink::aileron_Models::InstallStatus;
+use aileron_varlink::aileron_Models::{Error as ModelsError, InstallStatus};
 use gtk4::pango;
 use gtk4::prelude::*;
 use gtk4::{
@@ -15,6 +15,7 @@ use libadwaita::{
     ActionRow, AlertDialog, EntryRow, PreferencesGroup, ViewStack, ViewSwitcher, ViewSwitcherPolicy,
 };
 use relm4::{ComponentParts, ComponentSender, SimpleComponent};
+use zlink::futures_util::StreamExt;
 
 use super::{format_duration, format_speed, install_is_terminal_status, source_label};
 
@@ -239,9 +240,7 @@ fn build_widget(runtime_images_changed: Rc<dyn Fn()>) -> gtk4::Widget {
 
     refresh_readiness_list(&lists);
     refresh_downloads_list(&lists);
-    if has_active_installs() {
-        start_install_poll(&lists);
-    }
+    start_install_poll(&lists);
 
     let tasks_page = stack.add_titled(&tasks_page, Some("tasks"), "Tasks");
     tasks_page.set_icon_name(Some("checkbox-checked-symbolic"));
@@ -345,12 +344,40 @@ struct CatalogProfileDetails {
     use_cases: Vec<String>,
 }
 
+#[derive(Debug)]
+enum ModelsCallError {
+    Connection(String),
+    Transport(String),
+    Declared(ModelsError),
+    MissingInstallReply,
+}
+
+impl std::fmt::Display for ModelsCallError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Connection(reason) | Self::Transport(reason) => formatter.write_str(reason),
+            Self::Declared(error) => write!(formatter, "{error:?}"),
+            Self::MissingInstallReply => formatter.write_str("install returned no result"),
+        }
+    }
+}
+
 fn form_entry(title: &str) -> EntryRow {
     EntryRow::builder().title(title).build()
 }
 
 fn show_url_install_dialog(window: Option<&gtk4::Window>, lists: ModelLists) {
-    let runtimes = available_runtime_ids();
+    let window = window.cloned();
+    crate::async_runtime::spawn(available_runtime_ids(), move |runtimes| {
+        build_url_install_dialog(window.as_ref(), lists, runtimes.unwrap_or_default());
+    });
+}
+
+fn build_url_install_dialog(
+    window: Option<&gtk4::Window>,
+    lists: ModelLists,
+    runtimes: Vec<String>,
+) {
     let runtime_id = form_entry("Runtime");
     if let Some(runtime) = runtimes.first() {
         runtime_id.set_text(runtime);
@@ -451,25 +478,25 @@ fn refresh_library_list(lists: &ModelLists) {
     library.append(&row);
 
     let lists = lists.clone();
-    glib::spawn_future_local(async move {
-        let profiles = gio::spawn_blocking(move || {
+    crate::async_runtime::spawn(
+        async move {
             use aileron_varlink::aileron_Models::VarlinkClientInterface;
 
-            aileron_ipc::client::connect()
-                .map_err(|e| e.to_string())
-                .and_then(|conn| {
-                    let mut client = aileron_varlink::aileron_Models::VarlinkClient::new(conn);
-                    client.list_catalog().call().map_err(|e| e.to_string())
-                })
-        })
-        .await
-        .map_err(|_| "Profile library task failed".to_string())
-        .and_then(|result| result);
-
-        if lists.library_refresh_generation.get() == generation {
-            render_library_list(&lists, profiles);
-        }
-    });
+            let mut client = aileron_ipc::client::connect()
+                .await
+                .map_err(|e| e.to_string())?;
+            client
+                .list_catalog()
+                .await
+                .map_err(|e| e.to_string())?
+                .map_err(|e| format!("{e:?}"))
+        },
+        move |profiles| {
+            if lists.library_refresh_generation.get() == generation {
+                render_library_list(&lists, profiles);
+            }
+        },
+    );
 }
 
 fn render_library_list(
@@ -1073,22 +1100,22 @@ fn selected_use_cases(checks: &[(CheckButton, &str)]) -> Vec<String> {
         .collect()
 }
 
-fn profile_availability(use_cases: &[String]) -> String {
+async fn profile_availability(
+    client: &mut zlink::tokio::unix::Connection,
+    use_cases: &[String],
+) -> String {
     if use_cases.is_empty() {
         return "Unassigned".to_string();
     }
 
     use aileron_varlink::aileron_Inference::VarlinkClientInterface;
-    let Ok(conn) = aileron_ipc::client::connect() else {
-        return "Unavailable: daemon not reachable".to_string();
-    };
-    let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn);
     match client
         .get_use_case_availability("org.aileron.Manager".to_string(), use_cases[0].clone())
-        .call()
+        .await
     {
-        Ok(reply) if reply.availability.is_available => "Available".to_string(),
-        Ok(reply) => format!("Unavailable: {}", reply.availability.reason),
+        Ok(Ok(reply)) if reply.availability.is_available => "Available".to_string(),
+        Ok(Ok(reply)) => format!("Unavailable: {}", reply.availability.reason),
+        Ok(Err(error)) => format!("Unavailable: {error:?}"),
         Err(e) => format!("Unavailable: {e}"),
     }
 }
@@ -1100,22 +1127,21 @@ fn show_message(window: Option<&gtk4::Window>, heading: &str, body: &str) {
     dialog.present(window);
 }
 
-fn available_runtime_ids() -> Vec<String> {
+async fn available_runtime_ids() -> Result<Vec<String>, String> {
     use aileron_varlink::aileron_Models::VarlinkClientInterface;
-    let Ok(conn) = aileron_ipc::client::connect() else {
-        return Vec::new();
-    };
-    let mut client = aileron_varlink::aileron_Models::VarlinkClient::new(conn);
+    let mut client = aileron_ipc::client::connect()
+        .await
+        .map_err(|error| error.to_string())?;
     let mut runtimes = Vec::new();
-    if let Ok(reply) = client.list_runtime_manifests().call() {
+    if let Ok(Ok(reply)) = client.list_runtime_manifests().await {
         runtimes.extend(reply.runtimes.into_iter().map(|runtime| runtime.runtime_id));
     }
-    if let Ok(reply) = client.list().call() {
+    if let Ok(Ok(reply)) = client.list().await {
         runtimes.extend(reply.profiles.into_iter().map(|profile| profile.runtime_id));
     }
     runtimes.sort();
     runtimes.dedup();
-    runtimes
+    Ok(runtimes)
 }
 
 fn install_url_profile(
@@ -1125,102 +1151,109 @@ fn install_url_profile(
 ) {
     start_install_poll(&lists);
 
-    glib::spawn_future_local(async move {
-        let result = gio::spawn_blocking(move || {
+    crate::async_runtime::spawn_local(
+        move || async move {
             use aileron_varlink::aileron_Models::VarlinkClientInterface;
 
-            let conn = aileron_ipc::client::connect().map_err(|e| e.to_string())?;
-            let mut client = aileron_varlink::aileron_Models::VarlinkClient::new(conn);
-            let mut last_reply = None;
-            let mut install_call = client.install_url_profile(
-                request.runtime_id,
-                request.url,
-                request.sha256,
-                request.mmproj_url,
-                request.mmproj_sha256,
-                request.use_cases,
-            );
-            let mut call = install_call.more().map_err(|e| e.to_string())?;
-            for reply in &mut call {
-                let reply = reply.map_err(|e| e.to_string())?;
-                if reply.progress.done {
-                    last_reply = Some((reply.auto_assigned, reply.conflicts));
-                }
+            let mut client = aileron_ipc::client::connect()
+                .await
+                .map_err(|error| ModelsCallError::Connection(error.to_string()))?;
+            let mut replies = client
+                .install_url_profile(
+                    request.runtime_id,
+                    request.url,
+                    request.sha256,
+                    request.mmproj_url,
+                    request.mmproj_sha256,
+                    request.use_cases,
+                )
+                .await
+                .map_err(|error| ModelsCallError::Transport(error.to_string()))?;
+            match replies.next().await {
+                Some(Ok(Ok(reply))) => Ok((reply.auto_assigned, reply.conflicts)),
+                Some(Ok(Err(error))) => Err(ModelsCallError::Declared(error)),
+                Some(Err(error)) => Err(ModelsCallError::Transport(error.to_string())),
+                None => Err(ModelsCallError::MissingInstallReply),
             }
-            Ok::<_, String>(last_reply.unwrap_or_default())
-        })
-        .await;
+        },
+        move |result| {
+            refresh_model_page(&lists);
 
-        refresh_model_page(&lists);
-
-        match result {
-            Ok(Ok((auto_assigned, conflicts))) => {
-                if !conflicts.is_empty() {
-                    show_pull_result_dialog(window.as_ref(), auto_assigned, conflicts, lists);
+            match result {
+                Ok((auto_assigned, conflicts)) => {
+                    if !conflicts.is_empty() {
+                        show_pull_result_dialog(window.as_ref(), auto_assigned, conflicts, lists);
+                    }
                 }
+                Err(ModelsCallError::Declared(ModelsError::InstallFailed { reason, .. }))
+                    if is_non_error_install_result(&reason) =>
+                {
+                    refresh_model_page(&lists);
+                }
+                Err(error) => show_message(
+                    window.as_ref(),
+                    "Install failed",
+                    &install_error_message(&error),
+                ),
             }
-            Ok(Err(reason)) if is_non_error_install_result(&reason) => {
-                refresh_model_page(&lists);
-            }
-            Ok(Err(reason)) => show_message(
-                window.as_ref(),
-                "Install failed",
-                &install_error_message(&reason),
-            ),
-            Err(_) => show_message(window.as_ref(), "Install failed", "Install task failed"),
-        }
-    });
+        },
+    );
 }
 
 fn install_catalog_profile(profile_id: String, lists: ModelLists, window: Option<gtk4::Window>) {
     start_install_poll(&lists);
 
-    glib::spawn_future_local(async move {
-        let result = gio::spawn_blocking(move || {
+    crate::async_runtime::spawn_local(
+        move || async move {
             use aileron_varlink::aileron_Models::VarlinkClientInterface;
 
-            let conn = aileron_ipc::client::connect().map_err(|e| e.to_string())?;
-            let mut client = aileron_varlink::aileron_Models::VarlinkClient::new(conn);
-            let mut last_reply = None;
-            let mut install_call = client.install_manifest(profile_id);
-            let mut call = install_call.more().map_err(|e| e.to_string())?;
-            for reply in &mut call {
-                let reply = reply.map_err(|e| e.to_string())?;
-                if reply.progress.done {
-                    last_reply = Some((reply.auto_assigned, reply.conflicts));
-                }
+            let mut client = aileron_ipc::client::connect()
+                .await
+                .map_err(|error| ModelsCallError::Connection(error.to_string()))?;
+            let mut replies = client
+                .install_manifest(profile_id)
+                .await
+                .map_err(|error| ModelsCallError::Transport(error.to_string()))?;
+            match replies.next().await {
+                Some(Ok(Ok(reply))) => Ok((reply.auto_assigned, reply.conflicts)),
+                Some(Ok(Err(error))) => Err(ModelsCallError::Declared(error)),
+                Some(Err(error)) => Err(ModelsCallError::Transport(error.to_string())),
+                None => Err(ModelsCallError::MissingInstallReply),
             }
-            Ok::<_, String>(last_reply.unwrap_or_default())
-        })
-        .await;
+        },
+        move |result| {
+            refresh_model_page(&lists);
 
-        refresh_model_page(&lists);
-
-        match result {
-            Ok(Ok((auto_assigned, conflicts))) => {
-                if !conflicts.is_empty() {
-                    show_pull_result_dialog(window.as_ref(), auto_assigned, conflicts, lists);
+            match result {
+                Ok((auto_assigned, conflicts)) => {
+                    if !conflicts.is_empty() {
+                        show_pull_result_dialog(window.as_ref(), auto_assigned, conflicts, lists);
+                    }
                 }
+                Err(ModelsCallError::Declared(ModelsError::InstallFailed { reason, .. }))
+                    if is_non_error_install_result(&reason) =>
+                {
+                    refresh_model_page(&lists);
+                }
+                Err(error) => show_message(
+                    window.as_ref(),
+                    "Install failed",
+                    &install_error_message(&error),
+                ),
             }
-            Ok(Err(reason)) if is_non_error_install_result(&reason) => {
-                refresh_model_page(&lists);
-            }
-            Ok(Err(reason)) => show_message(
-                window.as_ref(),
-                "Install failed",
-                &install_error_message(&reason),
-            ),
-            Err(_) => show_message(window.as_ref(), "Install failed", "Install task failed"),
-        }
-    });
+        },
+    );
 }
 
 fn is_non_error_install_result(reason: &str) -> bool {
     reason.contains("install already running") || reason.contains("install cancelled")
 }
 
-fn install_error_message(reason: &str) -> String {
-    let reason = extract_varlink_reason(reason).unwrap_or(reason).trim();
+fn install_error_message(error: &ModelsCallError) -> String {
+    let ModelsCallError::Declared(ModelsError::InstallFailed { reason, .. }) = error else {
+        return error.to_string();
+    };
+    let reason = reason.trim();
     if let Some(image_ref) = reason.strip_prefix("local runtime image is not built: ") {
         return format!(
             "The required local runtime image is missing:\n\n{image_ref}\n\nBuild or tag this runtime image, then try the install again."
@@ -1229,58 +1262,54 @@ fn install_error_message(reason: &str) -> String {
     reason.to_string()
 }
 
-fn extract_varlink_reason(reason: &str) -> Option<&str> {
-    let marker = "reason: \"";
-    let start = reason.find(marker)? + marker.len();
-    let rest = &reason[start..];
-    let end = rest.find('\"')?;
-    Some(&rest[..end])
-}
-
 fn delete_profile(
     profile_id: String,
     force: bool,
     lists: ModelLists,
     window: Option<gtk4::Window>,
 ) {
-    use aileron_varlink::aileron_Models::VarlinkClientInterface;
+    let profile_id_for_call = profile_id.clone();
+    crate::async_runtime::spawn(
+        async move {
+            use aileron_varlink::aileron_Models::VarlinkClientInterface;
+            let mut client = aileron_ipc::client::connect()
+                .await
+                .map_err(|error| ModelsCallError::Connection(error.to_string()))?;
+            client
+                .delete_profile(profile_id_for_call, force)
+                .await
+                .map_err(|error| ModelsCallError::Transport(error.to_string()))?
+                .map_err(ModelsCallError::Declared)
+        },
+        move |result| match result {
+            Ok(_) => refresh_model_page(&lists),
+            Err(ModelsCallError::Declared(ModelsError::ProfileInUse { .. })) if !force => {
+                let dialog = AlertDialog::builder()
+                    .heading("Profile is in use")
+                    .body("This profile is assigned or has active sessions. Delete it anyway?")
+                    .build();
+                dialog.add_response("cancel", "Cancel");
+                dialog.add_response("delete", "Delete anyway");
+                dialog
+                    .set_response_appearance("delete", libadwaita::ResponseAppearance::Destructive);
+                dialog.set_close_response("cancel");
 
-    let result = aileron_ipc::client::connect()
-        .map_err(|e| e.to_string())
-        .and_then(|conn| {
-            let mut c = aileron_varlink::aileron_Models::VarlinkClient::new(conn);
-            c.delete_profile(profile_id.clone(), force)
-                .call()
-                .map_err(|e| e.to_string())
-        });
-
-    match result {
-        Ok(_) => refresh_model_page(&lists),
-        Err(reason) if !force && reason.contains("ProfileInUse") => {
-            let dialog = AlertDialog::builder()
-                .heading("Profile is in use")
-                .body("This profile is assigned or has active sessions. Delete it anyway?")
-                .build();
-            dialog.add_response("cancel", "Cancel");
-            dialog.add_response("delete", "Delete anyway");
-            dialog.set_response_appearance("delete", libadwaita::ResponseAppearance::Destructive);
-            dialog.set_close_response("cancel");
-
-            let window_for_response = window.clone();
-            dialog.connect_response(None, move |_, response| {
-                if response == "delete" {
-                    delete_profile(
-                        profile_id.clone(),
-                        true,
-                        lists.clone(),
-                        window_for_response.clone(),
-                    );
-                }
-            });
-            dialog.present(window.as_ref());
-        }
-        Err(reason) => show_message(window.as_ref(), "Delete failed", &reason),
-    }
+                let window_for_response = window.clone();
+                dialog.connect_response(None, move |_, response| {
+                    if response == "delete" {
+                        delete_profile(
+                            profile_id.clone(),
+                            true,
+                            lists.clone(),
+                            window_for_response.clone(),
+                        );
+                    }
+                });
+                dialog.present(window.as_ref());
+            }
+            Err(error) => show_message(window.as_ref(), "Delete failed", &error.to_string()),
+        },
+    );
 }
 
 fn refresh_model_page(lists: &ModelLists) {
@@ -1296,40 +1325,34 @@ fn start_install_poll(lists: &ModelLists) {
         return;
     }
     lists.install_poll_active.set(true);
-    refresh_downloads_list(lists);
-    let lists = lists.clone();
-    let mut grace_ticks = 15;
-    glib::timeout_add_seconds_local(2, move || {
-        refresh_downloads_list(&lists);
-        if has_active_installs() {
-            grace_ticks = 15;
-            glib::ControlFlow::Continue
-        } else if grace_ticks > 0 {
-            grace_ticks -= 1;
-            glib::ControlFlow::Continue
-        } else {
-            lists.install_poll_active.set(false);
-            glib::ControlFlow::Break
-        }
-    });
+    poll_installs(lists.clone(), 15);
 }
 
-fn has_active_installs() -> bool {
-    use aileron_varlink::aileron_Models::VarlinkClientInterface;
+fn poll_installs(lists: ModelLists, grace_ticks: u8) {
+    refresh_downloads_list(&lists);
+    crate::async_runtime::spawn(
+        async {
+            use aileron_varlink::aileron_Models::VarlinkClientInterface;
 
-    aileron_ipc::client::connect()
-        .map_err(|e| e.to_string())
-        .and_then(|conn| {
-            let mut client = aileron_varlink::aileron_Models::VarlinkClient::new(conn);
-            client.list_installs().call().map_err(|e| e.to_string())
-        })
-        .map(|reply| {
-            reply
-                .installs
-                .iter()
-                .any(|install| !install_is_terminal(install))
-        })
-        .unwrap_or(false)
+            let mut client = aileron_ipc::client::connect().await.ok()?;
+            let installs = client.list_installs().await.ok()?.ok()?.installs;
+            Some(installs.iter().any(|install| !install_is_terminal(install)))
+        },
+        move |active| {
+            let next_grace = if active.unwrap_or(false) {
+                15
+            } else {
+                grace_ticks.saturating_sub(1)
+            };
+            if next_grace == 0 {
+                lists.install_poll_active.set(false);
+                return;
+            }
+            glib::timeout_add_seconds_local_once(2, move || {
+                poll_installs(lists, next_grace);
+            });
+        },
+    );
 }
 
 fn refresh_readiness_list(lists: &ModelLists) {
@@ -1343,29 +1366,29 @@ fn refresh_readiness_list(lists: &ModelLists) {
     list_box.append(&row);
 
     let lists = lists.clone();
-    glib::spawn_future_local(async move {
-        let result = gio::spawn_blocking(move || {
+    crate::async_runtime::spawn(
+        async move {
             use aileron_varlink::aileron_Models::VarlinkClientInterface;
 
-            aileron_ipc::client::connect()
-                .map_err(|e| e.to_string())
-                .and_then(|conn| {
-                    let mut client = aileron_varlink::aileron_Models::VarlinkClient::new(conn);
-                    let profiles = client.list().call().map_err(|e| e.to_string())?.profiles;
-                    let catalog = client
-                        .list_catalog()
-                        .call()
-                        .map_err(|e| e.to_string())?
-                        .profiles;
-                    Ok::<_, String>((profiles, catalog))
-                })
-        })
-        .await
-        .map_err(|_| "Task readiness check failed".to_string())
-        .and_then(|result| result);
-
-        render_readiness_list(&lists, result);
-    });
+            let mut client = aileron_ipc::client::connect()
+                .await
+                .map_err(|e| e.to_string())?;
+            let profiles = client
+                .list()
+                .await
+                .map_err(|e| e.to_string())?
+                .map_err(|e| format!("{e:?}"))?
+                .profiles;
+            let catalog = client
+                .list_catalog()
+                .await
+                .map_err(|e| e.to_string())?
+                .map_err(|e| format!("{e:?}"))?
+                .profiles;
+            Ok((profiles, catalog))
+        },
+        move |result| render_readiness_list(&lists, result),
+    );
 }
 
 fn render_readiness_list(
@@ -1878,15 +1901,32 @@ fn refresh_downloads_list(lists: &ModelLists) {
         list.remove(&child);
     }
 
-    use aileron_varlink::aileron_Models::VarlinkClientInterface;
-    let installs = aileron_ipc::client::connect()
-        .map_err(|e| e.to_string())
-        .and_then(|conn| {
-            let mut client = aileron_varlink::aileron_Models::VarlinkClient::new(conn);
-            client.list_installs().call().map_err(|e| e.to_string())
-        });
+    let lists = lists.clone();
+    crate::async_runtime::spawn(
+        async {
+            use aileron_varlink::aileron_Models::VarlinkClientInterface;
+            let mut client = aileron_ipc::client::connect()
+                .await
+                .map_err(|e| e.to_string())?;
+            client
+                .list_installs()
+                .await
+                .map_err(|e| e.to_string())?
+                .map_err(|e| format!("{e:?}"))
+        },
+        move |result| render_downloads_list(&lists, result),
+    );
+}
 
-    let installs = match installs {
+fn render_downloads_list(
+    lists: &ModelLists,
+    result: Result<aileron_varlink::aileron_Models::ListInstalls_Reply, String>,
+) {
+    let list = &lists.downloads;
+    while let Some(child) = list.first_child() {
+        list.remove(&child);
+    }
+    let installs = match result {
         Ok(reply) => reply.installs,
         Err(reason) => {
             let row = ActionRow::new();
@@ -2015,25 +2055,26 @@ fn download_subtitle(
 }
 
 fn cancel_install(profile_id: String, lists: ModelLists, window: Option<gtk4::Window>) {
-    use aileron_varlink::aileron_Models::VarlinkClientInterface;
-
-    let result = aileron_ipc::client::connect()
-        .map_err(|e| e.to_string())
-        .and_then(|conn| {
-            let mut client = aileron_varlink::aileron_Models::VarlinkClient::new(conn);
+    crate::async_runtime::spawn(
+        async move {
+            use aileron_varlink::aileron_Models::VarlinkClientInterface;
+            let mut client = aileron_ipc::client::connect()
+                .await
+                .map_err(|e| e.to_string())?;
             client
                 .cancel_install(profile_id)
-                .call()
-                .map_err(|e| e.to_string())
-        });
-
-    match result {
-        Ok(_) => {
-            refresh_model_page(&lists);
-            start_install_poll(&lists);
-        }
-        Err(reason) => show_message(window.as_ref(), "Cancel failed", &reason),
-    }
+                .await
+                .map_err(|e| e.to_string())?
+                .map_err(|e| format!("{e:?}"))
+        },
+        move |result| match result {
+            Ok(_) => {
+                refresh_model_page(&lists);
+                start_install_poll(&lists);
+            }
+            Err(reason) => show_message(window.as_ref(), "Cancel failed", &reason),
+        },
+    );
 }
 
 fn confirm_cancel_install(profile_id: String, lists: ModelLists, window: Option<gtk4::Window>) {
@@ -2255,22 +2296,23 @@ fn assign_use_case_direct(
     lists: ModelLists,
     window: Option<gtk4::Window>,
 ) {
-    use aileron_varlink::aileron_Models::VarlinkClientInterface;
-
-    let result = aileron_ipc::client::connect()
-        .map_err(|e| e.to_string())
-        .and_then(|conn| {
-            let mut client = aileron_varlink::aileron_Models::VarlinkClient::new(conn);
+    crate::async_runtime::spawn(
+        async move {
+            use aileron_varlink::aileron_Models::VarlinkClientInterface;
+            let mut client = aileron_ipc::client::connect()
+                .await
+                .map_err(|e| e.to_string())?;
             client
                 .assign_use_case(profile_id, use_case)
-                .call()
-                .map_err(|e| e.to_string())
-        });
-
-    match result {
-        Ok(_) => refresh_model_page(&lists),
-        Err(reason) => show_message(window.as_ref(), "Assign failed", &reason),
-    }
+                .await
+                .map_err(|e| e.to_string())?
+                .map_err(|e| format!("{e:?}"))
+        },
+        move |result| match result {
+            Ok(_) => refresh_model_page(&lists),
+            Err(reason) => show_message(window.as_ref(), "Assign failed", &reason),
+        },
+    );
 }
 
 fn refresh_model_list(lists: &ModelLists) {
@@ -2279,31 +2321,55 @@ fn refresh_model_list(lists: &ModelLists) {
         list_box.remove(&child);
     }
 
-    use aileron_varlink::aileron_Models::VarlinkClientInterface;
-    let conn = match aileron_ipc::client::connect() {
-        Ok(c) => c,
-        Err(e) => {
-            let row = ActionRow::new();
-            row.set_title(&format!("Error: {e}"));
-            list_box.append(&row);
-            return;
-        }
-    };
+    let lists = lists.clone();
+    crate::async_runtime::spawn(
+        async {
+            use aileron_varlink::aileron_Models::VarlinkClientInterface as ModelsClient;
 
-    let mut client = aileron_varlink::aileron_Models::VarlinkClient::new(conn);
-    match client.list().call() {
-        Ok(reply) => {
-            if reply.profiles.is_empty() {
+            let mut models = aileron_ipc::client::connect()
+                .await
+                .map_err(|e| e.to_string())?;
+            let profiles = models
+                .list()
+                .await
+                .map_err(|e| e.to_string())?
+                .map_err(|e| format!("{e:?}"))?
+                .profiles;
+            let mut inference = aileron_ipc::client::connect()
+                .await
+                .map_err(|e| e.to_string())?;
+            let mut rows = Vec::with_capacity(profiles.len());
+            for profile in profiles {
+                let availability =
+                    profile_availability(&mut inference, &profile.assigned_use_cases).await;
+                rows.push((profile, availability));
+            }
+            Ok(rows)
+        },
+        move |result| render_model_list(&lists, result),
+    );
+}
+
+fn render_model_list(
+    lists: &ModelLists,
+    result: Result<Vec<(aileron_varlink::aileron_Models::ProfileInfo, String)>, String>,
+) {
+    let list_box = &lists.profiles;
+    while let Some(child) = list_box.first_child() {
+        list_box.remove(&child);
+    }
+    match result {
+        Ok(profiles) => {
+            if profiles.is_empty() {
                 let row = ActionRow::new();
                 row.set_title("No profiles installed");
                 row.set_subtitle("Use the Tasks or Profile Library tab to install a profile.");
                 list_box.append(&row);
                 return;
             }
-            for model in &reply.profiles {
+            for (model, availability) in &profiles {
                 let row = ActionRow::new();
                 row.set_title(&model.profile_id);
-                let availability = profile_availability(&model.assigned_use_cases);
                 row.set_subtitle(&format!(
                     "{} · {} · {} · {} · {}",
                     availability,
@@ -2383,21 +2449,19 @@ fn refresh_model_list(lists: &ModelLists) {
                             .collect();
                         let profile_id3 = profile_id2.clone();
                         let lists3 = lists2.clone();
-                        glib::spawn_future_local(async move {
-                            let _ = gio::spawn_blocking(move || {
+                        crate::async_runtime::spawn(
+                            async move {
                                 use aileron_varlink::aileron_Models::VarlinkClientInterface;
-                                if let Ok(conn) = aileron_ipc::client::connect() {
-                                    let mut c =
-                                        aileron_varlink::aileron_Models::VarlinkClient::new(conn);
+                                if let Ok(mut client) = aileron_ipc::client::connect().await {
                                     for use_case in selected {
-                                        let _ =
-                                            c.assign_use_case(profile_id3.clone(), use_case).call();
+                                        let _ = client
+                                            .assign_use_case(profile_id3.clone(), use_case)
+                                            .await;
                                     }
                                 }
-                            })
-                            .await;
-                            refresh_model_page(&lists3);
-                        });
+                            },
+                            move |_| refresh_model_page(&lists3),
+                        );
                     });
 
                     if let Some(window) = btn.root().and_then(|r| r.downcast::<gtk4::Window>().ok())
@@ -2521,24 +2585,22 @@ fn show_pull_result_dialog(
         }
         let conflicts_clone = conflicts.clone();
         let lists_clone = lists.clone();
-        glib::spawn_future_local(async move {
-            let _ = gio::spawn_blocking(move || {
+        crate::async_runtime::spawn(
+            async move {
                 use aileron_varlink::aileron_Models::VarlinkClientInterface;
-                if let Ok(conn) = aileron_ipc::client::connect() {
-                    let mut c = aileron_varlink::aileron_Models::VarlinkClient::new(conn);
+                if let Ok(mut client) = aileron_ipc::client::connect().await {
                     for conflict in &conflicts_clone {
-                        let _ = c
+                        let _ = client
                             .assign_use_case(
                                 conflict.new_profile.clone(),
                                 conflict.use_case.clone(),
                             )
-                            .call();
+                            .await;
                     }
                 }
-            })
-            .await;
-            refresh_model_page(&lists_clone);
-        });
+            },
+            move |_| refresh_model_page(&lists_clone),
+        );
     });
 
     dialog.present(window);
@@ -2552,27 +2614,34 @@ mod tests {
 
     #[test]
     fn formats_install_failed_reason() {
-        let message = install_error_message(
-            "aileron.Models.InstallFailed: Some(InstallFailed_Args { profile_id: \"x\", reason: \"local runtime image is not built: localhost/example:cpu\", })",
-        );
+        let message =
+            install_error_message(&ModelsCallError::Declared(ModelsError::InstallFailed {
+                profile_id: "x".to_string(),
+                reason: "local runtime image is not built: localhost/example:cpu".to_string(),
+            }));
 
         assert!(message.contains("The required local runtime image is missing"));
         assert!(message.contains("localhost/example:cpu"));
-        assert!(!message.contains("InstallFailed_Args"));
     }
 
     #[hegel::test]
-    fn extracts_generated_varlink_reason(tc: TestCase) {
+    fn formats_typed_install_failed_reason(tc: TestCase) {
         let reason = tc.draw(gs::sampled_from(vec![
             "install cancelled".to_string(),
             "local runtime image is not built: localhost/example:cpu".to_string(),
             "runtime image download already running".to_string(),
         ]));
-        let message = format!(
-            "aileron.Models.InstallFailed: Some(InstallFailed_Args {{ profile_id: \"x\", reason: \"{reason}\", }})"
-        );
+        let error = ModelsCallError::Declared(ModelsError::InstallFailed {
+            profile_id: "x".to_string(),
+            reason: reason.clone(),
+        });
+        let message = install_error_message(&error);
 
-        assert_eq!(extract_varlink_reason(&message), Some(reason.as_str()));
+        if reason.starts_with("local runtime image is not built: ") {
+            assert!(message.contains("The required local runtime image is missing"));
+        } else {
+            assert_eq!(message, reason);
+        }
     }
 
     #[test]

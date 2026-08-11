@@ -17,25 +17,138 @@ use crate::container::{
 };
 use crate::observability::{self, ObservabilityFailure};
 use crate::profiles::{ArtifactHash, RuntimeCandidate};
-use crate::request_execution::{self, ActiveContainerRequest, RequestCancellation};
-use crate::state::SharedState;
-#[allow(unused_imports)]
-// VarlinkCallError is a supertrait; its methods reach us via Call_* dyn objects.
-use aileron_varlink::aileron_Inference::{
-    AudioChunk, Call_CancelActiveRequest, Call_CreateSession, Call_EndSession,
-    Call_GetUseCaseAvailability, Call_Prewarm, Call_StreamDepth, Call_StreamDescribe,
-    Call_StreamDetect, Call_StreamEmbed, Call_StreamOcr, Call_StreamRespondGuided,
-    Call_StreamResponse, Call_StreamSegment, Call_StreamSubmitToolResultsGuided,
-    Call_StreamSynthesize, Call_StreamTranscribe, EmbedOptions, GuidedField, GuidedOptions,
-    ModelAvailability, ResponseOptions, SpeechOptions, SynthesisOptions, ToolCall, ToolDefinition,
-    ToolResult, VarlinkCallError, VarlinkInterface, VisionBoxPrompt, VisionDepthMap,
-    VisionDetection, VisionMask, VisionOptions, VisionPointPrompt, VisionSegmentOptions,
+use crate::request_execution::{
+    self, ActiveContainerRequest, OperationCancellation, RequestCancellation,
 };
+use crate::state::SharedState;
+use aileron_varlink::inference::{
+    AudioChunk, CreateSession_Reply, EmbedOptions, Error, GetUseCaseAvailability_Reply,
+    GuidedField, GuidedOptions, ModelAvailability, ResponseOptions, SpeechOptions,
+    StreamDepth_Reply, StreamDescribe_Reply, StreamDetect_Reply, StreamEmbed_Reply,
+    StreamOcr_Reply, StreamRespondGuided_Reply, StreamResponse_Reply, StreamSegment_Reply,
+    StreamSubmitToolResultsGuided_Reply, StreamSynthesize_Reply, StreamTranscribe_Reply,
+    SynthesisOptions, ToolCall, ToolDefinition, ToolResult, VisionDepthMap, VisionDetection,
+    VisionMask, VisionOptions, VisionSegmentOptions,
+};
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 
 pub struct InferenceHandler {
     state: SharedState,
-    rt: tokio::runtime::Handle,
 }
+
+pub type InferenceStream<T> = ReceiverStream<Result<zlink::Reply<T>, Error>>;
+
+#[derive(Debug)]
+struct StreamClosed;
+
+struct ChannelCall<T> {
+    sender: mpsc::Sender<Result<zlink::Reply<T>, Error>>,
+    more: bool,
+    continues: bool,
+}
+
+impl<T> ChannelCall<T> {
+    fn new(sender: mpsc::Sender<Result<zlink::Reply<T>, Error>>, more: bool) -> Self {
+        Self {
+            sender,
+            more,
+            continues: false,
+        }
+    }
+
+    fn send(&self, value: T) -> Result<(), StreamClosed> {
+        if self.sender.is_closed() {
+            return Err(StreamClosed);
+        }
+        let reply = zlink::Reply::from(value).set_continues(Some(self.continues));
+        tokio::task::block_in_place(|| self.sender.blocking_send(Ok(reply)))
+            .map_err(|_| StreamClosed)
+    }
+
+    fn wants_more(&self) -> bool {
+        self.more
+    }
+
+    fn set_continues(&mut self, continues: bool) {
+        self.continues = continues;
+    }
+
+    fn error(&self, error: Error) {
+        let _ = tokio::task::block_in_place(|| self.sender.blocking_send(Err(error)));
+    }
+}
+
+macro_rules! token_call {
+    ($trait_name:ident, $reply:ident) => {
+        trait $trait_name: Send {
+            fn wants_more(&self) -> bool;
+            fn disconnected(&self) -> bool;
+            fn set_continues(&mut self, continues: bool);
+            fn reply(&mut self, token: String) -> Result<(), StreamClosed>;
+        }
+
+        impl $trait_name for ChannelCall<$reply> {
+            fn wants_more(&self) -> bool {
+                self.more
+            }
+            fn disconnected(&self) -> bool {
+                self.sender.is_closed()
+            }
+            fn set_continues(&mut self, continues: bool) {
+                self.continues = continues;
+            }
+            fn reply(&mut self, token: String) -> Result<(), StreamClosed> {
+                self.send($reply { token })
+            }
+        }
+    };
+}
+
+token_call!(ResponseCall, StreamResponse_Reply);
+token_call!(TranscribeCall, StreamTranscribe_Reply);
+token_call!(DescribeCall, StreamDescribe_Reply);
+token_call!(OcrCall, StreamOcr_Reply);
+
+macro_rules! guided_call {
+    ($trait_name:ident, $reply:ident) => {
+        trait $trait_name: Send {
+            fn wants_more(&self) -> bool;
+            fn disconnected(&self) -> bool;
+            fn set_continues(&mut self, continues: bool);
+            fn reply(
+                &mut self,
+                snapshot_json: String,
+                tool_calls: Vec<ToolCall>,
+            ) -> Result<(), StreamClosed>;
+        }
+
+        impl $trait_name for ChannelCall<$reply> {
+            fn wants_more(&self) -> bool {
+                self.more
+            }
+            fn disconnected(&self) -> bool {
+                self.sender.is_closed()
+            }
+            fn set_continues(&mut self, continues: bool) {
+                self.continues = continues;
+            }
+            fn reply(
+                &mut self,
+                snapshot_json: String,
+                tool_calls: Vec<ToolCall>,
+            ) -> Result<(), StreamClosed> {
+                self.send($reply {
+                    snapshot_json,
+                    tool_calls,
+                })
+            }
+        }
+    };
+}
+
+guided_call!(GuidedResponseCall, StreamRespondGuided_Reply);
+guided_call!(GuidedToolResultsCall, StreamSubmitToolResultsGuided_Reply);
 
 type ProfileRuntime = (
     String,
@@ -177,261 +290,239 @@ enum ResolveSessionError {
 }
 
 impl InferenceHandler {
-    pub fn new(state: SharedState, rt: tokio::runtime::Handle) -> Self {
-        Self { state, rt }
+    pub fn new(state: SharedState) -> Self {
+        Self { state }
     }
-}
 
-impl VarlinkInterface for InferenceHandler {
-    fn get_use_case_availability(
+    pub async fn get_use_case_availability(
         &self,
-        call: &mut dyn Call_GetUseCaseAvailability,
         app_id: String,
         use_case: String,
-    ) -> varlink::Result<()> {
-        self.rt.block_on(async {
-            let (candidates, artifact_path) = {
-                let guard = self.state.0.lock().await;
-                if !is_supported_use_case(&use_case) {
-                    return call.reply(ModelAvailability {
-                        is_available: false,
-                        code: "unsupported_use_case".to_string(),
-                        reason: format!("unsupported use-case: {use_case}"),
-                    });
-                }
-                if !guard.config.allow_all
-                    && matches!(guard.permissions.check(&app_id, &use_case), Some(false))
-                {
-                    return call.reply(ModelAvailability {
-                        is_available: false,
-                        code: "permission_denied".to_string(),
-                        reason: format!("{app_id} is denied permission for {use_case}"),
-                    });
-                }
-                let profile_id = match assigned_profile_id_for_use_case(&guard, &use_case) {
-                    Some(profile_id) => profile_id,
-                    None => {
-                        return call.reply(ModelAvailability {
-                            is_available: false,
-                            code: "no_profile_assigned".to_string(),
-                            reason: format!("no profile assigned for {use_case}"),
-                        });
-                    }
-                };
-                let profile = match guard.profiles.get(&profile_id) {
-                    Some(profile) => profile,
-                    None => {
-                        return call.reply(ModelAvailability {
-                            is_available: false,
-                            code: "profile_not_installed".to_string(),
-                            reason: format!("assigned profile {profile_id} is not installed"),
-                        });
-                    }
-                };
-                if let Err(reason) = validate_runtime_profile_compatibility(&use_case, profile) {
-                    return call.reply(ModelAvailability {
-                        is_available: false,
-                        code: "artifact_missing".to_string(),
-                        reason,
-                    });
-                }
-                let candidates = resolve_runtime_candidates(&guard, profile);
-                if candidates.is_empty() {
-                    return call.reply(ModelAvailability {
-                        is_available: false,
-                        code: "runtime_unsupported".to_string(),
-                        reason: format!(
-                            "runtime {} does not support {}",
-                            profile.runtime_id,
-                            guard.variant.as_tag()
-                        ),
-                    });
-                }
-                (candidates, profile.artifact_path.clone())
-            };
-            let (oci_store, system_oci_store) = {
-                let containers = self.state.2.lock().await;
-                (
-                    containers.oci_store.clone(),
-                    containers.system_oci_store.clone(),
-                )
-            };
-
-            if !artifact_path.exists() {
-                return call.reply(ModelAvailability {
-                    is_available: false,
-                    code: "artifact_missing".to_string(),
-                    reason: format!("artifact path {} is missing", artifact_path.display()),
-                });
+    ) -> GetUseCaseAvailability_Reply {
+        let (candidates, artifact_path) = {
+            let guard = self.state.0.lock().await;
+            if !is_supported_use_case(&use_case) {
+                return availability_reply(
+                    false,
+                    "unsupported_use_case",
+                    format!("unsupported use-case: {use_case}"),
+                );
             }
+            if !guard.config.allow_all
+                && matches!(guard.permissions.check(&app_id, &use_case), Some(false))
+            {
+                return availability_reply(
+                    false,
+                    "permission_denied",
+                    format!("{app_id} is denied permission for {use_case}"),
+                );
+            }
+            let profile_id = match assigned_profile_id_for_use_case(&guard, &use_case) {
+                Some(profile_id) => profile_id,
+                None => {
+                    return availability_reply(
+                        false,
+                        "no_profile_assigned",
+                        format!("no profile assigned for {use_case}"),
+                    );
+                }
+            };
+            let profile = match guard.profiles.get(&profile_id) {
+                Some(profile) => profile,
+                None => {
+                    return availability_reply(
+                        false,
+                        "profile_not_installed",
+                        format!("assigned profile {profile_id} is not installed"),
+                    );
+                }
+            };
+            if let Err(reason) = validate_runtime_profile_compatibility(&use_case, profile) {
+                return availability_reply(false, "artifact_missing", reason);
+            }
+            let candidates = resolve_runtime_candidates(&guard, profile);
+            if candidates.is_empty() {
+                return availability_reply(
+                    false,
+                    "runtime_unsupported",
+                    format!(
+                        "runtime {} does not support {}",
+                        profile.runtime_id,
+                        guard.variant.as_tag()
+                    ),
+                );
+            }
+            (candidates, profile.artifact_path.clone())
+        };
+        let (oci_store, system_oci_store) = {
+            let containers = self.state.2.lock().await;
+            (
+                containers.oci_store.clone(),
+                containers.system_oci_store.clone(),
+            )
+        };
 
-            let runtime_exists = candidates.iter().any(|candidate| {
-                crate::container::runtime_rootfs_path_in_stores(
-                    &oci_store,
-                    &system_oci_store,
-                    &candidate.image_ref,
-                )
-                .is_some()
-            });
+        if !artifact_path.exists() {
+            return availability_reply(
+                false,
+                "artifact_missing",
+                format!("artifact path {} is missing", artifact_path.display()),
+            );
+        }
 
-            call.reply(ModelAvailability {
-                is_available: runtime_exists,
-                code: if runtime_exists {
-                    "available".to_string()
-                } else {
-                    "runtime_missing".to_string()
-                },
-                reason: if runtime_exists {
-                    "available".to_string()
-                } else {
-                    runtime_missing_reason(&candidates)
-                },
-            })
-        })
+        let runtime_exists = candidates.iter().any(|candidate| {
+            crate::container::runtime_rootfs_path_in_stores(
+                &oci_store,
+                &system_oci_store,
+                &candidate.image_ref,
+            )
+            .is_some()
+        });
+
+        availability_reply(
+            runtime_exists,
+            if runtime_exists {
+                "available"
+            } else {
+                "runtime_missing"
+            },
+            if runtime_exists {
+                "available".to_string()
+            } else {
+                runtime_missing_reason(&candidates)
+            },
+        )
     }
 
-    fn create_session(
+    pub async fn create_session(
         &self,
-        call: &mut dyn Call_CreateSession,
         app_id: String,
         use_case: String,
         instructions: String,
-    ) -> varlink::Result<()> {
-        self.rt.block_on(async {
-            match create_session_record(&self.state, app_id, use_case, instructions).await {
-                Ok((session_id, profile_id)) => call.reply(session_id, profile_id),
-                Err(CreateSessionError::PermissionPromptRequired(app_id, use_case)) => {
-                    call.reply_permission_prompt_required(app_id, use_case)
-                }
-                Err(CreateSessionError::PermissionDenied(app_id, use_case)) => {
-                    call.reply_permission_denied(app_id, use_case)
-                }
-                Err(CreateSessionError::ModelUnavailable(reason)) => {
-                    call.reply_model_unavailable(reason)
-                }
-                Err(CreateSessionError::InvalidInput(reason)) => call.reply_invalid_input(reason),
-            }
-        })
-    }
-
-    fn prewarm(&self, call: &mut dyn Call_Prewarm, session_id: String) -> varlink::Result<()> {
-        self.rt.block_on(async {
-            let resolved = match resolve_session_runtime(&self.state, &session_id, |_| Ok(())).await
-            {
-                Ok(resolved) => resolved,
-                Err(ResolveSessionError::SessionNotFound(id)) => {
-                    return call.reply_session_not_found(id);
-                }
-                Err(ResolveSessionError::ModelUnavailable(reason)) => {
-                    return call.reply_model_unavailable(reason);
-                }
-                Err(ResolveSessionError::InvalidInput(reason)) => {
-                    return call.reply_invalid_input(reason);
-                }
-            };
-
-            if let Err(e) = with_locked_container(
-                "Prewarm",
-                &self.state,
-                &session_id,
-                resolved.clone(),
-                RequestExecutionMode::Interactive,
-                std::convert::identity,
-                |_container, _handle, _spawned| Ok(()),
-            )
+    ) -> Result<CreateSession_Reply, Error> {
+        create_session_record(&self.state, app_id, use_case, instructions)
             .await
-            {
-                return reply_generation_failure(call, e);
-            }
-
-            call.reply()
-        })
+            .map(|(session_id, profile_id)| CreateSession_Reply {
+                session_id,
+                profile_id,
+            })
+            .map_err(|error| match error {
+                CreateSessionError::PermissionPromptRequired(app_id, use_case) => {
+                    Error::PermissionPromptRequired { app_id, use_case }
+                }
+                CreateSessionError::PermissionDenied(app_id, use_case) => {
+                    Error::PermissionDenied { app_id, use_case }
+                }
+                CreateSessionError::ModelUnavailable(reason) => Error::ModelUnavailable { reason },
+                CreateSessionError::InvalidInput(reason) => Error::InvalidInput { reason },
+            })
     }
 
-    fn stream_response(
+    pub async fn prewarm(&self, session_id: String) -> Result<(), Error> {
+        let resolved = resolve_session_runtime(&self.state, &session_id, |_| Ok(()))
+            .await
+            .map_err(resolve_error)?;
+
+        if let Err(e) = with_locked_container(
+            "Prewarm",
+            &self.state,
+            &session_id,
+            resolved.clone(),
+            RequestExecutionMode::Interactive,
+            None,
+            std::convert::identity,
+            |_container, _handle, _spawned| Ok(()),
+        )
+        .await
+        {
+            return Err(generation_failure_error(e));
+        }
+
+        Ok(())
+    }
+
+    pub fn stream_response(
         &self,
-        call: &mut dyn Call_StreamResponse,
+        more: bool,
         session_id: String,
         input_json: String,
         media_paths: Vec<String>,
         options: ResponseOptions,
-    ) -> varlink::Result<()> {
-        self.rt.block_on(async {
-            match stream_tokens(
-                &self.state,
-                call,
+    ) -> InferenceStream<StreamResponse_Reply> {
+        let (sender, receiver) = mpsc::channel(8);
+        let state = self.state.clone();
+        tokio::spawn(async move {
+            let cancellation = OperationCancellation::default();
+            let _disconnect_watcher = cancellation.watch_sender(&sender);
+            let mut call = ChannelCall::new(sender, more);
+            let error = stream_tokens(
+                &state,
+                &cancellation,
+                &mut call,
                 session_id,
                 input_json,
                 media_paths,
                 options,
             )
             .await
-            {
-                Ok(()) => Ok(()),
-                Err(GenerationError::SessionNotFound(id)) => call.reply_session_not_found(id),
-                Err(GenerationError::ModelUnavailable(reason)) => {
-                    call.reply_model_unavailable(reason)
-                }
-                Err(GenerationError::InvalidOptions(reason)) => {
-                    call.reply_invalid_generation_options(reason)
-                }
-                Err(GenerationError::InvalidInput(reason)) => call.reply_invalid_input(reason),
-                Err(GenerationError::Failed(reason)) => reply_generation_failure(call, reason),
-                Err(GenerationError::Reply(e)) => Err(e),
+            .err()
+            .and_then(|error| generation_error(error, false));
+            if let Some(error) = error {
+                call.error(error);
             }
-        })
+        });
+        ReceiverStream::new(receiver)
     }
 
-    fn stream_transcribe(
+    pub fn stream_transcribe(
         &self,
-        call: &mut dyn Call_StreamTranscribe,
+        more: bool,
         session_id: String,
         audio_path: String,
         options: SpeechOptions,
-    ) -> varlink::Result<()> {
-        self.rt.block_on(async {
-            match stream_transcription(&self.state, call, session_id, audio_path, options).await {
-                Ok(()) => Ok(()),
-                Err(SpeechError::SessionNotFound(id)) => call.reply_session_not_found(id),
-                Err(SpeechError::ModelUnavailable(reason)) => call.reply_model_unavailable(reason),
-                Err(SpeechError::InvalidInput(reason)) => call.reply_invalid_input(reason),
-                Err(SpeechError::Failed(reason)) => reply_generation_failure(call, reason),
-                Err(SpeechError::Reply(e)) => Err(e),
+    ) -> InferenceStream<StreamTranscribe_Reply> {
+        let (sender, receiver) = mpsc::channel(8);
+        let state = self.state.clone();
+        tokio::spawn(async move {
+            let cancellation = OperationCancellation::default();
+            let _disconnect_watcher = cancellation.watch_sender(&sender);
+            let mut call = ChannelCall::new(sender, more);
+            let error = stream_transcription(
+                &state,
+                &cancellation,
+                &mut call,
+                session_id,
+                audio_path,
+                options,
+            )
+            .await
+            .err()
+            .and_then(speech_error);
+            if let Some(error) = error {
+                call.error(error);
             }
-        })
+        });
+        ReceiverStream::new(receiver)
     }
 
-    fn stream_synthesize(
+    pub fn stream_describe(
         &self,
-        call: &mut dyn Call_StreamSynthesize,
-        session_id: String,
-        text: String,
-        options: SynthesisOptions,
-    ) -> varlink::Result<()> {
-        self.rt.block_on(async {
-            match stream_synthesis(&self.state, call, session_id, text, options).await {
-                Ok(()) => Ok(()),
-                Err(SpeechError::SessionNotFound(id)) => call.reply_session_not_found(id),
-                Err(SpeechError::ModelUnavailable(reason)) => call.reply_model_unavailable(reason),
-                Err(SpeechError::InvalidInput(reason)) => call.reply_invalid_input(reason),
-                Err(SpeechError::Failed(reason)) => reply_generation_failure(call, reason),
-                Err(SpeechError::Reply(e)) => Err(e),
-            }
-        })
-    }
-
-    fn stream_describe(
-        &self,
-        call: &mut dyn Call_StreamDescribe,
+        more: bool,
         session_id: String,
         image_path: String,
         instructions: String,
         options: VisionOptions,
-    ) -> varlink::Result<()> {
-        self.rt.block_on(async {
-            match stream_vision_text(
-                &self.state,
-                call,
+    ) -> InferenceStream<StreamDescribe_Reply> {
+        let (sender, receiver) = mpsc::channel(8);
+        let state = self.state.clone();
+        tokio::spawn(async move {
+            let cancellation = OperationCancellation::default();
+            let _disconnect_watcher = cancellation.watch_sender(&sender);
+            let mut call = ChannelCall::new(sender, more);
+            let error = stream_vision_text(
+                &state,
+                &cancellation,
+                &mut call,
                 session_id,
                 image_path,
                 instructions,
@@ -439,29 +530,58 @@ impl VarlinkInterface for InferenceHandler {
                 "vision.describe",
             )
             .await
-            {
-                Ok(()) => Ok(()),
-                Err(VisionError::SessionNotFound(id)) => call.reply_session_not_found(id),
-                Err(VisionError::ModelUnavailable(reason)) => call.reply_model_unavailable(reason),
-                Err(VisionError::InvalidInput(reason)) => call.reply_invalid_input(reason),
-                Err(VisionError::Failed(reason)) => reply_generation_failure(call, reason),
-                Err(VisionError::Reply(e)) => Err(e),
+            .err()
+            .and_then(vision_error);
+            if let Some(error) = error {
+                call.error(error);
             }
-        })
+        });
+        ReceiverStream::new(receiver)
     }
 
-    fn stream_ocr(
+    pub fn stream_synthesize(
         &self,
-        call: &mut dyn Call_StreamOcr,
+        more: bool,
+        session_id: String,
+        text: String,
+        options: SynthesisOptions,
+    ) -> InferenceStream<StreamSynthesize_Reply> {
+        let (sender, receiver) = mpsc::channel(8);
+        let state = self.state.clone();
+        tokio::spawn(async move {
+            let cancellation = OperationCancellation::default();
+            let _disconnect_watcher = cancellation.watch_sender(&sender);
+            let mut call = ChannelCall::new(sender, more);
+            let error =
+                stream_synthesis(&state, &cancellation, &mut call, session_id, text, options)
+                    .await
+                    .err()
+                    .and_then(speech_error);
+            if let Some(error) = error {
+                call.error(error);
+            }
+        });
+        ReceiverStream::new(receiver)
+    }
+
+    pub fn stream_ocr(
+        &self,
+        more: bool,
         session_id: String,
         image_path: String,
         instructions: String,
         options: VisionOptions,
-    ) -> varlink::Result<()> {
-        self.rt.block_on(async {
-            match stream_vision_text(
-                &self.state,
-                call,
+    ) -> InferenceStream<StreamOcr_Reply> {
+        let (sender, receiver) = mpsc::channel(8);
+        let state = self.state.clone();
+        tokio::spawn(async move {
+            let cancellation = OperationCancellation::default();
+            let _disconnect_watcher = cancellation.watch_sender(&sender);
+            let mut call = ChannelCall::new(sender, more);
+            let error = stream_vision_text(
+                &state,
+                &cancellation,
+                &mut call,
                 session_id,
                 image_path,
                 instructions,
@@ -469,117 +589,163 @@ impl VarlinkInterface for InferenceHandler {
                 "vision.ocr",
             )
             .await
-            {
-                Ok(()) => Ok(()),
-                Err(VisionError::SessionNotFound(id)) => call.reply_session_not_found(id),
-                Err(VisionError::ModelUnavailable(reason)) => call.reply_model_unavailable(reason),
-                Err(VisionError::InvalidInput(reason)) => call.reply_invalid_input(reason),
-                Err(VisionError::Failed(reason)) => reply_generation_failure(call, reason),
-                Err(VisionError::Reply(e)) => Err(e),
+            .err()
+            .and_then(vision_error);
+            if let Some(error) = error {
+                call.error(error);
             }
-        })
+        });
+        ReceiverStream::new(receiver)
     }
 
-    fn stream_detect(
+    pub fn stream_detect(
         &self,
-        call: &mut dyn Call_StreamDetect,
+        _more: bool,
         session_id: String,
         image_path: String,
         instructions: String,
         options: VisionOptions,
-    ) -> varlink::Result<()> {
-        self.rt.block_on(async {
-            match vision_detections(&self.state, session_id, image_path, instructions, options)
-                .await
-            {
-                Ok(detections) => call.reply(detections),
-                Err(VisionError::SessionNotFound(id)) => call.reply_session_not_found(id),
-                Err(VisionError::ModelUnavailable(reason)) => call.reply_model_unavailable(reason),
-                Err(VisionError::InvalidInput(reason)) => call.reply_invalid_input(reason),
-                Err(VisionError::Failed(reason)) => reply_generation_failure(call, reason),
-                Err(VisionError::Reply(e)) => Err(e),
-            }
-        })
+    ) -> InferenceStream<StreamDetect_Reply> {
+        let (sender, receiver) = mpsc::channel(1);
+        let state = self.state.clone();
+        tokio::spawn(async move {
+            let cancellation = OperationCancellation::default();
+            let _disconnect_watcher = cancellation.watch_sender(&sender);
+            let item = vision_detections(
+                &state,
+                &cancellation,
+                session_id,
+                image_path,
+                instructions,
+                options,
+            )
+            .await
+            .map(|detections| {
+                zlink::Reply::from(StreamDetect_Reply { detections }).set_continues(Some(false))
+            })
+            .map_err(|error| {
+                vision_error(error).expect("single-result operation has no send error")
+            });
+            let _ = sender.send(item).await;
+        });
+        ReceiverStream::new(receiver)
     }
 
-    fn stream_segment(
+    pub fn stream_segment(
         &self,
-        call: &mut dyn Call_StreamSegment,
+        _more: bool,
         session_id: String,
         image_path: String,
         instructions: String,
         options: VisionSegmentOptions,
-    ) -> varlink::Result<()> {
-        self.rt.block_on(async {
-            match vision_masks(&self.state, session_id, image_path, instructions, options).await {
-                Ok(masks) => call.reply(masks),
-                Err(VisionError::SessionNotFound(id)) => call.reply_session_not_found(id),
-                Err(VisionError::ModelUnavailable(reason)) => call.reply_model_unavailable(reason),
-                Err(VisionError::InvalidInput(reason)) => call.reply_invalid_input(reason),
-                Err(VisionError::Failed(reason)) => reply_generation_failure(call, reason),
-                Err(VisionError::Reply(e)) => Err(e),
-            }
-        })
+    ) -> InferenceStream<StreamSegment_Reply> {
+        let (sender, receiver) = mpsc::channel(1);
+        let state = self.state.clone();
+        tokio::spawn(async move {
+            let cancellation = OperationCancellation::default();
+            let _disconnect_watcher = cancellation.watch_sender(&sender);
+            let item = vision_masks(
+                &state,
+                &cancellation,
+                session_id,
+                image_path,
+                instructions,
+                options,
+            )
+            .await
+            .map(|masks| {
+                zlink::Reply::from(StreamSegment_Reply { masks }).set_continues(Some(false))
+            })
+            .map_err(|error| {
+                vision_error(error).expect("single-result operation has no send error")
+            });
+            let _ = sender.send(item).await;
+        });
+        ReceiverStream::new(receiver)
     }
 
-    fn stream_depth(
+    pub fn stream_depth(
         &self,
-        call: &mut dyn Call_StreamDepth,
+        _more: bool,
         session_id: String,
         image_path: String,
         instructions: String,
         options: VisionOptions,
-    ) -> varlink::Result<()> {
-        self.rt.block_on(async {
-            match vision_depth(&self.state, session_id, image_path, instructions, options).await {
-                Ok(depth) => call.reply(depth),
-                Err(VisionError::SessionNotFound(id)) => call.reply_session_not_found(id),
-                Err(VisionError::ModelUnavailable(reason)) => call.reply_model_unavailable(reason),
-                Err(VisionError::InvalidInput(reason)) => call.reply_invalid_input(reason),
-                Err(VisionError::Failed(reason)) => reply_generation_failure(call, reason),
-                Err(VisionError::Reply(e)) => Err(e),
-            }
-        })
+    ) -> InferenceStream<StreamDepth_Reply> {
+        let (sender, receiver) = mpsc::channel(1);
+        let state = self.state.clone();
+        tokio::spawn(async move {
+            let cancellation = OperationCancellation::default();
+            let _disconnect_watcher = cancellation.watch_sender(&sender);
+            let item = vision_depth(
+                &state,
+                &cancellation,
+                session_id,
+                image_path,
+                instructions,
+                options,
+            )
+            .await
+            .map(|depth| zlink::Reply::from(StreamDepth_Reply { depth }).set_continues(Some(false)))
+            .map_err(|error| {
+                vision_error(error).expect("single-result operation has no send error")
+            });
+            let _ = sender.send(item).await;
+        });
+        ReceiverStream::new(receiver)
     }
 
-    fn stream_embed(
+    pub fn stream_embed(
         &self,
-        call: &mut dyn Call_StreamEmbed,
+        _more: bool,
         session_id: String,
         text: String,
         options: EmbedOptions,
-    ) -> varlink::Result<()> {
-        self.rt.block_on(async {
-            match embedding_vector(&self.state, session_id, text, options).await {
-                Ok(result) => call.reply(result.embedding, result.pipeline_id),
-                Err(GenerationError::SessionNotFound(id)) => call.reply_session_not_found(id),
-                Err(GenerationError::ModelUnavailable(reason)) => {
-                    call.reply_model_unavailable(reason)
-                }
-                Err(GenerationError::InvalidOptions(reason)) => {
-                    call.reply_invalid_generation_options(reason)
-                }
-                Err(GenerationError::InvalidInput(reason)) => call.reply_invalid_input(reason),
-                Err(GenerationError::Failed(reason)) => reply_generation_failure(call, reason),
-                Err(GenerationError::Reply(e)) => Err(e),
-            }
-        })
+    ) -> InferenceStream<StreamEmbed_Reply> {
+        let (sender, receiver) = mpsc::channel(1);
+        let state = self.state.clone();
+        tokio::spawn(async move {
+            let cancellation = OperationCancellation::default();
+            let _disconnect_watcher = cancellation.watch_sender(&sender);
+            let item = embedding_vector(&state, &cancellation, session_id, text, options)
+                .await
+                .map(|result| {
+                    zlink::Reply::from(StreamEmbed_Reply {
+                        embedding: result.embedding,
+                        embedding_pipeline_id: result.pipeline_id,
+                    })
+                    .set_continues(Some(false))
+                })
+                .map_err(|error| {
+                    generation_error(error, false)
+                        .expect("single-result operation has no send error")
+                });
+            let _ = sender.send(item).await;
+        });
+        ReceiverStream::new(receiver)
     }
 
-    fn stream_respond_guided(
+    #[allow(clippy::too_many_arguments)]
+    pub fn stream_respond_guided(
         &self,
-        call: &mut dyn Call_StreamRespondGuided,
+        more: bool,
         session_id: String,
         prompt: String,
         media_paths: Vec<String>,
         fields: Vec<GuidedField>,
         tools: Vec<ToolDefinition>,
         options: GuidedOptions,
-    ) -> varlink::Result<()> {
-        self.rt.block_on(async {
-            match stream_guided_snapshots(
-                &self.state,
-                call,
+    ) -> InferenceStream<StreamRespondGuided_Reply> {
+        let (sender, receiver) = mpsc::channel(8);
+        let state = self.state.clone();
+        tokio::spawn(async move {
+            let cancellation = OperationCancellation::default();
+            let _disconnect_watcher = cancellation.watch_sender(&sender);
+            let mut call = ChannelCall::new(sender, more);
+            let error = stream_guided_snapshots(
+                &state,
+                &cancellation,
+                &mut call,
                 GuidedStreamRequest {
                     session_id,
                     prompt,
@@ -590,25 +756,19 @@ impl VarlinkInterface for InferenceHandler {
                 },
             )
             .await
-            {
-                Ok(()) => Ok(()),
-                Err(GenerationError::SessionNotFound(id)) => call.reply_session_not_found(id),
-                Err(GenerationError::ModelUnavailable(reason)) => {
-                    call.reply_model_unavailable(reason)
-                }
-                Err(GenerationError::InvalidOptions(reason)) => {
-                    call.reply_invalid_generation_options(reason)
-                }
-                Err(GenerationError::InvalidInput(reason)) => call.reply_invalid_input(reason),
-                Err(GenerationError::Failed(reason)) => reply_guided_failure(call, reason),
-                Err(GenerationError::Reply(e)) => Err(e),
+            .err()
+            .and_then(|error| generation_error(error, true));
+            if let Some(error) = error {
+                call.error(error);
             }
-        })
+        });
+        ReceiverStream::new(receiver)
     }
 
-    fn stream_submit_tool_results_guided(
+    #[allow(clippy::too_many_arguments)]
+    pub fn stream_submit_tool_results_guided(
         &self,
-        call: &mut dyn Call_StreamSubmitToolResultsGuided,
+        more: bool,
         session_id: String,
         prompt: String,
         media_paths: Vec<String>,
@@ -616,11 +776,17 @@ impl VarlinkInterface for InferenceHandler {
         fields: Vec<GuidedField>,
         tools: Vec<ToolDefinition>,
         options: GuidedOptions,
-    ) -> varlink::Result<()> {
-        self.rt.block_on(async {
-            match stream_guided_tool_results(
-                &self.state,
-                call,
+    ) -> InferenceStream<StreamSubmitToolResultsGuided_Reply> {
+        let (sender, receiver) = mpsc::channel(8);
+        let state = self.state.clone();
+        tokio::spawn(async move {
+            let cancellation = OperationCancellation::default();
+            let _disconnect_watcher = cancellation.watch_sender(&sender);
+            let mut call = ChannelCall::new(sender, more);
+            let error = stream_guided_tool_results(
+                &state,
+                &cancellation,
+                &mut call,
                 session_id,
                 prompt,
                 media_paths,
@@ -630,73 +796,71 @@ impl VarlinkInterface for InferenceHandler {
                 options,
             )
             .await
-            {
-                Ok(()) => Ok(()),
-                Err(GenerationError::SessionNotFound(id)) => call.reply_session_not_found(id),
-                Err(GenerationError::ModelUnavailable(reason)) => {
-                    call.reply_model_unavailable(reason)
-                }
-                Err(GenerationError::InvalidOptions(reason)) => {
-                    call.reply_invalid_generation_options(reason)
-                }
-                Err(GenerationError::InvalidInput(reason)) => call.reply_invalid_input(reason),
-                Err(GenerationError::Failed(reason)) => reply_guided_failure(call, reason),
-                Err(GenerationError::Reply(e)) => Err(e),
+            .err()
+            .and_then(|error| generation_error(error, true));
+            if let Some(error) = error {
+                call.error(error);
             }
-        })
+        });
+        ReceiverStream::new(receiver)
     }
 
-    fn end_session(
-        &self,
-        call: &mut dyn Call_EndSession,
-        session_id: String,
-    ) -> varlink::Result<()> {
-        self.rt.block_on(async {
-            let (profile_id, app_id, use_case) = {
-                let mut guard = self.state.0.lock().await;
-                let Some(session) = guard.sessions.remove(&session_id) else {
-                    return call.reply_session_not_found(session_id);
-                };
-                request_execution::mark_session_closed(&self.state, &session_id);
-                (session.profile_id, session.app_id, session.use_case)
+    pub async fn end_session(&self, session_id: String) -> Result<(), Error> {
+        let (profile_id, app_id, use_case) = {
+            let mut guard = self.state.0.lock().await;
+            let Some(session) = guard.sessions.remove(&session_id) else {
+                return Err(Error::SessionNotFound { session_id });
             };
-            request_execution::terminate_active_container_handles_for_session(
-                &self.state,
-                &profile_id,
-                &session_id,
-            )
-            .await;
-            observability::log_session_ended(observability::SessionFields {
-                session_id: &session_id,
-                app_id: &app_id,
-                use_case: &use_case,
-                profile_id: &profile_id,
-            });
-            call.reply()
-        })
+            request_execution::mark_session_closed(&self.state, &session_id);
+            (session.profile_id, session.app_id, session.use_case)
+        };
+        request_execution::terminate_active_container_handles_for_session(
+            &self.state,
+            &profile_id,
+            &session_id,
+        )
+        .await;
+        observability::log_session_ended(observability::SessionFields {
+            session_id: &session_id,
+            app_id: &app_id,
+            use_case: &use_case,
+            profile_id: &profile_id,
+        });
+        Ok(())
     }
 
-    fn cancel_active_request(
-        &self,
-        call: &mut dyn Call_CancelActiveRequest,
-        session_id: String,
-    ) -> varlink::Result<()> {
-        self.rt.block_on(async {
-            let profile_id = {
-                let guard = self.state.0.lock().await;
-                let Some(session) = guard.sessions.get(&session_id) else {
-                    return call.reply_session_not_found(session_id);
-                };
-                session.profile_id.clone()
-            };
-            request_execution::terminate_active_container_handles_for_session(
-                &self.state,
-                &profile_id,
-                &session_id,
-            )
-            .await;
-            call.reply()
-        })
+    pub async fn cancel_active_request(&self, session_id: String) -> Result<(), Error> {
+        let profile_id = {
+            let guard = self.state.0.lock().await;
+            guard
+                .sessions
+                .get(&session_id)
+                .map(|session| session.profile_id.clone())
+                .ok_or_else(|| Error::SessionNotFound {
+                    session_id: session_id.clone(),
+                })?
+        };
+        request_execution::terminate_active_container_handles_for_session(
+            &self.state,
+            &profile_id,
+            &session_id,
+        )
+        .await;
+        Ok(())
+    }
+}
+
+fn availability_reply(
+    is_available: bool,
+    code: &str,
+    reason: String,
+) -> GetUseCaseAvailability_Reply {
+    GetUseCaseAvailability_Reply {
+        availability: ModelAvailability {
+            is_available,
+            code: code.to_string(),
+            reason,
+        },
     }
 }
 
@@ -800,7 +964,8 @@ fn assigned_profile_id_for_use_case(guard: &crate::state::Inner, use_case: &str)
 
 async fn stream_transcription(
     state: &SharedState,
-    call: &mut dyn Call_StreamTranscribe,
+    cancellation: &OperationCancellation,
+    call: &mut dyn TranscribeCall,
     session_id: String,
     audio_path: String,
     options: SpeechOptions,
@@ -822,11 +987,12 @@ async fn stream_transcription(
         &session_id,
         resolved.clone(),
         execution_mode,
+        Some(cancellation),
         SpeechError::Failed,
-        |container, _handle, _spawned| {
+        |container, handle, _spawned| {
             let wants_more = call.wants_more();
             let mut pending_token: Option<String> = None;
-            let mut reply_error: Option<varlink::Error> = None;
+            let mut reply_error: Option<StreamClosed> = None;
             let mut cancelled = false;
 
             let result = container.stream_transcribe(
@@ -835,6 +1001,11 @@ async fn stream_transcription(
                 task,
                 execution_mode.as_str(),
                 |token| {
+                    if call.disconnected() {
+                        handle.terminate();
+                        cancelled = true;
+                        return;
+                    }
                     if cancelled
                         || RequestCancellation::for_session(state, &session_id).is_cancelled()
                     {
@@ -854,6 +1025,7 @@ async fn stream_transcription(
                     if let Some(previous) = pending_token.replace(token) {
                         call.set_continues(true);
                         if let Err(e) = call.reply(previous) {
+                            handle.terminate();
                             reply_error = Some(e);
                         }
                     }
@@ -891,7 +1063,8 @@ async fn stream_transcription(
 
 async fn stream_synthesis(
     state: &SharedState,
-    call: &mut dyn Call_StreamSynthesize,
+    cancellation: &OperationCancellation,
+    call: &mut ChannelCall<StreamSynthesize_Reply>,
     session_id: String,
     text: String,
     options: SynthesisOptions,
@@ -911,12 +1084,13 @@ async fn stream_synthesis(
         &session_id,
         resolved.clone(),
         execution_mode,
+        Some(cancellation),
         SpeechError::Failed,
-        |container, _handle, _spawned| {
+        |container, handle, _spawned| {
             let wants_more = call.wants_more();
             let mut pending_chunk: Option<AudioChunk> = None;
             let mut terminal_metadata: Option<(i64, i64, String)> = None;
-            let mut reply_error: Option<varlink::Error> = None;
+            let mut reply_error: Option<StreamClosed> = None;
             let mut cancelled = false;
             let result = container.stream_synthesize(
                 &text,
@@ -924,7 +1098,14 @@ async fn stream_synthesis(
                 &options.language_hint,
                 execution_mode.as_str(),
                 |chunk: RuntimeAudioChunk| {
-                    if RequestCancellation::for_session(state, &session_id).is_cancelled() {
+                    if call.sender.is_closed() {
+                        handle.terminate();
+                        cancelled = true;
+                        anyhow::bail!("synthesis stream receiver disconnected");
+                    }
+                    if cancellation.ensure_not_cancelled().is_err()
+                        || RequestCancellation::for_session(state, &session_id).is_cancelled()
+                    {
                         cancelled = true;
                         anyhow::bail!(request_execution::request_cancelled_reason());
                     }
@@ -941,7 +1122,8 @@ async fn stream_synthesis(
                     };
                     if wants_more {
                         call.set_continues(true);
-                        if let Err(error) = call.reply(chunk) {
+                        if let Err(error) = call.send(StreamSynthesize_Reply { chunk }) {
+                            handle.terminate();
                             reply_error = Some(error);
                             anyhow::bail!("failed to send synthesis stream reply");
                         }
@@ -974,16 +1156,20 @@ async fn stream_synthesis(
                 let (sample_rate, channels, sample_format) = terminal_metadata
                     .expect("validated synthesis stream has at least one audio chunk");
                 call.set_continues(false);
-                call.reply(AudioChunk {
-                    audio_base64: String::new(),
-                    sample_rate,
-                    channels,
-                    sample_format,
+                call.send(StreamSynthesize_Reply {
+                    chunk: AudioChunk {
+                        audio_base64: String::new(),
+                        sample_rate,
+                        channels,
+                        sample_format,
+                    },
                 })
                 .map_err(SpeechError::Reply)
             } else {
-                call.reply(pending_chunk.expect("validated synthesis stream has audio"))
-                    .map_err(SpeechError::Reply)
+                call.send(StreamSynthesize_Reply {
+                    chunk: pending_chunk.expect("validated synthesis stream has audio"),
+                })
+                .map_err(SpeechError::Reply)
             }
         },
     )
@@ -1022,8 +1208,10 @@ fn validate_synthesis_option(name: &str, value: &str, max_bytes: usize) -> Resul
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn stream_vision_text<C: TextStreamCall + ?Sized>(
     state: &SharedState,
+    cancellation: &OperationCancellation,
     call: &mut C,
     session_id: String,
     image_path: String,
@@ -1052,11 +1240,12 @@ async fn stream_vision_text<C: TextStreamCall + ?Sized>(
         &session_id,
         resolved.clone(),
         execution_mode,
+        Some(cancellation),
         VisionError::Failed,
-        |container, _handle, _spawned| {
+        |container, handle, _spawned| {
             let wants_more = call.wants_more();
             let mut pending_token: Option<String> = None;
-            let mut reply_error: Option<varlink::Error> = None;
+            let mut reply_error: Option<StreamClosed> = None;
             let mut saw_token = false;
             let mut cancelled = false;
 
@@ -1066,6 +1255,11 @@ async fn stream_vision_text<C: TextStreamCall + ?Sized>(
                     &instructions,
                     execution_mode.as_str(),
                     |token| {
+                        if call.disconnected() {
+                            handle.terminate();
+                            cancelled = true;
+                            return;
+                        }
                         if cancelled
                             || RequestCancellation::for_session(state, &session_id).is_cancelled()
                         {
@@ -1080,6 +1274,9 @@ async fn stream_vision_text<C: TextStreamCall + ?Sized>(
                             &mut saw_token,
                             &mut reply_error,
                         );
+                        if reply_error.is_some() {
+                            handle.terminate();
+                        }
                     },
                 )
             } else {
@@ -1088,6 +1285,11 @@ async fn stream_vision_text<C: TextStreamCall + ?Sized>(
                     &instructions,
                     execution_mode.as_str(),
                     |token| {
+                        if call.disconnected() {
+                            handle.terminate();
+                            cancelled = true;
+                            return;
+                        }
                         if cancelled
                             || RequestCancellation::for_session(state, &session_id).is_cancelled()
                         {
@@ -1102,6 +1304,9 @@ async fn stream_vision_text<C: TextStreamCall + ?Sized>(
                             &mut saw_token,
                             &mut reply_error,
                         );
+                        if reply_error.is_some() {
+                            handle.terminate();
+                        }
                     },
                 )
             };
@@ -1143,7 +1348,7 @@ fn forward_text_stream_token<C: TextStreamCall + ?Sized>(
     token: String,
     pending_token: &mut Option<String>,
     saw_token: &mut bool,
-    reply_error: &mut Option<varlink::Error>,
+    reply_error: &mut Option<StreamClosed>,
 ) {
     if !token.is_empty() {
         *saw_token = true;
@@ -1171,6 +1376,7 @@ fn vision_text_allows_empty_output(expected_use_case: &str) -> bool {
 
 async fn vision_detections(
     state: &SharedState,
+    cancellation: &OperationCancellation,
     session_id: String,
     image_path: String,
     instructions: String,
@@ -1192,6 +1398,7 @@ async fn vision_detections(
         &session_id,
         resolved.clone(),
         execution_mode,
+        Some(cancellation),
         VisionError::Failed,
         |container, handle, spawned| {
             let result = container
@@ -1221,6 +1428,7 @@ async fn vision_detections(
 
 async fn vision_masks(
     state: &SharedState,
+    cancellation: &OperationCancellation,
     session_id: String,
     image_path: String,
     instructions: String,
@@ -1261,6 +1469,7 @@ async fn vision_masks(
         &session_id,
         resolved.clone(),
         execution_mode,
+        Some(cancellation),
         VisionError::Failed,
         |container, handle, spawned| {
             let result = container
@@ -1299,6 +1508,7 @@ async fn vision_masks(
 
 async fn vision_depth(
     state: &SharedState,
+    cancellation: &OperationCancellation,
     session_id: String,
     image_path: String,
     instructions: String,
@@ -1320,6 +1530,7 @@ async fn vision_depth(
         &session_id,
         resolved.clone(),
         execution_mode,
+        Some(cancellation),
         VisionError::Failed,
         |container, handle, spawned| {
             let result = container
@@ -1344,6 +1555,7 @@ async fn vision_depth(
 
 async fn embedding_vector(
     state: &SharedState,
+    cancellation: &OperationCancellation,
     session_id: String,
     text: String,
     options: EmbedOptions,
@@ -1361,6 +1573,7 @@ async fn embedding_vector(
         &session_id,
         resolved.clone(),
         execution_mode,
+        Some(cancellation),
         GenerationError::Failed,
         |container, handle, spawned| {
             let pipeline_id = embedding_pipeline_id(&resolved, container);
@@ -1628,7 +1841,8 @@ fn base64_encode(data: &[u8]) -> String {
 
 async fn stream_tokens(
     state: &SharedState,
-    call: &mut dyn Call_StreamResponse,
+    cancellation: &OperationCancellation,
+    call: &mut dyn ResponseCall,
     session_id: String,
     input_json: String,
     media_paths: Vec<String>,
@@ -1655,17 +1869,23 @@ async fn stream_tokens(
         &session_id,
         resolved.clone(),
         execution_mode,
+        Some(cancellation),
         GenerationError::Failed,
-        |container, _handle, _spawned| {
+        |container, handle, _spawned| {
             let wants_more = call.wants_more();
             let mut pending_token: Option<String> = None;
-            let mut reply_error: Option<varlink::Error> = None;
+            let mut reply_error: Option<StreamClosed> = None;
             let mut saw_token = false;
             let mut cancelled = false;
 
             macro_rules! generate_with_instructions {
                 ($instructions:expr) => {
                     container.generate(Some($instructions), &prompt, Some(&input), max_tokens, execution_mode.as_str(), |token| {
+                        if call.disconnected() {
+                            handle.terminate();
+                            cancelled = true;
+                            return;
+                        }
                         if cancelled
                             || RequestCancellation::for_session(state, &session_id).is_cancelled()
                         {
@@ -1687,6 +1907,7 @@ async fn stream_tokens(
                         if let Some(previous) = pending_token.replace(token) {
                             call.set_continues(true);
                             if let Err(e) = call.reply(previous) {
+                                handle.terminate();
                                 reply_error = Some(e);
                             }
                         }
@@ -1742,7 +1963,7 @@ enum GenerationError {
     InvalidOptions(String),
     InvalidInput(String),
     Failed(String),
-    Reply(varlink::Error),
+    Reply(StreamClosed),
 }
 
 enum SpeechError {
@@ -1750,7 +1971,7 @@ enum SpeechError {
     ModelUnavailable(String),
     InvalidInput(String),
     Failed(String),
-    Reply(varlink::Error),
+    Reply(StreamClosed),
 }
 
 enum VisionError {
@@ -1758,7 +1979,47 @@ enum VisionError {
     ModelUnavailable(String),
     InvalidInput(String),
     Failed(String),
-    Reply(varlink::Error),
+    Reply(StreamClosed),
+}
+
+fn resolve_error(error: ResolveSessionError) -> Error {
+    match error {
+        ResolveSessionError::SessionNotFound(session_id) => Error::SessionNotFound { session_id },
+        ResolveSessionError::ModelUnavailable(reason) => Error::ModelUnavailable { reason },
+        ResolveSessionError::InvalidInput(reason) => Error::InvalidInput { reason },
+    }
+}
+
+fn generation_error(error: GenerationError, guided: bool) -> Option<Error> {
+    Some(match error {
+        GenerationError::SessionNotFound(session_id) => Error::SessionNotFound { session_id },
+        GenerationError::ModelUnavailable(reason) => Error::ModelUnavailable { reason },
+        GenerationError::InvalidOptions(reason) => Error::InvalidGenerationOptions { reason },
+        GenerationError::InvalidInput(reason) => Error::InvalidInput { reason },
+        GenerationError::Failed(reason) if guided => guided_failure_error(reason),
+        GenerationError::Failed(reason) => generation_failure_error(reason),
+        GenerationError::Reply(_) => return None,
+    })
+}
+
+fn speech_error(error: SpeechError) -> Option<Error> {
+    Some(match error {
+        SpeechError::SessionNotFound(session_id) => Error::SessionNotFound { session_id },
+        SpeechError::ModelUnavailable(reason) => Error::ModelUnavailable { reason },
+        SpeechError::InvalidInput(reason) => Error::InvalidInput { reason },
+        SpeechError::Failed(reason) => generation_failure_error(reason),
+        SpeechError::Reply(_) => return None,
+    })
+}
+
+fn vision_error(error: VisionError) -> Option<Error> {
+    Some(match error {
+        VisionError::SessionNotFound(session_id) => Error::SessionNotFound { session_id },
+        VisionError::ModelUnavailable(reason) => Error::ModelUnavailable { reason },
+        VisionError::InvalidInput(reason) => Error::InvalidInput { reason },
+        VisionError::Failed(reason) => generation_failure_error(reason),
+        VisionError::Reply(_) => return None,
+    })
 }
 
 impl From<ResolveSessionError> for GenerationError {
@@ -1955,11 +2216,19 @@ async fn model_container(
     session_id: &str,
     resolved: &ResolvedSessionRuntime,
     execution_mode: RequestExecutionMode,
+    operation_cancellation: Option<&OperationCancellation>,
 ) -> Result<(ContainerHandle, bool), String> {
     let deadline = std::time::Instant::now() + crate::container::STARTUP_TIMEOUT;
     tokio::time::timeout_at(
         tokio::time::Instant::from_std(deadline),
-        model_container_before_deadline(state, session_id, resolved, execution_mode, deadline),
+        model_container_before_deadline(
+            state,
+            session_id,
+            resolved,
+            execution_mode,
+            deadline,
+            operation_cancellation,
+        ),
     )
     .await
     .map_err(|_| "container startup timed out".to_string())?
@@ -1971,9 +2240,12 @@ async fn model_container_before_deadline(
     resolved: &ResolvedSessionRuntime,
     execution_mode: RequestExecutionMode,
     deadline: std::time::Instant,
+    operation_cancellation: Option<&OperationCancellation>,
 ) -> Result<(ContainerHandle, bool), String> {
+    ensure_operation_connected(operation_cancellation)?;
     ensure_resolved_session_active(state, session_id, resolved).await?;
     let prepared = loop {
+        ensure_operation_connected(operation_cancellation)?;
         RequestCancellation::for_session(state, session_id).ensure_not_cancelled()?;
         ensure_background_start_still_allowed(state, resolved, execution_mode)?;
         ensure_profile_epoch_current(state, resolved)?;
@@ -2005,6 +2277,7 @@ async fn model_container_before_deadline(
             let state = state.clone();
             let session_id = session_id.to_string();
             let resolved = resolved.clone();
+            let operation_cancellation = operation_cancellation.cloned();
             tokio::task::spawn_blocking(move || {
                 let handle = plan
                     .spawn(
@@ -2017,6 +2290,9 @@ async fn model_container_before_deadline(
                             }
                             RequestCancellation::for_session(&state, &session_id)
                                 .ensure_not_cancelled()
+                                .and_then(|_| {
+                                    ensure_operation_connected(operation_cancellation.as_ref())
+                                })
                                 .and_then(|_| {
                                     ensure_background_start_still_allowed(
                                         &state,
@@ -2036,6 +2312,7 @@ async fn model_container_before_deadline(
         }
     };
     let spawned = plan.is_some();
+    ensure_operation_connected(operation_cancellation)?;
     if let Err(e) = ensure_resolved_session_active(state, session_id, resolved).await {
         if !spawned && profile_is_missing(state, &resolved.profile_id).await {
             let mut containers = state.2.lock().await;
@@ -2065,16 +2342,26 @@ impl Drop for StartupCancellation {
     }
 }
 
+fn ensure_operation_connected(cancellation: Option<&OperationCancellation>) -> Result<(), String> {
+    cancellation.map_or(Ok(()), OperationCancellation::ensure_not_cancelled)
+}
+
 fn lock_container_for_session<'a>(
     state: &SharedState,
     session_id: &str,
     handle: &'a ContainerHandle,
     spawned: bool,
+    operation_cancellation: Option<&OperationCancellation>,
 ) -> Result<MutexGuard<'a, Container>, LockContainerError> {
     loop {
         RequestCancellation::for_session(state, session_id)
             .ensure_not_cancelled_or_terminate_spawned(handle, spawned)
             .map_err(LockContainerError::Failed)?;
+        if let Some(cancellation) = operation_cancellation {
+            cancellation
+                .ensure_not_cancelled_or_terminate_spawned(handle, spawned)
+                .map_err(LockContainerError::Failed)?;
+        }
         ensure_handle_ready_for_request(handle, spawned)?;
         match handle.try_lock() {
             Ok(container) => return Ok(container),
@@ -2090,12 +2377,14 @@ fn lock_container_for_session<'a>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn with_locked_container<T, E: ObservabilityFailure>(
     method: &'static str,
     state: &SharedState,
     session_id: &str,
     mut resolved: ResolvedSessionRuntime,
     execution_mode: RequestExecutionMode,
+    operation_cancellation: Option<&OperationCancellation>,
     map_failed: impl Fn(String) -> E,
     op: impl FnOnce(&mut Container, &ContainerHandle, bool) -> Result<T, E>,
 ) -> Result<T, E> {
@@ -2129,6 +2418,7 @@ async fn with_locked_container<T, E: ObservabilityFailure>(
         {
             RequestCancellation::for_session(state, session_id)
                 .ensure_not_cancelled()
+                .and_then(|_| ensure_operation_connected(operation_cancellation))
                 .map_err(|reason| {
                     map_observed_failure(
                         method,
@@ -2143,8 +2433,14 @@ async fn with_locked_container<T, E: ObservabilityFailure>(
             tokio::time::sleep(Duration::from_millis(25)).await;
             continue;
         }
-        let (handle, spawned) = match model_container(state, session_id, &resolved, execution_mode)
-            .await
+        let (handle, spawned) = match model_container(
+            state,
+            session_id,
+            &resolved,
+            execution_mode,
+            operation_cancellation,
+        )
+        .await
         {
             Ok(container) => container,
             Err(reason) if is_startup_finalizing_retry(&reason) => {
@@ -2184,22 +2480,27 @@ async fn with_locked_container<T, E: ObservabilityFailure>(
             }
         };
         {
-            let mut container =
-                match lock_container_for_session(state, session_id, &handle, spawned) {
-                    Ok(container) => container,
-                    Err(LockContainerError::Retry) => continue,
-                    Err(LockContainerError::Failed(reason)) => {
-                        return Err(map_observed_failure(
-                            method,
-                            session_id,
-                            &resolved,
-                            started_at,
-                            observability::container_source(spawned),
-                            &map_failed,
-                            reason,
-                        ));
-                    }
-                };
+            let mut container = match lock_container_for_session(
+                state,
+                session_id,
+                &handle,
+                spawned,
+                operation_cancellation,
+            ) {
+                Ok(container) => container,
+                Err(LockContainerError::Retry) => continue,
+                Err(LockContainerError::Failed(reason)) => {
+                    return Err(map_observed_failure(
+                        method,
+                        session_id,
+                        &resolved,
+                        started_at,
+                        observability::container_source(spawned),
+                        &map_failed,
+                        reason,
+                    ));
+                }
+            };
 
             RequestCancellation::for_session(state, session_id)
                 .ensure_not_cancelled_or_terminate_spawned(&handle, spawned)
@@ -2214,6 +2515,21 @@ async fn with_locked_container<T, E: ObservabilityFailure>(
                         reason,
                     )
                 })?;
+            if let Some(cancellation) = operation_cancellation {
+                cancellation
+                    .ensure_not_cancelled_or_terminate_spawned(&handle, spawned)
+                    .map_err(|reason| {
+                        map_observed_failure(
+                            method,
+                            session_id,
+                            &resolved,
+                            started_at,
+                            observability::container_source(spawned),
+                            &map_failed,
+                            reason,
+                        )
+                    })?;
+            }
             match ensure_handle_ready_for_request(&handle, spawned) {
                 Ok(()) => {}
                 Err(LockContainerError::Retry) => continue,
@@ -2260,6 +2576,8 @@ async fn with_locked_container<T, E: ObservabilityFailure>(
                     session_id,
                     handle.clone(),
                 );
+                let _operation_handle = operation_cancellation
+                    .map(|cancellation| cancellation.register_handle(&handle));
                 RequestCancellation::for_session(state, session_id)
                     .ensure_not_cancelled_or_terminate_spawned(&handle, spawned)
                     .map_err(|reason| {
@@ -2273,6 +2591,19 @@ async fn with_locked_container<T, E: ObservabilityFailure>(
                             reason,
                         )
                     })?;
+                if let Some(cancellation) = operation_cancellation {
+                    cancellation.ensure_not_cancelled().map_err(|reason| {
+                        map_observed_failure(
+                            method,
+                            session_id,
+                            &resolved,
+                            started_at,
+                            observability::container_source(spawned),
+                            &map_failed,
+                            reason,
+                        )
+                    })?;
+                }
                 if spawned {
                     handle.publish();
                 }
@@ -2483,61 +2814,63 @@ async fn profile_is_missing(state: &SharedState, profile_id: &str) -> bool {
 
 trait TextStreamCall {
     fn wants_more(&self) -> bool;
+    fn disconnected(&self) -> bool;
     fn set_continues(&mut self, continues: bool);
-    fn reply_token(&mut self, token: String) -> varlink::Result<()>;
+    fn reply_token(&mut self, token: String) -> Result<(), StreamClosed>;
 }
 
-impl TextStreamCall for dyn Call_StreamDescribe + '_ {
+impl TextStreamCall for ChannelCall<StreamDescribe_Reply> {
     fn wants_more(&self) -> bool {
-        let call: &dyn Call_StreamDescribe = self;
-        call.wants_more()
+        DescribeCall::wants_more(self)
+    }
+
+    fn disconnected(&self) -> bool {
+        DescribeCall::disconnected(self)
     }
 
     fn set_continues(&mut self, continues: bool) {
-        let call: &mut dyn Call_StreamDescribe = self;
-        call.set_continues(continues);
+        DescribeCall::set_continues(self, continues);
     }
 
-    fn reply_token(&mut self, token: String) -> varlink::Result<()> {
-        self.reply(token)
+    fn reply_token(&mut self, token: String) -> Result<(), StreamClosed> {
+        DescribeCall::reply(self, token)
     }
 }
 
-impl TextStreamCall for dyn Call_StreamOcr + '_ {
+impl TextStreamCall for ChannelCall<StreamOcr_Reply> {
     fn wants_more(&self) -> bool {
-        let call: &dyn Call_StreamOcr = self;
-        call.wants_more()
+        OcrCall::wants_more(self)
+    }
+
+    fn disconnected(&self) -> bool {
+        OcrCall::disconnected(self)
     }
 
     fn set_continues(&mut self, continues: bool) {
-        let call: &mut dyn Call_StreamOcr = self;
-        call.set_continues(continues);
+        OcrCall::set_continues(self, continues);
     }
 
-    fn reply_token(&mut self, token: String) -> varlink::Result<()> {
-        self.reply(token)
+    fn reply_token(&mut self, token: String) -> Result<(), StreamClosed> {
+        OcrCall::reply(self, token)
     }
 }
 
-fn reply_generation_failure(
-    call: &mut dyn VarlinkCallError,
-    reason: String,
-) -> varlink::Result<()> {
+fn generation_failure_error(reason: String) -> Error {
     match generation_failure_reply(&reason) {
-        FailureReply::ContextWindowExceeded => call.reply_context_window_exceeded(reason),
-        FailureReply::UnsupportedLanguage => call.reply_unsupported_language(reason),
-        FailureReply::SafetyRefusal => call.reply_safety_refusal(reason),
-        FailureReply::RequestCancelled => call.reply_request_cancelled(reason),
-        FailureReply::InvalidInput => call.reply_invalid_input(reason),
-        FailureReply::GenerationFailed => call.reply_generation_failed(reason),
+        FailureReply::ContextWindowExceeded => Error::ContextWindowExceeded { reason },
+        FailureReply::UnsupportedLanguage => Error::UnsupportedLanguage { reason },
+        FailureReply::SafetyRefusal => Error::SafetyRefusal { reason },
+        FailureReply::RequestCancelled => Error::RequestCancelled { reason },
+        FailureReply::InvalidInput => Error::InvalidInput { reason },
+        FailureReply::GenerationFailed => Error::GenerationFailed { reason },
     }
 }
 
-fn reply_guided_failure(call: &mut dyn VarlinkCallError, reason: String) -> varlink::Result<()> {
+fn guided_failure_error(reason: String) -> Error {
     match guided_failure_reply(&reason) {
-        FailureReply::ContextWindowExceeded => call.reply_context_window_exceeded(reason),
-        FailureReply::RequestCancelled => call.reply_request_cancelled(reason),
-        _ => call.reply_guided_generation_failed(reason),
+        FailureReply::ContextWindowExceeded => Error::ContextWindowExceeded { reason },
+        FailureReply::RequestCancelled => Error::RequestCancelled { reason },
+        _ => Error::GuidedGenerationFailed { reason },
     }
 }
 
@@ -2586,7 +2919,8 @@ struct GuidedStreamRequest {
 
 async fn stream_guided_snapshots(
     state: &SharedState,
-    call: &mut dyn Call_StreamRespondGuided,
+    cancellation: &OperationCancellation,
+    call: &mut dyn GuidedResponseCall,
     request: GuidedStreamRequest,
 ) -> Result<(), GenerationError> {
     let GuidedStreamRequest {
@@ -2617,14 +2951,15 @@ async fn stream_guided_snapshots(
         &session_id,
         resolved.clone(),
         execution_mode,
+        Some(cancellation),
         GenerationError::Failed,
-        |container, _handle, _spawned| {
+        |container, handle, _spawned| {
             let wants_more = call.wants_more();
             let mut pending_snapshot: Option<String> = None;
             let mut pending_tool_calls: Option<Vec<ToolCall>> = None;
             let mut final_snapshot = String::new();
             let mut emitted_tool_calls = false;
-            let mut reply_error: Option<varlink::Error> = None;
+            let mut reply_error: Option<StreamClosed> = None;
             let mut cancelled = false;
             let tools = tools.into_iter().map(varlink_tool_definition).collect();
             let result = container.stream_structured(
@@ -2637,10 +2972,18 @@ async fn stream_guided_snapshots(
                 tools,
                 Vec::new(),
                 |snapshot, tool_calls, done| {
+                    if call.disconnected() {
+                        handle.terminate();
+                        cancelled = true;
+                        return;
+                    }
                     if cancelled
                         || RequestCancellation::for_session(state, &session_id).is_cancelled()
                     {
                         cancelled = true;
+                        return;
+                    }
+                    if emitted_tool_calls {
                         return;
                     }
                     if !snapshot.is_empty() {
@@ -2661,6 +3004,7 @@ async fn stream_guided_snapshots(
                         call.set_continues(false);
                         emitted_tool_calls = true;
                         if let Err(e) = call.reply(String::new(), varlink_tool_calls(tool_calls)) {
+                            handle.terminate();
                             reply_error = Some(e);
                         }
                         return;
@@ -2668,6 +3012,7 @@ async fn stream_guided_snapshots(
                     if let Some(previous) = pending_snapshot.replace(snapshot) {
                         call.set_continues(true);
                         if let Err(e) = call.reply(previous, Vec::new()) {
+                            handle.terminate();
                             reply_error = Some(e);
                         }
                     }
@@ -2719,7 +3064,8 @@ async fn stream_guided_snapshots(
 #[allow(clippy::too_many_arguments)]
 async fn stream_guided_tool_results(
     state: &SharedState,
-    call: &mut dyn Call_StreamSubmitToolResultsGuided,
+    cancellation: &OperationCancellation,
+    call: &mut dyn GuidedToolResultsCall,
     session_id: String,
     prompt: String,
     media_paths: Vec<String>,
@@ -2748,14 +3094,15 @@ async fn stream_guided_tool_results(
         &session_id,
         resolved.clone(),
         execution_mode,
+        Some(cancellation),
         GenerationError::Failed,
-        |container, _handle, _spawned| {
+        |container, handle, _spawned| {
             let wants_more = call.wants_more();
             let mut pending_snapshot: Option<String> = None;
             let mut pending_tool_calls: Option<Vec<ToolCall>> = None;
             let mut final_snapshot = String::new();
             let mut emitted_tool_calls = false;
-            let mut reply_error: Option<varlink::Error> = None;
+            let mut reply_error: Option<StreamClosed> = None;
             let mut cancelled = false;
             let tools = tools.into_iter().map(varlink_tool_definition).collect();
             let tool_results = results.into_iter().map(varlink_tool_result).collect();
@@ -2769,10 +3116,18 @@ async fn stream_guided_tool_results(
                 tools,
                 tool_results,
                 |snapshot, tool_calls, done| {
+                    if call.disconnected() {
+                        handle.terminate();
+                        cancelled = true;
+                        return;
+                    }
                     if cancelled
                         || RequestCancellation::for_session(state, &session_id).is_cancelled()
                     {
                         cancelled = true;
+                        return;
+                    }
+                    if emitted_tool_calls {
                         return;
                     }
                     if !snapshot.is_empty() {
@@ -2793,6 +3148,7 @@ async fn stream_guided_tool_results(
                         call.set_continues(false);
                         emitted_tool_calls = true;
                         if let Err(e) = call.reply(String::new(), varlink_tool_calls(tool_calls)) {
+                            handle.terminate();
                             reply_error = Some(e);
                         }
                         return;
@@ -2800,6 +3156,7 @@ async fn stream_guided_tool_results(
                     if let Some(previous) = pending_snapshot.replace(snapshot) {
                         call.set_continues(true);
                         if let Err(e) = call.reply(previous, Vec::new()) {
+                            handle.terminate();
                             reply_error = Some(e);
                         }
                     }
@@ -3983,5 +4340,92 @@ mod tests {
         assert!(used.load(Ordering::Relaxed) >= 5 + 3 * 8);
         drop(request);
         assert_eq!(used.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bounded_stream_producer_stops_when_disconnected_before_reply() {
+        let (sender, receiver) = mpsc::channel(1);
+        drop(receiver);
+        let producer = tokio::spawn(async move {
+            let call = ChannelCall::<StreamResponse_Reply>::new(sender, true);
+            call.send(StreamResponse_Reply {
+                token: "ignored".to_string(),
+            })
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), producer)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn response_stream_silent_producer_stops_when_disconnected_before_first_item() {
+        let cancellation = OperationCancellation::default();
+        let worker_cancellation = cancellation.clone();
+        let (sender, receiver) =
+            mpsc::channel::<Result<zlink::Reply<StreamResponse_Reply>, Error>>(1);
+        let watcher = cancellation.watch_sender(&sender);
+        let worker = tokio::task::spawn_blocking(move || {
+            while worker_cancellation.ensure_not_cancelled().is_ok() {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+
+        drop(receiver);
+
+        tokio::time::timeout(Duration::from_secs(2), worker)
+            .await
+            .expect("silent StreamResponse producer should stop promptly")
+            .expect("silent StreamResponse producer should exit cleanly");
+        watcher.stop();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bounded_stream_producer_stops_when_disconnected_midstream() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let (continue_sender, continue_receiver) = tokio::sync::oneshot::channel();
+        let producer = tokio::spawn(async move {
+            let mut call = ChannelCall::<StreamResponse_Reply>::new(sender, true);
+            call.continues = true;
+            call.send(StreamResponse_Reply {
+                token: "first".to_string(),
+            })?;
+            let _ = continue_receiver.await;
+            call.send(StreamResponse_Reply {
+                token: "second".to_string(),
+            })
+        });
+
+        let first = receiver.recv().await.unwrap().unwrap();
+        assert_eq!(first.continues(), Some(true));
+        drop(receiver);
+        let _ = continue_sender.send(());
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), producer)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn single_result_stream_reply_is_terminal_even_when_more_was_requested() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let mut call = ChannelCall::<StreamResponse_Reply>::new(sender, true);
+        call.set_continues(false);
+        call.send(StreamResponse_Reply {
+            token: String::new(),
+        })
+        .unwrap();
+        drop(call);
+
+        let reply = receiver.recv().await.unwrap().unwrap();
+        assert_eq!(reply.continues(), Some(false));
+        assert!(receiver.recv().await.is_none());
     }
 }

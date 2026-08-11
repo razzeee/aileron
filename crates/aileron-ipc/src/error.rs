@@ -2,8 +2,8 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum IpcError {
-    #[error("varlink error: {0}")]
-    Varlink(#[from] varlink::Error),
+    #[error("varlink transport error: {0}")]
+    Zlink(#[from] zlink::Error),
 
     #[error("connection refused: socket not found at {path}")]
     NotConnected { path: String },

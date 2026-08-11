@@ -1,4 +1,5 @@
 mod app;
+mod async_runtime;
 mod pages;
 
 fn main() {

@@ -5,14 +5,12 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-aileron-varlink = { workspace = true }
-tokio           = { workspace = true }
-serde           = { workspace = true }
 serde_json      = { workspace = true }
 anyhow          = { workspace = true }
 thiserror       = { workspace = true }
 tracing         = { workspace = true }
-varlink         = { workspace = true }
+zlink           = { workspace = true }
 
 [dev-dependencies]
 hegeltest       = { workspace = true }
+tokio           = { workspace = true }

@@ -1,14 +1,19 @@
+use aileron_varlink::aileron_Inference as inference;
+use aileron_varlink::aileron_Inference::VarlinkClientInterface as _;
+use aileron_varlink::aileron_Inference::VarlinkStreamingClientInterface as _;
+use aileron_varlink::aileron_Permissions as permissions;
+use aileron_varlink::aileron_Permissions::VarlinkClientInterface as _;
 /// D-Bus portal backend for task-oriented local model capabilities.
 use anyhow::Result;
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::convert::TryFrom;
+use std::future::Future;
 use std::os::fd::AsRawFd;
-use std::process::Command;
-use std::sync::{Arc, Mutex, RwLock};
-use std::thread;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::process::Command;
 use tracing::{info, warn};
 use zbus::zvariant::{OwnedFd, OwnedObjectPath, Type};
 use zbus::{connection, interface, message::Header, object_server::SignalEmitter};
@@ -99,7 +104,7 @@ struct RequestRecord {
     session_handle: Option<String>,
     daemon_session_id: Option<String>,
     cancelled: bool,
-    active_connection: Option<Arc<Mutex<Box<dyn varlink::Stream>>>>,
+    cancel_tx: tokio::sync::watch::Sender<bool>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -160,6 +165,7 @@ impl Drop for PrewarmWorkerGuard {
     }
 }
 
+#[cfg(test)]
 async fn blocking<T: Send + 'static>(
     workers: &'static tokio::sync::Semaphore,
     request: Option<(&PortalState, &str)>,
@@ -204,7 +210,11 @@ impl<T> AsyncReplies<T> {
         if let Some(worker) = self.worker.take()
             && let Err(error) = worker.await
         {
-            return Some(Err(map_request_error(&self.state, &self.request_id, error)));
+            return Some(Err(map_request_transport_error(
+                &self.state,
+                &self.request_id,
+                error,
+            )));
         }
         None
     }
@@ -221,34 +231,27 @@ impl<T> Drop for AsyncReplies<T> {
                 complete_request_cancellation(&state, &request_id, cancellation).await;
             });
         }
-        let connection = self
-            .state
-            .requests
-            .lock()
-            .unwrap()
-            .get(&self.request_id)
-            .and_then(|record| record.active_connection.clone());
-        if let Some(connection) = connection {
-            shutdown_request_connection(&connection);
+        if let Some(worker) = &self.worker {
+            worker.abort();
         }
     }
 }
 
-async fn stream_replies<Q, R, E>(
+type StreamFuture<'a, R> = std::pin::Pin<
+    Box<dyn Future<Output = zlink::Result<inference::InferenceReplyStream<'a, R>>> + Send + 'a>,
+>;
+
+async fn stream_replies<R>(
     state: Arc<PortalState>,
     request_id: &str,
     fds: Vec<OwnedFd>,
     background: bool,
-    make_call: impl FnOnce(
-        aileron_varlink::aileron_Inference::VarlinkClient,
-    ) -> varlink::MethodCall<Q, R, E>
+    make_call: impl for<'a> FnOnce(&'a mut zlink::tokio::unix::Connection) -> StreamFuture<'a, R>
     + Send
     + 'static,
 ) -> zbus::fdo::Result<AsyncReplies<R>>
 where
-    Q: Serialize + Send + 'static,
-    R: serde::de::DeserializeOwned + Send + 'static,
-    E: From<varlink::Error> + std::fmt::Display + Send + 'static,
+    R: serde::de::DeserializeOwned + std::fmt::Debug + Send + 'static,
 {
     // Acquire the background quota before shared capacity, leaving room for
     // interactive preemption and availability/session operations.
@@ -273,30 +276,33 @@ where
         request_id: request_id.to_string(),
     };
     let request_id = request_id.to_string();
-    replies.worker = Some(tokio::task::spawn_blocking(move || {
+    replies.worker = Some(tokio::spawn(async move {
         let _permit = permit;
         let _background_permit = background_permit;
         // The daemon opens /proc paths lazily, so retain the fds through the last read.
         let _fds = fds;
-        let result = (|| {
-            let connection = connect_request_daemon(&state, &request_id)?;
-            let mut call = make_call(aileron_varlink::aileron_Inference::VarlinkClient::new(
-                connection,
-            ));
-            let iter = call
-                .more()
-                .map_err(|e| map_request_error(&state, &request_id, e))?;
-            for reply in iter {
+        let result = async {
+            let mut connection = connect_request_daemon(&state, &request_id).await?;
+            let mut stream = await_request(&state, &request_id, make_call(&mut connection))
+                .await?
+                .map_err(|e| map_request_transport_error(&state, &request_id, e))?;
+            while let Some(reply) = await_request(&state, &request_id, stream.next()).await? {
                 ensure_request_active(&state, &request_id)?;
-                let reply = reply.map_err(|e| map_request_error(&state, &request_id, e))?;
-                if sender.blocking_send(Ok(reply)).is_err() {
+                let reply = reply
+                    .map_err(|e| map_request_transport_error(&state, &request_id, e))?
+                    .map_err(map_inference_error)?;
+                if await_request(&state, &request_id, sender.send(Ok(reply)))
+                    .await?
+                    .is_err()
+                {
                     break;
                 }
             }
             Ok(())
-        })();
+        }
+        .await;
         if let Err(error) = result {
-            let _ = sender.blocking_send(Err(error));
+            let _ = sender.send(Err(error)).await;
         }
     }));
     Ok(replies)
@@ -659,8 +665,6 @@ impl LanguagePortalBackend {
         #[zbus(header)] header: Header<'_>,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) -> zbus::fdo::Result<()> {
-        use aileron_varlink::aileron_Inference::VarlinkClientInterface;
-
         ensure_portal_frontend(conn, &header).await?;
         let request_id = request_handle.as_str();
         let session_id = session_handle.as_str();
@@ -680,13 +684,17 @@ impl LanguagePortalBackend {
                 request_id,
                 media_fds,
                 options.execution_mode == "background",
-                move |mut client| {
-                    client.stream_response(
-                        daemon_session_id,
-                        input_json,
-                        media_paths,
-                        options.into_varlink(),
-                    )
+                move |client| {
+                    Box::pin(async move {
+                        client
+                            .stream_response(
+                                daemon_session_id,
+                                input_json,
+                                media_paths,
+                                options.into_varlink(),
+                            )
+                            .await
+                    })
                 },
             )
             .await?;
@@ -694,9 +702,7 @@ impl LanguagePortalBackend {
             let mut pending_token: Option<String> = None;
             while let Some(reply) = replies.recv().await {
                 ensure_request_active(&self.state, request_id)?;
-                let token = reply
-                    .map_err(|e| map_request_error(&self.state, request_id, e))?
-                    .token;
+                let token = reply?.token;
 
                 if let Some(previous) = pending_token.replace(token) {
                     LanguagePortalBackend::token_received(
@@ -752,8 +758,6 @@ impl LanguagePortalBackend {
         #[zbus(header)] header: Header<'_>,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) -> zbus::fdo::Result<()> {
-        use aileron_varlink::aileron_Inference::VarlinkClientInterface;
-
         ensure_portal_frontend(conn, &header).await?;
         let request_id = request_handle.as_str();
         let session_id = session_handle.as_str();
@@ -773,21 +777,25 @@ impl LanguagePortalBackend {
                 request_id,
                 media_fds,
                 options.execution_mode == "background",
-                move |mut client| {
-                    client.stream_respond_guided(
-                        daemon_session_id,
-                        prompt,
-                        media_paths,
-                        fields
-                            .into_iter()
-                            .map(GuidedFieldDbus::into_varlink)
-                            .collect(),
-                        tools
-                            .into_iter()
-                            .map(ToolDefinitionDbus::into_varlink)
-                            .collect(),
-                        options.into_varlink(),
-                    )
+                move |client| {
+                    Box::pin(async move {
+                        client
+                            .stream_respond_guided(
+                                daemon_session_id,
+                                prompt,
+                                media_paths,
+                                fields
+                                    .into_iter()
+                                    .map(GuidedFieldDbus::into_varlink)
+                                    .collect(),
+                                tools
+                                    .into_iter()
+                                    .map(ToolDefinitionDbus::into_varlink)
+                                    .collect(),
+                                options.into_varlink(),
+                            )
+                            .await
+                    })
                 },
             )
             .await?;
@@ -796,7 +804,7 @@ impl LanguagePortalBackend {
             let mut emitted_terminal_tool_calls = false;
             while let Some(reply) = replies.recv().await {
                 ensure_request_active(&self.state, request_id)?;
-                let reply = reply.map_err(|e| map_request_error(&self.state, request_id, e))?;
+                let reply = reply?;
                 let snapshot = reply.snapshot_json;
                 let tool_calls = reply
                     .tool_calls
@@ -885,8 +893,6 @@ impl LanguagePortalBackend {
         #[zbus(header)] header: Header<'_>,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) -> zbus::fdo::Result<()> {
-        use aileron_varlink::aileron_Inference::VarlinkClientInterface;
-
         ensure_portal_frontend(conn, &header).await?;
         let request_id = request_handle.as_str();
         let session_id = session_handle.as_str();
@@ -906,25 +912,29 @@ impl LanguagePortalBackend {
                 request_id,
                 media_fds,
                 options.execution_mode == "background",
-                move |mut client| {
-                    client.stream_submit_tool_results_guided(
-                        daemon_session_id,
-                        prompt,
-                        media_paths,
-                        results
-                            .into_iter()
-                            .map(ToolResultDbus::into_varlink)
-                            .collect(),
-                        fields
-                            .into_iter()
-                            .map(GuidedFieldDbus::into_varlink)
-                            .collect(),
-                        tools
-                            .into_iter()
-                            .map(ToolDefinitionDbus::into_varlink)
-                            .collect(),
-                        options.into_varlink(),
-                    )
+                move |client| {
+                    Box::pin(async move {
+                        client
+                            .stream_submit_tool_results_guided(
+                                daemon_session_id,
+                                prompt,
+                                media_paths,
+                                results
+                                    .into_iter()
+                                    .map(ToolResultDbus::into_varlink)
+                                    .collect(),
+                                fields
+                                    .into_iter()
+                                    .map(GuidedFieldDbus::into_varlink)
+                                    .collect(),
+                                tools
+                                    .into_iter()
+                                    .map(ToolDefinitionDbus::into_varlink)
+                                    .collect(),
+                                options.into_varlink(),
+                            )
+                            .await
+                    })
                 },
             )
             .await?;
@@ -933,7 +943,7 @@ impl LanguagePortalBackend {
             let mut emitted_terminal_tool_calls = false;
             while let Some(reply) = replies.recv().await {
                 ensure_request_active(&self.state, request_id)?;
-                let reply = reply.map_err(|e| map_request_error(&self.state, request_id, e))?;
+                let reply = reply?;
                 let snapshot = reply.snapshot_json;
                 let tool_calls = reply
                     .tool_calls
@@ -1000,8 +1010,6 @@ impl LanguagePortalBackend {
         #[zbus(header)] header: Header<'_>,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) -> zbus::fdo::Result<()> {
-        use aileron_varlink::aileron_Inference::VarlinkClientInterface;
-
         ensure_portal_frontend(conn, &header).await?;
         let request_id = request_handle.as_str();
         let session_id = session_handle.as_str();
@@ -1020,8 +1028,12 @@ impl LanguagePortalBackend {
                 request_id,
                 vec![],
                 options.execution_mode == "background",
-                move |mut client| {
-                    client.stream_embed(daemon_session_id, text, options.into_varlink())
+                move |client| {
+                    Box::pin(async move {
+                        client
+                            .stream_embed(daemon_session_id, text, options.into_varlink())
+                            .await
+                    })
                 },
             )
             .await?;
@@ -1030,7 +1042,7 @@ impl LanguagePortalBackend {
             let mut embedding_pipeline_id = String::new();
             while let Some(reply) = replies.recv().await {
                 ensure_request_active(&self.state, request_id)?;
-                let reply = reply.map_err(|e| map_request_error(&self.state, request_id, e))?;
+                let reply = reply?;
                 last_embedding = reply.embedding;
                 embedding_pipeline_id = reply.embedding_pipeline_id;
             }
@@ -1193,8 +1205,6 @@ impl SpokenLanguagePortalBackend {
         #[zbus(header)] header: Header<'_>,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) -> zbus::fdo::Result<()> {
-        use aileron_varlink::aileron_Inference::VarlinkClientInterface;
-
         ensure_portal_frontend(conn, &header).await?;
         let request_id = request_handle.as_str();
         let session_id = session_handle.as_str();
@@ -1214,8 +1224,16 @@ impl SpokenLanguagePortalBackend {
                 request_id,
                 vec![audio_fd],
                 options.execution_mode == "background",
-                move |mut client| {
-                    client.stream_transcribe(daemon_session_id, audio_path, options.into_varlink())
+                move |client| {
+                    Box::pin(async move {
+                        client
+                            .stream_transcribe(
+                                daemon_session_id,
+                                audio_path,
+                                options.into_varlink(),
+                            )
+                            .await
+                    })
                 },
             )
             .await?;
@@ -1223,9 +1241,7 @@ impl SpokenLanguagePortalBackend {
             let mut pending_text: Option<String> = None;
             while let Some(reply) = replies.recv().await {
                 ensure_request_active(&self.state, request_id)?;
-                let text = reply
-                    .map_err(|e| map_request_error(&self.state, request_id, e))?
-                    .token;
+                let text = reply?.token;
 
                 if let Some(previous) = pending_text.replace(text) {
                     SpokenLanguagePortalBackend::transcription_received(
@@ -1278,8 +1294,6 @@ impl SpokenLanguagePortalBackend {
         #[zbus(header)] header: Header<'_>,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) -> zbus::fdo::Result<()> {
-        use aileron_varlink::aileron_Inference::VarlinkClientInterface;
-
         ensure_portal_frontend(conn, &header).await?;
         validate_synthesis_input(text, &options)?;
         let request_id = request_handle.as_str();
@@ -1300,8 +1314,16 @@ impl SpokenLanguagePortalBackend {
                 request_id,
                 vec![],
                 options.execution_mode == "background",
-                move |mut client| {
-                    client.stream_synthesize(record.daemon_session_id, text, options.into_varlink())
+                move |client| {
+                    Box::pin(async move {
+                        client
+                            .stream_synthesize(
+                                record.daemon_session_id,
+                                text,
+                                options.into_varlink(),
+                            )
+                            .await
+                    })
                 },
             )
             .await?;
@@ -1311,9 +1333,7 @@ impl SpokenLanguagePortalBackend {
             let mut terminal_seen = false;
             while let Some(reply) = replies.recv().await {
                 ensure_request_active(&self.state, request_id)?;
-                let chunk = reply
-                    .map_err(|e| map_request_error(&self.state, request_id, e))?
-                    .chunk;
+                let chunk = reply?.chunk;
                 let decoded = decode_audio_chunk(chunk, metadata.as_ref())?;
                 metadata = Some(decoded.metadata.clone());
                 let done = decoded.audio.is_empty();
@@ -1487,8 +1507,6 @@ impl VisionPortalBackend {
         #[zbus(header)] header: Header<'_>,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) -> zbus::fdo::Result<()> {
-        use aileron_varlink::aileron_Inference::VarlinkClientInterface;
-
         ensure_portal_frontend(conn, &header).await?;
         let request_id = request_handle.as_str();
         let session_id = session_handle.as_str();
@@ -1508,13 +1526,17 @@ impl VisionPortalBackend {
                 request_id,
                 vec![image_fd],
                 options.execution_mode == "background",
-                move |mut client| {
-                    client.stream_describe(
-                        daemon_session_id,
-                        image_path,
-                        instructions,
-                        options.into_varlink(),
-                    )
+                move |client| {
+                    Box::pin(async move {
+                        client
+                            .stream_describe(
+                                daemon_session_id,
+                                image_path,
+                                instructions,
+                                options.into_varlink(),
+                            )
+                            .await
+                    })
                 },
             )
             .await?;
@@ -1522,9 +1544,7 @@ impl VisionPortalBackend {
             let mut pending_text: Option<String> = None;
             while let Some(reply) = replies.recv().await {
                 ensure_request_active(&self.state, request_id)?;
-                let text = reply
-                    .map_err(|e| map_request_error(&self.state, request_id, e))?
-                    .token;
+                let text = reply?.token;
 
                 if let Some(previous) = pending_text.replace(text) {
                     VisionPortalBackend::vision_text_received(
@@ -1569,8 +1589,6 @@ impl VisionPortalBackend {
         #[zbus(header)] header: Header<'_>,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) -> zbus::fdo::Result<()> {
-        use aileron_varlink::aileron_Inference::VarlinkClientInterface;
-
         ensure_portal_frontend(conn, &header).await?;
         let request_id = request_handle.as_str();
         let session_id = session_handle.as_str();
@@ -1590,13 +1608,17 @@ impl VisionPortalBackend {
                 request_id,
                 vec![image_fd],
                 options.execution_mode == "background",
-                move |mut client| {
-                    client.stream_ocr(
-                        daemon_session_id,
-                        image_path,
-                        instructions,
-                        options.into_varlink(),
-                    )
+                move |client| {
+                    Box::pin(async move {
+                        client
+                            .stream_ocr(
+                                daemon_session_id,
+                                image_path,
+                                instructions,
+                                options.into_varlink(),
+                            )
+                            .await
+                    })
                 },
             )
             .await?;
@@ -1604,9 +1626,7 @@ impl VisionPortalBackend {
             let mut pending_text: Option<String> = None;
             while let Some(reply) = replies.recv().await {
                 ensure_request_active(&self.state, request_id)?;
-                let text = reply
-                    .map_err(|e| map_request_error(&self.state, request_id, e))?
-                    .token;
+                let text = reply?.token;
 
                 if let Some(previous) = pending_text.replace(text) {
                     VisionPortalBackend::vision_text_received(
@@ -1651,8 +1671,6 @@ impl VisionPortalBackend {
         #[zbus(header)] header: Header<'_>,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) -> zbus::fdo::Result<()> {
-        use aileron_varlink::aileron_Inference::VarlinkClientInterface;
-
         ensure_portal_frontend(conn, &header).await?;
         let request_id = request_handle.as_str();
         let session_id = session_handle.as_str();
@@ -1672,13 +1690,17 @@ impl VisionPortalBackend {
                 request_id,
                 vec![image_fd],
                 options.execution_mode == "background",
-                move |mut client| {
-                    client.stream_detect(
-                        daemon_session_id,
-                        image_path,
-                        instructions,
-                        options.into_varlink(),
-                    )
+                move |client| {
+                    Box::pin(async move {
+                        client
+                            .stream_detect(
+                                daemon_session_id,
+                                image_path,
+                                instructions,
+                                options.into_varlink(),
+                            )
+                            .await
+                    })
                 },
             )
             .await?;
@@ -1686,8 +1708,7 @@ impl VisionPortalBackend {
             let mut last_detections = Vec::new();
             while let Some(reply) = replies.recv().await {
                 ensure_request_active(&self.state, request_id)?;
-                last_detections = reply
-                    .map_err(|e| map_request_error(&self.state, request_id, e))?
+                last_detections = reply?
                     .detections
                     .into_iter()
                     .map(|detection| VisionDetectionDbus {
@@ -1730,8 +1751,6 @@ impl VisionPortalBackend {
         #[zbus(header)] header: Header<'_>,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) -> zbus::fdo::Result<()> {
-        use aileron_varlink::aileron_Inference::VarlinkClientInterface;
-
         ensure_portal_frontend(conn, &header).await?;
         let request_id = request_handle.as_str();
         let session_id = session_handle.as_str();
@@ -1747,25 +1766,20 @@ impl VisionPortalBackend {
             let image_path = fd_proc_path(&image_fd);
             let instructions = instructions.to_string();
             let mut replies = stream_replies(
-                self.state.clone(),
-                request_id,
-                vec![image_fd],
-                options.execution_mode == "background",
-                move |mut client| {
-                    client.stream_segment(
-                        daemon_session_id,
-                        image_path,
-                        instructions,
-                        options.into_varlink(),
-                    )
-                },
-            ).await?;
+                self.state.clone(), request_id, vec![image_fd], options.execution_mode == "background",
+                move |client| Box::pin(async move { client.stream_segment(
+                    daemon_session_id,
+                    image_path,
+                    instructions,
+                    options.into_varlink(),
+                ).await }),
+            )
+            .await?;
 
             let mut last_masks = Vec::new();
             while let Some(reply) = replies.recv().await {
                 ensure_request_active(&self.state, request_id)?;
-                last_masks = reply
-                    .map_err(|e| map_request_error(&self.state, request_id, e))?
+                last_masks = reply?
                     .masks
                     .into_iter()
                     .map(|mask| {
@@ -1823,8 +1837,6 @@ impl VisionPortalBackend {
         #[zbus(header)] header: Header<'_>,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) -> zbus::fdo::Result<()> {
-        use aileron_varlink::aileron_Inference::VarlinkClientInterface;
-
         ensure_portal_frontend(conn, &header).await?;
         let request_id = request_handle.as_str();
         let session_id = session_handle.as_str();
@@ -1844,13 +1856,17 @@ impl VisionPortalBackend {
                 request_id,
                 vec![image_fd],
                 options.execution_mode == "background",
-                move |mut client| {
-                    client.stream_depth(
-                        daemon_session_id,
-                        image_path,
-                        instructions,
-                        options.into_varlink(),
-                    )
+                move |client| {
+                    Box::pin(async move {
+                        client
+                            .stream_depth(
+                                daemon_session_id,
+                                image_path,
+                                instructions,
+                                options.into_varlink(),
+                            )
+                            .await
+                    })
                 },
             )
             .await?;
@@ -1858,9 +1874,7 @@ impl VisionPortalBackend {
             let mut last_depth = None;
             while let Some(reply) = replies.recv().await {
                 ensure_request_active(&self.state, request_id)?;
-                let depth = reply
-                    .map_err(|e| map_request_error(&self.state, request_id, e))?
-                    .depth;
+                let depth = reply?.depth;
                 last_depth = Some(depth_map_into_dbus(depth)?);
             }
 
@@ -2015,7 +2029,7 @@ async fn begin_request(
                 session_handle: session_handle.map(str::to_string),
                 daemon_session_id: None,
                 cancelled: false,
-                active_connection: None,
+                cancel_tx: tokio::sync::watch::channel(false).0,
             },
         );
     }
@@ -2068,20 +2082,17 @@ fn cancel_request_record(
     state: &PortalState,
     request_id: &str,
 ) -> Option<(Option<String>, Option<String>)> {
-    let (connection, daemon_session_id, session_handle) = {
+    let (daemon_session_id, session_handle) = {
         let mut requests = state.requests.lock().unwrap();
         let record = requests.get_mut(request_id)?;
         record.cancelled = true;
+        record.cancel_tx.send_replace(true);
         (
-            record.active_connection.take(),
             record.daemon_session_id.take(),
             record.session_handle.clone(),
         )
     };
 
-    if let Some(connection) = connection {
-        shutdown_request_connection(&connection);
-    }
     Some((daemon_session_id, session_handle))
 }
 
@@ -2094,27 +2105,14 @@ async fn complete_request_cancellation(
         return;
     };
     if let Some(session_id) = daemon_session_id {
-        let daemon_address = state.daemon_address();
-        let result = blocking(&CONTROL_WORKERS, None, move || {
-            use aileron_varlink::aileron_Inference::VarlinkClientInterface;
-
-            let connection =
-                varlink::Connection::with_address(&daemon_address).map_err(anyhow::Error::from);
-            connection
-                .and_then(|connection| {
-                    let mut client =
-                        aileron_varlink::aileron_Inference::VarlinkClient::new(connection);
-                    client
-                        .cancel_active_request(session_id)
-                        .call()
-                        .map(|_| ())
-                        .map_err(anyhow::Error::from)
-                })
-                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))
-        })
-        .await;
-        if let Err(error) = result {
-            warn!("failed to cancel active daemon request: {error}");
+        let _permit = CONTROL_WORKERS.acquire().await.unwrap();
+        match connect_daemon(state).await {
+            Ok(mut client) => match client.cancel_active_request(session_id).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => warn!("failed to cancel active daemon request: {error:?}"),
+                Err(error) => warn!("failed to cancel active daemon request: {error}"),
+            },
+            Err(error) => warn!("failed to connect while cancelling daemon request: {error}"),
         }
     }
     if let Some(session_handle) = session_handle {
@@ -2164,66 +2162,46 @@ fn finish_synthesis_request(state: &PortalState, session_id: &str, request_id: &
 }
 
 fn cancel_session_requests(state: &PortalState, session_id: &str) {
-    let connections = {
-        let mut requests = state.requests.lock().unwrap();
-        let mut connections = Vec::new();
-        for record in requests.values_mut() {
-            if record.session_handle.as_deref() == Some(session_id) {
-                record.cancelled = true;
-                if let Some(connection) = record.active_connection.clone() {
-                    connections.push(connection);
-                }
-            }
+    let mut requests = state.requests.lock().unwrap();
+    for record in requests.values_mut() {
+        if record.session_handle.as_deref() == Some(session_id) {
+            record.cancelled = true;
+            record.cancel_tx.send_replace(true);
         }
-        connections
-    };
-
-    for connection in connections {
-        shutdown_request_connection(&connection);
     }
 }
 
-fn attach_request_connection(
+fn request_cancellation(
     state: &PortalState,
     request_id: &str,
-    connection: Arc<RwLock<varlink::Connection>>,
-) -> zbus::fdo::Result<()> {
-    // Never contend with MethodCall::send's connection lock during cancellation.
-    let shutdown = Arc::new(Mutex::new(
-        connection
-            .write()
-            .unwrap()
-            .stream
-            .as_mut()
-            .ok_or_else(|| zbus::fdo::Error::Failed("missing Varlink stream".to_string()))?
-            .try_clone()
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?,
-    ));
-    let should_shutdown = {
-        let mut requests = state.requests.lock().unwrap();
-        let Some(record) = requests.get_mut(request_id) else {
-            return Err(request_cancelled_error());
-        };
-        if record.cancelled {
-            true
-        } else {
-            record.active_connection = Some(shutdown.clone());
-            false
-        }
-    };
-
-    if should_shutdown {
-        shutdown_request_connection(&shutdown);
-        return Err(request_cancelled_error());
-    }
-
-    Ok(())
+) -> zbus::fdo::Result<tokio::sync::watch::Receiver<bool>> {
+    state
+        .requests
+        .lock()
+        .unwrap()
+        .get(request_id)
+        .filter(|record| !record.cancelled)
+        .map(|record| record.cancel_tx.subscribe())
+        .ok_or_else(request_cancelled_error)
 }
 
-fn connect_request_daemon(
+async fn await_request<T>(
     state: &PortalState,
     request_id: &str,
-) -> zbus::fdo::Result<Arc<RwLock<varlink::Connection>>> {
+    future: impl Future<Output = T>,
+) -> zbus::fdo::Result<T> {
+    let mut cancellation = request_cancellation(state, request_id)?;
+    tokio::select! {
+        biased;
+        _ = cancellation.wait_for(|cancelled| *cancelled) => Err(request_cancelled_error()),
+        output = future => Ok(output),
+    }
+}
+
+async fn connect_request_daemon(
+    state: &PortalState,
+    request_id: &str,
+) -> zbus::fdo::Result<zlink::tokio::unix::Connection> {
     ensure_request_active(state, request_id)?;
     let session_handle = state
         .requests
@@ -2238,16 +2216,14 @@ fn connect_request_daemon(
         }
         attach_request_daemon_session(state, request_id, &record.daemon_session_id)?;
     }
-    let connection = varlink::Connection::with_address(&state.daemon_address());
-    let connection = connection.map_err(|e| map_request_error(state, request_id, e))?;
-    attach_request_connection(state, request_id, connection.clone())?;
-    Ok(connection)
+    await_request(state, request_id, connect_daemon(state))
+        .await?
+        .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))
 }
 
-fn shutdown_request_connection(connection: &Arc<Mutex<Box<dyn varlink::Stream>>>) {
-    if let Err(e) = connection.lock().unwrap().shutdown() {
-        warn!("failed to shut down cancelled Varlink request: {e}");
-    }
+async fn connect_daemon(state: &PortalState) -> zlink::Result<zlink::tokio::unix::Connection> {
+    let address = state.daemon_address();
+    zlink::tokio::unix::connect(address.strip_prefix("unix:").unwrap_or(&address)).await
 }
 
 fn ensure_request_active(state: &PortalState, request_id: &str) -> zbus::fdo::Result<()> {
@@ -2275,7 +2251,7 @@ fn request_is_cancelled(state: &PortalState, request_id: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn map_request_error(
+fn map_request_transport_error(
     state: &PortalState,
     request_id: &str,
     error: impl std::fmt::Display,
@@ -2285,6 +2261,41 @@ fn map_request_error(
     } else {
         zbus::fdo::Error::Failed(error.to_string())
     }
+}
+
+fn map_inference_error(error: inference::Error) -> zbus::fdo::Error {
+    use inference::Error;
+
+    match error {
+        Error::PermissionDenied { app_id, use_case } => zbus::fdo::Error::AccessDenied(format!(
+            "aileron.Inference.PermissionDenied: permission denied for {app_id} / {use_case}"
+        )),
+        Error::PermissionPromptRequired { app_id, use_case } => zbus::fdo::Error::Failed(format!(
+            "aileron.Inference.PermissionPromptRequired: permission prompt required for {app_id} / {use_case}"
+        )),
+        Error::SessionNotFound { session_id } => zbus::fdo::Error::Failed(format!(
+            "aileron.Inference.SessionNotFound: session {session_id} was not found"
+        )),
+        Error::ModelUnavailable { reason } => inference_failure("ModelUnavailable", reason),
+        Error::InvalidGenerationOptions { reason } => {
+            inference_failure("InvalidGenerationOptions", reason)
+        }
+        Error::GuidedGenerationFailed { reason } => {
+            inference_failure("GuidedGenerationFailed", reason)
+        }
+        Error::GenerationFailed { reason } => inference_failure("GenerationFailed", reason),
+        Error::ContextWindowExceeded { reason } => {
+            inference_failure("ContextWindowExceeded", reason)
+        }
+        Error::UnsupportedLanguage { reason } => inference_failure("UnsupportedLanguage", reason),
+        Error::SafetyRefusal { reason } => inference_failure("SafetyRefusal", reason),
+        Error::RequestCancelled { reason } => inference_failure("RequestCancelled", reason),
+        Error::InvalidInput { reason } => inference_failure("InvalidInput", reason),
+    }
+}
+
+fn inference_failure(name: &str, reason: String) -> zbus::fdo::Error {
+    zbus::fdo::Error::Failed(format!("aileron.Inference.{name}: {reason}"))
 }
 
 fn request_cancelled_error() -> zbus::fdo::Error {
@@ -2301,56 +2312,23 @@ async fn get_use_case_availability_impl(
     app_id: &str,
     use_case: &str,
 ) -> zbus::fdo::Result<ModelAvailabilityDbus> {
-    use aileron_varlink::aileron_Inference::VarlinkClientInterface;
+    let mut client = aileron_ipc::client::connect()
+        .await
+        .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+    let reply = client
+        .get_use_case_availability(app_id.to_string(), use_case.to_string())
+        .await
+        .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?
+        .map_err(map_inference_error)?;
 
-    let app_id = app_id.to_string();
-    let use_case = use_case.to_string();
-    blocking(&TRANSPORT_WORKERS, None, move || {
-        let conn =
-            aileron_ipc::client::connect().map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-        let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn);
-        let reply = client
-            .get_use_case_availability(app_id, use_case)
-            .call()
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-
-        Ok(ModelAvailabilityDbus {
-            is_available: reply.availability.is_available,
-            code: reply.availability.code,
-            reason: reply.availability.reason,
-        })
+    Ok(ModelAvailabilityDbus {
+        is_available: reply.availability.is_available,
+        code: reply.availability.code,
+        reason: reply.availability.reason,
     })
-    .await
 }
 
 async fn create_session_impl(
-    state: &Arc<PortalState>,
-    request_id: &str,
-    app_id: &str,
-    parent_window: &str,
-    use_case: &str,
-    instructions: &str,
-) -> zbus::fdo::Result<String> {
-    let worker_state = state.clone();
-    let worker_request_id = request_id.to_string();
-    let app_id = app_id.to_string();
-    let parent_window = parent_window.to_string();
-    let use_case = use_case.to_string();
-    let instructions = instructions.to_string();
-    blocking(&TRANSPORT_WORKERS, Some((state, request_id)), move || {
-        create_session_blocking(
-            &worker_state,
-            &worker_request_id,
-            &app_id,
-            &parent_window,
-            &use_case,
-            &instructions,
-        )
-    })
-    .await
-}
-
-fn create_session_blocking(
     state: &PortalState,
     request_id: &str,
     app_id: &str,
@@ -2358,47 +2336,50 @@ fn create_session_blocking(
     use_case: &str,
     instructions: &str,
 ) -> zbus::fdo::Result<String> {
-    use aileron_varlink::aileron_Inference::VarlinkClientInterface;
-
-    let conn = connect_request_daemon(state, request_id)?;
-    let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn.clone());
-    let reply = match client
-        .create_session(
+    let mut client = connect_request_daemon(state, request_id).await?;
+    let reply = match await_request(
+        state,
+        request_id,
+        client.create_session(
             app_id.to_string(),
             use_case.to_string(),
             instructions.to_string(),
-        )
-        .call()
+        ),
+    )
+    .await?
+    .map_err(|e| map_request_transport_error(state, request_id, e))?
     {
         Ok(reply) => reply,
-        Err(_) if request_is_cancelled(state, request_id) => return Err(request_cancelled_error()),
-        Err(e) if is_permission_denied(&e) => {
+        Err(inference::Error::PermissionDenied { app_id, use_case }) => {
             return Err(zbus::fdo::Error::AccessDenied(format!(
                 "aileron.Inference.PermissionDenied: permission denied for {app_id} / {use_case}"
             )));
         }
-        Err(e) if is_permission_prompt_required(&e) => {
+        Err(inference::Error::PermissionPromptRequired { .. }) => {
             ensure_request_active(state, request_id)?;
-            if !prompt_permission(state, request_id, app_id, parent_window, use_case)? {
-                set_permission_for_request(state, request_id, app_id, use_case, false)?;
+            if !prompt_permission(state, request_id, app_id, parent_window, use_case).await? {
+                set_permission_for_request(state, request_id, app_id, use_case, false).await?;
                 ensure_request_active(state, request_id)?;
                 return Err(zbus::fdo::Error::AccessDenied(format!(
                     "aileron.Inference.PermissionDenied: permission denied for {app_id} / {use_case}"
                 )));
             }
             ensure_request_active(state, request_id)?;
-            set_permission_for_request(state, request_id, app_id, use_case, true)?;
-            attach_request_connection(state, request_id, conn.clone())?;
-            client
-                .create_session(
+            set_permission_for_request(state, request_id, app_id, use_case, true).await?;
+            await_request(
+                state,
+                request_id,
+                client.create_session(
                     app_id.to_string(),
                     use_case.to_string(),
                     instructions.to_string(),
-                )
-                .call()
-                .map_err(|e| map_request_error(state, request_id, e))?
+                ),
+            )
+            .await?
+            .map_err(|e| map_request_transport_error(state, request_id, e))?
+            .map_err(map_inference_error)?
         }
-        Err(e) => return Err(map_request_error(state, request_id, e)),
+        Err(error) => return Err(map_inference_error(error)),
     };
 
     if let Err(e) = ensure_request_active(state, request_id) {
@@ -2733,49 +2714,29 @@ async fn prewarm_impl(
     daemon_session_id: String,
     interface: PortalInterface,
 ) -> zbus::fdo::Result<()> {
-    use aileron_varlink::aileron_Inference::VarlinkClientInterface;
-
     ensure_known_session(&state, &session_handle, interface)?;
     ensure_request_active(&state, &request_id)?;
     acquire_prewarm_worker(&state)?;
-    let guard = PrewarmWorkerGuard {
+    let _guard = PrewarmWorkerGuard {
         state: state.clone(),
     };
-    let worker_state = state.clone();
-    let worker_request_id = request_id.clone();
-    while_request_active(
-        &state,
-        &request_id,
-        blocking(&TRANSPORT_WORKERS, Some((&state, &request_id)), move || {
-            let _guard = guard;
-            let state = worker_state;
-            let request_id = worker_request_id;
-            let conn = connect_request_daemon(&state, &request_id)?;
-            let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn);
-            client
-                .prewarm(daemon_session_id)
-                .call()
-                .map_err(|e| map_request_error(&state, &request_id, e))?;
-            ensure_request_active(&state, &request_id)
-        }),
-    )
-    .await?
+    ensure_request_active(&state, &request_id)?;
+    let mut client = connect_request_daemon(&state, &request_id).await?;
+    await_request(&state, &request_id, client.prewarm(daemon_session_id))
+        .await?
+        .map_err(|e| map_request_transport_error(&state, &request_id, e))?
+        .map_err(map_inference_error)
 }
 
 async fn end_daemon_session(session_id: String) -> zbus::fdo::Result<()> {
-    blocking(&CONTROL_WORKERS, None, move || {
-        use aileron_varlink::aileron_Inference::VarlinkClientInterface;
-
-        let conn =
-            aileron_ipc::client::connect().map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-        let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(conn);
-        client
-            .end_session(session_id)
-            .call()
-            .map(|_| ())
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))
-    })
-    .await
+    let mut client = aileron_ipc::client::connect()
+        .await
+        .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+    client
+        .end_session(session_id)
+        .await
+        .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?
+        .map_err(map_inference_error)
 }
 
 fn end_daemon_session_async(session_id: String) {
@@ -2786,33 +2747,30 @@ fn end_daemon_session_async(session_id: String) {
     });
 }
 
-fn is_permission_denied(error: &impl std::fmt::Display) -> bool {
-    error.to_string().contains("PermissionDenied")
-}
-
-fn is_permission_prompt_required(error: &impl std::fmt::Display) -> bool {
-    error.to_string().contains("PermissionPromptRequired")
-}
-
-fn set_permission_for_request(
+async fn set_permission_for_request(
     state: &PortalState,
     request_id: &str,
     app_id: &str,
     use_case: &str,
     allowed: bool,
 ) -> zbus::fdo::Result<()> {
-    use aileron_varlink::aileron_Permissions::VarlinkClientInterface;
-
-    let conn = connect_request_daemon(state, request_id)?;
-    let mut client = aileron_varlink::aileron_Permissions::VarlinkClient::new(conn);
-    client
-        .set_app_permission(app_id.to_string(), use_case.to_string(), allowed)
-        .call()
-        .map_err(|e| map_request_error(state, request_id, e))?;
+    let mut client = connect_request_daemon(state, request_id).await?;
+    await_request(
+        state,
+        request_id,
+        client.set_app_permission(app_id.to_string(), use_case.to_string(), allowed),
+    )
+    .await?
+    .map_err(|e| map_request_transport_error(state, request_id, e))?
+    .map_err(map_permissions_error)?;
     Ok(())
 }
 
-fn prompt_permission(
+fn map_permissions_error(error: permissions::Error) -> zbus::fdo::Error {
+    match error {}
+}
+
+async fn prompt_permission(
     state: &PortalState,
     request_id: &str,
     app_id: &str,
@@ -2825,7 +2783,8 @@ fn prompt_permission(
     let parent_xid = x11_parent_window_id(parent_window);
 
     if parent_xid.is_some()
-        && let Ok(result) = run_kdialog_permission_prompt(state, request_id, &text, parent_xid)
+        && let Ok(result) =
+            run_kdialog_permission_prompt(state, request_id, &text, parent_xid).await
     {
         return result;
     }
@@ -2842,12 +2801,12 @@ fn prompt_permission(
     if let Some(xid) = parent_xid {
         zenity.arg(format!("--attach={xid}"));
     }
-    if let Ok(result) = run_prompt_command(state, request_id, &mut zenity) {
+    if let Ok(result) = run_prompt_command(state, request_id, &mut zenity).await {
         return result;
     }
 
     if parent_xid.is_none()
-        && let Ok(result) = run_kdialog_permission_prompt(state, request_id, &text, None)
+        && let Ok(result) = run_kdialog_permission_prompt(state, request_id, &text, None).await
     {
         return result;
     }
@@ -2857,7 +2816,7 @@ fn prompt_permission(
     ))
 }
 
-fn run_kdialog_permission_prompt(
+async fn run_kdialog_permission_prompt(
     state: &PortalState,
     request_id: &str,
     text: &str,
@@ -2869,10 +2828,10 @@ fn run_kdialog_permission_prompt(
         kdialog.args(["--attach", xid]);
     }
     kdialog.args(["--yesno", text]);
-    run_prompt_command(state, request_id, &mut kdialog)
+    run_prompt_command(state, request_id, &mut kdialog).await
 }
 
-fn run_prompt_command(
+async fn run_prompt_command(
     state: &PortalState,
     request_id: &str,
     command: &mut Command,
@@ -2880,8 +2839,8 @@ fn run_prompt_command(
     let mut child = command.spawn()?;
     loop {
         if let Err(e) = ensure_request_active(state, request_id) {
-            let _ = child.kill();
-            let _ = child.wait();
+            let _ = child.kill().await;
+            let _ = child.wait().await;
             return Ok(Err(e));
         }
 
@@ -2889,7 +2848,7 @@ fn run_prompt_command(
             return Ok(Ok(status.success()));
         }
 
-        thread::sleep(Duration::from_millis(100));
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
@@ -3099,6 +3058,7 @@ mod tests {
     use hegel::TestCase;
     use hegel::generators as gs;
     use std::sync::mpsc;
+    use std::thread;
 
     static ADMISSION_TEST: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -3137,7 +3097,7 @@ mod tests {
                     session_handle: Some("session".to_string()),
                     daemon_session_id: None,
                     cancelled: false,
-                    active_connection: None,
+                    cancel_tx: tokio::sync::watch::channel(false).0,
                 },
             );
             Self {
@@ -3169,7 +3129,6 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn delayed_first_reply_keeps_executor_live_and_preserves_order_and_fds() {
-        use aileron_varlink::aileron_Inference::VarlinkClientInterface;
         use std::io::Write;
 
         let daemon = TestDaemon::new();
@@ -3198,24 +3157,23 @@ mod tests {
                 write!(stream, "{reply}\0").unwrap();
             }
         });
-        let mut replies = stream_replies(
-            daemon.state.clone(),
-            "request",
-            vec![fd],
-            false,
-            |mut client| {
-                client.stream_embed(
-                    "daemon-session".to_string(),
-                    "text".to_string(),
-                    EmbedOptionsDbus {
-                        execution_mode: "interactive".to_string(),
-                    }
-                    .into_varlink(),
-                )
-            },
-        )
-        .await
-        .unwrap();
+        let mut replies =
+            stream_replies(daemon.state.clone(), "request", vec![fd], false, |client| {
+                Box::pin(async move {
+                    client
+                        .stream_embed(
+                            "daemon-session".to_string(),
+                            "text".to_string(),
+                            EmbedOptionsDbus {
+                                execution_mode: "interactive".to_string(),
+                            }
+                            .into_varlink(),
+                        )
+                        .await
+                })
+            })
+            .await
+            .unwrap();
         tokio::time::timeout(Duration::from_secs(1), started_rx)
             .await
             .unwrap()
@@ -3240,7 +3198,6 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn cancellation_before_first_reply_reaches_daemon_with_data_workers_full() {
-        use aileron_varlink::aileron_Inference::VarlinkClientInterface;
         use std::io::{Read, Write};
 
         let _admission_test = ADMISSION_TEST.lock().await;
@@ -3261,26 +3218,25 @@ mod tests {
             let request = read_request(&mut control);
             assert_eq!(request["method"], "aileron.Inference.CancelActiveRequest");
             assert_eq!(request["parameters"]["session_id"], "daemon-session");
-            control.write_all(b"{\"parameters\":{}}\0").unwrap();
+            control.write_all(b"{}\0").unwrap();
         });
-        let mut replies = stream_replies(
-            daemon.state.clone(),
-            "request",
-            vec![],
-            false,
-            |mut client| {
-                client.stream_embed(
-                    "daemon-session".to_string(),
-                    "text".to_string(),
-                    EmbedOptionsDbus {
-                        execution_mode: "interactive".to_string(),
-                    }
-                    .into_varlink(),
-                )
-            },
-        )
-        .await
-        .unwrap();
+        let mut replies =
+            stream_replies(daemon.state.clone(), "request", vec![], false, |client| {
+                Box::pin(async move {
+                    client
+                        .stream_embed(
+                            "daemon-session".to_string(),
+                            "text".to_string(),
+                            EmbedOptionsDbus {
+                                execution_mode: "interactive".to_string(),
+                            }
+                            .into_varlink(),
+                        )
+                        .await
+                })
+            })
+            .await
+            .unwrap();
         tokio::time::timeout(Duration::from_secs(1), started_rx)
             .await
             .unwrap()
@@ -3305,7 +3261,6 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn background_saturation_admits_interactive_and_general_work() {
-        use aileron_varlink::aileron_Inference::VarlinkClientInterface;
         use std::io::Write;
         use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -3346,20 +3301,24 @@ mod tests {
                     session_handle: None,
                     daemon_session_id: None,
                     cancelled: false,
-                    active_connection: None,
+                    cancel_tx: tokio::sync::watch::channel(false).0,
                 },
             );
             let state = daemon.state.clone();
             tasks.push(tokio::spawn(async move {
-                let mut replies = stream_replies(state, &request_id, vec![], true, |mut client| {
-                    client.stream_embed(
-                        "session".to_string(),
-                        "background".to_string(),
-                        EmbedOptionsDbus {
-                            execution_mode: "background".to_string(),
-                        }
-                        .into_varlink(),
-                    )
+                let mut replies = stream_replies(state, &request_id, vec![], true, |client| {
+                    Box::pin(async move {
+                        client
+                            .stream_embed(
+                                "session".to_string(),
+                                "background".to_string(),
+                                EmbedOptionsDbus {
+                                    execution_mode: "background".to_string(),
+                                }
+                                .into_varlink(),
+                            )
+                            .await
+                    })
                 })
                 .await
                 .unwrap();
@@ -3376,24 +3335,23 @@ mod tests {
                 started_rx.try_recv().is_err(),
                 "background work exceeded its quota"
             );
-            let mut replies = stream_replies(
-                daemon.state.clone(),
-                "request",
-                vec![],
-                false,
-                |mut client| {
-                    client.stream_embed(
-                        "daemon-session".to_string(),
-                        "interactive".to_string(),
-                        EmbedOptionsDbus {
-                            execution_mode: "interactive".to_string(),
-                        }
-                        .into_varlink(),
-                    )
-                },
-            )
-            .await
-            .unwrap();
+            let mut replies =
+                stream_replies(daemon.state.clone(), "request", vec![], false, |client| {
+                    Box::pin(async move {
+                        client
+                            .stream_embed(
+                                "daemon-session".to_string(),
+                                "interactive".to_string(),
+                                EmbedOptionsDbus {
+                                    execution_mode: "interactive".to_string(),
+                                }
+                                .into_varlink(),
+                            )
+                            .await
+                    })
+                })
+                .await
+                .unwrap();
             assert_eq!(
                 replies.recv().await.unwrap().unwrap().embedding_pipeline_id,
                 "interactive"
@@ -3488,7 +3446,8 @@ mod tests {
                     b"{\"parameters\":{\"session_id\":\"created\",\"profile_id\":\"test\"}}\0"
                         .as_slice()
                 } else {
-                    b"{\"parameters\":{}}\0".as_slice()
+                    // Match the daemon's zlink unit reply, with no parameters.
+                    b"{}\0".as_slice()
                 };
                 stream.write_all(reply).unwrap();
             });
@@ -3572,7 +3531,6 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn dropping_backpressured_stream_cancels_daemon_and_releases_worker() {
-        use aileron_varlink::aileron_Inference::VarlinkClientInterface;
         use std::io::{Read, Write};
 
         let daemon = TestDaemon::new();
@@ -3597,25 +3555,23 @@ mod tests {
                 read_request(&mut control)["method"],
                 "aileron.Inference.CancelActiveRequest"
             );
-            control.write_all(b"{\"parameters\":{}}\0").unwrap();
+            control.write_all(b"{}\0").unwrap();
             cancelled_tx.send(()).unwrap();
         });
-        let replies = stream_replies(
-            daemon.state.clone(),
-            "request",
-            vec![],
-            false,
-            |mut client| {
-                client.stream_embed(
-                    "daemon-session".to_string(),
-                    "text".to_string(),
-                    EmbedOptionsDbus {
-                        execution_mode: "interactive".to_string(),
-                    }
-                    .into_varlink(),
-                )
-            },
-        )
+        let replies = stream_replies(daemon.state.clone(), "request", vec![], false, |client| {
+            Box::pin(async move {
+                client
+                    .stream_embed(
+                        "daemon-session".to_string(),
+                        "text".to_string(),
+                        EmbedOptionsDbus {
+                            execution_mode: "interactive".to_string(),
+                        }
+                        .into_varlink(),
+                    )
+                    .await
+            })
+        })
         .await
         .unwrap();
         tokio::time::timeout(Duration::from_secs(1), sent_rx)
@@ -3650,7 +3606,6 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn stream_transport_error_is_not_successful_eof() {
-        use aileron_varlink::aileron_Inference::VarlinkClientInterface;
         use std::io::Write;
 
         let daemon = TestDaemon::new();
@@ -3660,24 +3615,23 @@ mod tests {
             read_request(&mut stream);
             stream.write_all(b"{\"error\":\"aileron.Inference.GenerationFailed\",\"parameters\":{\"reason\":\"test failure\"}}\0").unwrap();
         });
-        let mut replies = stream_replies(
-            daemon.state.clone(),
-            "request",
-            vec![],
-            false,
-            |mut client| {
-                client.stream_embed(
-                    "daemon-session".to_string(),
-                    "text".to_string(),
-                    EmbedOptionsDbus {
-                        execution_mode: "interactive".to_string(),
-                    }
-                    .into_varlink(),
-                )
-            },
-        )
-        .await
-        .unwrap();
+        let mut replies =
+            stream_replies(daemon.state.clone(), "request", vec![], false, |client| {
+                Box::pin(async move {
+                    client
+                        .stream_embed(
+                            "daemon-session".to_string(),
+                            "text".to_string(),
+                            EmbedOptionsDbus {
+                                execution_mode: "interactive".to_string(),
+                            }
+                            .into_varlink(),
+                        )
+                        .await
+                })
+            })
+            .await
+            .unwrap();
         let error = tokio::time::timeout(Duration::from_secs(1), replies.recv())
             .await
             .unwrap()
@@ -3908,17 +3862,15 @@ mod tests {
     }
 
     #[test]
-    fn permission_denied_detection_matches_error_text() {
-        assert!(is_permission_denied(&"aileron.Inference.PermissionDenied"));
-        assert!(!is_permission_denied(
-            &"aileron.Inference.ProfileUnavailable"
-        ));
-        assert!(!is_permission_denied(
-            &"aileron.Inference.PermissionPromptRequired"
-        ));
-        assert!(is_permission_prompt_required(
-            &"aileron.Inference.PermissionPromptRequired"
-        ));
+    fn permission_denied_maps_from_the_typed_inference_error() {
+        let error = map_inference_error(inference::Error::PermissionDenied {
+            app_id: "org.example.App".into(),
+            use_case: "language.summarize".into(),
+        });
+
+        assert!(matches!(error, zbus::fdo::Error::AccessDenied(_)));
+        assert!(error.to_string().contains("org.example.App"));
+        assert!(error.to_string().contains("language.summarize"));
     }
 
     #[test]
@@ -4019,12 +3971,11 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn request_cancellation_shuts_down_active_connection() {
-        use std::io::Read;
-        use std::os::unix::net::UnixListener;
+    #[tokio::test]
+    async fn request_cancellation_aborts_operation_and_drops_its_connection() {
         use std::time::{SystemTime, UNIX_EPOCH};
+        use tokio::io::AsyncReadExt;
+        use tokio::net::UnixListener;
 
         let suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -4035,64 +3986,55 @@ mod tests {
             std::process::id()
         ));
         let listener = UnixListener::bind(&socket_path).expect("test socket should bind");
-        let (accepted_tx, accepted_rx) = mpsc::channel();
-        let reader = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("test socket should accept");
-            accepted_tx.send(()).ok();
+        let reader = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("test socket should accept");
             let mut buf = [0; 1];
             stream
                 .read(&mut buf)
+                .await
                 .expect("test socket read should finish")
         });
-        let connection =
-            varlink::Connection::with_address(&format!("unix:{}", socket_path.to_string_lossy()))
-                .expect("test socket should connect");
-        accepted_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("test socket should be accepted");
+        let connection = zlink::tokio::unix::connect(&socket_path)
+            .await
+            .expect("test socket should connect");
 
-        let state = PortalState::default();
-        state.requests.lock().unwrap().insert(
-            "request-1".to_string(),
-            RequestRecord {
-                session_handle: None,
-                daemon_session_id: None,
-                cancelled: false,
-                active_connection: None,
-            },
-        );
-        attach_request_connection(&state, "request-1", connection.clone()).unwrap();
-        let _held_send_lock = connection.write().unwrap();
-
-        tokio::runtime::Runtime::new()
+        let state = Arc::new(PortalState::default());
+        state
+            .requests
+            .lock()
             .unwrap()
-            .block_on(cancel_request(&state, "request-1"));
+            .insert("request-1".to_string(), test_request_record(None));
+        let operation_state = state.clone();
+        let operation = tokio::spawn(async move {
+            await_request(&operation_state, "request-1", async move {
+                let _connection = connection;
+                std::future::pending::<()>().await;
+            })
+            .await
+        });
 
-        assert_eq!(
-            reader.join().expect("reader thread should finish"),
-            0,
-            "server side should observe EOF after request cancellation"
-        );
+        cancel_request(&state, "request-1").await;
+
+        let error = operation
+            .await
+            .unwrap()
+            .expect_err("operation should abort");
+        assert!(error.to_string().contains("RequestCancelled"));
+        assert_eq!(reader.await.unwrap(), 0, "server side should observe EOF");
         let _ = std::fs::remove_file(socket_path);
     }
 
-    #[test]
-    fn request_cancellation_rejects_active_request() {
+    #[tokio::test]
+    async fn request_cancellation_rejects_active_request() {
         let state = PortalState::default();
-        state.requests.lock().unwrap().insert(
-            "request-1".to_string(),
-            RequestRecord {
-                session_handle: None,
-                daemon_session_id: None,
-                cancelled: false,
-                active_connection: None,
-            },
-        );
+        state
+            .requests
+            .lock()
+            .unwrap()
+            .insert("request-1".to_string(), test_request_record(None));
 
         assert!(ensure_request_active(&state, "request-1").is_ok());
-        tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(cancel_request(&state, "request-1"));
+        cancel_request(&state, "request-1").await;
 
         let err =
             ensure_request_active(&state, "request-1").expect_err("cancelled request should fail");
@@ -4105,15 +4047,13 @@ mod tests {
     #[test]
     fn cancelled_synthesis_request_releases_session_slot() {
         let state = PortalState::default();
-        state.requests.lock().unwrap().insert(
-            "request-1".to_string(),
-            RequestRecord {
-                session_handle: Some("session-1".to_string()),
-                daemon_session_id: None,
-                cancelled: true,
-                active_connection: None,
-            },
-        );
+        let mut record = test_request_record(Some("session-1"));
+        record.cancelled = true;
+        state
+            .requests
+            .lock()
+            .unwrap()
+            .insert("request-1".to_string(), record);
         begin_synthesis_request(&state, "session-1", "request-1").unwrap();
 
         finish_synthesis_request(&state, "session-1", "request-1");
@@ -4127,26 +4067,25 @@ mod tests {
         let state = PortalState::default();
         state.requests.lock().unwrap().insert(
             "request-1".to_string(),
-            RequestRecord {
-                session_handle: Some("session-1".to_string()),
-                daemon_session_id: None,
-                cancelled: false,
-                active_connection: None,
-            },
+            test_request_record(Some("session-1")),
         );
         state.requests.lock().unwrap().insert(
             "request-2".to_string(),
-            RequestRecord {
-                session_handle: Some("session-2".to_string()),
-                daemon_session_id: None,
-                cancelled: false,
-                active_connection: None,
-            },
+            test_request_record(Some("session-2")),
         );
 
         cancel_session_requests(&state, "session-1");
 
         assert!(ensure_request_active(&state, "request-1").is_err());
         assert!(ensure_request_active(&state, "request-2").is_ok());
+    }
+
+    fn test_request_record(session_handle: Option<&str>) -> RequestRecord {
+        RequestRecord {
+            session_handle: session_handle.map(str::to_string),
+            daemon_session_id: None,
+            cancelled: false,
+            cancel_tx: tokio::sync::watch::channel(false).0,
+        }
     }
 }

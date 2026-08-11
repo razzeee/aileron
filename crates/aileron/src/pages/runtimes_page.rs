@@ -105,33 +105,29 @@ fn refresh_runtime_images(list_box: &ListBox) {
     append_message(list_box, "Loading runtime images");
 
     let list_box = list_box.clone();
-    glib::spawn_future_local(async move {
-        let result = gio::spawn_blocking(move || {
+    crate::async_runtime::spawn(
+        async move {
             use aileron_varlink::aileron_Models::VarlinkClientInterface;
 
-            aileron_ipc::client::connect()
-                .map_err(|e| e.to_string())
-                .and_then(|conn| {
-                    let mut client = aileron_varlink::aileron_Models::VarlinkClient::new(conn);
-                    let images = client
-                        .list_runtime_images()
-                        .call()
-                        .map(|reply| reply.images)
-                        .map_err(|e| e.to_string())?;
-                    let installs = client
-                        .list_installs()
-                        .call()
-                        .map(|reply| reply.installs)
-                        .map_err(|e| e.to_string())?;
-                    Ok((images, installs))
-                })
-        })
-        .await
-        .map_err(|_| "Runtime image list task failed".to_string())
-        .and_then(|result| result);
-
-        render_runtime_images(&list_box, result);
-    });
+            let mut client = aileron_ipc::client::connect()
+                .await
+                .map_err(|e| e.to_string())?;
+            let images = client
+                .list_runtime_images()
+                .await
+                .map_err(|e| e.to_string())?
+                .map_err(|e| format!("{e:?}"))?
+                .images;
+            let installs = client
+                .list_installs()
+                .await
+                .map_err(|e| e.to_string())?
+                .map_err(|e| format!("{e:?}"))?
+                .installs;
+            Ok((images, installs))
+        },
+        move |result| render_runtime_images(&list_box, result),
+    );
 }
 
 fn render_runtime_images(
@@ -314,33 +310,27 @@ fn update_runtime_image(list_box: &ListBox, image_ref: &str) {
 
     let list_box = list_box.clone();
     let image_ref = image_ref.to_string();
-    glib::spawn_future_local(async move {
-        let result = gio::spawn_blocking(move || {
+    crate::async_runtime::spawn(
+        async move {
             use aileron_varlink::aileron_Models::VarlinkClientInterface;
 
-            aileron_ipc::client::connect()
-                .map_err(|e| e.to_string())
-                .and_then(|conn| {
-                    let mut client = aileron_varlink::aileron_Models::VarlinkClient::new(conn);
-                    client
-                        .update_runtime_image(image_ref)
-                        .call()
-                        .map(|_| ())
-                        .map_err(|e| e.to_string())
-                })
-        })
-        .await
-        .map_err(|_| "Runtime image update task failed".to_string())
-        .and_then(|result| result);
-
-        match result {
+            let mut client = aileron_ipc::client::connect()
+                .await
+                .map_err(|e| e.to_string())?;
+            client
+                .update_runtime_image(image_ref)
+                .await
+                .map_err(|e| e.to_string())?
+                .map_err(|e| format!("{e:?}"))
+        },
+        move |result| match result {
             Ok(()) => refresh_runtime_images(&list_box),
             Err(e) => {
                 clear_list(&list_box);
                 append_message(&list_box, &format!("Update failed: {e}"));
             }
-        }
-    });
+        },
+    );
 }
 
 fn prune_unused_runtime_images(list_box: &ListBox) {
@@ -348,33 +338,28 @@ fn prune_unused_runtime_images(list_box: &ListBox) {
     append_message(list_box, "Removing unused runtime images");
 
     let list_box = list_box.clone();
-    glib::spawn_future_local(async move {
-        let result = gio::spawn_blocking(move || {
+    crate::async_runtime::spawn(
+        async move {
             use aileron_varlink::aileron_Models::VarlinkClientInterface;
 
-            aileron_ipc::client::connect()
-                .map_err(|e| e.to_string())
-                .and_then(|conn| {
-                    let mut client = aileron_varlink::aileron_Models::VarlinkClient::new(conn);
-                    client
-                        .prune_unused_runtime_images()
-                        .call()
-                        .map(|_| ())
-                        .map_err(|e| e.to_string())
-                })
-        })
-        .await
-        .map_err(|_| "Runtime image cleanup task failed".to_string())
-        .and_then(|result| result);
-
-        match result {
+            let mut client = aileron_ipc::client::connect()
+                .await
+                .map_err(|e| e.to_string())?;
+            client
+                .prune_unused_runtime_images()
+                .await
+                .map_err(|e| e.to_string())?
+                .map(|_| ())
+                .map_err(|e| format!("{e:?}"))
+        },
+        move |result| match result {
             Ok(()) => refresh_runtime_images(&list_box),
             Err(e) => {
                 clear_list(&list_box);
                 append_message(&list_box, &format!("Cleanup failed: {e}"));
             }
-        }
-    });
+        },
+    );
 }
 
 fn confirm_prune_unused_runtime_images(list_box: &ListBox, window: Option<&gtk4::Window>) {
@@ -402,33 +387,27 @@ fn remove_runtime_image(list_box: &ListBox, image_id: &str) {
 
     let list_box = list_box.clone();
     let image_id = image_id.to_string();
-    glib::spawn_future_local(async move {
-        let result = gio::spawn_blocking(move || {
+    crate::async_runtime::spawn(
+        async move {
             use aileron_varlink::aileron_Models::VarlinkClientInterface;
 
-            aileron_ipc::client::connect()
-                .map_err(|e| e.to_string())
-                .and_then(|conn| {
-                    let mut client = aileron_varlink::aileron_Models::VarlinkClient::new(conn);
-                    client
-                        .remove_runtime_image(image_id)
-                        .call()
-                        .map(|_| ())
-                        .map_err(|e| e.to_string())
-                })
-        })
-        .await
-        .map_err(|_| "Runtime image remove task failed".to_string())
-        .and_then(|result| result);
-
-        match result {
+            let mut client = aileron_ipc::client::connect()
+                .await
+                .map_err(|e| e.to_string())?;
+            client
+                .remove_runtime_image(image_id)
+                .await
+                .map_err(|e| e.to_string())?
+                .map_err(|e| format!("{e:?}"))
+        },
+        move |result| match result {
             Ok(()) => refresh_runtime_images(&list_box),
             Err(e) => {
                 clear_list(&list_box);
                 append_message(&list_box, &format!("Remove failed: {e}"));
             }
-        }
-    });
+        },
+    );
 }
 
 fn confirm_remove_runtime_image(list_box: &ListBox, image_id: &str, window: Option<&gtk4::Window>) {

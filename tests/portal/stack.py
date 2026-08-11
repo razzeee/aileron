@@ -156,10 +156,11 @@ def main():
                 connection.connect(
                     str(Path(env["AILERON_RUNTIME_DIR"]) / "aileron.socket")
                 )
-                connection.sendall(
-                    json.dumps({"method": method, "parameters": parameters}).encode()
-                    + b"\0"
-                )
+                # zlink encodes argument-free methods without a parameters field.
+                request = {"method": method}
+                if parameters:
+                    request["parameters"] = parameters
+                connection.sendall(json.dumps(request).encode() + b"\0")
                 response = b""
                 while b"\0" not in response:
                     chunk = connection.recv(65536)

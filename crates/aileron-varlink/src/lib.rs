@@ -1,160 +1,211 @@
-/// Varlink interface definitions and generated type bindings for the Aileron project.
-///
-/// The four interfaces are:
-/// - `aileron.Inference`   – create sessions, generate text, transcribe audio, describe images
-/// - `aileron.Models`      – list, pull, delete, and assign OCI images
-/// - `aileron.Permissions` – per-app, per-use-case permission records
-/// - `aileron.Sessions`    – inspect and kill active inference sessions
-///
-/// Generated source files are produced by `varlink_generator::cargo_build` and
-/// placed in `$OUT_DIR`.  The module name matches the file stem produced by the
-/// generator (dots in the interface name are replaced with underscores).
+//! Owned zlink contracts for Aileron's four Varlink interfaces.
+//!
+//! The checked-in `.varlink` files are the wire-format source of truth. These
+//! bindings are handwritten so streaming replies remain owned and reviewable.
 
-// The varlink code generator produces non-standard names (e.g. `Call_Foo`,
-// `Foo_Args`).  Suppress the relevant lints for these modules only.
-#[allow(
-    non_snake_case,
-    non_camel_case_types,
-    dead_code,
-    unused_imports,
-    clippy::all
-)]
-pub mod aileron_Inference {
-    include!(concat!(env!("OUT_DIR"), "/aileron.Inference.rs"));
-}
+#[allow(non_snake_case)]
+pub mod aileron_Inference;
+#[allow(non_snake_case)]
+pub mod aileron_Models;
+#[allow(non_snake_case)]
+pub mod aileron_Permissions;
+#[allow(non_snake_case)]
+pub mod aileron_Sessions;
 
-#[allow(
-    non_snake_case,
-    non_camel_case_types,
-    dead_code,
-    unused_imports,
-    clippy::all
-)]
-pub mod aileron_Models {
-    include!(concat!(env!("OUT_DIR"), "/aileron.Models.rs"));
-}
-
-#[allow(
-    non_snake_case,
-    non_camel_case_types,
-    dead_code,
-    unused_imports,
-    clippy::all
-)]
-pub mod aileron_Permissions {
-    include!(concat!(env!("OUT_DIR"), "/aileron.Permissions.rs"));
-}
-
-#[allow(
-    non_snake_case,
-    non_camel_case_types,
-    dead_code,
-    unused_imports,
-    clippy::all
-)]
-pub mod aileron_Sessions {
-    include!(concat!(env!("OUT_DIR"), "/aileron.Sessions.rs"));
-}
-
-// Convenience aliases that downstream crates use.
 pub use aileron_Inference as inference;
 pub use aileron_Models as models;
 pub use aileron_Permissions as permissions;
 pub use aileron_Sessions as sessions;
 
+/// The protocol IDLs embedded for service introspection and drift tests.
+pub const INTERFACES: [(&str, &str); 4] = [
+    (
+        "aileron.Inference",
+        include_str!("../varlink/aileron.Inference.varlink"),
+    ),
+    (
+        "aileron.Models",
+        include_str!("../varlink/aileron.Models.varlink"),
+    ),
+    (
+        "aileron.Permissions",
+        include_str!("../varlink/aileron.Permissions.varlink"),
+    ),
+    (
+        "aileron.Sessions",
+        include_str!("../varlink/aileron.Sessions.varlink"),
+    ),
+];
+
 #[cfg(test)]
 mod tests {
-    use hegel::TestCase;
-    use hegel::generators as gs;
+    use super::*;
+    use zlink::introspect::ReplyError as _;
 
     #[test]
-    fn catalog_profile_info_accepts_missing_license() {
-        let profile: crate::aileron_Models::CatalogProfileInfo =
-            serde_json::from_value(serde_json::json!({
-                "profile_id": "old-daemon-profile",
-                "model_id": "old-daemon-model",
-                "llmfit_model_id": "",
-                "runtime_id": "llm-vision-whisper",
-                "tier": "balanced",
-                "disk_size_gb": 1.0,
-                "min_ram_gb": 1.0,
-                "recommended_ram_gb": 1.0,
-                "min_vram_gb": 0.0,
-                "fit_score": 0.0,
-                "use_case_fit_scores": [],
-                "fit_level": "recommended",
-                "recommended": true,
-                "installing": false,
-                "recommendation_reason": "test",
-                "use_cases": ["language.extract"]
-            }))
-            .expect("missing optional catalog fields should decode from older daemons");
-
-        assert_eq!(profile.spdx_license, None);
-        assert!(profile.llmfit_provider.is_none());
-        assert!(profile.supported_languages.is_none());
-        assert!(profile.score_components.is_none());
+    fn every_checked_in_idl_parses_and_has_the_expected_name() {
+        for (name, source) in INTERFACES {
+            let interface = zlink::idl::Interface::try_from(source).expect("valid Varlink IDL");
+            assert_eq!(interface.name(), name);
+            assert!(!interface.is_empty());
+        }
     }
 
-    #[hegel::test]
-    fn catalog_profile_info_decodes_optional_license(tc: TestCase) {
-        let include_license = tc.draw(gs::booleans());
-        let license = tc.draw(gs::sampled_from(vec![
-            "MIT".to_string(),
-            "Apache-2.0".to_string(),
-            "GPL-3.0-or-later".to_string(),
-        ]));
-        let mut value = serde_json::json!({
-            "profile_id": "profile",
-            "model_id": "model",
-            "llmfit_model_id": "",
-            "llmfit_provider": "",
-            "parameter_count": "",
-            "quantization": "",
-            "context_length": 0,
-            "release_date": "",
-            "capabilities": [],
-            "supported_languages": ["en"],
-            "runtime_id": "llm-vision-whisper",
-            "tier": "balanced",
-            "disk_size_gb": 1.0,
-            "min_ram_gb": 1.0,
-            "recommended_ram_gb": 1.0,
-            "min_vram_gb": 0.0,
-            "fit_score": 0.0,
-            "use_case_fit_scores": [],
-            "fit_level": "recommended",
-            "run_mode": "",
-            "inference_runtime": "",
-            "memory_required_gb": 0.0,
-            "memory_available_gb": 0.0,
-            "utilization_pct": 0.0,
-            "estimated_tps": 0.0,
-            "best_quant": "",
-            "effective_context_length": 0,
-            "fit_notes": [],
-            "score_components": {
-                "quality": 0.0,
-                "speed": 0.0,
-                "fit": 0.0,
-                "context": 0.0
-            },
-            "recommended": true,
-            "installing": false,
-            "recommendation_reason": "test",
-            "use_cases": ["language.extract"]
-        });
-        if include_license {
-            value["spdx_license"] = serde_json::Value::String(license.clone());
+    #[test]
+    fn handwritten_custom_types_and_errors_match_the_idls_structurally() {
+        assert_contract(
+            INTERFACES[0].1,
+            inference::CUSTOM_TYPES,
+            inference::Error::VARIANTS,
+            &[
+                "GetUseCaseAvailability",
+                "CreateSession",
+                "Prewarm",
+                "StreamResponse",
+                "StreamRespondGuided",
+                "StreamSubmitToolResultsGuided",
+                "StreamEmbed",
+                "StreamTranscribe",
+                "StreamSynthesize",
+                "StreamDescribe",
+                "StreamOcr",
+                "StreamDetect",
+                "StreamSegment",
+                "StreamDepth",
+                "CancelActiveRequest",
+                "EndSession",
+            ],
+        );
+        assert_contract(
+            INTERFACES[1].1,
+            models::CUSTOM_TYPES,
+            models::Error::VARIANTS,
+            &[
+                "List",
+                "ListRuntimeManifests",
+                "ListRuntimeImages",
+                "RemoveRuntimeImage",
+                "UpdateRuntimeImage",
+                "PruneUnusedRuntimeImages",
+                "ListCatalog",
+                "ListInstalls",
+                "CancelInstall",
+                "InstallManifest",
+                "InstallUrlProfile",
+                "DeleteProfile",
+                "AssignUseCase",
+            ],
+        );
+        assert_contract(
+            INTERFACES[2].1,
+            permissions::CUSTOM_TYPES,
+            permissions::Error::VARIANTS,
+            &["ListAppPermissions", "SetAppPermission"],
+        );
+        assert_contract(
+            INTERFACES[3].1,
+            sessions::CUSTOM_TYPES,
+            sessions::Error::VARIANTS,
+            &["ListActive", "KillSession"],
+        );
+    }
+
+    fn assert_contract(
+        source: &str,
+        rust_types: &[&zlink::idl::CustomType<'static>],
+        rust_errors: &[&zlink::idl::Error<'static>],
+        rust_methods: &[&str],
+    ) {
+        let idl = zlink::idl::Interface::try_from(source).unwrap();
+        let idl_methods = idl
+            .methods()
+            .map(|method| method.name())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            idl_methods,
+            rust_methods,
+            "method list drifted for {}",
+            idl.name()
+        );
+
+        let idl_types = idl.custom_types().collect::<Vec<_>>();
+        assert_eq!(
+            idl_types.len(),
+            rust_types.len(),
+            "type count drifted for {}",
+            idl.name()
+        );
+        for rust_type in rust_types {
+            let idl_type = idl_types
+                .iter()
+                .find(|candidate| candidate.name() == rust_type.name())
+                .unwrap_or_else(|| panic!("{} is absent from {}", rust_type.name(), idl.name()));
+            let rust_object = rust_type
+                .as_object()
+                .expect("Aileron IDLs use object types");
+            let idl_object = idl_type.as_object().expect("Aileron IDLs use object types");
+            let rust_fields = rust_object
+                .fields()
+                .map(|field| (field.name(), field.ty()))
+                .collect::<Vec<_>>();
+            let idl_fields = idl_object
+                .fields()
+                .map(|field| (field.name(), field.ty()))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                rust_fields,
+                idl_fields,
+                "field drift in {}.{}",
+                idl.name(),
+                rust_type.name()
+            );
         }
 
-        let profile: crate::aileron_Models::CatalogProfileInfo =
-            serde_json::from_value(value).expect("catalog profile should decode");
-
+        let idl_errors = idl.errors().collect::<Vec<_>>();
         assert_eq!(
-            profile.spdx_license.as_deref(),
-            include_license.then_some(license.as_str())
+            idl_errors.len(),
+            rust_errors.len(),
+            "error count drifted for {}",
+            idl.name()
         );
-        assert_eq!(profile.supported_languages, Some(vec!["en".to_string()]));
+        for rust_error in rust_errors {
+            let idl_error = idl_errors
+                .iter()
+                .find(|candidate| candidate.name() == rust_error.name())
+                .unwrap_or_else(|| panic!("{} is absent from {}", rust_error.name(), idl.name()));
+            let rust_fields = rust_error
+                .fields()
+                .map(|field| (field.name(), field.ty()))
+                .collect::<Vec<_>>();
+            let idl_fields = idl_error
+                .fields()
+                .map(|field| (field.name(), field.ty()))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                rust_fields,
+                idl_fields,
+                "field drift in {}.{}",
+                idl.name(),
+                rust_error.name()
+            );
+        }
+    }
+
+    #[test]
+    fn aliases_keep_the_public_contract_modules_available() {
+        let value = models::RuntimeImage {
+            variant: "cpu".into(),
+            image_ref: "example/image:latest".into(),
+        };
+        let json = serde_json::to_value(value).unwrap();
+        assert_eq!(json["variant"], "cpu");
+
+        let permission = permissions::AppPermission {
+            app_id: "org.example.App".into(),
+            use_case: "language.generate".into(),
+            allowed: true,
+            last_used: None,
+        };
+        assert!(serde_json::to_value(permission).unwrap()["last_used"].is_null());
     }
 }
