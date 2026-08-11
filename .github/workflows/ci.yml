@@ -36,8 +36,11 @@ jobs:
           key: core-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: core-${{ runner.os }}-
 
-      - name: Install system deps (dbus only)
-        run: sudo apt-get install -y --no-install-recommends libdbus-1-dev pkg-config
+      - name: Install system deps and external Varlink client
+        run: sudo apt-get install -y --no-install-recommends libdbus-1-dev pkg-config systemd
+
+      - name: Install Rust Varlink client
+        run: cargo install varlink-cli --locked
 
       - name: cargo fmt
         run: cargo fmt --all -- --check
@@ -57,6 +60,13 @@ jobs:
           -p aileron-ipc
           -p aileron-daemon
           -p aileron-portal
+
+      - name: External Varlink interoperability
+        env:
+          AILERON_REQUIRE_EXTERNAL_VARLINK_CLIENTS: 1
+        run: |
+          cargo test -p aileron-varlink --test external_interop -- --nocapture
+          cargo test -p aileron-daemon --test external_interop -- --nocapture
 
       - name: cargo clippy (core crates only)
         run: >

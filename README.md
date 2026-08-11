@@ -55,7 +55,7 @@ Further reading:
 | `aileron-portal` | binary | xdg-desktop-portal implementation backend; bridges D-Bus ↔ Varlink |
 | `aileron` | binary | GTK4/libadwaita management UI |
 | `aileron-demo` | binary | Sandboxed GTK4 article summarizer; end-to-end demo app |
-| `aileron-varlink` | library | Varlink IDL files and generated bindings |
+| `aileron-varlink` | library | Varlink IDLs and handwritten zlink bindings |
 | `aileron-ipc` | library | Varlink client/server connection helpers |
 
 Reusable runtime images live in `runtimes/`. Model artifacts are installed separately under `$XDG_DATA_HOME/aileron/models/<model-id>/` and mounted read-only into runtimes at `/model`. Model manifests reference a `runtime_id`; runtime manifests map that ID plus the detected hardware variant to an OCI image.
@@ -320,6 +320,26 @@ kill %1
 ```
 
 Install the `varlink` CLI with: `cargo install varlink-cli`
+
+### Validate external Varlink interoperability
+
+The Rust bindings in `aileron-varlink` are handwritten zlink contracts; the
+checked-in `.varlink` files remain the wire-format source of truth. A controlled
+test service validates service metadata, introspection, ordinary calls, typed
+errors, and streaming termination against both systemd `varlinkctl` and the
+Rust `varlink` CLI without model hardware or container images:
+
+```sh
+cargo install varlink-cli --locked
+AILERON_REQUIRE_EXTERNAL_VARLINK_CLIENTS=1 \
+    cargo test -p aileron-varlink --test external_interop -- --nocapture
+AILERON_REQUIRE_EXTERNAL_VARLINK_CLIENTS=1 \
+    cargo test -p aileron-daemon --test external_interop -- --nocapture
+```
+
+Install `varlinkctl` from your distribution's systemd package. Without the
+environment variable, the test skips with a diagnostic when either CLI is not
+installed; CI installs and requires both.
 
 ## Getting started (with a real model)
 

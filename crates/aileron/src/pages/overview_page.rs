@@ -33,6 +33,7 @@ pub struct OverviewPage {
 #[derive(Debug)]
 pub enum OverviewMsg {
     Refresh,
+    Loaded(OverviewSummary),
 }
 
 pub struct OverviewWidgets {
@@ -77,9 +78,14 @@ impl SimpleComponent for OverviewPage {
         }
     }
 
-    fn update(&mut self, msg: Self::Input, _sender: ComponentSender<Self>) {
+    fn update(&mut self, msg: Self::Input, sender: ComponentSender<Self>) {
         match msg {
-            OverviewMsg::Refresh => self.summary = load_summary(),
+            OverviewMsg::Refresh => {
+                crate::async_runtime::spawn(load_summary(), move |summary| {
+                    sender.input(OverviewMsg::Loaded(summary));
+                });
+            }
+            OverviewMsg::Loaded(summary) => self.summary = summary,
         }
     }
 
@@ -205,31 +211,36 @@ fn metric_card(title: &str, value: &str) -> (Box, Label) {
     (card, value_label)
 }
 
-fn load_summary() -> OverviewSummary {
+async fn load_summary() -> OverviewSummary {
     let mut summary = OverviewSummary::default();
 
     use aileron_varlink::aileron_Models::VarlinkClientInterface as ModelsClient;
-    match aileron_ipc::client::connect() {
+    match aileron_ipc::client::connect().await {
         Ok(conn) => {
-            let mut client = aileron_varlink::aileron_Models::VarlinkClient::new(conn);
-            match client.list().call() {
-                Ok(reply) => {
+            let mut client = conn;
+            match client.list().await {
+                Ok(Ok(reply)) => {
                     summary.ready_tasks = ready_task_count(&reply.profiles);
                 }
+                Ok(Err(e)) => summary.errors.push(format!("Profiles unavailable: {e:?}")),
                 Err(e) => summary.errors.push(format!("Profiles unavailable: {e}")),
             }
-            match client.list_installs().call() {
-                Ok(reply) => {
+            match client.list_installs().await {
+                Ok(Ok(reply)) => {
                     summary.active_downloads = reply
                         .installs
                         .iter()
                         .filter(|install| !install_is_terminal(install))
                         .count();
                 }
+                Ok(Err(e)) => summary.errors.push(format!("Downloads unavailable: {e:?}")),
                 Err(e) => summary.errors.push(format!("Downloads unavailable: {e}")),
             }
-            match client.list_runtime_images().call() {
-                Ok(reply) => summary.runtime_images = reply.images.len(),
+            match client.list_runtime_images().await {
+                Ok(Ok(reply)) => summary.runtime_images = reply.images.len(),
+                Ok(Err(e)) => summary
+                    .errors
+                    .push(format!("Runtime images unavailable: {e:?}")),
                 Err(e) => summary
                     .errors
                     .push(format!("Runtime images unavailable: {e}")),
@@ -242,11 +253,12 @@ fn load_summary() -> OverviewSummary {
     }
 
     use aileron_varlink::aileron_Sessions::VarlinkClientInterface as SessionsClient;
-    match aileron_ipc::client::connect() {
+    match aileron_ipc::client::connect().await {
         Ok(conn) => {
-            let mut client = aileron_varlink::aileron_Sessions::VarlinkClient::new(conn);
-            match client.list_active().call() {
-                Ok(reply) => summary.active_sessions = reply.sessions.len(),
+            let mut client = conn;
+            match client.list_active().await {
+                Ok(Ok(reply)) => summary.active_sessions = reply.sessions.len(),
+                Ok(Err(e)) => summary.errors.push(format!("Sessions unavailable: {e:?}")),
                 Err(e) => summary.errors.push(format!("Sessions unavailable: {e}")),
             }
         }
@@ -256,11 +268,14 @@ fn load_summary() -> OverviewSummary {
     }
 
     use aileron_varlink::aileron_Permissions::VarlinkClientInterface as PermissionsClient;
-    match aileron_ipc::client::connect() {
+    match aileron_ipc::client::connect().await {
         Ok(conn) => {
-            let mut client = aileron_varlink::aileron_Permissions::VarlinkClient::new(conn);
-            match client.list_app_permissions().call() {
-                Ok(reply) => summary.permissions = reply.permissions.len(),
+            let mut client = conn;
+            match client.list_app_permissions().await {
+                Ok(Ok(reply)) => summary.permissions = reply.permissions.len(),
+                Ok(Err(e)) => summary
+                    .errors
+                    .push(format!("Permissions unavailable: {e:?}")),
                 Err(e) => summary.errors.push(format!("Permissions unavailable: {e}")),
             }
         }

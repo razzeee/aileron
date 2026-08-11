@@ -14,7 +14,6 @@ use super::{format_duration, format_speed, install_is_terminal_status};
 
 pub struct DownloadsPage {
     poll_active: Rc<Cell<bool>>,
-    start_poll: bool,
 }
 
 #[derive(Debug)]
@@ -46,7 +45,6 @@ impl SimpleComponent for DownloadsPage {
         refresh_downloads_list(&list_box);
         let model = DownloadsPage {
             poll_active: Rc::new(Cell::new(false)),
-            start_poll: has_active_downloads(),
         };
         let mut widgets = DownloadsWidgets { list_box };
         model.update_view(&mut widgets, sender);
@@ -55,17 +53,13 @@ impl SimpleComponent for DownloadsPage {
 
     fn update(&mut self, msg: Self::Input, _sender: ComponentSender<Self>) {
         match msg {
-            DownloadsMsg::Refresh => {
-                self.start_poll = has_active_downloads();
-            }
+            DownloadsMsg::Refresh => {}
         }
     }
 
     fn update_view(&self, widgets: &mut Self::Widgets, sender: ComponentSender<Self>) {
         refresh_downloads_list(&widgets.list_box);
-        if self.start_poll {
-            start_poll(&widgets.list_box, self.poll_active.clone(), sender);
-        }
+        start_poll(&widgets.list_box, self.poll_active.clone(), sender);
     }
 }
 
@@ -80,19 +74,9 @@ fn start_poll(
     poll_active.set(true);
     refresh_downloads_list(list_box);
 
-    let mut grace_ticks = 15;
     glib::timeout_add_seconds_local(2, move || {
         sender.input(DownloadsMsg::Refresh);
-        if has_active_downloads() {
-            grace_ticks = 15;
-            glib::ControlFlow::Continue
-        } else if grace_ticks > 0 {
-            grace_ticks -= 1;
-            glib::ControlFlow::Continue
-        } else {
-            poll_active.set(false);
-            glib::ControlFlow::Break
-        }
+        glib::ControlFlow::Continue
     });
 }
 
@@ -122,16 +106,41 @@ fn build_page(page: &PreferencesPage) -> ListBox {
 fn refresh_downloads_list(list: &ListBox) {
     clear_list(list);
 
-    use aileron_varlink::aileron_Models::VarlinkClientInterface;
-    let installs = aileron_ipc::client::connect()
-        .map_err(|e| e.to_string())
-        .and_then(|conn| {
-            let mut client = aileron_varlink::aileron_Models::VarlinkClient::new(conn);
-            client.list_installs().call().map_err(|e| e.to_string())
-        });
+    let list = list.clone();
+    crate::async_runtime::spawn(
+        async {
+            use aileron_varlink::aileron_Models::VarlinkClientInterface;
+            let mut client = aileron_ipc::client::connect()
+                .await
+                .map_err(|e| e.to_string())?;
+            let installs = client
+                .list_installs()
+                .await
+                .map_err(|e| e.to_string())?
+                .map_err(|e| format!("{e:?}"))?
+                .installs;
+            let profile_runtime_ids = client
+                .list_catalog()
+                .await
+                .map_err(|e| e.to_string())?
+                .map_err(|e| format!("{e:?}"))?
+                .profiles
+                .into_iter()
+                .map(|profile| (profile.profile_id, profile.runtime_id))
+                .collect();
+            Ok((installs, profile_runtime_ids))
+        },
+        move |result| render_downloads_list(&list, result),
+    );
+}
 
-    let installs = match installs {
-        Ok(reply) => reply.installs,
+fn render_downloads_list(
+    list: &ListBox,
+    result: Result<(Vec<InstallStatus>, HashMap<String, String>), String>,
+) {
+    clear_list(list);
+    let (installs, profile_runtime_ids) = match result {
+        Ok(values) => values,
         Err(reason) => {
             let row = ActionRow::new();
             row.set_title("Downloads unavailable");
@@ -160,7 +169,6 @@ fn refresh_downloads_list(list: &ListBox) {
         .into_iter()
         .partition(|install| !is_runtime_download(&install.profile_id));
 
-    let profile_runtime_ids = catalog_profile_runtime_ids();
     let mut grouped_runtime_downloads = HashSet::new();
 
     for install in &profile_installs {
@@ -446,25 +454,6 @@ fn runtime_download_runtime_id(profile_id: &str) -> Option<String> {
     )
 }
 
-fn catalog_profile_runtime_ids() -> HashMap<String, String> {
-    use aileron_varlink::aileron_Models::VarlinkClientInterface;
-
-    aileron_ipc::client::connect()
-        .map_err(|e| e.to_string())
-        .and_then(|conn| {
-            let mut client = aileron_varlink::aileron_Models::VarlinkClient::new(conn);
-            client.list_catalog().call().map_err(|e| e.to_string())
-        })
-        .map(|reply| {
-            reply
-                .profiles
-                .into_iter()
-                .map(|profile| (profile.profile_id, profile.runtime_id))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 fn runtime_phase(status: &str) -> &'static str {
     if status.starts_with("Failed:") {
         "Failed to prepare"
@@ -496,46 +485,32 @@ fn compact_image_ref(image_ref: &str) -> String {
     format!("{registry}/…/{image}")
 }
 
-fn has_active_downloads() -> bool {
-    use aileron_varlink::aileron_Models::VarlinkClientInterface;
-
-    aileron_ipc::client::connect()
-        .map_err(|e| e.to_string())
-        .and_then(|conn| {
-            let mut client = aileron_varlink::aileron_Models::VarlinkClient::new(conn);
-            client.list_installs().call().map_err(|e| e.to_string())
-        })
-        .map(|reply| {
-            reply
-                .installs
-                .iter()
-                .any(|install| !install_is_terminal(install))
-        })
-        .unwrap_or(false)
-}
-
 fn cancel_install(profile_id: &str, window: Option<gtk4::Window>) {
-    use aileron_varlink::aileron_Models::VarlinkClientInterface;
-
-    let result = aileron_ipc::client::connect()
-        .map_err(|e| e.to_string())
-        .and_then(|conn| {
-            let mut client = aileron_varlink::aileron_Models::VarlinkClient::new(conn);
+    let profile_id = profile_id.to_string();
+    crate::async_runtime::spawn(
+        async move {
+            use aileron_varlink::aileron_Models::VarlinkClientInterface;
+            let mut client = aileron_ipc::client::connect()
+                .await
+                .map_err(|e| e.to_string())?;
             client
-                .cancel_install(profile_id.to_string())
-                .call()
-                .map_err(|e| e.to_string())
-        });
-
-    if let Err(reason) = result {
-        let dialog = AlertDialog::builder()
-            .heading("Cancel failed")
-            .body(&reason)
-            .build();
-        dialog.add_response("ok", "OK");
-        dialog.set_default_response(Some("ok"));
-        dialog.present(window.as_ref());
-    }
+                .cancel_install(profile_id)
+                .await
+                .map_err(|e| e.to_string())?
+                .map_err(|e| format!("{e:?}"))
+        },
+        move |result| {
+            if let Err(reason) = result {
+                let dialog = AlertDialog::builder()
+                    .heading("Cancel failed")
+                    .body(&reason)
+                    .build();
+                dialog.add_response("ok", "OK");
+                dialog.set_default_response(Some("ok"));
+                dialog.present(window.as_ref());
+            }
+        },
+    );
 }
 
 fn confirm_cancel_install(profile_id: &str, window: Option<gtk4::Window>) {

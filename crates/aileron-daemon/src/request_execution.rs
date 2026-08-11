@@ -1,15 +1,112 @@
 //! Daemon request execution lifecycle helpers.
 //!
-//! This module owns cancellation vocabulary for inference requests. Session
-//! closure is the real cancellation seam today; the `RequestCancellation` shape
-//! leaves room for per-request cancellation if another adapter makes it real.
+//! This module owns session-wide cancellation and operation-local disconnect
+//! cancellation for inference requests.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex as StdMutex};
 use std::thread;
 use std::time::Duration;
 
 use crate::container::ContainerHandle;
 use crate::state::SharedState;
+use tokio::sync::mpsc;
+
+#[derive(Clone, Default)]
+pub(crate) struct OperationCancellation {
+    cancelled: Arc<AtomicBool>,
+    active_handle: Arc<StdMutex<Option<ContainerHandle>>>,
+}
+
+impl OperationCancellation {
+    pub(crate) fn ensure_not_cancelled(&self) -> Result<(), String> {
+        if self.cancelled.load(Ordering::SeqCst) {
+            Err(operation_disconnected_reason())
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(crate) fn ensure_not_cancelled_or_terminate_spawned(
+        &self,
+        handle: &ContainerHandle,
+        spawned: bool,
+    ) -> Result<(), String> {
+        if let Err(reason) = self.ensure_not_cancelled() {
+            if spawned {
+                handle.terminate();
+            }
+            Err(reason)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(crate) fn register_handle(&self, handle: &ContainerHandle) -> OperationHandleGuard {
+        {
+            let mut active = self
+                .active_handle
+                .lock()
+                .expect("operation handle mutex poisoned");
+            *active = Some(handle.clone());
+            if self.cancelled.load(Ordering::SeqCst) {
+                handle.terminate();
+            }
+        }
+        OperationHandleGuard {
+            active_handle: self.active_handle.clone(),
+            handle: handle.clone(),
+        }
+    }
+
+    pub(crate) fn watch_sender<T: Send + 'static>(
+        &self,
+        sender: &mpsc::Sender<T>,
+    ) -> DisconnectWatcher {
+        let cancellation = self.clone();
+        let sender = sender.clone();
+        spawn_watcher(move || {
+            if sender.is_closed() {
+                cancellation.cancel();
+                true
+            } else {
+                false
+            }
+        })
+    }
+
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+        if let Some(handle) = self
+            .active_handle
+            .lock()
+            .expect("operation handle mutex poisoned")
+            .as_ref()
+        {
+            handle.terminate();
+        }
+    }
+}
+
+pub(crate) struct OperationHandleGuard {
+    active_handle: Arc<StdMutex<Option<ContainerHandle>>>,
+    handle: ContainerHandle,
+}
+
+impl Drop for OperationHandleGuard {
+    fn drop(&mut self) {
+        let mut active = self
+            .active_handle
+            .lock()
+            .expect("operation handle mutex poisoned");
+        if active
+            .as_ref()
+            .is_some_and(|handle| handle.ptr_eq(&self.handle))
+        {
+            *active = None;
+        }
+    }
+}
 
 pub(crate) struct ActiveContainerRequest<'a> {
     state: &'a SharedState,
@@ -108,6 +205,10 @@ pub(crate) fn request_cancelled_reason() -> String {
     "container returned error request_cancelled: session was closed".to_string()
 }
 
+fn operation_disconnected_reason() -> String {
+    "container returned error request_cancelled: client disconnected".to_string()
+}
+
 pub(crate) fn background_preempted_reason() -> String {
     "container returned error request_cancelled: background request was preempted by interactive request"
         .to_string()
@@ -121,6 +222,8 @@ pub(crate) struct CancelWatcher {
     stop: Arc<(StdMutex<bool>, Condvar)>,
     thread: Option<thread::JoinHandle<()>>,
 }
+
+pub(crate) type DisconnectWatcher = CancelWatcher;
 
 impl CancelWatcher {
     pub(crate) fn stop(mut self) {
@@ -148,12 +251,22 @@ fn spawn_cancel_watcher(
     let state = state.clone();
     let session_id = session_id.to_string();
     let handle = handle.clone();
+    spawn_watcher(move || {
+        if state.is_session_cancelled(&session_id) {
+            handle.terminate();
+            true
+        } else {
+            false
+        }
+    })
+}
+
+fn spawn_watcher(mut should_stop: impl FnMut() -> bool + Send + 'static) -> CancelWatcher {
     let stop = Arc::new((StdMutex::new(false), Condvar::new()));
     let thread_stop = stop.clone();
     let thread = thread::spawn(move || {
         loop {
-            if state.is_session_cancelled(&session_id) {
-                handle.terminate();
+            if should_stop() {
                 break;
             }
             let (lock, wake) = &*thread_stop;
@@ -254,5 +367,64 @@ mod tests {
         assert!(!is_request_cancelled_failure(
             "container returned error invalid_input: bad"
         ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn disconnect_before_first_reply_cancels_only_the_operation() {
+        let state = shared_state();
+        let cancellation = OperationCancellation::default();
+        let (sender, receiver) = mpsc::channel::<()>(1);
+        let watcher = cancellation.watch_sender(&sender);
+
+        drop(receiver);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while cancellation.ensure_not_cancelled().is_ok() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("disconnect watcher should cancel startup promptly");
+        assert!(!state.is_session_cancelled("session-a"));
+        watcher.stop();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn in_flight_operation_exits_within_two_seconds_after_disconnect() {
+        let cancellation = OperationCancellation::default();
+        let worker_cancellation = cancellation.clone();
+        let (sender, receiver) = mpsc::channel::<()>(1);
+        let watcher = cancellation.watch_sender(&sender);
+        let worker = tokio::task::spawn_blocking(move || {
+            while worker_cancellation.ensure_not_cancelled().is_ok() {
+                thread::sleep(Duration::from_millis(10));
+            }
+        });
+
+        drop(receiver);
+
+        tokio::time::timeout(Duration::from_secs(2), worker)
+            .await
+            .expect("in-flight operation should stop promptly")
+            .expect("worker should exit cleanly");
+        watcher.stop();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn disconnect_watcher_stops_while_receiver_is_open() {
+        let cancellation = OperationCancellation::default();
+        let (sender, _receiver) = mpsc::channel::<()>(1);
+        let watcher = cancellation.watch_sender(&sender);
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio::task::spawn_blocking(move || {
+                watcher.stop();
+            }),
+        )
+        .await
+        .expect("producer cleanup should stop watcher promptly")
+        .expect("watcher should stop cleanly");
+        assert!(cancellation.ensure_not_cancelled().is_ok());
     }
 }

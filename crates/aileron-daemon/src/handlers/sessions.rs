@@ -1,71 +1,58 @@
-/// Varlink handler for `aileron.Sessions`.
+//! Business operations for `aileron.Sessions`.
 use crate::observability;
 use crate::request_execution;
 use crate::state::SharedState;
-#[allow(unused_imports)]
-// VarlinkCallError is a supertrait; its methods reach us via Call_* dyn objects
-use aileron_varlink::aileron_Sessions::{
-    Call_KillSession, Call_ListActive, SessionInfo, VarlinkCallError, VarlinkInterface,
-};
+use aileron_varlink::sessions::{Error, ListActive_Reply, SessionInfo};
 
 pub struct SessionsHandler {
     state: SharedState,
-    rt: tokio::runtime::Handle,
 }
 
 impl SessionsHandler {
-    pub fn new(state: SharedState, rt: tokio::runtime::Handle) -> Self {
-        Self { state, rt }
-    }
-}
-
-impl VarlinkInterface for SessionsHandler {
-    fn list_active(&self, call: &mut dyn Call_ListActive) -> varlink::Result<()> {
-        self.rt.block_on(async {
-            let guard = self.state.0.lock().await;
-            call.reply(active_sessions(&guard))
-        })
+    pub fn new(state: SharedState) -> Self {
+        Self { state }
     }
 
-    fn kill_session(
-        &self,
-        call: &mut dyn Call_KillSession,
-        session_id: String,
-    ) -> varlink::Result<()> {
-        self.rt.block_on(async {
-            let (app_id, use_case, profile_id, unused_profile_id) = {
-                let mut guard = self.state.0.lock().await;
-                match kill_session(&mut guard, &session_id) {
-                    KillSessionResult::NotFound => return call.reply_session_not_found(session_id),
-                    KillSessionResult::Removed {
-                        app_id,
-                        use_case,
-                        profile_id,
-                        unused_profile_id,
-                    } => {
-                        request_execution::mark_session_closed(&self.state, &session_id);
-                        (app_id, use_case, profile_id, unused_profile_id)
-                    }
+    pub async fn list_active(&self) -> ListActive_Reply {
+        let guard = self.state.0.lock().await;
+        ListActive_Reply {
+            sessions: active_sessions(&guard),
+        }
+    }
+
+    pub async fn kill_session(&self, session_id: String) -> Result<(), Error> {
+        let (app_id, use_case, profile_id, unused_profile_id) = {
+            let mut guard = self.state.0.lock().await;
+            match kill_session(&mut guard, &session_id) {
+                KillSessionResult::NotFound => return Err(Error::SessionNotFound { session_id }),
+                KillSessionResult::Removed {
+                    app_id,
+                    use_case,
+                    profile_id,
+                    unused_profile_id,
+                } => {
+                    request_execution::mark_session_closed(&self.state, &session_id);
+                    (app_id, use_case, profile_id, unused_profile_id)
                 }
-            };
-            request_execution::terminate_active_container_handles_for_session(
-                &self.state,
-                &profile_id,
-                &session_id,
-            )
-            .await;
-            if let Some(unused_profile_id) = unused_profile_id {
-                let mut containers = self.state.2.lock().await;
-                containers.kill(&unused_profile_id);
             }
-            observability::log_session_ended(observability::SessionFields {
-                session_id: &session_id,
-                app_id: &app_id,
-                use_case: &use_case,
-                profile_id: &profile_id,
-            });
-            call.reply()
-        })
+        };
+        request_execution::terminate_active_container_handles_for_session(
+            &self.state,
+            &profile_id,
+            &session_id,
+        )
+        .await;
+        if let Some(unused_profile_id) = unused_profile_id {
+            let mut containers = self.state.2.lock().await;
+            containers.kill(&unused_profile_id);
+        }
+        observability::log_session_ended(observability::SessionFields {
+            session_id: &session_id,
+            app_id: &app_id,
+            use_case: &use_case,
+            profile_id: &profile_id,
+        });
+        Ok(())
     }
 }
 
