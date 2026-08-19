@@ -29,7 +29,7 @@ const PORTAL_PATH: &str = "/org/freedesktop/portal/desktop";
 const LANGUAGE_IFACE: &str = "org.freedesktop.portal.Language";
 const REQUEST_IFACE: &str = "org.freedesktop.portal.Request";
 const SESSION_IFACE: &str = "org.freedesktop.portal.Session";
-const SPEECH_IFACE: &str = "org.freedesktop.portal.Speech";
+const SPOKEN_LANGUAGE_IFACE: &str = "org.freedesktop.portal.SpokenLanguage";
 const VISION_IFACE: &str = "org.freedesktop.portal.Vision";
 static PORTAL_CONNECTION: OnceLock<zbus::blocking::Connection> = OnceLock::new();
 static USE_BACKGROUND_EXECUTION: AtomicBool = AtomicBool::new(false);
@@ -1393,7 +1393,8 @@ struct PortalPhraseSynthesizer {
 impl PortalPhraseSynthesizer {
     fn new() -> anyhow::Result<Self> {
         let conn = zbus::blocking::Connection::session()?;
-        let proxy = zbus::blocking::Proxy::new(&conn, PORTAL_BUS, PORTAL_PATH, SPEECH_IFACE)?;
+        let proxy =
+            zbus::blocking::Proxy::new(&conn, PORTAL_BUS, PORTAL_PATH, SPOKEN_LANGUAGE_IFACE)?;
         let session_handle = create_public_session_on_connection(
             &proxy,
             &conn,
@@ -1417,9 +1418,14 @@ impl PhraseSynthesizer for PortalPhraseSynthesizer {
     ) -> anyhow::Result<()> {
         let call_conn = self.connection.clone();
         let signal_conn = call_conn.clone();
-        let proxy = zbus::blocking::Proxy::new(&call_conn, PORTAL_BUS, PORTAL_PATH, SPEECH_IFACE)?;
-        let signal_proxy =
-            zbus::blocking::Proxy::new(&signal_conn, PORTAL_BUS, PORTAL_PATH, SPEECH_IFACE)?;
+        let proxy =
+            zbus::blocking::Proxy::new(&call_conn, PORTAL_BUS, PORTAL_PATH, SPOKEN_LANGUAGE_IFACE)?;
+        let signal_proxy = zbus::blocking::Proxy::new(
+            &signal_conn,
+            PORTAL_BUS,
+            PORTAL_PATH,
+            SPOKEN_LANGUAGE_IFACE,
+        )?;
         let mut audio_iter = signal_proxy.receive_signal("AudioReceived")?;
         let expected_session = self.session_handle.clone();
         let (event_tx, event_rx) = std::sync::mpsc::channel();
@@ -2760,9 +2766,10 @@ fn transcribe_recording(
 
     let call_conn = portal_connection()?;
     let signal_conn = call_conn.clone();
-    let proxy = zbus::blocking::Proxy::new(&call_conn, PORTAL_BUS, PORTAL_PATH, SPEECH_IFACE)?;
+    let proxy =
+        zbus::blocking::Proxy::new(&call_conn, PORTAL_BUS, PORTAL_PATH, SPOKEN_LANGUAGE_IFACE)?;
     let sig_proxy =
-        zbus::blocking::Proxy::new(&signal_conn, PORTAL_BUS, PORTAL_PATH, SPEECH_IFACE)?;
+        zbus::blocking::Proxy::new(&signal_conn, PORTAL_BUS, PORTAL_PATH, SPOKEN_LANGUAGE_IFACE)?;
 
     tx.send(SpeechEvent::Phase(SpeechPhase::CreatingSession))?;
     let session_handle = create_public_session(&proxy, use_case, speech_instructions(use_case))?;
@@ -2798,9 +2805,10 @@ fn live_transcribe_recording(
     let source_language_hint = source_language_hint.to_string();
     let call_conn = portal_connection()?;
     let signal_conn = call_conn.clone();
-    let proxy = zbus::blocking::Proxy::new(&call_conn, PORTAL_BUS, PORTAL_PATH, SPEECH_IFACE)?;
+    let proxy =
+        zbus::blocking::Proxy::new(&call_conn, PORTAL_BUS, PORTAL_PATH, SPOKEN_LANGUAGE_IFACE)?;
     let sig_proxy =
-        zbus::blocking::Proxy::new(&signal_conn, PORTAL_BUS, PORTAL_PATH, SPEECH_IFACE)?;
+        zbus::blocking::Proxy::new(&signal_conn, PORTAL_BUS, PORTAL_PATH, SPOKEN_LANGUAGE_IFACE)?;
 
     tx.send(SpeechEvent::Phase(SpeechPhase::CreatingSession))?;
     let session_handle = create_public_session(&proxy, use_case, speech_instructions(use_case))?;
