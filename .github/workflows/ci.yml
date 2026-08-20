@@ -176,8 +176,9 @@ jobs:
         env:
           AILERON_STUB_IMAGE: aileron/stub:ci
           AILERON_OCI_STORE: ${{ runner.temp }}/aileron-oci
+        # The runner's static Podman bundle shadows Ubuntu's AppArmor-profiled crun.
         run: >
-          cargo test
+          PATH="/usr/bin:$PATH" cargo test
           -p aileron-daemon
           stub_runtime_roundtrip_through_container_wrapper
           -- --ignored
