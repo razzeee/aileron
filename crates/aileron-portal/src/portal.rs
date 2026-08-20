@@ -93,7 +93,7 @@ impl PortalInterface {
     fn label(self) -> &'static str {
         match self {
             Self::Language => "Language",
-            Self::SpokenLanguage => "SpokenLanguage",
+            Self::SpokenLanguage => "Speech",
             Self::Vision => "Vision",
         }
     }
@@ -3101,7 +3101,7 @@ mod tests {
             .expect_err("wrong interface should be rejected");
 
         assert!(err.to_string().contains("Language portal"));
-        assert!(err.to_string().contains("SpokenLanguage"));
+        assert!(err.to_string().contains("Speech"));
     }
 
     #[test]
