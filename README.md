@@ -20,11 +20,11 @@ Aileron solves both. All IPC is over a Varlink Unix socket. Flatpak sandboxes ca
 ```
 ┌─────────────────────────────────────────┐
 │  Flatpak sandbox                        │
-│  aileron-demo  ──── D-Bus ────────────► │──► org.freedesktop.portal.{Language,Speech,Vision}
+│  aileron-demo  ──── D-Bus ────────────► │──► org.freedesktop.portal.{Language,SpokenLanguage,Vision}
 └─────────────────────────────────────────┘             │
                                                         │ xdg-desktop-portal frontend
                                                         │ D-Bus
-                                                 org.freedesktop.impl.portal.{Language,Speech,Vision}
+                                                 org.freedesktop.impl.portal.{Language,SpokenLanguage,Vision}
                                                         │
                                                  aileron-portal backend
                                                         │ Varlink (Unix socket)
@@ -165,7 +165,7 @@ System packages should keep the `/usr/bin` service paths, install the portal des
 
 ### Public portal frontend prototype
 
-The public `org.freedesktop.portal.Language`, `org.freedesktop.portal.Speech`, and `org.freedesktop.portal.Vision` APIs require the patched `xdg-desktop-portal` frontend in this repository. A stock system `xdg-desktop-portal` does not expose these public interfaces yet. Sandboxed apps and the demo should call the public frontend interfaces; the frontend derives the app identity and forwards to the Aileron implementation backend.
+The public `org.freedesktop.portal.Language`, `org.freedesktop.portal.SpokenLanguage`, and `org.freedesktop.portal.Vision` APIs require the patched `xdg-desktop-portal` frontend in this repository. A stock system `xdg-desktop-portal` does not expose these public interfaces yet. Sandboxed apps and the demo should call the public frontend interfaces; the frontend derives the app identity and forwards to the Aileron implementation backend.
 
 ```sh
 git submodule update --init xdg-desktop-portal
@@ -483,14 +483,14 @@ method KillSession(session_id: string) -> ()
 
 ## D-Bus portal interfaces
 
-`aileron-portal` is the xdg-desktop-portal implementation backend. It registers on the session bus as `org.freedesktop.impl.portal.desktop.aileron` at path `/org/freedesktop/portal/desktop` and serves three task-clustered implementation interfaces. In the upstream xdg-desktop-portal prototype, sandboxed apps call the public `org.freedesktop.portal.Language`, `org.freedesktop.portal.Speech`, and `org.freedesktop.portal.Vision` frontend interfaces; xdg-desktop-portal derives the app identity and forwards to this backend.
+`aileron-portal` is the xdg-desktop-portal implementation backend. It registers on the session bus as `org.freedesktop.impl.portal.desktop.aileron` at path `/org/freedesktop/portal/desktop` and serves three task-clustered implementation interfaces. In the upstream xdg-desktop-portal prototype, sandboxed apps call the public `org.freedesktop.portal.Language`, `org.freedesktop.portal.SpokenLanguage`, and `org.freedesktop.portal.Vision` frontend interfaces; xdg-desktop-portal derives the app identity and forwards to this backend.
 
 The portal does not talk to containers directly. It translates D-Bus calls into `aileron.Inference` Varlink calls, and the daemon owns permissions, sessions, model assignments, and container stdio.
 
 | Public interface | Use-case prefix | Methods |
 |---|---|---|
 | `org.freedesktop.portal.Language` | `language.*` | `GetUseCaseAvailability`, `CreateSession`, `Prewarm`, `StreamResponse`, `StreamRespondGuided`, `StreamSubmitToolResultsGuided`, `StreamEmbed` |
-| `org.freedesktop.portal.Speech` | `speech.*` | `GetUseCaseAvailability`, `CreateSession`, `Prewarm`, `StreamTranscribe`, `StreamSynthesize` |
+| `org.freedesktop.portal.SpokenLanguage` | `speech.*` | `GetUseCaseAvailability`, `CreateSession`, `Prewarm`, `StreamTranscribe`, `StreamSynthesize` |
 | `org.freedesktop.portal.Vision` | `vision.*` | `GetUseCaseAvailability`, `CreateSession`, `Prewarm`, `StreamDescribe`, `StreamOcr`, `StreamDetect`, `StreamSegment`, `StreamDepth` |
 
 Apps call the public interfaces on `org.freedesktop.portal.Desktop`. The public frontend derives the app identity, returns request handles for operations that may prompt, load, or stream, and closes backend sessions when the app calls `Close` on the corresponding `org.freedesktop.portal.Session` object. The implementation backend receives the standard `handle: o` and `session_handle: o` object paths plus internal `app_id: s` strings and is only called by xdg-desktop-portal.
@@ -516,7 +516,7 @@ Apps call the public interfaces on `org.freedesktop.portal.Desktop`. The public 
 | `StreamSubmitToolResultsGuided` | `session_handle: o, prompt: s, media_fds: ah, results: a(sss), fields: a(sssb), tools: a(sss), options: a{sv}` | `handle: o` | Full language generation sessions only; continues after the app executes or rejects tool calls; emits guided signals |
 | `StreamEmbed` | `session_handle: o, text: s, options: a{sv}` | `handle: o` | `language.embed` sessions only; emits one `EmbeddingReceived` signal |
 
-### Speech Methods
+### SpokenLanguage Methods
 
 | Method | Parameters | Returns | Notes |
 |---|---|---|---|
@@ -548,7 +548,7 @@ Audio and image payloads are passed to the public portal as readable, sealable m
 | `GuidedSnapshotReceived` | `request_handle: o, session_handle: o, snapshot_json: s, done: b` | Each validated JSON snapshot during `StreamRespondGuided` on `Language` |
 | `GuidedToolCallsReceived` | `request_handle: o, session_handle: o, tool_calls: a(sss), done: b` | Tool calls requested during `StreamRespondGuided` or `StreamSubmitToolResultsGuided` on `Language` |
 | `EmbeddingReceived` | `request_handle: o, session_handle: o, embedding: ad, embedding_pipeline_id: s, done: b` | Embedding vector and compatibility metadata during `StreamEmbed` on `Language` |
-| `TranscriptionReceived` | `request_handle: o, session_handle: o, text: s, done: b` | Each segment during `StreamTranscribe` on `Speech` |
+| `TranscriptionReceived` | `request_handle: o, session_handle: o, text: s, done: b` | Each segment during `StreamTranscribe` on `SpokenLanguage` |
 | `AudioReceived` | `request_handle: o, session_handle: o, audio: ay, sample_rate: u, channels: u, sample_format: s, done: b` | Each self-describing PCM chunk during `StreamSynthesize`; the terminal signal may have empty audio |
 | `VisionTextReceived` | `request_handle: o, session_handle: o, text: s, done: b` | Each text token during `StreamDescribe` or `StreamOcr` on `Vision` |
 | `VisionDetectionsReceived` | `request_handle: o, session_handle: o, detections: a(sddddd), done: b` | Detection result during `StreamDetect` on `Vision` |
@@ -563,8 +563,8 @@ The current prototype returns portal/backend cancellations through the request `
 
 There is no direct portal-to-container transport. The complete inference API path is:
 
-1. Sandboxed app calls `org.freedesktop.portal.Language`, `org.freedesktop.portal.Speech`, or `org.freedesktop.portal.Vision` over session D-Bus.
-2. The patched `xdg-desktop-portal` frontend derives the app identity and forwards to `org.freedesktop.impl.portal.Language`, `org.freedesktop.impl.portal.Speech`, or `org.freedesktop.impl.portal.Vision` on `aileron-portal`.
+1. Sandboxed app calls `org.freedesktop.portal.Language`, `org.freedesktop.portal.SpokenLanguage`, or `org.freedesktop.portal.Vision` over session D-Bus.
+2. The patched `xdg-desktop-portal` frontend derives the app identity and forwards to `org.freedesktop.impl.portal.Language`, `org.freedesktop.impl.portal.SpokenLanguage`, or `org.freedesktop.impl.portal.Vision` on `aileron-portal`.
 3. `aileron-portal` maps that call to `aileron.Inference` over the daemon's Varlink Unix socket.
 4. `aileron-daemon` validates permissions/options, resolves the assigned profile for the session use-case, and serializes one request at a time to the profile container over stdio.
 5. The container returns newline-delimited JSON chunks on stdout; the daemon aggregates or streams them back through Varlink, and the portal returns a D-Bus value or emits D-Bus signals.

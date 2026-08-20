@@ -57,7 +57,7 @@ pub async fn run() -> Result<()> {
     let _conn = connection::Builder::session()?
         .name(BUS_NAME)?
         .serve_at(OBJECT_PATH, LanguagePortalBackend::new(state.clone()))?
-        .serve_at(OBJECT_PATH, SpeechPortalBackend::new(state.clone()))?
+        .serve_at(OBJECT_PATH, SpokenLanguagePortalBackend::new(state.clone()))?
         .serve_at(OBJECT_PATH, VisionPortalBackend::new(state))?
         .build()
         .await?;
@@ -85,7 +85,7 @@ struct RequestRecord {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum PortalInterface {
     Language,
-    Speech,
+    SpokenLanguage,
     Vision,
 }
 
@@ -93,7 +93,7 @@ impl PortalInterface {
     fn label(self) -> &'static str {
         match self {
             Self::Language => "Language",
-            Self::Speech => "Speech",
+            Self::SpokenLanguage => "Speech",
             Self::Vision => "Vision",
         }
     }
@@ -111,7 +111,7 @@ struct LanguagePortalBackend {
     state: Arc<PortalState>,
 }
 
-struct SpeechPortalBackend {
+struct SpokenLanguagePortalBackend {
     state: Arc<PortalState>,
 }
 
@@ -146,7 +146,7 @@ impl LanguagePortalBackend {
     }
 }
 
-impl SpeechPortalBackend {
+impl SpokenLanguagePortalBackend {
     fn new(state: Arc<PortalState>) -> Self {
         Self { state }
     }
@@ -864,9 +864,9 @@ impl LanguagePortalBackend {
     ) -> zbus::Result<()>;
 }
 
-#[interface(name = "org.freedesktop.impl.portal.Speech")]
+#[interface(name = "org.freedesktop.impl.portal.SpokenLanguage")]
 #[allow(clippy::too_many_arguments)]
-impl SpeechPortalBackend {
+impl SpokenLanguagePortalBackend {
     #[zbus(property, name = "version")]
     fn version(&self) -> u32 {
         2
@@ -897,7 +897,7 @@ impl SpeechPortalBackend {
         instructions: &str,
     ) -> zbus::fdo::Result<()> {
         ensure_portal_frontend(conn, &header).await?;
-        ensure_interface_use_case(use_case, PortalInterface::Speech)?;
+        ensure_interface_use_case(use_case, PortalInterface::SpokenLanguage)?;
         let request_id = request_handle.as_str();
         let session_handle = session_handle.as_str();
         begin_request(conn, &self.state, request_id, None).await?;
@@ -920,7 +920,7 @@ impl SpeechPortalBackend {
                 session_handle,
                 daemon_session_id,
                 use_case,
-                PortalInterface::Speech,
+                PortalInterface::SpokenLanguage,
             )
             .await?;
             if let Err(e) = ensure_request_active(&self.state, request_id) {
@@ -947,9 +947,10 @@ impl SpeechPortalBackend {
         let session_id = session_handle.as_str();
         begin_request(conn, &self.state, request_id, Some(session_id)).await?;
         let result = async {
-            let record = ensure_known_session(&self.state, session_id, PortalInterface::Speech)?;
+            let record =
+                ensure_known_session(&self.state, session_id, PortalInterface::SpokenLanguage)?;
             ensure_request_active(&self.state, request_id)?;
-            SpeechPortalBackend::model_loading(
+            SpokenLanguagePortalBackend::model_loading(
                 &emitter,
                 &request_handle,
                 &session_handle,
@@ -963,7 +964,7 @@ impl SpeechPortalBackend {
                 request_id.to_string(),
                 session_id.to_string(),
                 record.daemon_session_id,
-                PortalInterface::Speech,
+                PortalInterface::SpokenLanguage,
             )
             .await
         }
@@ -998,7 +999,8 @@ impl SpeechPortalBackend {
         let session_id = session_handle.as_str();
         begin_request(conn, &self.state, request_id, Some(session_id)).await?;
         let result = async {
-            let record = ensure_known_session(&self.state, session_id, PortalInterface::Speech)?;
+            let record =
+                ensure_known_session(&self.state, session_id, PortalInterface::SpokenLanguage)?;
             ensure_speech_session_use_case(&record, "StreamTranscribe")?;
             ensure_request_active(&self.state, request_id)?;
             self.emit_loading(&request_handle, &session_handle, &emitter)
@@ -1022,7 +1024,7 @@ impl SpeechPortalBackend {
                     .token;
 
                 if let Some(previous) = pending_text.replace(text) {
-                    SpeechPortalBackend::transcription_received(
+                    SpokenLanguagePortalBackend::transcription_received(
                         &emitter,
                         &request_handle,
                         &session_handle,
@@ -1035,7 +1037,7 @@ impl SpeechPortalBackend {
             }
 
             ensure_request_active(&self.state, request_id)?;
-            SpeechPortalBackend::transcription_received(
+            SpokenLanguagePortalBackend::transcription_received(
                 &emitter,
                 &request_handle,
                 &session_handle,
@@ -1080,7 +1082,8 @@ impl SpeechPortalBackend {
         let session_id = session_handle.as_str();
         begin_request(conn, &self.state, request_id, Some(session_id)).await?;
         let result = async {
-            let record = ensure_known_session(&self.state, session_id, PortalInterface::Speech)?;
+            let record =
+                ensure_known_session(&self.state, session_id, PortalInterface::SpokenLanguage)?;
             ensure_exact_session_use_case(&record, "speech.synthesize", "StreamSynthesize")?;
             begin_synthesis_request(&self.state, session_id, request_id)?;
             attach_request_daemon_session(&self.state, request_id, &record.daemon_session_id)?;
@@ -1758,7 +1761,7 @@ fn ensure_interface_use_case(use_case: &str, interface: PortalInterface) -> zbus
 fn supported_use_cases(interface: PortalInterface) -> &'static [&'static str] {
     match interface {
         PortalInterface::Language => LANGUAGE_USE_CASES,
-        PortalInterface::Speech => SPEECH_USE_CASES,
+        PortalInterface::SpokenLanguage => SPEECH_USE_CASES,
         PortalInterface::Vision => VISION_USE_CASES,
     }
 }
@@ -2395,7 +2398,7 @@ async fn emit_audio_chunk(
     chunk: &DecodedAudioChunk,
     done: bool,
 ) -> zbus::fdo::Result<()> {
-    SpeechPortalBackend::audio_received(
+    SpokenLanguagePortalBackend::audio_received(
         emitter,
         request_handle,
         session_handle,
@@ -2667,14 +2670,14 @@ impl LanguagePortalBackend {
     }
 }
 
-impl SpeechPortalBackend {
+impl SpokenLanguagePortalBackend {
     async fn emit_loading(
         &self,
         request_handle: &OwnedObjectPath,
         session_handle: &OwnedObjectPath,
         emitter: &SignalEmitter<'_>,
     ) -> zbus::fdo::Result<()> {
-        SpeechPortalBackend::model_loading(
+        SpokenLanguagePortalBackend::model_loading(
             emitter,
             request_handle,
             session_handle,
@@ -2870,9 +2873,9 @@ mod tests {
         let (use_case, interface) = tc.draw(gs::sampled_from(vec![
             ("language.summarize", PortalInterface::Language),
             ("language.embed", PortalInterface::Language),
-            ("speech.transcribe", PortalInterface::Speech),
-            ("speech.translate", PortalInterface::Speech),
-            ("speech.synthesize", PortalInterface::Speech),
+            ("speech.transcribe", PortalInterface::SpokenLanguage),
+            ("speech.translate", PortalInterface::SpokenLanguage),
+            ("speech.synthesize", PortalInterface::SpokenLanguage),
             ("vision.describe", PortalInterface::Vision),
             ("vision.detect", PortalInterface::Vision),
             ("vision.segment", PortalInterface::Vision),
@@ -2887,7 +2890,7 @@ mod tests {
         let (use_case, interface) = tc.draw(gs::sampled_from(vec![
             ("language.generate", PortalInterface::Language),
             ("speech.transcribe", PortalInterface::Language),
-            ("vision.describe", PortalInterface::Speech),
+            ("vision.describe", PortalInterface::SpokenLanguage),
             ("language.summarize", PortalInterface::Vision),
         ]));
 
@@ -3094,7 +3097,7 @@ mod tests {
             ensure_known_session(&state, "session-1", PortalInterface::Language).is_ok(),
             "session should be valid on its owning interface"
         );
-        let err = ensure_known_session(&state, "session-1", PortalInterface::Speech)
+        let err = ensure_known_session(&state, "session-1", PortalInterface::SpokenLanguage)
             .expect_err("wrong interface should be rejected");
 
         assert!(err.to_string().contains("Language portal"));
