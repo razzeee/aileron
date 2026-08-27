@@ -11,7 +11,9 @@ path = "src/main.rs"
 [dependencies]
 aileron-varlink = { workspace = true }
 aileron-ipc     = { workspace = true }
+zlink           = { workspace = true }
 tokio           = { workspace = true }
+tokio-stream    = { workspace = true }
 serde           = { workspace = true }
 serde_json      = { workspace = true }
 llmfit-core     = { workspace = true }
@@ -21,7 +23,6 @@ thiserror       = { workspace = true }
 clap            = { workspace = true }
 tracing         = { workspace = true }
 tracing-subscriber = { workspace = true }
-varlink         = { workspace = true }
 chrono          = { workspace = true }
 reqwest         = { workspace = true }
 sha2            = { workspace = true }

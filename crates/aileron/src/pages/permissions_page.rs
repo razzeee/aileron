@@ -73,64 +73,70 @@ fn refresh_permissions(list_box: &ListBox) {
         list_box.remove(&child);
     }
 
-    use aileron_varlink::aileron_Permissions::VarlinkClientInterface;
-    let conn = match aileron_ipc::client::connect() {
-        Ok(c) => c,
-        Err(e) => {
-            let row = ActionRow::new();
-            row.set_title("Permissions unavailable");
-            row.set_subtitle(&e.to_string());
-            list_box.append(&row);
-            return;
-        }
-    };
-
-    let mut client = aileron_varlink::aileron_Permissions::VarlinkClient::new(conn);
-    match client.list_app_permissions().call() {
-        Ok(reply) => {
-            if reply.permissions.is_empty() {
+    let list_box = list_box.clone();
+    crate::async_runtime::spawn(
+        async {
+            use aileron_varlink::aileron_Permissions::VarlinkClientInterface;
+            let mut client = aileron_ipc::client::connect()
+                .await
+                .map_err(|error| error.to_string())?;
+            client
+                .list_app_permissions()
+                .await
+                .map_err(|error| error.to_string())?
+                .map_err(|error| format!("{error:?}"))
+        },
+        move |result| match result {
+            Err(e) => {
                 let row = ActionRow::new();
-                row.set_title("No permissions recorded");
+                row.set_title("Permissions unavailable");
+                row.set_subtitle(&e.to_string());
                 list_box.append(&row);
-                return;
             }
-            for perm in &reply.permissions {
-                let row = SwitchRow::builder()
-                    .title(&perm.use_case)
-                    .active(perm.allowed)
-                    .build();
-                let subtitle = match &perm.last_used {
-                    Some(lu) => format!(
-                        "{} — last used (local): {}",
-                        perm.app_id,
-                        format_local_time(lu)
-                    ),
-                    None => perm.app_id.clone(),
-                };
-                row.set_subtitle(&subtitle);
+            Ok(reply) => {
+                if reply.permissions.is_empty() {
+                    let row = ActionRow::new();
+                    row.set_title("No permissions recorded");
+                    list_box.append(&row);
+                    return;
+                }
+                for perm in &reply.permissions {
+                    let row = SwitchRow::builder()
+                        .title(&perm.use_case)
+                        .active(perm.allowed)
+                        .build();
+                    let subtitle = match &perm.last_used {
+                        Some(lu) => format!(
+                            "{} — last used (local): {}",
+                            perm.app_id,
+                            format_local_time(lu)
+                        ),
+                        None => perm.app_id.clone(),
+                    };
+                    row.set_subtitle(&subtitle);
 
-                let app_id = perm.app_id.clone();
-                let use_case = perm.use_case.clone();
-                row.connect_active_notify(move |switch| {
-                    use aileron_varlink::aileron_Permissions::VarlinkClientInterface;
-                    let allowed = switch.is_active();
-                    if let Ok(conn) = aileron_ipc::client::connect() {
-                        let mut c = aileron_varlink::aileron_Permissions::VarlinkClient::new(conn);
-                        let _ = c
-                            .set_app_permission(app_id.clone(), use_case.clone(), allowed)
-                            .call();
-                    }
-                });
-                list_box.append(&row);
+                    let app_id = perm.app_id.clone();
+                    let use_case = perm.use_case.clone();
+                    row.connect_active_notify(move |switch| {
+                        let allowed = switch.is_active();
+                        let app_id = app_id.clone();
+                        let use_case = use_case.clone();
+                        crate::async_runtime::spawn(
+                            async move {
+                                use aileron_varlink::aileron_Permissions::VarlinkClientInterface;
+                                if let Ok(mut client) = aileron_ipc::client::connect().await {
+                                    let _ =
+                                        client.set_app_permission(app_id, use_case, allowed).await;
+                                }
+                            },
+                            |_| {},
+                        );
+                    });
+                    list_box.append(&row);
+                }
             }
-        }
-        Err(e) => {
-            let row = ActionRow::new();
-            row.set_title("Permissions unavailable");
-            row.set_subtitle(&e.to_string());
-            list_box.append(&row);
-        }
-    }
+        },
+    );
 }
 
 fn format_local_time(timestamp: &str) -> String {

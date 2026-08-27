@@ -1,10 +1,10 @@
-/// aileron-ipc — Varlink client/server connection helpers.
+/// Aileron Varlink client/server connection helpers.
 ///
 /// Provides:
 /// - `socket_path()` – resolve the socket path at runtime
 /// - `varlink_address()` – Varlink address string for the daemon socket
-/// - `client::connect()` – open a typed Varlink client connection
-/// - `server::remove_stale_socket()` – clean up a leftover socket file
+/// - `client::connect()` - asynchronously open a zlink Unix connection
+/// - `server::remove_stale_socket()` - clean up a leftover socket file
 pub mod client;
 pub mod error;
 pub mod server;

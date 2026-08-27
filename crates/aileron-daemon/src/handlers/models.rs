@@ -18,125 +18,114 @@ use crate::request_execution;
 use crate::state::{
     InstallRecord, InstallSample, RuntimeUpdateCheck as CachedRuntimeUpdateCheck, SharedState,
 };
-#[allow(unused_imports)]
-use aileron_varlink::aileron_Models::{
-    Call_AssignUseCase, Call_CancelInstall, Call_DeleteProfile, Call_InstallManifest,
-    Call_InstallUrlProfile, Call_List, Call_ListCatalog, Call_ListInstalls, Call_ListRuntimeImages,
-    Call_ListRuntimeManifests, Call_PruneUnusedRuntimeImages, Call_RemoveRuntimeImage,
-    Call_UpdateRuntimeImage, CatalogProfileInfo, FitScoreComponents, InstallProgress,
-    InstallStatus, OciRuntimeImage, ProfileInfo, RuntimeImage, RuntimeImageCleanupError,
-    RuntimeManifestInfo, UseCaseConflict, UseCaseFitScore, VarlinkCallError, VarlinkInterface,
+use aileron_varlink::models::{
+    CatalogProfileInfo, Error, FitScoreComponents, InstallManifest_Reply, InstallProgress,
+    InstallStatus, InstallUrlProfile_Reply, List_Reply, ListCatalog_Reply, ListInstalls_Reply,
+    ListRuntimeImages_Reply, ListRuntimeManifests_Reply, OciRuntimeImage, ProfileInfo,
+    PruneUnusedRuntimeImages_Reply, RuntimeImage, RuntimeImageCleanupError, RuntimeManifestInfo,
+    UseCaseConflict, UseCaseFitScore,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-fn io_err(_msg: impl std::fmt::Display) -> varlink::Error {
-    varlink::Error::from(varlink::ErrorKind::Io(std::io::ErrorKind::Other))
-}
-
+#[derive(Clone)]
 pub struct ModelsHandler {
     state: SharedState,
-    rt: tokio::runtime::Handle,
 }
 
 impl ModelsHandler {
-    pub fn new(state: SharedState, rt: tokio::runtime::Handle) -> Self {
-        Self { state, rt }
-    }
-}
-
-impl VarlinkInterface for ModelsHandler {
-    fn list(&self, call: &mut dyn Call_List) -> varlink::Result<()> {
-        self.rt.block_on(async {
-            let guard = self.state.0.lock().await;
-            let profiles: Vec<ProfileInfo> = guard
-                .profiles
-                .all()
-                .map(|profile| {
-                    let mut assigned_use_cases: Vec<String> = guard
-                        .assignments
-                        .all()
-                        .iter()
-                        .filter(|(_, assigned)| assigned.as_str() == profile.profile_id)
-                        .map(|(use_case, _)| use_case.clone())
-                        .collect();
-                    if assigned_use_cases
-                        .iter()
-                        .any(|use_case| use_case == "speech.transcribe")
-                        && guard.assignments.get("speech.translate").is_none()
-                        && profile.supports_use_case("speech.translate")
-                    {
-                        assigned_use_cases.push("speech.translate".to_string());
-                    }
-                    assigned_use_cases.sort();
-                    assigned_use_cases.dedup();
-                    let runtime_images = if profile.runtime_images.is_empty() {
-                        guard.runtimes.images_for(&profile.runtime_id)
-                    } else {
-                        profile.runtime_images.clone()
-                    };
-                    ProfileInfo {
-                        profile_id: profile.profile_id.clone(),
-                        model_id: profile.model_id.clone(),
-                        runtime_id: profile.runtime_id.clone(),
-                        artifact_path: profile.artifact_path.display().to_string(),
-                        runtime_images: runtime_images
-                            .iter()
-                            .map(|image| RuntimeImage {
-                                variant: image.variant.clone(),
-                                image_ref: image.image_ref.clone(),
-                            })
-                            .collect(),
-                        use_cases: profile.effective_use_cases(),
-                        specializations: Some(profile.specializations.clone()),
-                        assigned_use_cases,
-                        size_bytes: profile_artifact_size_bytes(&profile.artifact_path),
-                        installed_at: profile.installed_at.clone(),
-                        source: profile.source.clone(),
-                    }
-                })
-                .collect();
-
-            call.reply(profiles)
-        })
+    pub fn new(state: SharedState) -> Self {
+        Self { state }
     }
 
-    fn install_manifest(
-        &self,
-        call: &mut dyn Call_InstallManifest,
-        profile_id: String,
-    ) -> varlink::Result<()> {
-        self.rt.block_on(async {
-            let result = match crate::manifests::find_model_manifest(&profile_id) {
-                Ok(Some(path)) => {
-                    install_manifest_path(&self.state, path, Some(profile_id.clone())).await
+    pub async fn list(&self) -> List_Reply {
+        let guard = self.state.0.lock().await;
+        let profiles: Vec<ProfileInfo> = guard
+            .profiles
+            .all()
+            .map(|profile| {
+                let mut assigned_use_cases: Vec<String> = guard
+                    .assignments
+                    .all()
+                    .iter()
+                    .filter(|(_, assigned)| assigned.as_str() == profile.profile_id)
+                    .map(|(use_case, _)| use_case.clone())
+                    .collect();
+                if assigned_use_cases
+                    .iter()
+                    .any(|use_case| use_case == "speech.transcribe")
+                    && guard.assignments.get("speech.translate").is_none()
+                    && profile.supports_use_case("speech.translate")
+                {
+                    assigned_use_cases.push("speech.translate".to_string());
                 }
-                Ok(None) => install_generated_llmfit_manifest(&self.state, &profile_id).await,
-                Err(e) => Err(e),
-            };
-            let (auto_assigned, conflicts) = match result {
-                Ok(result) => result,
-                Err(e) => return call.reply_install_failed(profile_id, e.to_string()),
-            };
+                assigned_use_cases.sort();
+                assigned_use_cases.dedup();
+                let runtime_images = if profile.runtime_images.is_empty() {
+                    guard.runtimes.images_for(&profile.runtime_id)
+                } else {
+                    profile.runtime_images.clone()
+                };
+                ProfileInfo {
+                    profile_id: profile.profile_id.clone(),
+                    model_id: profile.model_id.clone(),
+                    runtime_id: profile.runtime_id.clone(),
+                    artifact_path: profile.artifact_path.display().to_string(),
+                    runtime_images: runtime_images
+                        .iter()
+                        .map(|image| RuntimeImage {
+                            variant: image.variant.clone(),
+                            image_ref: image.image_ref.clone(),
+                        })
+                        .collect(),
+                    use_cases: profile.effective_use_cases(),
+                    specializations: Some(profile.specializations.clone()),
+                    assigned_use_cases,
+                    size_bytes: profile_artifact_size_bytes(&profile.artifact_path),
+                    installed_at: profile.installed_at.clone(),
+                    source: profile.source.clone(),
+                }
+            })
+            .collect();
 
-            call.reply(
-                InstallProgress {
+        List_Reply { profiles }
+    }
+
+    pub async fn install_manifest(
+        &self,
+        profile_id: String,
+    ) -> Result<InstallManifest_Reply, Error> {
+        let result = match crate::manifests::find_model_manifest(&profile_id) {
+            Ok(Some(path)) => {
+                install_manifest_path(&self.state, path, Some(profile_id.clone())).await
+            }
+            Ok(None) => install_generated_llmfit_manifest(&self.state, &profile_id).await,
+            Err(e) => Err(e),
+        };
+        let (auto_assigned, conflicts) = match result {
+            Ok(result) => result,
+            Err(e) => {
+                return Err(Error::InstallFailed {
                     profile_id,
-                    bytes_pulled: 0,
-                    total_bytes: 0,
-                    done: true,
-                },
-                auto_assigned,
-                conflicts,
-            )
+                    reason: e.to_string(),
+                });
+            }
+        };
+
+        Ok(InstallManifest_Reply {
+            progress: InstallProgress {
+                profile_id,
+                bytes_pulled: 0,
+                total_bytes: 0,
+                done: true,
+            },
+            auto_assigned,
+            conflicts,
         })
     }
 
-    fn list_runtime_manifests(
-        &self,
-        call: &mut dyn Call_ListRuntimeManifests,
-    ) -> varlink::Result<()> {
-        let runtimes = self.rt.block_on(async {
+    pub async fn list_runtime_manifests(&self) -> ListRuntimeManifests_Reply {
+        let runtimes = {
             let guard = self.state.0.lock().await;
             guard
                 .runtimes
@@ -147,83 +136,52 @@ impl VarlinkInterface for ModelsHandler {
                     variants: runtime.variants,
                 })
                 .collect()
-        });
-        call.reply(runtimes)
+        };
+        ListRuntimeManifests_Reply { runtimes }
     }
 
-    fn list_runtime_images(&self, call: &mut dyn Call_ListRuntimeImages) -> varlink::Result<()> {
-        let images = self
-            .rt
-            .block_on(async { list_runtime_images_for_state(&self.state).await });
-        match images {
-            Ok(images) => call.reply(images),
-            Err(e) => Err(io_err(e)),
-        }
+    pub async fn list_runtime_images(&self) -> anyhow::Result<ListRuntimeImages_Reply> {
+        Ok(ListRuntimeImages_Reply {
+            images: list_runtime_images_for_state(&self.state).await?,
+        })
     }
 
-    fn remove_runtime_image(
+    pub async fn remove_runtime_image(&self, image_id: String) -> anyhow::Result<()> {
+        let usage = runtime_image_usage(&self.state).await;
+        let store = oci_store_for_state(&self.state).await;
+        remove_aileron_runtime_image(&store, &image_id, &usage).await
+    }
+
+    pub async fn update_runtime_image(&self, image_ref: String) -> anyhow::Result<()> {
+        start_runtime_image_update(&self.state, &image_ref).await
+    }
+
+    pub async fn prune_unused_runtime_images(
         &self,
-        call: &mut dyn Call_RemoveRuntimeImage,
-        image_id: String,
-    ) -> varlink::Result<()> {
-        let result = self.rt.block_on(async {
-            let usage = runtime_image_usage(&self.state).await;
-            let store = oci_store_for_state(&self.state).await;
-            remove_aileron_runtime_image(&store, &image_id, &usage).await
-        });
-        match result {
-            Ok(()) => call.reply(),
-            Err(e) => Err(io_err(e)),
-        }
-    }
-
-    fn update_runtime_image(
-        &self,
-        call: &mut dyn Call_UpdateRuntimeImage,
-        image_ref: String,
-    ) -> varlink::Result<()> {
-        let result = self
-            .rt
-            .block_on(async { start_runtime_image_update(&self.state, &image_ref).await });
-        match result {
-            Ok(()) => call.reply(),
-            Err(e) => Err(io_err(e)),
-        }
-    }
-
-    fn prune_unused_runtime_images(
-        &self,
-        call: &mut dyn Call_PruneUnusedRuntimeImages,
-    ) -> varlink::Result<()> {
-        let result = self.rt.block_on(async {
-            let usage = runtime_image_usage(&self.state).await;
-            let store = oci_store_for_state(&self.state).await;
-            let images = build_aileron_runtime_images(
-                stored_aileron_runtime_images(&store)?,
-                &usage,
-                &HashMap::new(),
-            );
-            let mut removed = Vec::new();
-            let mut errors = Vec::new();
-            for image in images.into_iter().filter(|image| !image.in_use) {
-                match remove_oci_runtime_rootfs(&store, &image.image_id).await {
-                    Ok(()) => removed.push(image.image_ref),
-                    Err(e) => errors.push(RuntimeImageCleanupError {
-                        image_ref: image.image_ref,
-                        reason: e.to_string(),
-                    }),
-                }
+    ) -> anyhow::Result<PruneUnusedRuntimeImages_Reply> {
+        let usage = runtime_image_usage(&self.state).await;
+        let store = oci_store_for_state(&self.state).await;
+        let images = build_aileron_runtime_images(
+            stored_aileron_runtime_images(&store)?,
+            &usage,
+            &HashMap::new(),
+        );
+        let mut removed = Vec::new();
+        let mut errors = Vec::new();
+        for image in images.into_iter().filter(|image| !image.in_use) {
+            match remove_oci_runtime_rootfs(&store, &image.image_id).await {
+                Ok(()) => removed.push(image.image_ref),
+                Err(e) => errors.push(RuntimeImageCleanupError {
+                    image_ref: image.image_ref,
+                    reason: e.to_string(),
+                }),
             }
-            Ok::<_, anyhow::Error>((removed, errors))
-        });
-        match result {
-            Ok((removed, errors)) => call.reply(removed, errors),
-            Err(e) => Err(io_err(e)),
         }
+        Ok(PruneUnusedRuntimeImages_Reply { removed, errors })
     }
 
-    fn list_installs(&self, call: &mut dyn Call_ListInstalls) -> varlink::Result<()> {
-        let installs = self.rt.block_on(async {
+    pub async fn list_installs(&self) -> ListInstalls_Reply {
+        let installs = {
             let guard = self.state.0.lock().await;
             guard
                 .installing_profiles
@@ -254,24 +212,25 @@ impl VarlinkInterface for ModelsHandler {
                     }
                 })
                 .collect()
-        });
-        call.reply(installs)
+        };
+        ListInstalls_Reply { installs }
     }
 
-    fn cancel_install(
-        &self,
-        call: &mut dyn Call_CancelInstall,
-        profile_id: String,
-    ) -> varlink::Result<()> {
-        self.rt.block_on(async {
-            let mut guard = self.state.0.lock().await;
-            request_cancel_install(&mut guard, &profile_id);
-            call.reply()
-        })
+    pub async fn cancel_install(&self, profile_id: String) {
+        let mut guard = self.state.0.lock().await;
+        request_cancel_install(&mut guard, &profile_id);
     }
 
-    fn list_catalog(&self, call: &mut dyn Call_ListCatalog) -> varlink::Result<()> {
-        let (variant, memory_gb, installing_profiles) = self.rt.block_on(async {
+    pub fn url_profile_id(runtime_id: &str, url: &str, sha256: &str) -> anyhow::Result<String> {
+        Ok(generated_model_id(
+            runtime_id,
+            &filename_from_url(url)?,
+            sha256,
+        ))
+    }
+
+    pub async fn list_catalog(&self) -> ListCatalog_Reply {
+        let (variant, memory_gb, installing_profiles) = {
             let guard = self.state.0.lock().await;
             (
                 guard.variant,
@@ -282,7 +241,7 @@ impl VarlinkInterface for ModelsHandler {
                     .cloned()
                     .collect::<Vec<_>>(),
             )
-        });
+        };
         let llmfit_system = crate::llmfit_metadata::detect_system();
         let profiles = manifests::list_catalog_profiles().unwrap_or_default();
         let profiles = profiles
@@ -434,180 +393,194 @@ impl VarlinkInterface for ModelsHandler {
                 }
             })
             .collect();
-        call.reply(profiles)
+        ListCatalog_Reply { profiles }
     }
 
-    fn install_url_profile(
+    pub async fn install_url_profile(
         &self,
-        call: &mut dyn Call_InstallUrlProfile,
         runtime_id: String,
         url: String,
         sha256: String,
         mmproj_url: String,
         mmproj_sha256: String,
         use_cases: Vec<String>,
-    ) -> varlink::Result<()> {
-        self.rt.block_on(async {
-            let source_filename = match filename_from_url(&url) {
+    ) -> Result<InstallUrlProfile_Reply, Error> {
+        let source_filename = match filename_from_url(&url) {
+            Ok(filename) => filename,
+            Err(e) => {
+                return Err(Error::InstallFailed {
+                    profile_id: url,
+                    reason: e.to_string(),
+                });
+            }
+        };
+        let filename = match installed_artifact_filename(&runtime_id, source_filename) {
+            Ok(filename) => filename,
+            Err(e) => {
+                return Err(Error::InstallFailed {
+                    profile_id: url,
+                    reason: e.to_string(),
+                });
+            }
+        };
+        let mut artifacts = vec![ManifestArtifact {
+            role: "model".to_string(),
+            url,
+            filename: filename.clone(),
+            sha256: sha256.clone(),
+            size_bytes: 0,
+        }];
+        if !mmproj_url.is_empty() || !mmproj_sha256.is_empty() {
+            if mmproj_url.is_empty() || mmproj_sha256.is_empty() {
+                return Err(Error::InstallFailed {
+                    profile_id: filename,
+                    reason: "mmproj URL and SHA-256 must be provided together".to_string(),
+                });
+            }
+            let mmproj_filename = match filename_from_url(&mmproj_url) {
                 Ok(filename) => filename,
-                Err(e) => return call.reply_install_failed(url, e.to_string()),
+                Err(e) => {
+                    return Err(Error::InstallFailed {
+                        profile_id: mmproj_url,
+                        reason: e.to_string(),
+                    });
+                }
             };
-            let filename = match installed_artifact_filename(&runtime_id, source_filename) {
-                Ok(filename) => filename,
-                Err(e) => return call.reply_install_failed(url, e.to_string()),
-            };
-            let mut artifacts = vec![ManifestArtifact {
-                role: "model".to_string(),
-                url,
-                filename: filename.clone(),
-                sha256: sha256.clone(),
+            artifacts.push(ManifestArtifact {
+                role: "mmproj".to_string(),
+                url: mmproj_url,
+                filename: mmproj_filename,
+                sha256: mmproj_sha256,
                 size_bytes: 0,
-            }];
-            if !mmproj_url.is_empty() || !mmproj_sha256.is_empty() {
-                if mmproj_url.is_empty() || mmproj_sha256.is_empty() {
-                    return call.reply_install_failed(
-                        filename,
-                        "mmproj URL and SHA-256 must be provided together".to_string(),
-                    );
-                }
-                let mmproj_filename = match filename_from_url(&mmproj_url) {
-                    Ok(filename) => filename,
-                    Err(e) => return call.reply_install_failed(mmproj_url, e.to_string()),
-                };
-                artifacts.push(ManifestArtifact {
-                    role: "mmproj".to_string(),
-                    url: mmproj_url,
-                    filename: mmproj_filename,
-                    sha256: mmproj_sha256,
-                    size_bytes: 0,
-                });
-            }
-            let model_id = generated_model_id(&runtime_id, &filename, &sha256);
-            let profile_id = model_id.clone();
-            let manifest = ModelManifest {
-                profile_id: profile_id.clone(),
-                model_id,
-                llmfit_model_id: String::new(),
-                runtime_id,
-                runtime_options: Default::default(),
-                tier: String::new(),
-                disk_size_gb: 0.0,
-                min_ram_gb: 0.0,
-                runtime_images: Vec::new(),
-                use_cases,
-                specializations: Vec::new(),
-                artifacts,
-            };
-            let (auto_assigned, conflicts) =
-                match install_manifest_data(&self.state, manifest).await {
-                    Ok(result) => result,
-                    Err(e) => return call.reply_install_failed(profile_id, e.to_string()),
-                };
-
-            call.reply(
-                InstallProgress {
+            });
+        }
+        let model_id = generated_model_id(&runtime_id, &filename, &sha256);
+        let profile_id = model_id.clone();
+        let manifest = ModelManifest {
+            profile_id: profile_id.clone(),
+            model_id,
+            llmfit_model_id: String::new(),
+            runtime_id,
+            runtime_options: Default::default(),
+            tier: String::new(),
+            disk_size_gb: 0.0,
+            min_ram_gb: 0.0,
+            runtime_images: Vec::new(),
+            use_cases,
+            specializations: Vec::new(),
+            artifacts,
+        };
+        let (auto_assigned, conflicts) = match install_manifest_data(&self.state, manifest).await {
+            Ok(result) => result,
+            Err(e) => {
+                return Err(Error::InstallFailed {
                     profile_id,
-                    bytes_pulled: 0,
-                    total_bytes: 0,
-                    done: true,
-                },
-                auto_assigned,
-                conflicts,
-            )
-        })
-    }
-
-    fn delete_profile(
-        &self,
-        call: &mut dyn Call_DeleteProfile,
-        profile_id: String,
-        force: bool,
-    ) -> varlink::Result<()> {
-        self.rt.block_on(async {
-            let cancelled_sessions = {
-                let mut guard = self.state.0.lock().await;
-                if guard.profiles.get(&profile_id).is_none() {
-                    return call.reply_profile_not_found(profile_id);
-                }
-
-                let assigned = guard
-                    .assignments
-                    .all()
-                    .values()
-                    .any(|assigned| assigned == &profile_id);
-                let active_sessions: Vec<String> = guard
-                    .sessions
-                    .iter()
-                    .filter(|(_, session)| session.profile_id == profile_id)
-                    .map(|(session_id, _)| session_id.clone())
-                    .collect();
-
-                if !force && (assigned || !active_sessions.is_empty()) {
-                    return call.reply_profile_in_use(profile_id);
-                }
-
-                let mut cancelled_sessions = Vec::new();
-                for session_id in &active_sessions {
-                    request_execution::mark_session_closed(&self.state, session_id);
-                    if let Some(session) = guard.sessions.remove(session_id.as_str()) {
-                        cancelled_sessions.push(session);
-                    }
-                }
-                let epoch = guard.profile_epochs.entry(profile_id.clone()).or_default();
-                *epoch = epoch.saturating_add(1);
-                self.state.set_profile_epoch(&profile_id, *epoch);
-                let _ = guard.assignments.remove_profile(&profile_id);
-                guard.profiles.remove(&profile_id).map_err(io_err)?;
-                cancelled_sessions
-            };
-            for session in &cancelled_sessions {
-                observability::log_session_ended(observability::SessionFields {
-                    session_id: &session.session_id,
-                    app_id: &session.app_id,
-                    use_case: &session.use_case,
-                    profile_id: &session.profile_id,
+                    reason: e.to_string(),
                 });
             }
-            for session in &cancelled_sessions {
-                request_execution::terminate_active_container_handles_for_session(
-                    &self.state,
-                    &profile_id,
-                    session.session_id.as_str(),
-                )
-                .await;
-            }
-            let mut containers = self.state.2.lock().await;
-            let profile_still_missing = {
-                let guard = self.state.0.lock().await;
-                guard.profiles.get(&profile_id).is_none()
-            };
-            if profile_still_missing {
-                containers.kill(&profile_id);
-            }
-            call.reply()
+        };
+
+        Ok(InstallUrlProfile_Reply {
+            progress: InstallProgress {
+                profile_id,
+                bytes_pulled: 0,
+                total_bytes: 0,
+                done: true,
+            },
+            auto_assigned,
+            conflicts,
         })
     }
 
-    fn assign_use_case(
-        &self,
-        call: &mut dyn Call_AssignUseCase,
-        profile_id: String,
-        use_case: String,
-    ) -> varlink::Result<()> {
-        self.rt.block_on(async {
+    pub async fn delete_profile(&self, profile_id: String, force: bool) -> Result<(), Error> {
+        let cancelled_sessions = {
             let mut guard = self.state.0.lock().await;
-            let Some(profile) = guard.profiles.get(&profile_id) else {
-                return call.reply_profile_not_found(profile_id);
-            };
-            if !profile_supports_use_case(profile, &use_case) {
-                return call.reply_unsupported_use_case(profile_id, use_case);
+            if guard.profiles.get(&profile_id).is_none() {
+                return Err(Error::ProfileNotFound { profile_id });
             }
-            guard
+
+            let assigned = guard
                 .assignments
-                .assign(use_case, profile_id)
-                .map_err(io_err)?;
-            call.reply()
-        })
+                .all()
+                .values()
+                .any(|assigned| assigned == &profile_id);
+            let active_sessions: Vec<String> = guard
+                .sessions
+                .iter()
+                .filter(|(_, session)| session.profile_id == profile_id)
+                .map(|(session_id, _)| session_id.clone())
+                .collect();
+
+            if !force && (assigned || !active_sessions.is_empty()) {
+                return Err(Error::ProfileInUse { profile_id });
+            }
+
+            let mut cancelled_sessions = Vec::new();
+            for session_id in &active_sessions {
+                request_execution::mark_session_closed(&self.state, session_id);
+                if let Some(session) = guard.sessions.remove(session_id.as_str()) {
+                    cancelled_sessions.push(session);
+                }
+            }
+            let epoch = guard.profile_epochs.entry(profile_id.clone()).or_default();
+            *epoch = epoch.saturating_add(1);
+            self.state.set_profile_epoch(&profile_id, *epoch);
+            let _ = guard.assignments.remove_profile(&profile_id);
+            guard
+                .profiles
+                .remove(&profile_id)
+                .map_err(|error| Error::InstallFailed {
+                    profile_id: profile_id.clone(),
+                    reason: error.to_string(),
+                })?;
+            cancelled_sessions
+        };
+        for session in &cancelled_sessions {
+            observability::log_session_ended(observability::SessionFields {
+                session_id: &session.session_id,
+                app_id: &session.app_id,
+                use_case: &session.use_case,
+                profile_id: &session.profile_id,
+            });
+        }
+        for session in &cancelled_sessions {
+            request_execution::terminate_active_container_handles_for_session(
+                &self.state,
+                &profile_id,
+                session.session_id.as_str(),
+            )
+            .await;
+        }
+        let mut containers = self.state.2.lock().await;
+        let profile_still_missing = {
+            let guard = self.state.0.lock().await;
+            guard.profiles.get(&profile_id).is_none()
+        };
+        if profile_still_missing {
+            containers.kill(&profile_id);
+        }
+        Ok(())
+    }
+
+    pub async fn assign_use_case(&self, profile_id: String, use_case: String) -> Result<(), Error> {
+        let mut guard = self.state.0.lock().await;
+        let Some(profile) = guard.profiles.get(&profile_id) else {
+            return Err(Error::ProfileNotFound { profile_id });
+        };
+        if !profile_supports_use_case(profile, &use_case) {
+            return Err(Error::UnsupportedUseCase {
+                profile_id,
+                use_case,
+            });
+        }
+        guard
+            .assignments
+            .assign(use_case, profile_id)
+            .map_err(|error| Error::InstallFailed {
+                profile_id: "assignment".to_string(),
+                reason: error.to_string(),
+            })?;
+        Ok(())
     }
 }
 
@@ -1093,13 +1066,7 @@ async fn schedule_runtime_update_checks(
         let state = state.clone();
         let image_ref = image.image_ref.clone();
         tokio::spawn(async move {
-            let result = tokio::task::spawn_blocking({
-                let image_ref = image_ref.clone();
-                move || remote_selected_manifest_digest(&image_ref)
-            })
-            .await
-            .map_err(|error| anyhow::anyhow!("runtime update check task failed: {error}"))
-            .and_then(|result| result);
+            let result = remote_selected_manifest_digest(&image_ref);
             finish_runtime_update_check(&state, &image_ref, &local_digest, result).await;
         });
     }
@@ -2212,71 +2179,133 @@ async fn pull_runtime_image_unconditional(
     state: Option<SharedState>,
     owner_profile_id: Option<String>,
 ) -> anyhow::Result<()> {
-    let store = store.to_path_buf();
-    let image_ref = image_ref.to_string();
-    tokio::task::spawn_blocking(move || {
-        pull_runtime_image_blocking(&store, &image_ref, state, owner_profile_id)
-    })
-    .await
-    .context("runtime image pull task failed")?
+    pull_runtime_image_work(store, image_ref, state, owner_profile_id).await
 }
 
-fn pull_runtime_image_blocking(
+async fn pull_runtime_image_work(
     store: &Path,
     image_ref: &str,
     state: Option<SharedState>,
     owner_profile_id: Option<String>,
 ) -> anyhow::Result<()> {
-    std::fs::create_dir_all(store.join("rootfs"))?;
-    std::fs::create_dir_all(store.join("metadata"))?;
-    std::fs::create_dir_all(store.join("tmp"))?;
-
-    let key = crate::container::store_key(image_ref);
+    let store = store.to_path_buf();
+    let image_ref = image_ref.to_string();
+    let key = crate::container::store_key(&image_ref);
     let oci_layout = store
         .join("tmp")
         .join(format!("oci-layout-{}", Uuid::new_v4()));
     let rootfs_tmp = store.join("tmp").join(format!("rootfs-{}", Uuid::new_v4()));
 
-    let result = (|| {
-        ensure_runtime_pull_not_cancelled(state.as_ref(), image_ref, owner_profile_id.as_deref())?;
-        let copy_steps = remote_runtime_copy_steps(image_ref).ok().flatten();
-        let cancel_check =
-            runtime_pull_cancel_check(state.clone(), image_ref, owner_profile_id.clone());
-        copy_image_to_oci_layout(
-            image_ref,
-            &oci_layout,
-            |progress| {
-                if let Some(state) = state.as_ref() {
-                    update_runtime_download_sync(state, image_ref, progress);
-                }
-            },
-            copy_steps,
-            cancel_check,
-        )?;
-        ensure_runtime_pull_not_cancelled(state.as_ref(), image_ref, owner_profile_id.as_deref())?;
-        let manifest = read_selected_manifest(&oci_layout)?;
-        if let Some(state) = state.as_ref() {
-            update_runtime_download_sync(
-                state,
-                image_ref,
-                RuntimePullProgress::Status("Unpacking runtime image...".to_string()),
+    let result = async {
+        let setup_store = store.clone();
+        spawn_runtime_pull_blocking(move || {
+            std::fs::create_dir_all(setup_store.join("rootfs"))?;
+            std::fs::create_dir_all(setup_store.join("metadata"))?;
+            std::fs::create_dir_all(setup_store.join("tmp"))?;
+            Ok(())
+        })
+        .await?;
+
+        let pull_state = state.clone();
+        let pull_image_ref = image_ref.clone();
+        let pull_owner_profile_id = owner_profile_id.clone();
+        let pull_oci_layout = oci_layout.clone();
+        let pull_rootfs_tmp = rootfs_tmp.clone();
+        let manifest = spawn_runtime_pull_blocking(move || {
+            ensure_runtime_pull_not_cancelled(
+                pull_state.as_ref(),
+                &pull_image_ref,
+                pull_owner_profile_id.as_deref(),
+            )?;
+            let copy_steps = remote_runtime_copy_steps(&pull_image_ref).ok().flatten();
+            let cancel_check = runtime_pull_cancel_check(
+                pull_state.clone(),
+                &pull_image_ref,
+                pull_owner_profile_id.clone(),
             );
-        }
-        std::fs::create_dir_all(&rootfs_tmp)?;
-        ensure_runtime_pull_not_cancelled(state.as_ref(), image_ref, owner_profile_id.as_deref())?;
-        render_oci_layout_dir(&oci_layout, &rootfs_tmp)?;
-        ensure_runtime_pull_not_cancelled(state.as_ref(), image_ref, owner_profile_id.as_deref())?;
-        let labels = read_image_config_labels(&oci_layout, &manifest).unwrap_or_default();
+            copy_image_to_oci_layout(
+                &pull_image_ref,
+                &pull_oci_layout,
+                |progress| {
+                    if let Some(state) = pull_state.as_ref() {
+                        update_runtime_download_sync(state, &pull_image_ref, progress);
+                    }
+                },
+                copy_steps,
+                cancel_check,
+            )?;
+            ensure_runtime_pull_not_cancelled(
+                pull_state.as_ref(),
+                &pull_image_ref,
+                pull_owner_profile_id.as_deref(),
+            )?;
+            let manifest = read_selected_manifest(&pull_oci_layout)?;
+            if let Some(state) = pull_state.as_ref() {
+                update_runtime_download_sync(
+                    state,
+                    &pull_image_ref,
+                    RuntimePullProgress::Status("Unpacking runtime image...".to_string()),
+                );
+            }
+            std::fs::create_dir_all(&pull_rootfs_tmp)?;
+            ensure_runtime_pull_not_cancelled(
+                pull_state.as_ref(),
+                &pull_image_ref,
+                pull_owner_profile_id.as_deref(),
+            )?;
+            Ok(manifest)
+        })
+        .await?;
 
-        replace_runtime_rootfs(store, &key, &rootfs_tmp, || {
-            write_runtime_metadata(image_ref, &manifest, &labels, store, &key)
-        })?;
+        render_oci_layout_dir(&oci_layout, &rootfs_tmp).await?;
+
+        let finish_store = store.clone();
+        let finish_state = state.clone();
+        let finish_image_ref = image_ref.clone();
+        let finish_owner_profile_id = owner_profile_id.clone();
+        let finish_key = key.clone();
+        let finish_oci_layout = oci_layout.clone();
+        let finish_rootfs_tmp = rootfs_tmp.clone();
+        spawn_runtime_pull_blocking(move || {
+            ensure_runtime_pull_not_cancelled(
+                finish_state.as_ref(),
+                &finish_image_ref,
+                finish_owner_profile_id.as_deref(),
+            )?;
+            let labels =
+                read_image_config_labels(&finish_oci_layout, &manifest).unwrap_or_default();
+            replace_runtime_rootfs(&finish_store, &finish_key, &finish_rootfs_tmp, || {
+                write_runtime_metadata(
+                    &finish_image_ref,
+                    &manifest,
+                    &labels,
+                    &finish_store,
+                    &finish_key,
+                )
+            })
+        })
+        .await
+    }
+    .await;
+
+    let _ = spawn_runtime_pull_blocking(move || {
+        let _ = std::fs::remove_dir_all(oci_layout);
+        let _ = std::fs::remove_dir_all(rootfs_tmp);
         Ok(())
-    })();
-
-    let _ = std::fs::remove_dir_all(&oci_layout);
-    let _ = std::fs::remove_dir_all(&rootfs_tmp);
+    })
+    .await;
     result
+}
+
+async fn spawn_runtime_pull_blocking<T>(
+    work: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
+) -> anyhow::Result<T>
+where
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(work)
+        .await
+        .context("runtime image pull task failed")?
 }
 
 fn runtime_pull_cancel_check(
@@ -2752,11 +2781,9 @@ fn descriptor_matches_host(descriptor: &OciDescriptor) -> bool {
         && platform.architecture.as_deref() == Some(oci_arch(std::env::consts::ARCH))
 }
 
-fn render_oci_layout_dir(oci_layout: &Path, rootfs: &Path) -> anyhow::Result<()> {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    rt.block_on(ocirender::convert_dir(oci_layout, rootfs))
+async fn render_oci_layout_dir(oci_layout: &Path, rootfs: &Path) -> anyhow::Result<()> {
+    ocirender::convert_dir(oci_layout, rootfs)
+        .await
         .with_context(|| format!("failed to render OCI layout {}", oci_layout.display()))
 }
 
@@ -2992,8 +3019,17 @@ async fn download_artifacts_to_temp(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::assignments::Assignments;
+    use crate::config::Config;
+    use crate::container::ContainerPool;
+    use crate::hardware::Variant;
+    use crate::manifests::RuntimeManifestStore;
+    use crate::permissions::PermissionStore;
+    use crate::profiles::ProfileStore;
+    use crate::state::Inner;
     use hegel::TestCase;
     use hegel::generators as gs;
+    use std::collections::{HashSet, VecDeque};
 
     #[test]
     fn vision_foundation_url_artifacts_use_runtime_layout() {
@@ -3011,6 +3047,8 @@ mod tests {
     }
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
+    use std::sync::Mutex as StdMutex;
+    use tokio::sync::{Mutex, oneshot};
 
     fn profile_with_use_cases(use_cases: &[&str]) -> Profile {
         profile_with_runtime_and_use_cases("runtime", use_cases)
@@ -3048,6 +3086,39 @@ mod tests {
             specializations: Vec::new(),
             artifacts: Vec::new(),
         }
+    }
+
+    fn runtime_pull_test_state() -> SharedState {
+        SharedState(
+            Arc::new(Mutex::new(Inner {
+                config: Config {
+                    allow_all: false,
+                    auto_grant: false,
+                    idle_timeout_secs: 300,
+                    container_memory: "1g".to_string(),
+                    oci_store: None,
+                },
+                permissions: PermissionStore::default(),
+                assignments: Assignments::default(),
+                profiles: ProfileStore::default(),
+                profile_epochs: HashMap::new(),
+                runtimes: RuntimeManifestStore::default(),
+                sessions: HashMap::new(),
+                installing_profiles: HashMap::new(),
+                runtime_downloads: HashMap::new(),
+                runtime_download_owners: HashMap::new(),
+                runtime_update_checks: HashMap::new(),
+                recent_installs: VecDeque::new(),
+                recent_runtime_downloads: VecDeque::new(),
+                variant: Variant::Cpu,
+            })),
+            Arc::new(StdMutex::new(HashMap::new())),
+            Arc::new(Mutex::new(ContainerPool::new())),
+            Arc::new(StdMutex::new(HashSet::new())),
+            Arc::new(StdMutex::new(HashMap::new())),
+            Arc::new(StdMutex::new(HashMap::new())),
+            Arc::new(StdMutex::new(HashMap::new())),
+        )
     }
 
     fn cpu_only_system_specs() -> llmfit_core::SystemSpecs {
@@ -3957,6 +4028,60 @@ Writing manifest to image destination\n";
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn runtime_pull_callbacks_run_off_the_async_dispatcher() {
+        let state = runtime_pull_test_state();
+        let image_ref = "ghcr.io/example/runtime:cpu";
+        state
+            .0
+            .lock()
+            .await
+            .runtime_downloads
+            .insert(runtime_download_key(image_ref), install_record());
+
+        let blocking_state = state.clone();
+        let (started_tx, started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let work = tokio::spawn(async move {
+            spawn_runtime_pull_blocking(move || {
+                update_runtime_download_sync(
+                    &blocking_state,
+                    image_ref,
+                    RuntimePullProgress::Percent(42),
+                );
+                let _ = started_tx.send(());
+                release_rx
+                    .recv()
+                    .map_err(|error| anyhow::anyhow!("release channel closed: {error}"))?;
+                ensure_runtime_pull_not_cancelled(Some(&blocking_state), image_ref, None)
+            })
+            .await
+        });
+
+        started_rx.await.expect("blocking work started");
+        let mut guard = match tokio::time::timeout(Duration::from_secs(1), state.0.lock()).await {
+            Ok(guard) => guard,
+            Err(error) => {
+                let _ = release_tx.send(());
+                panic!("async dispatcher was blocked: {error}");
+            }
+        };
+        let download = guard
+            .runtime_downloads
+            .get_mut(&runtime_download_key(image_ref))
+            .expect("runtime download");
+        assert_eq!(download.bytes_pulled, 42);
+        download.cancel_requested = true;
+        drop(guard);
+        release_tx.send(()).expect("release blocking work");
+
+        let error = work
+            .await
+            .expect("runtime pull task")
+            .expect_err("cancellation should stop runtime pull work");
+        assert!(error.to_string().contains("runtime image pull cancelled"));
+    }
+
     #[test]
     fn image_ref_with_digest_replaces_tag_after_last_slash() {
         assert_eq!(
@@ -4014,8 +4139,8 @@ Writing manifest to image destination\n";
         );
     }
 
-    #[test]
-    fn render_oci_layout_applies_whiteout_files() {
+    #[tokio::test]
+    async fn render_oci_layout_applies_whiteout_files() {
         let oci_layout = std::env::temp_dir().join(format!("aileron-oci-test-{}", Uuid::new_v4()));
         let rootfs = std::env::temp_dir().join(format!("aileron-rootfs-test-{}", Uuid::new_v4()));
         write_test_oci_layout(
@@ -4026,15 +4151,17 @@ Writing manifest to image destination\n";
             ],
         );
 
-        render_oci_layout_dir(&oci_layout, &rootfs).expect("render OCI layout");
+        render_oci_layout_dir(&oci_layout, &rootfs)
+            .await
+            .expect("render OCI layout");
         assert!(!rootfs.join("etc/keep").exists());
 
         let _ = std::fs::remove_dir_all(oci_layout);
         let _ = std::fs::remove_dir_all(rootfs);
     }
 
-    #[test]
-    fn render_oci_layout_applies_opaque_whiteout() {
+    #[tokio::test]
+    async fn render_oci_layout_applies_opaque_whiteout() {
         let oci_layout = std::env::temp_dir().join(format!("aileron-oci-test-{}", Uuid::new_v4()));
         let rootfs = std::env::temp_dir().join(format!("aileron-rootfs-test-{}", Uuid::new_v4()));
         write_test_oci_layout(
@@ -4045,7 +4172,9 @@ Writing manifest to image destination\n";
             ],
         );
 
-        render_oci_layout_dir(&oci_layout, &rootfs).expect("render OCI layout");
+        render_oci_layout_dir(&oci_layout, &rootfs)
+            .await
+            .expect("render OCI layout");
         assert!(!rootfs.join("var/cache/old").exists());
 
         let _ = std::fs::remove_dir_all(oci_layout);
@@ -4053,8 +4182,8 @@ Writing manifest to image destination\n";
     }
 
     #[cfg(unix)]
-    #[test]
-    fn render_oci_layout_preserves_absolute_symlinks() {
+    #[tokio::test]
+    async fn render_oci_layout_preserves_absolute_symlinks() {
         let oci_layout = std::env::temp_dir().join(format!("aileron-oci-test-{}", Uuid::new_v4()));
         let rootfs = std::env::temp_dir().join(format!("aileron-rootfs-test-{}", Uuid::new_v4()));
         write_test_oci_layout(
@@ -4062,7 +4191,9 @@ Writing manifest to image destination\n";
             vec![tar_with_symlink("etc/alternatives/awk", "/usr/bin/mawk")],
         );
 
-        render_oci_layout_dir(&oci_layout, &rootfs).expect("render OCI layout");
+        render_oci_layout_dir(&oci_layout, &rootfs)
+            .await
+            .expect("render OCI layout");
         assert_eq!(
             std::fs::read_link(rootfs.join("etc/alternatives/awk")).unwrap(),
             PathBuf::from("/usr/bin/mawk")
@@ -4072,8 +4203,8 @@ Writing manifest to image destination\n";
         let _ = std::fs::remove_dir_all(rootfs);
     }
 
-    #[test]
-    fn render_oci_layout_resolves_hardlinks_from_archive_root() {
+    #[tokio::test]
+    async fn render_oci_layout_resolves_hardlinks_from_archive_root() {
         let oci_layout = std::env::temp_dir().join(format!("aileron-oci-test-{}", Uuid::new_v4()));
         let rootfs = std::env::temp_dir().join(format!("aileron-rootfs-test-{}", Uuid::new_v4()));
         write_test_oci_layout(
@@ -4084,7 +4215,9 @@ Writing manifest to image destination\n";
             ],
         );
 
-        render_oci_layout_dir(&oci_layout, &rootfs).expect("render OCI layout");
+        render_oci_layout_dir(&oci_layout, &rootfs)
+            .await
+            .expect("render OCI layout");
         assert_eq!(
             std::fs::read_to_string(rootfs.join("usr/bin/perl5.40.1")).unwrap(),
             "perl"
@@ -4110,13 +4243,15 @@ Writing manifest to image destination\n";
         let _ = std::fs::remove_dir_all(target);
     }
 
-    #[test]
+    #[tokio::test]
     #[ignore = "requires AILERON_TEST_OCI_LAYOUT pointing at a real OCI layout"]
-    fn render_real_oci_layout() {
+    async fn render_real_oci_layout() {
         let oci_layout = std::env::var("AILERON_TEST_OCI_LAYOUT").expect("AILERON_TEST_OCI_LAYOUT");
         let rootfs = std::env::temp_dir().join(format!("aileron-rootfs-test-{}", Uuid::new_v4()));
 
-        render_oci_layout_dir(Path::new(&oci_layout), &rootfs).expect("render real OCI layout");
+        render_oci_layout_dir(Path::new(&oci_layout), &rootfs)
+            .await
+            .expect("render real OCI layout");
 
         let _ = std::fs::remove_dir_all(rootfs);
     }
