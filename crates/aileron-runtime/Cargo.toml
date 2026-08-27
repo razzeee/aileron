@@ -25,7 +25,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 base64 = { workspace = true }
 encoding_rs = { version = "0.8.35", optional = true }
-llama-cpp-2 = { version = "0.1.150", optional = true }
+llama-cpp-2 = { version = "0.1.154", optional = true }
 whisper-rs = { version = "0.16.0", optional = true }
 
 [[bin]]

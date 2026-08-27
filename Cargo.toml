@@ -23,7 +23,7 @@ aileron-ipc     = { path = "crates/aileron-ipc" }
 tokio    = { version = "1", features = ["full"] }
 serde    = { version = "1", features = ["derive"] }
 serde_json = "1"
-llmfit-core = "1.1.6"
+llmfit-core = "1.1.11"
 uuid     = { version = "1", features = ["v4"] }
 anyhow   = "1"
 thiserror = "2"
@@ -44,8 +44,8 @@ reqwest = { version = "0.13", features = ["blocking"] }
 chrono = "0.4"
 sha2 = "0.11"
 tar = "0.4"
-ocirender = "0.2.1"
-hegeltest = "0.28.0"
-base64 = "0.22"
+ocirender = "0.2.2"
+hegeltest = "0.32.2"
+base64 = "0.23"
 image = { version = "0.25", default-features = false, features = ["png"] }
 isolang = "2.4"
