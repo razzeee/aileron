@@ -45,7 +45,7 @@ chrono = "0.4"
 sha2 = "0.11"
 tar = "0.4"
 ocirender = "0.2.2"
-hegeltest = "0.32.2"
+hegeltest = "0.38.0"
 base64 = "0.23"
 image = { version = "0.25", default-features = false, features = ["png"] }
 isolang = "2.4"
