@@ -150,7 +150,8 @@ jobs:
           dnf install -y ca-certificates curl gcc git tar xz
           meson ninja-build pkgconf-pkg-config gettext
           glib2-devel liburing-devel json-glib-devel fuse3-devel
-          gdk-pixbuf2-devel gstreamer1-plugins-base-devel
+          gdk-pixbuf2-devel gstreamer1 gstreamer1-plugins-base-devel
+          gstreamer1-plugins-good
           pipewire-devel wireplumber-devel dbus-devel dbus-daemon
           umockdev-devel python3-gobject python3-dbus python3-dbusmock
           python3-pytest bubblewrap crun gsettings-desktop-schemas
