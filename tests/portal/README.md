@@ -55,6 +55,28 @@ user with working rootless crun, or inside a disposable privileged CI container.
 The CI container needs nested namespaces for crun; no host services are installed
 or restarted. Stack process logs are printed on failure.
 
+CI uses `--privileged --cgroupns=private` and wraps the real-stack command with
+`ci_cgroups.py`. Docker initially puts PID 1 and exec processes at the cgroup
+namespace root. cgroup v2 cannot enable the memory controller for children while
+that root is populated, so privilege alone does not make nested limits work.
+The wrapper moves the job processes into a leaf, enables memory and PID
+controllers at the now-empty root, and runs `probe_crun.py` to verify the actual
+512 MiB memory and 256 PID limits inside crun. It then runs the stack with all
+assertions enabled. In `finally`, it restores the original layout so subsequent
+Actions Docker execs can join the job cgroup again.
+
+These cgroup tools are for a fresh, disposable Docker container only, never the
+host, a host cgroup namespace, or a bind mount of host cgroups. No host cgroup
+configuration or services need changing. To check delegation without building
+the frontend, run `python3 tests/portal/ci_cgroups.py true` inside that container
+with Python and crun installed. The wrapper always runs the limit probe first.
+
+Process-walk unit tests need only the Python standard library:
+
+```sh
+python3 -B -m unittest discover -s tests/portal -p 'test_*.py'
+```
+
 ## Deterministic cancellation
 
 ```sh

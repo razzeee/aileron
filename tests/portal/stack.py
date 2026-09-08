@@ -23,6 +23,46 @@ import termios
 import time
 
 
+def find_stub(daemon_pid, executable):
+    """Return the owned stub's PID and pidfd; caller must close the descriptor."""
+    children = [daemon_pid]
+    seen = set()
+    transient = (FileNotFoundError, PermissionError, ProcessLookupError)
+    while children:
+        pid = children.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        proc = Path(f"/proc/{pid}")
+        try:
+            pidfd = os.pidfd_open(pid)
+        except transient:
+            continue
+        matched = False
+        try:
+            try:
+                matched = os.path.samefile(proc / "exe", executable)
+            except transient:
+                pass
+            if matched:
+                return pid, pidfd
+            try:
+                for task in (proc / "task").iterdir():
+                    try:
+                        children.extend(
+                            int(child)
+                            for child in (task / "children").read_text().split()
+                        )
+                    except transient:
+                        continue
+            except transient:
+                pass
+        finally:
+            if not matched:
+                os.close(pidfd)
+    raise AssertionError("cannot locate the harness-owned OCI stub")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("build_dir", type=Path)
@@ -264,21 +304,7 @@ def main():
             if args.check_cancellation:
                 # Stop only our own container's stub, then wait for bytes in its
                 # input pipe. Cancellation must happen after the daemon sent work.
-                children = [daemon.pid]
-                stub_pid = None
-                while children:
-                    pid = children.pop()
-                    proc = Path(f"/proc/{pid}")
-                    if os.path.samefile(proc / "exe", rootfs / "entrypoint"):
-                        stub_pid = pid
-                        break
-                    for task in (proc / "task").iterdir():
-                        children.extend(
-                            int(child)
-                            for child in (task / "children").read_text().split()
-                        )
-                assert stub_pid is not None, "cannot locate the harness-owned OCI stub"
-                pidfd = os.pidfd_open(stub_pid)
+                stub_pid, pidfd = find_stub(daemon.pid, rootfs / "entrypoint")
                 stack.callback(os.close, pidfd)
 
                 def resume_stub():
