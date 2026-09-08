@@ -581,8 +581,14 @@ impl VarlinkInterface for ModelsHandler {
                 let guard = self.state.0.lock().await;
                 guard.profiles.get(&profile_id).is_none()
             };
-            if profile_still_missing {
-                containers.kill(&profile_id);
+            let killed = if profile_still_missing {
+                containers.kill(&profile_id)
+            } else {
+                None
+            };
+            drop(containers);
+            if let Some(handle) = killed {
+                handle.wait_terminated().await;
             }
             call.reply()
         })

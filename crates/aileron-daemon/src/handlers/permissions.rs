@@ -57,11 +57,40 @@ async fn set_permission(
     allowed: bool,
     path: &std::path::Path,
 ) -> anyhow::Result<()> {
-    let removed = {
+    set_permission_with_sync(
+        state,
+        app_id,
+        use_case,
+        allowed,
+        path,
+        std::fs::File::sync_all,
+    )
+    .await
+}
+
+async fn set_permission_with_sync(
+    state: &SharedState,
+    app_id: &str,
+    use_case: &str,
+    allowed: bool,
+    path: &std::path::Path,
+    sync_directory: impl FnOnce(&std::fs::File) -> std::io::Result<()>,
+) -> anyhow::Result<()> {
+    let (removed, result) = {
         let mut guard = state.0.lock().await;
-        guard
-            .permissions
-            .set_to_path(app_id, use_case, allowed, path)?;
+        let result = guard.permissions.set_to_path_with_sync(
+            app_id,
+            use_case,
+            allowed,
+            path,
+            sync_directory,
+        );
+        if let Err(err) = &result
+            && !err.is::<crate::permissions::UncertainCommit>()
+        {
+            return result;
+        }
+        // A visible denial must revoke access even if directory sync failed.
         let mut removed = Vec::new();
         if !allowed {
             guard.sessions.retain(|session_id, session| {
@@ -74,7 +103,7 @@ async fn set_permission(
                 }
             });
         }
-        removed
+        (removed, result)
     };
     // Termination can wait for runtime locks. Never hold the state lock here.
     for session in removed {
@@ -91,7 +120,7 @@ async fn set_permission(
             profile_id: &session.profile_id,
         });
     }
-    Ok(())
+    result
 }
 
 fn app_permissions(store: &crate::permissions::PermissionStore) -> Vec<AppPermission> {
@@ -221,6 +250,45 @@ mod tests {
         for token in tokens {
             assert!(token.is_cancelled());
         }
+    }
+
+    #[tokio::test]
+    async fn uncertain_denial_invalidates_sessions_and_returns_error() {
+        use request_execution::RequestCancellation;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("permissions.json");
+        let state = test_state();
+        populate_sessions(&state).await;
+        set_permission(&state, "app", "case", true, &path)
+            .await
+            .unwrap();
+        let tokens =
+            ["active", "queued", "cold"].map(|id| RequestCancellation::for_session(&state, id));
+
+        let error = set_permission_with_sync(&state, "app", "case", false, &path, |directory| {
+            assert!(directory.metadata()?.is_dir());
+            let saved: PermissionStore = serde_json::from_slice(&std::fs::read(&path)?).unwrap();
+            assert_eq!(saved.check("app", "case"), Some(false));
+            Err(std::io::Error::other("injected directory sync failure"))
+        })
+        .await
+        .unwrap_err();
+
+        assert!(error.is::<crate::permissions::UncertainCommit>());
+        for token in tokens {
+            assert!(token.is_cancelled());
+        }
+        let guard = state.0.lock().await;
+        assert_eq!(guard.permissions.check("app", "case"), Some(false));
+        assert_eq!(guard.sessions.len(), 2);
+        for id in ["other-app", "other-case"] {
+            assert!(guard.sessions.contains_key(id));
+            assert!(!state.is_session_cancelled(id));
+        }
+        let saved: PermissionStore =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved.check("app", "case"), Some(false));
     }
 
     #[tokio::test]

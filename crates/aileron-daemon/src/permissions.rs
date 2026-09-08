@@ -9,6 +9,12 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+/// The rename is visible, but its crash durability is unknown. Callers must
+/// apply the new state (including revocation) without acknowledging success.
+#[derive(Debug, thiserror::Error)]
+#[error("permission rename is visible but directory sync failed: {0}")]
+pub(crate) struct UncertainCommit(#[source] std::io::Error);
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PermissionEntry {
     pub allowed: bool,
@@ -46,9 +52,18 @@ impl PermissionStore {
     }
 
     fn save_to_path(&self, path: &Path) -> Result<()> {
+        self.save_to_path_with_sync(path, std::fs::File::sync_all)
+    }
+
+    fn save_to_path_with_sync(
+        &self,
+        path: &Path,
+        sync_directory: impl FnOnce(&std::fs::File) -> std::io::Result<()>,
+    ) -> Result<()> {
         let data = serde_json::to_vec_pretty(self)?;
         let parent = path.parent().unwrap();
         std::fs::create_dir_all(parent)?;
+        let directory = std::fs::File::open(parent)?;
         let temporary = parent.join(format!(".permissions-{}.tmp", uuid::Uuid::new_v4()));
         let mut file = std::fs::OpenOptions::new()
             .write(true)
@@ -59,6 +74,7 @@ impl PermissionStore {
             file.write_all(&data)?;
             file.sync_all()?;
             std::fs::rename(&temporary, path)?;
+            sync_directory(&directory).map_err(UncertainCommit)?;
             Ok(())
         })();
         if result.is_err() {
@@ -80,10 +96,18 @@ impl PermissionStore {
     /// Record a denied permission entry when an app asks for a new use-case.
     /// This lets management UIs show first-use denials without granting access.
     pub fn deny_if_missing(&mut self, app_id: &str, use_case: &str) -> Result<()> {
+        self.deny_if_missing_with_save(app_id, use_case, Self::save)
+    }
+
+    fn deny_if_missing_with_save(
+        &mut self,
+        app_id: &str,
+        use_case: &str,
+        save: impl FnOnce(&Self) -> Result<()>,
+    ) -> Result<()> {
         let mut next = self.clone();
         if next.insert_denied_if_missing(app_id, use_case) {
-            next.save()?;
-            *self = next;
+            return self.commit_next(next, save);
         }
         Ok(())
     }
@@ -115,6 +139,17 @@ impl PermissionStore {
         allowed: bool,
         path: &Path,
     ) -> Result<()> {
+        self.set_to_path_with_sync(app_id, use_case, allowed, path, std::fs::File::sync_all)
+    }
+
+    pub(crate) fn set_to_path_with_sync(
+        &mut self,
+        app_id: &str,
+        use_case: &str,
+        allowed: bool,
+        path: &Path,
+        sync_directory: impl FnOnce(&std::fs::File) -> std::io::Result<()>,
+    ) -> Result<()> {
         let mut next = self.clone();
         let key = Self::key(app_id, use_case);
         let entry = next.0.entry(key).or_insert(PermissionEntry {
@@ -122,19 +157,39 @@ impl PermissionStore {
             last_used: None,
         });
         entry.allowed = allowed;
-        next.save_to_path(path)?;
-        *self = next;
-        Ok(())
+        self.commit_next(next, |next| {
+            next.save_to_path_with_sync(path, sync_directory)
+        })
+    }
+
+    fn commit_next(&mut self, next: Self, save: impl FnOnce(&Self) -> Result<()>) -> Result<()> {
+        let result = save(&next);
+        if result.is_ok()
+            || result
+                .as_ref()
+                .is_err_and(|err| err.is::<UncertainCommit>())
+        {
+            *self = next;
+        }
+        result
     }
 
     /// Touch last-used timestamp for an entry.
     pub fn touch(&mut self, app_id: &str, use_case: &str) -> Result<()> {
+        self.touch_with_save(app_id, use_case, Self::save)
+    }
+
+    fn touch_with_save(
+        &mut self,
+        app_id: &str,
+        use_case: &str,
+        save: impl FnOnce(&Self) -> Result<()>,
+    ) -> Result<()> {
         let key = Self::key(app_id, use_case);
         let mut next = self.clone();
         if let Some(entry) = next.0.get_mut(&key) {
             entry.last_used = Some(chrono::Utc::now().to_rfc3339());
-            next.save()?;
-            *self = next;
+            return self.commit_next(next, save);
         }
         Ok(())
     }
@@ -181,6 +236,63 @@ mod tests {
         );
         assert_eq!(path.metadata().unwrap().permissions().mode() & 0o777, 0o600);
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn uncertain_permission_commit_updates_memory_and_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("permissions.json");
+        for allowed in [false, true] {
+            let mut store = PermissionStore::default();
+            store.set_to_path("app", "case", !allowed, &path).unwrap();
+            let error = store
+                .set_to_path_with_sync("app", "case", allowed, &path, |directory| {
+                    assert!(directory.metadata()?.is_dir());
+                    let saved: PermissionStore =
+                        serde_json::from_slice(&std::fs::read(&path)?).unwrap();
+                    assert_eq!(saved.check("app", "case"), Some(allowed));
+                    Err(std::io::Error::other("injected directory sync failure"))
+                })
+                .unwrap_err();
+
+            assert!(error.is::<UncertainCommit>());
+            assert_eq!(store.check("app", "case"), Some(allowed));
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                serde_json::to_vec_pretty(&store).unwrap()
+            );
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        }
+    }
+
+    #[test]
+    fn uncertain_first_denial_and_touch_keep_memory_consistent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("permissions.json");
+        let mut store = PermissionStore::default();
+        let save = |next: &PermissionStore| {
+            next.save_to_path_with_sync(&path, |_| {
+                Err(std::io::Error::other("injected directory sync failure"))
+            })
+        };
+
+        let error = store
+            .deny_if_missing_with_save("app", "case", save)
+            .unwrap_err();
+        assert!(error.is::<UncertainCommit>());
+        assert_eq!(store.check("app", "case"), Some(false));
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            serde_json::to_vec_pretty(&store).unwrap()
+        );
+
+        let error = store.touch_with_save("app", "case", save).unwrap_err();
+        assert!(error.is::<UncertainCommit>());
+        assert!(store.0["app/case"].last_used.is_some());
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            serde_json::to_vec_pretty(&store).unwrap()
+        );
     }
 
     #[test]

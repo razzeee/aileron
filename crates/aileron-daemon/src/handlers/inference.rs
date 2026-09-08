@@ -2361,8 +2361,11 @@ fn is_wait_retry(reason: &str) -> bool {
 
 async fn terminate_stale_handle(state: &SharedState, profile_id: &str, handle: &ContainerHandle) {
     handle.terminate();
-    let mut containers = state.2.lock().await;
-    containers.kill_handle(profile_id, handle);
+    {
+        let mut containers = state.2.lock().await;
+        containers.kill_handle(profile_id, handle);
+    }
+    handle.wait_terminated().await;
 }
 
 async fn refresh_resolved_session_runtime(
@@ -3197,25 +3200,34 @@ fn read_media_path(path: &str, budget: &mut MediaBudget<'_>) -> Result<Vec<u8>, 
     let metadata = file
         .metadata()
         .map_err(|e| format!("failed to stat media path {path}: {e}"))?;
-    let too_large = || {
-        format!("media path {path} exceeds maximum size of {STREAM_RESPONSE_MEDIA_MAX_BYTES} bytes")
-    };
-    if metadata.len() > STREAM_RESPONSE_MEDIA_MAX_BYTES {
-        return Err(too_large());
+    read_media_file(file, metadata.len(), path, budget)
+}
+
+fn read_media_file(
+    mut file: std::fs::File,
+    size: u64,
+    path: &str,
+    budget: &mut MediaBudget<'_>,
+) -> Result<Vec<u8>, String> {
+    if size > STREAM_RESPONSE_MEDIA_MAX_BYTES {
+        return Err(format!(
+            "media path {path} exceeds maximum size of {STREAM_RESPONSE_MEDIA_MAX_BYTES} bytes"
+        ));
     }
-    // Reserve before allocating, allowing for Vec growth even if the file grows after stat.
-    let read_reservation = 2 * (STREAM_RESPONSE_MEDIA_MAX_BYTES as usize + 1);
-    budget.reserve(read_reservation)?;
-    let mut data = Vec::new();
-    file.take(STREAM_RESPONSE_MEDIA_MAX_BYTES + 1)
-        .read_to_end(&mut data)
+    let size = size as usize;
+    // Reserve raw bytes plus base64, its JSON value copy, and the serialized request
+    // before allocating. Read into a fixed-size buffer so growth cannot bypass the budget.
+    budget.reserve(size + 3 * size.div_ceil(3) * 4)?;
+    let mut data = vec![0; size];
+    file.read_exact(&mut data)
         .map_err(|e| format!("failed to read media path {path}: {e}"))?;
-    if data.len() as u64 > STREAM_RESPONSE_MEDIA_MAX_BYTES {
-        return Err(too_large());
+    // Direct Varlink files need not be sealed. Reject growth rather than returning
+    // a truncated payload or allocating beyond the size we reserved.
+    match file.read_exact(&mut [0; 1]) {
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {}
+        Err(e) => return Err(format!("failed to read media path {path}: {e}")),
+        Ok(()) => return Err(format!("media path {path} changed size while reading")),
     }
-    budget.release(read_reservation - data.capacity());
-    // Raw bytes plus base64, its JSON value copy, and serialized request buffer.
-    budget.reserve(3 * data.len().div_ceil(3) * 4)?;
     Ok(data)
 }
 
@@ -3741,6 +3753,74 @@ mod tests {
     }
 
     #[test]
+    fn read_media_path_rejects_growth_after_stat() {
+        for original_size in [0, 3] {
+            for grown_size in [4, STREAM_RESPONSE_MEDIA_MAX_BYTES + 1] {
+                let file = tempfile::NamedTempFile::new().unwrap();
+                file.as_file().set_len(original_size).unwrap();
+                let reader = std::fs::File::open(file.path()).unwrap();
+                let size = reader.metadata().unwrap().len();
+                file.as_file().set_len(grown_size).unwrap();
+                let used = AtomicUsize::new(0);
+                let mut budget = MediaBudget {
+                    used: &used,
+                    reserved: 0,
+                };
+                let error =
+                    read_media_file(reader, size, file.path().to_str().unwrap(), &mut budget)
+                        .unwrap_err();
+                assert!(error.contains("changed size while reading"));
+                let size = size as usize;
+                assert_eq!(budget.reserved, size + 3 * size.div_ceil(3) * 4);
+                drop(budget);
+                assert_eq!(used.load(Ordering::Relaxed), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn read_media_path_rejects_shrink_after_stat() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), b"media").unwrap();
+        let reader = std::fs::File::open(file.path()).unwrap();
+        let size = reader.metadata().unwrap().len();
+        file.as_file().set_len(2).unwrap();
+        let used = AtomicUsize::new(0);
+        let mut budget = MediaBudget {
+            used: &used,
+            reserved: 0,
+        };
+        let error =
+            read_media_file(reader, size, file.path().to_str().unwrap(), &mut budget).unwrap_err();
+        assert!(error.contains("failed to read media path"));
+        drop(budget);
+        assert_eq!(used.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn read_media_path_accepts_size_boundaries() {
+        for size in [0, STREAM_RESPONSE_MEDIA_MAX_BYTES] {
+            let file = tempfile::NamedTempFile::new().unwrap();
+            file.as_file().set_len(size).unwrap();
+            let used = AtomicUsize::new(0);
+            let mut budget = MediaBudget {
+                used: &used,
+                reserved: 0,
+            };
+            let data = read_media_path(file.path().to_str().unwrap(), &mut budget).unwrap();
+            assert_eq!(data.len(), size as usize);
+            assert_eq!(data.capacity(), size as usize);
+            assert_eq!(
+                budget.reserved,
+                data.capacity() + 3 * data.len().div_ceil(3) * 4
+            );
+            drop(data);
+            drop(budget);
+            assert_eq!(used.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    #[test]
     fn media_budget_is_shared_and_released_on_drop() {
         let used = AtomicUsize::new(0);
         let mut first = MediaBudget {
@@ -3806,6 +3886,47 @@ mod tests {
     }
 
     #[test]
+    fn read_media_path_small_concurrent_reads_fit_remaining_budget() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), b"abc").unwrap();
+        let used = AtomicUsize::new(0);
+        let mut active = MediaBudget {
+            used: &used,
+            reserved: 0,
+        };
+        // Each request needs three raw bytes and three four-byte base64 copies.
+        active.reserve(IN_FLIGHT_MEDIA_MAX_BYTES - 2 * 15).unwrap();
+        std::thread::scope(|scope| {
+            let requests = (0..2)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let mut budget = MediaBudget {
+                            used: &used,
+                            reserved: 0,
+                        };
+                        let data = read_media_path(file.path().to_str().unwrap(), &mut budget)
+                            .expect("small media must fit the remaining budget");
+                        (data, budget)
+                    })
+                })
+                .collect::<Vec<_>>();
+            let requests = requests
+                .into_iter()
+                .map(|request| request.join().unwrap())
+                .collect::<Vec<_>>();
+            for (data, budget) in &requests {
+                assert_eq!(data, b"abc");
+                assert_eq!(budget.reserved, 15);
+            }
+            assert_eq!(used.load(Ordering::Relaxed), IN_FLIGHT_MEDIA_MAX_BYTES);
+            drop(requests);
+        });
+        assert_eq!(used.load(Ordering::Relaxed), IN_FLIGHT_MEDIA_MAX_BYTES - 30);
+        drop(active);
+        assert_eq!(used.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
     fn read_media_path_rejects_exhausted_budget() {
         let file = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(file.path(), b"media").unwrap();
@@ -3819,6 +3940,11 @@ mod tests {
             used: &used,
             reserved: 0,
         };
+        let error = read_media_path(file.path().to_str().unwrap(), &mut queued).unwrap_err();
+        assert!(error.contains("in-flight media exceeds memory budget"));
+        assert_eq!(queued.reserved, 0);
+        // Raw bytes alone fit, but the complete reservation is one byte short.
+        active.release(5 + 3 * 8 - 1);
         let error = read_media_path(file.path().to_str().unwrap(), &mut queued).unwrap_err();
         assert!(error.contains("in-flight media exceeds memory budget"));
         assert_eq!(queued.reserved, 0);

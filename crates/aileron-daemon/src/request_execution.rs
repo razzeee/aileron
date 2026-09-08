@@ -98,9 +98,14 @@ pub(crate) async fn terminate_active_container_handles_for_session(
     if handles.is_empty() {
         return;
     }
-    let mut containers = state.2.lock().await;
+    {
+        let mut containers = state.2.lock().await;
+        for handle in &handles {
+            containers.kill_handle(profile_id, handle);
+        }
+    }
     for handle in handles {
-        containers.kill_handle(profile_id, &handle);
+        handle.wait_terminated().await;
     }
 }
 
