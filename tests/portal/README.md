@@ -69,9 +69,16 @@ These cgroup tools are for a fresh, disposable Docker container only, never the
 host, a host cgroup namespace, or a bind mount of host cgroups. No host cgroup
 configuration or services need changing. To check delegation without building
 the frontend, run `python3 tests/portal/ci_cgroups.py true` inside that container
-with Python and crun installed. The wrapper always runs the limit probe first.
+with Python, crun, `/bin/sh`, `/usr/bin/cat` and `/usr/bin/ldd` installed. The
+wrapper always runs the limit probe first. The probe copies these two trusted
+system binaries and their ELF libraries into a temporary, read-only rootfs, with
+fresh proc and cgroup mounts. It uses crun's default `pivot_root`, not the outer
+Docker root or a pivot bypass.
 
-Process-walk unit tests need only the Python standard library:
+Process-walk and probe regression tests use Python's standard library. Probe
+tests also need the system binaries above; the isolated shell/`cat` execution
+test needs root for `chroot` and skips otherwise. Run that test in the disposable
+container, not by elevating the host test command:
 
 ```sh
 python3 -B -m unittest discover -s tests/portal -p 'test_*.py'
