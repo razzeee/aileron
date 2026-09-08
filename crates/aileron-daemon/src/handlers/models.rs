@@ -5,7 +5,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{
-    Arc,
+    Arc, LazyLock, Mutex, Weak,
     atomic::{AtomicBool, Ordering},
 };
 use std::thread;
@@ -2845,12 +2845,73 @@ async fn register_profile(
     Ok((auto_assigned, conflicts))
 }
 
+fn artifact_install_lock(target_dir: &Path) -> anyhow::Result<Arc<tokio::sync::Mutex<()>>> {
+    static LOCKS: LazyLock<Mutex<HashMap<PathBuf, Weak<tokio::sync::Mutex<()>>>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    let parent = target_dir
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    // Identify the directory entry being replaced, not a profile or a stripped model name.
+    let key = parent.canonicalize()?.join(
+        target_dir
+            .file_name()
+            .context("model target must have a directory name")?,
+    );
+    let mut locks = LOCKS.lock().unwrap_or_else(|error| error.into_inner());
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    let lock = locks.entry(key).or_default();
+    if let Some(lock) = lock.upgrade() {
+        return Ok(lock);
+    }
+    let new_lock = Arc::new(tokio::sync::Mutex::new(()));
+    *lock = Arc::downgrade(&new_lock);
+    Ok(new_lock)
+}
+
+struct ArtifactStagingDir(PathBuf);
+
+impl ArtifactStagingDir {
+    fn new(target_dir: &Path) -> std::io::Result<Self> {
+        loop {
+            let path =
+                target_dir.with_file_name(format!(".aileron-install-{}.tmp", Uuid::new_v4()));
+            match std::fs::create_dir(&path) {
+                Ok(()) => return Ok(Self(path)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+    }
+}
+
+impl Drop for ArtifactStagingDir {
+    fn drop(&mut self) {
+        // Only remove the directory this install created, including on future cancellation.
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 async fn install_artifacts(
     state: &SharedState,
     profile_id: &str,
     target_dir: &PathBuf,
     artifacts: &[ManifestArtifact],
 ) -> anyhow::Result<()> {
+    let lock = artifact_install_lock(target_dir)?;
+    let acquire = lock.lock();
+    tokio::pin!(acquire);
+    let _guard = loop {
+        ensure_install_not_cancelled(state, profile_id).await?;
+        // Keep our queue position while polling the CancelInstall flag.
+        tokio::select! {
+            guard = &mut acquire => break guard,
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+        }
+    };
+    ensure_install_not_cancelled(state, profile_id).await?;
     if target_dir.exists() {
         update_install_status(state, profile_id, "Verifying existing artifacts...").await;
         if artifacts_match(target_dir, artifacts).await? {
@@ -2862,22 +2923,14 @@ async fn install_artifacts(
         }
     }
 
-    let temp_dir = target_dir.with_extension("tmp");
-    if temp_dir.exists() {
-        std::fs::remove_dir_all(&temp_dir)?;
-    }
-    std::fs::create_dir_all(&temp_dir)?;
-
-    let result = download_artifacts_to_temp(state, profile_id, &temp_dir, artifacts).await;
-    if result.is_err() {
-        let _ = std::fs::remove_dir_all(&temp_dir);
-    }
-    result?;
+    let temp_dir = ArtifactStagingDir::new(target_dir)?;
+    download_artifacts_to_temp(state, profile_id, &temp_dir.0, artifacts).await?;
+    ensure_install_not_cancelled(state, profile_id).await?;
 
     if target_dir.exists() {
         std::fs::remove_dir_all(target_dir)?;
     }
-    std::fs::rename(temp_dir, target_dir)?;
+    std::fs::rename(&temp_dir.0, target_dir)?;
     Ok(())
 }
 
@@ -2994,6 +3047,195 @@ mod tests {
     use super::*;
     use hegel::TestCase;
     use hegel::generators as gs;
+
+    #[tokio::test]
+    async fn dotted_model_installs_use_independent_staging_dirs() {
+        let root = tempfile::tempdir().unwrap();
+        let first = root.path().join("llama3.1-8b");
+        let second = root.path().join("llama3.2-3b");
+        assert_eq!(first.with_extension("tmp"), second.with_extension("tmp"));
+        let legacy = first.with_extension("tmp");
+        std::fs::create_dir(&legacy).unwrap();
+        std::fs::write(legacy.join("keep"), b"unrelated").unwrap();
+
+        let barrier = tokio::sync::Barrier::new(2);
+        let install = |target: PathBuf, contents: &'static [u8]| {
+            let barrier = &barrier;
+            async move {
+                let lock = artifact_install_lock(&target).unwrap();
+                let _guard = lock.lock().await;
+                let staging = ArtifactStagingDir::new(&target).unwrap();
+                assert_eq!(staging.0.parent(), target.parent());
+                std::fs::write(staging.0.join("model"), contents).unwrap();
+                barrier.wait().await;
+                assert_eq!(std::fs::read(staging.0.join("model")).unwrap(), contents);
+                std::fs::rename(&staging.0, &target).unwrap();
+                let path = staging.0.clone();
+                drop(staging);
+                assert!(!path.exists());
+                assert_eq!(std::fs::read(target.join("model")).unwrap(), contents);
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(install(first, b"first"), install(second, b"second"));
+        })
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read(legacy.join("keep")).unwrap(), b"unrelated");
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 3);
+    }
+
+    #[tokio::test]
+    async fn artifact_staging_cleanup_is_scoped_on_error_and_cancellation() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("model.1");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("keep"), b"installed").unwrap();
+        let survivor = ArtifactStagingDir::new(&target).unwrap();
+        std::fs::write(survivor.0.join("keep"), b"downloading").unwrap();
+
+        let failed_path;
+        {
+            let failed = ArtifactStagingDir::new(&target).unwrap();
+            failed_path = failed.0.clone();
+            assert_ne!(failed.0, survivor.0);
+            std::fs::write(failed.0.join("partial"), b"partial").unwrap();
+            // A nonempty target rejects publication; dropping still cleans the staging dir.
+            assert!(std::fs::rename(&failed.0, &target).is_err());
+        }
+        assert!(!failed_path.exists());
+
+        let (ready, started) = tokio::sync::oneshot::channel();
+        let cancelled_target = target.clone();
+        let task = tokio::spawn(async move {
+            let staging = ArtifactStagingDir::new(&cancelled_target).unwrap();
+            std::fs::write(staging.0.join("partial"), b"partial").unwrap();
+            ready.send(staging.0.clone()).unwrap();
+            std::future::pending::<()>().await;
+            drop(staging);
+        });
+        let cancelled_path = started.await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(!cancelled_path.exists());
+        assert_eq!(std::fs::read(target.join("keep")).unwrap(), b"installed");
+        assert_eq!(
+            std::fs::read(survivor.0.join("keep")).unwrap(),
+            b"downloading"
+        );
+        drop(survivor);
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn queued_artifact_install_observes_cancel_install_flag() {
+        use std::future::{Future, poll_fn};
+        use std::task::Poll;
+
+        let state = SharedState(
+            Arc::new(tokio::sync::Mutex::new(crate::state::Inner {
+                config: crate::config::Config {
+                    allow_all: false,
+                    auto_grant: false,
+                    idle_timeout_secs: 300,
+                    container_memory: "8g".to_string(),
+                    oci_store: None,
+                },
+                permissions: Default::default(),
+                assignments: Default::default(),
+                profiles: Default::default(),
+                profile_epochs: Default::default(),
+                runtimes: Default::default(),
+                sessions: Default::default(),
+                installing_profiles: Default::default(),
+                runtime_downloads: Default::default(),
+                runtime_download_owners: Default::default(),
+                runtime_update_checks: Default::default(),
+                recent_installs: Default::default(),
+                recent_runtime_downloads: Default::default(),
+                variant: crate::hardware::Variant::Cpu,
+            })),
+            Default::default(),
+            Arc::new(tokio::sync::Mutex::new(
+                crate::container::ContainerPool::new(),
+            )),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        );
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("model.1");
+        begin_install(&state, "active", 0).await.unwrap();
+        begin_install(&state, "queued", 0).await.unwrap();
+        let lock = artifact_install_lock(&target).unwrap();
+        let _active_guard = lock.lock().await;
+        let staging = ArtifactStagingDir::new(&target).unwrap();
+        std::fs::write(staging.0.join("partial"), b"active download").unwrap();
+
+        let queued = async {
+            let result = install_artifacts(&state, "queued", &target, &[]).await;
+            finish_install(
+                &state,
+                "queued",
+                result.as_ref().err().map(|e| e.to_string()),
+            )
+            .await;
+            result
+        };
+        tokio::pin!(queued);
+        poll_fn(|cx| {
+            assert!(queued.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        {
+            let mut guard = state.0.lock().await;
+            request_cancel_install(&mut guard, "queued");
+            assert!(guard.installing_profiles["queued"].cancel_requested);
+        }
+
+        let error = tokio::time::timeout(Duration::from_secs(1), queued)
+            .await
+            .expect("queued cancellation must finish while the target lock is still held")
+            .unwrap_err();
+        assert_eq!(error.to_string(), "install cancelled for queued");
+        let guard = state.0.lock().await;
+        assert!(!guard.installing_profiles.contains_key("queued"));
+        assert!(!guard.installing_profiles["active"].cancel_requested);
+        assert_eq!(guard.recent_installs[0].0, "queued");
+        assert!(lock.try_lock().is_err());
+        assert_eq!(
+            std::fs::read(staging.0.join("partial")).unwrap(),
+            b"active download"
+        );
+        assert!(!target.exists());
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn artifact_install_locks_follow_target_directory_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("model.1");
+        let first = artifact_install_lock(&target).unwrap();
+        let same = artifact_install_lock(&root.path().join(".").join("model.1")).unwrap();
+        let other = artifact_install_lock(&root.path().join("model.2")).unwrap();
+        assert!(Arc::ptr_eq(&first, &same));
+        assert!(!Arc::ptr_eq(&first, &other));
+        let guard = first.lock().await;
+        assert!(same.try_lock().is_err());
+        assert!(other.try_lock().is_ok());
+        drop(guard);
+        assert!(same.try_lock().is_ok());
+
+        #[cfg(unix)]
+        {
+            let alias = root.path().join("alias");
+            symlink(root.path(), &alias).unwrap();
+            let aliased = artifact_install_lock(&alias.join("model.1")).unwrap();
+            assert!(Arc::ptr_eq(&first, &aliased));
+        }
+    }
 
     #[test]
     fn vision_foundation_url_artifacts_use_runtime_layout() {

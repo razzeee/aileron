@@ -6,7 +6,7 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::sync::{
     Arc, MutexGuard, TryLockError,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::time::Duration;
 use uuid::Uuid;
@@ -50,6 +50,51 @@ type ProfileRuntime = (
 );
 
 const STREAM_RESPONSE_MEDIA_MAX_BYTES: u64 = 64 * 1024 * 1024;
+const IN_FLIGHT_MEDIA_MAX_BYTES: usize = 512 * 1024 * 1024;
+static IN_FLIGHT_MEDIA_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+// Kept by the request, including while waiting for a container and serializing media.
+struct MediaBudget<'a> {
+    used: &'a AtomicUsize,
+    reserved: usize,
+}
+
+impl Default for MediaBudget<'_> {
+    fn default() -> Self {
+        Self {
+            used: &IN_FLIGHT_MEDIA_BYTES,
+            reserved: 0,
+        }
+    }
+}
+
+impl MediaBudget<'_> {
+    fn reserve(&mut self, bytes: usize) -> Result<(), String> {
+        self.used
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                used.checked_add(bytes)
+                    .filter(|total| *total <= IN_FLIGHT_MEDIA_MAX_BYTES)
+            })
+            .map_err(|_| {
+                format!(
+                    "in-flight media exceeds memory budget of {IN_FLIGHT_MEDIA_MAX_BYTES} bytes"
+                )
+            })?;
+        self.reserved += bytes;
+        Ok(())
+    }
+
+    fn release(&mut self, bytes: usize) {
+        self.reserved -= bytes;
+        self.used.fetch_sub(bytes, Ordering::Relaxed);
+    }
+}
+
+impl Drop for MediaBudget<'_> {
+    fn drop(&mut self) {
+        self.release(self.reserved);
+    }
+}
 
 #[derive(Debug, Clone)]
 struct ResolvedSessionRuntime {
@@ -768,7 +813,9 @@ async fn stream_transcription(
     .await
     .map_err(SpeechError::from)?;
     let task = ensure_speech_use_case(&resolved.use_case).map_err(SpeechError::InvalidInput)?;
-    let audio_bytes = read_media_path(&audio_path).map_err(SpeechError::InvalidInput)?;
+    let mut media_budget = MediaBudget::default();
+    let audio_bytes =
+        read_media_path(&audio_path, &mut media_budget).map_err(SpeechError::InvalidInput)?;
     with_locked_container(
         "StreamTranscribe",
         state,
@@ -996,7 +1043,9 @@ async fn stream_vision_text<C: TextStreamCall + ?Sized>(
     })
     .await
     .map_err(VisionError::from)?;
-    let image_bytes = read_media_path(&image_path).map_err(VisionError::InvalidInput)?;
+    let mut media_budget = MediaBudget::default();
+    let image_bytes =
+        read_media_path(&image_path, &mut media_budget).map_err(VisionError::InvalidInput)?;
     with_locked_container(
         method,
         state,
@@ -1134,7 +1183,9 @@ async fn vision_detections(
     })
     .await
     .map_err(VisionError::from)?;
-    let image_bytes = read_media_path(&image_path).map_err(VisionError::InvalidInput)?;
+    let mut media_budget = MediaBudget::default();
+    let image_bytes =
+        read_media_path(&image_path, &mut media_budget).map_err(VisionError::InvalidInput)?;
     with_locked_container(
         "StreamDetect",
         state,
@@ -1182,7 +1233,9 @@ async fn vision_masks(
     })
     .await
     .map_err(VisionError::from)?;
-    let image_bytes = read_media_path(&image_path).map_err(VisionError::InvalidInput)?;
+    let mut media_budget = MediaBudget::default();
+    let image_bytes =
+        read_media_path(&image_path, &mut media_budget).map_err(VisionError::InvalidInput)?;
     let points = options
         .points
         .into_iter()
@@ -1258,7 +1311,9 @@ async fn vision_depth(
     })
     .await
     .map_err(VisionError::from)?;
-    let image_bytes = read_media_path(&image_path).map_err(VisionError::InvalidInput)?;
+    let mut media_budget = MediaBudget::default();
+    let image_bytes =
+        read_media_path(&image_path, &mut media_budget).map_err(VisionError::InvalidInput)?;
     with_locked_container(
         "StreamDepth",
         state,
@@ -1329,6 +1384,7 @@ async fn embedding_vector(
 fn normalize_stream_input(
     input_json: &str,
     media_paths: &[String],
+    budget: &mut MediaBudget<'_>,
 ) -> Result<Vec<InputMessage>, String> {
     let value: Value =
         serde_json::from_str(input_json).map_err(|e| format!("invalid input_json: {e}"))?;
@@ -1348,7 +1404,7 @@ fn normalize_stream_input(
         items
             .iter()
             .enumerate()
-            .map(|(index, item)| normalize_message(item, media_paths, index))
+            .map(|(index, item)| normalize_message(item, media_paths, index, budget))
             .collect()
     } else {
         Ok(vec![InputMessage {
@@ -1356,7 +1412,7 @@ fn normalize_stream_input(
             content: items
                 .iter()
                 .enumerate()
-                .map(|(index, item)| normalize_part(item, media_paths, index))
+                .map(|(index, item)| normalize_part(item, media_paths, index, budget))
                 .collect::<Result<Vec<_>, _>>()?,
         }])
     }
@@ -1365,6 +1421,7 @@ fn normalize_stream_input(
 fn normalize_guided_input(
     prompt: &str,
     media_paths: &[String],
+    budget: &mut MediaBudget<'_>,
 ) -> Result<Option<Vec<InputMessage>>, String> {
     if !prompt.trim_start().starts_with('[') {
         if media_paths.is_empty() {
@@ -1375,7 +1432,7 @@ fn normalize_guided_input(
         );
     }
 
-    match normalize_stream_input(prompt, media_paths) {
+    match normalize_stream_input(prompt, media_paths, budget) {
         Ok(input) => Ok(Some(input)),
         Err(_error) if media_paths.is_empty() => Ok(None),
         Err(error) => Err(error),
@@ -1386,6 +1443,7 @@ fn normalize_message(
     value: &Value,
     media_paths: &[String],
     index: usize,
+    budget: &mut MediaBudget<'_>,
 ) -> Result<InputMessage, String> {
     let object = value
         .as_object()
@@ -1410,7 +1468,7 @@ fn normalize_message(
         content: content
             .iter()
             .enumerate()
-            .map(|(part_index, part)| normalize_part(part, media_paths, part_index))
+            .map(|(part_index, part)| normalize_part(part, media_paths, part_index, budget))
             .collect::<Result<Vec<_>, _>>()?,
     })
 }
@@ -1419,6 +1477,7 @@ fn normalize_part(
     value: &Value,
     media_paths: &[String],
     index: usize,
+    budget: &mut MediaBudget<'_>,
 ) -> Result<InputPart, String> {
     let object = value
         .as_object()
@@ -1438,18 +1497,28 @@ fn normalize_part(
         "output_text" => Ok(InputPart::OutputText {
             text: non_empty_string(object, "text", index)?,
         }),
-        "input_image" => media_part(object, media_paths, index, "image/", |data, mime_type| {
-            InputPart::InputImage {
+        "input_image" => media_part(
+            object,
+            media_paths,
+            index,
+            budget,
+            "image/",
+            |data, mime_type| InputPart::InputImage {
                 image: data,
                 mime_type,
-            }
-        }),
-        "input_audio" => media_part(object, media_paths, index, "audio/", |data, mime_type| {
-            InputPart::InputAudio {
+            },
+        ),
+        "input_audio" => media_part(
+            object,
+            media_paths,
+            index,
+            budget,
+            "audio/",
+            |data, mime_type| InputPart::InputAudio {
                 audio: data,
                 mime_type,
-            }
-        }),
+            },
+        ),
         other => Err(format!("content part {index} has unsupported type {other}")),
     }
 }
@@ -1473,6 +1542,7 @@ fn media_part(
     object: &Map<String, Value>,
     media_paths: &[String],
     index: usize,
+    budget: &mut MediaBudget<'_>,
     mime_prefix: &str,
     build: impl FnOnce(String, String) -> InputPart,
 ) -> Result<InputPart, String> {
@@ -1490,30 +1560,9 @@ fn media_part(
     let path = media_paths
         .get(fd_index)
         .ok_or_else(|| format!("content part {index} fd_index {fd_index} is out of range"))?;
-    let data = read_stream_response_media_path(path, fd_index)?;
+    let data = read_media_path(path, budget)
+        .map_err(|error| format!("media fd_index {fd_index}: {error}"))?;
     Ok(build(base64_encode(&data), mime_type))
-}
-
-fn read_stream_response_media_path(path: &str, fd_index: usize) -> Result<Vec<u8>, String> {
-    if path.trim().is_empty() {
-        return Err(format!("media fd_index {fd_index} path must not be empty"));
-    }
-
-    let file = std::fs::File::open(path)
-        .map_err(|e| format!("failed to read media fd_index {fd_index}: {e}"))?;
-    let mut reader = file.take(STREAM_RESPONSE_MEDIA_MAX_BYTES + 1);
-    let mut data = Vec::new();
-    reader
-        .read_to_end(&mut data)
-        .map_err(|e| format!("failed to read media fd_index {fd_index}: {e}"))?;
-
-    if data.len() as u64 > STREAM_RESPONSE_MEDIA_MAX_BYTES {
-        return Err(format!(
-            "media fd_index {fd_index} exceeds maximum size of {STREAM_RESPONSE_MEDIA_MAX_BYTES} bytes"
-        ));
-    }
-
-    Ok(data)
 }
 
 fn render_text_prompt(input: &[InputMessage]) -> String {
@@ -1594,8 +1643,9 @@ async fn stream_tokens(
     let resolved = resolve_session_runtime(state, &session_id, ensure_language_generation_use_case)
         .await
         .map_err(GenerationError::from)?;
-    let input =
-        normalize_stream_input(&input_json, &media_paths).map_err(GenerationError::InvalidInput)?;
+    let mut media_budget = MediaBudget::default();
+    let input = normalize_stream_input(&input_json, &media_paths, &mut media_budget)
+        .map_err(GenerationError::InvalidInput)?;
     let prompt = render_text_prompt(&input);
     let instructions =
         apply_translation_hints(&resolved.use_case, resolved.instructions.clone(), &options);
@@ -1906,37 +1956,113 @@ async fn model_container(
     resolved: &ResolvedSessionRuntime,
     execution_mode: RequestExecutionMode,
 ) -> Result<(ContainerHandle, bool), String> {
+    let deadline = std::time::Instant::now() + crate::container::STARTUP_TIMEOUT;
+    tokio::time::timeout_at(
+        tokio::time::Instant::from_std(deadline),
+        model_container_before_deadline(state, session_id, resolved, execution_mode, deadline),
+    )
+    .await
+    .map_err(|_| "container startup timed out".to_string())?
+}
+
+async fn model_container_before_deadline(
+    state: &SharedState,
+    session_id: &str,
+    resolved: &ResolvedSessionRuntime,
+    execution_mode: RequestExecutionMode,
+    deadline: std::time::Instant,
+) -> Result<(ContainerHandle, bool), String> {
     ensure_resolved_session_active(state, session_id, resolved).await?;
-    let (container, spawned) = state
-        .2
-        .lock()
-        .await
-        .get_or_spawn_any_checked(
+    let prepared = loop {
+        RequestCancellation::for_session(state, session_id).ensure_not_cancelled()?;
+        ensure_background_start_still_allowed(state, resolved, execution_mode)?;
+        ensure_profile_epoch_current(state, resolved)?;
+        if std::time::Instant::now() >= deadline {
+            return Err("container startup timed out".to_string());
+        }
+        let result = state.2.lock().await.prepare_startup(
             &resolved.profile_id,
             resolved.profile_epoch,
             &resolved.runtime_id,
             &resolved.image_refs,
             &resolved.artifact_path,
             &resolved.runtime_options,
-            |_| {},
-            || {
-                RequestCancellation::for_session(state, session_id)
-                    .ensure_not_cancelled()
-                    .and_then(|_| {
-                        ensure_background_start_still_allowed(state, resolved, execution_mode)
-                    })
-                    .and_then(|_| ensure_profile_epoch_current(state, resolved))
-            },
-        )
-        .map_err(|e| e.to_string())?;
+        );
+        match result {
+            Ok(prepared) => break prepared,
+            Err(error) if is_startup_finalizing_retry(&error.to_string()) => {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    };
+    let (container, plan) = match prepared {
+        crate::container::PreparedStartup::Warm(handle) => (handle, None),
+        crate::container::PreparedStartup::Cold(plan) => {
+            // spawn_blocking outlives a dropped future; explicitly cancel its startup.
+            let abandoned = StartupCancellation(Arc::new(AtomicBool::new(false)));
+            let cancelled = abandoned.0.clone();
+            let state = state.clone();
+            let session_id = session_id.to_string();
+            let resolved = resolved.clone();
+            tokio::task::spawn_blocking(move || {
+                let handle = plan
+                    .spawn(
+                        |_| {},
+                        || {
+                            if cancelled.load(Ordering::SeqCst) {
+                                return Err(
+                                    "container startup cancelled; retry request".to_string()
+                                );
+                            }
+                            RequestCancellation::for_session(&state, &session_id)
+                                .ensure_not_cancelled()
+                                .and_then(|_| {
+                                    ensure_background_start_still_allowed(
+                                        &state,
+                                        &resolved,
+                                        execution_mode,
+                                    )
+                                })
+                                .and_then(|_| ensure_profile_epoch_current(&state, &resolved))
+                        },
+                        deadline,
+                    )
+                    .map_err(|error| error.to_string())?;
+                Ok::<_, String>((handle, Some(plan)))
+            })
+            .await
+            .map_err(|error| error.to_string())??
+        }
+    };
+    let spawned = plan.is_some();
     if let Err(e) = ensure_resolved_session_active(state, session_id, resolved).await {
-        if spawned || profile_is_missing(state, &resolved.profile_id).await {
+        if !spawned && profile_is_missing(state, &resolved.profile_id).await {
             let mut containers = state.2.lock().await;
             containers.kill_handle(&resolved.profile_id, &container);
         }
         return Err(e);
     }
+    if let Some(plan) = plan {
+        let mut pool = state.2.lock().await;
+        RequestCancellation::for_session(state, session_id).ensure_not_cancelled()?;
+        ensure_background_start_still_allowed(state, resolved, execution_mode)?;
+        ensure_profile_epoch_current(state, resolved)?;
+        if std::time::Instant::now() >= deadline {
+            return Err("container startup timed out".to_string());
+        }
+        pool.publish_startup(&plan, &container)
+            .map_err(|error| error.to_string())?;
+    }
     Ok((container, spawned))
+}
+
+struct StartupCancellation(Arc<AtomicBool>);
+
+impl Drop for StartupCancellation {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
 }
 
 fn lock_container_for_session<'a>(
@@ -2478,8 +2604,9 @@ async fn stream_guided_snapshots(
     let resolved = resolve_session_runtime(state, &session_id, ensure_language_generation_use_case)
         .await
         .map_err(GenerationError::from)?;
-    let input =
-        normalize_guided_input(&prompt, &media_paths).map_err(GenerationError::InvalidInput)?;
+    let mut media_budget = MediaBudget::default();
+    let input = normalize_guided_input(&prompt, &media_paths, &mut media_budget)
+        .map_err(GenerationError::InvalidInput)?;
     let prompt = input.as_deref().map(render_text_prompt).unwrap_or(prompt);
     with_locked_container(
         "StreamRespondGuided",
@@ -2608,8 +2735,9 @@ async fn stream_guided_tool_results(
     let resolved = resolve_session_runtime(state, &session_id, ensure_language_generation_use_case)
         .await
         .map_err(GenerationError::from)?;
-    let input =
-        normalize_guided_input(&prompt, &media_paths).map_err(GenerationError::InvalidInput)?;
+    let mut media_budget = MediaBudget::default();
+    let input = normalize_guided_input(&prompt, &media_paths, &mut media_budget)
+        .map_err(GenerationError::InvalidInput)?;
     let prompt = input.as_deref().map(render_text_prompt).unwrap_or(prompt);
     with_locked_container(
         "StreamSubmitToolResultsGuided",
@@ -3059,12 +3187,36 @@ fn guided_fields_schema(fields: &[GuidedField]) -> Result<Value, String> {
     }))
 }
 
-fn read_media_path(path: &str) -> Result<Vec<u8>, String> {
+fn read_media_path(path: &str, budget: &mut MediaBudget<'_>) -> Result<Vec<u8>, String> {
     if path.trim().is_empty() {
         return Err("media path must not be empty".to_string());
     }
 
-    std::fs::read(path).map_err(|e| format!("failed to read media path {path}: {e}"))
+    let file =
+        std::fs::File::open(path).map_err(|e| format!("failed to read media path {path}: {e}"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|e| format!("failed to stat media path {path}: {e}"))?;
+    let too_large = || {
+        format!("media path {path} exceeds maximum size of {STREAM_RESPONSE_MEDIA_MAX_BYTES} bytes")
+    };
+    if metadata.len() > STREAM_RESPONSE_MEDIA_MAX_BYTES {
+        return Err(too_large());
+    }
+    // Reserve before allocating, allowing for Vec growth even if the file grows after stat.
+    let read_reservation = 2 * (STREAM_RESPONSE_MEDIA_MAX_BYTES as usize + 1);
+    budget.reserve(read_reservation)?;
+    let mut data = Vec::new();
+    file.take(STREAM_RESPONSE_MEDIA_MAX_BYTES + 1)
+        .read_to_end(&mut data)
+        .map_err(|e| format!("failed to read media path {path}: {e}"))?;
+    if data.len() as u64 > STREAM_RESPONSE_MEDIA_MAX_BYTES {
+        return Err(too_large());
+    }
+    budget.release(read_reservation - data.capacity());
+    // Raw bytes plus base64, its JSON value copy, and serialized request buffer.
+    budget.reserve(3 * data.len().div_ceil(3) * 4)?;
+    Ok(data)
 }
 
 #[cfg(test)]
@@ -3119,8 +3271,12 @@ mod tests {
 
     #[test]
     fn stream_input_normalizes_text_shorthand() {
-        let input =
-            normalize_stream_input(r#"[{"type":"input_text","text":"hello"}]"#, &[]).unwrap();
+        let input = normalize_stream_input(
+            r#"[{"type":"input_text","text":"hello"}]"#,
+            &[],
+            &mut MediaBudget::default(),
+        )
+        .unwrap();
 
         assert_eq!(input.len(), 1);
         assert_eq!(input[0].role, "user");
@@ -3143,6 +3299,7 @@ mod tests {
         let input = normalize_stream_input(
             r#"[{"role":"user","content":[{"type":"input_image","fd_index":0,"mime_type":"image/png"}]}]"#,
             &media_paths,
+            &mut MediaBudget::default(),
         )
         .unwrap();
 
@@ -3160,6 +3317,7 @@ mod tests {
         let error = normalize_stream_input(
             r#"[{"type":"input_audio","fd_index":1,"mime_type":"audio/wav"}]"#,
             &[],
+            &mut MediaBudget::default(),
         )
         .unwrap_err();
 
@@ -3177,6 +3335,7 @@ mod tests {
         let error = normalize_stream_input(
             r#"[{"type":"input_image","fd_index":0,"mime_type":"image/png"}]"#,
             &media_paths,
+            &mut MediaBudget::default(),
         )
         .unwrap_err();
 
@@ -3185,7 +3344,9 @@ mod tests {
 
     #[test]
     fn guided_input_keeps_bracketed_text_plain_without_media() {
-        let input = normalize_guided_input("[draft] summarize this", &[]).unwrap();
+        let input =
+            normalize_guided_input("[draft] summarize this", &[], &mut MediaBudget::default())
+                .unwrap();
 
         assert!(input.is_none());
     }
@@ -3195,6 +3356,7 @@ mod tests {
         let input = normalize_guided_input(
             r#"[{"role":"user","content":[{"type":"input_text","text":"hi"}]}]"#,
             &[],
+            &mut MediaBudget::default(),
         )
         .unwrap()
         .unwrap();
@@ -3207,7 +3369,12 @@ mod tests {
     #[test]
     fn guided_input_requires_json_when_media_is_attached() {
         let media_paths = vec!["/tmp/image.png".to_string()];
-        let error = normalize_guided_input("describe this image", &media_paths).unwrap_err();
+        let error = normalize_guided_input(
+            "describe this image",
+            &media_paths,
+            &mut MediaBudget::default(),
+        )
+        .unwrap_err();
 
         assert!(error.contains("guided media requires prompt"));
     }
@@ -3543,7 +3710,10 @@ mod tests {
         std::fs::write(file.path(), b"media").expect("temp media should be written");
 
         assert_eq!(
-            read_media_path(file.path().to_str().expect("path should be utf-8")),
+            read_media_path(
+                file.path().to_str().expect("path should be utf-8"),
+                &mut MediaBudget::default()
+            ),
             Ok(b"media".to_vec())
         );
     }
@@ -3551,8 +3721,141 @@ mod tests {
     #[test]
     fn read_media_path_rejects_empty_path() {
         assert_eq!(
-            read_media_path("  "),
+            read_media_path("  ", &mut MediaBudget::default()),
             Err("media path must not be empty".to_string())
         );
+    }
+
+    #[test]
+    fn read_media_path_rejects_huge_sparse_file_before_reserving() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        file.as_file().set_len(1_u64 << 40).unwrap();
+        let used = AtomicUsize::new(0);
+        let mut budget = MediaBudget {
+            used: &used,
+            reserved: 0,
+        };
+        let error = read_media_path(file.path().to_str().unwrap(), &mut budget).unwrap_err();
+        assert!(error.contains("exceeds maximum size"));
+        assert_eq!(used.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn media_budget_is_shared_and_released_on_drop() {
+        let used = AtomicUsize::new(0);
+        let mut first = MediaBudget {
+            used: &used,
+            reserved: 0,
+        };
+        let mut second = MediaBudget {
+            used: &used,
+            reserved: 0,
+        };
+        first.reserve(IN_FLIGHT_MEDIA_MAX_BYTES - 1).unwrap();
+        second.reserve(1).unwrap();
+        assert!(second.reserve(1).is_err());
+        assert!(second.reserve(usize::MAX).is_err());
+        assert_eq!(used.load(Ordering::Relaxed), IN_FLIGHT_MEDIA_MAX_BYTES);
+        drop(first);
+        second.reserve(IN_FLIGHT_MEDIA_MAX_BYTES - 1).unwrap();
+        drop(second);
+        assert_eq!(used.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn media_budget_retains_normalized_media_until_request_drop() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), [1_u8, 2, 3]).unwrap();
+        let used = AtomicUsize::new(0);
+        let mut budget = MediaBudget {
+            used: &used,
+            reserved: 0,
+        };
+        let paths = vec![file.path().display().to_string()];
+        let input = normalize_stream_input(
+            r#"[{"type":"input_image","fd_index":0,"mime_type":"image/png"},{"type":"input_image","fd_index":0,"mime_type":"image/png"}]"#,
+            &paths,
+            &mut budget,
+        ).unwrap();
+        assert!(used.load(Ordering::Relaxed) >= 2 * (3 + 3 * 4));
+        drop(input);
+        assert!(used.load(Ordering::Relaxed) > 0);
+        drop(budget);
+        assert_eq!(used.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn media_budget_releases_after_partial_normalization_error() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), [1_u8, 2, 3]).unwrap();
+        let used = AtomicUsize::new(0);
+        {
+            let mut budget = MediaBudget {
+                used: &used,
+                reserved: 0,
+            };
+            let result = normalize_guided_input(
+                r#"[{"type":"input_image","fd_index":0,"mime_type":"image/png"},{"type":"invalid"}]"#,
+                &[file.path().display().to_string()],
+                &mut budget,
+            );
+            assert!(result.is_err());
+            assert!(used.load(Ordering::Relaxed) > 0);
+        }
+        assert_eq!(used.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn read_media_path_rejects_exhausted_budget() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), b"media").unwrap();
+        let used = AtomicUsize::new(0);
+        let mut active = MediaBudget {
+            used: &used,
+            reserved: 0,
+        };
+        active.reserve(IN_FLIGHT_MEDIA_MAX_BYTES).unwrap();
+        let mut queued = MediaBudget {
+            used: &used,
+            reserved: 0,
+        };
+        let error = read_media_path(file.path().to_str().unwrap(), &mut queued).unwrap_err();
+        assert!(error.contains("in-flight media exceeds memory budget"));
+        assert_eq!(queued.reserved, 0);
+        drop(active);
+        assert_eq!(
+            read_media_path(file.path().to_str().unwrap(), &mut queued).unwrap(),
+            b"media"
+        );
+        drop(queued);
+        assert_eq!(used.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn media_budget_releases_when_queued_request_is_dropped() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), b"media").unwrap();
+        let used = AtomicUsize::new(0);
+        let mut request = Box::pin(async {
+            let mut budget = MediaBudget {
+                used: &used,
+                reserved: 0,
+            };
+            let data = read_media_path(file.path().to_str().unwrap(), &mut budget).unwrap();
+            std::future::pending::<()>().await;
+            drop(data);
+        });
+        assert_eq!(
+            request
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Pending
+        );
+        assert!(used.load(Ordering::Relaxed) >= 5 + 3 * 8);
+        drop(request);
+        assert_eq!(used.load(Ordering::Relaxed), 0);
     }
 }
