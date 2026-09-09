@@ -529,7 +529,7 @@ fn runtime_phase(status: &str) -> &'static str {
         "Finalizing"
     } else if status.contains("Unpacking") || status.contains("unpack") {
         "Unpacking"
-    } else if status.contains("Pulling") || status == "Copying runtime image blobs..." {
+    } else if status.contains("Pulling") || status.contains("Copying") {
         "Pulling"
     } else {
         "Preparing"
@@ -788,6 +788,25 @@ mod tests {
     }
 
     #[test]
+    fn runtime_copy_wording_preserves_progress() {
+        for status in [
+            "Copying runtime image blobs...",
+            "Copying runtime image layers",
+            "Copying blobs",
+        ] {
+            let mut install = install_status("runtime:stub:cpu", status);
+            install.bytes_pulled = 1000;
+            install.total_bytes = 2000;
+            assert_eq!(runtime_phase(status), "Pulling");
+            assert_eq!(runtime_progress_fraction(&install), Some(0.5));
+            assert_eq!(
+                runtime_progress_text(&install).as_deref(),
+                Some("1.0 KB / 2.0 KB copied")
+            );
+        }
+    }
+
+    #[test]
     fn runtime_non_copy_phases_hide_stale_progress() {
         for (status, phase, terminal) in [
             ("Preparing runtime image...", "Preparing", false),
@@ -796,6 +815,7 @@ mod tests {
             ("Cancelling runtime setup...", "Cancelling", false),
             ("Failed: cancelled", "Failed to prepare", true),
             ("Failed: Pulling image failed", "Failed to prepare", true),
+            ("Failed: Copying image failed", "Failed to prepare", true),
             ("Completed", "Prepared", true),
         ] {
             let mut install = install_status("runtime:stub:cpu", status);

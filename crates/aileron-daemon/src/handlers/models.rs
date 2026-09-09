@@ -2563,6 +2563,8 @@ fn remote_runtime_manifest(image_ref: &str) -> anyhow::Result<(String, OciManife
             .iter()
             .filter(|descriptor| descriptor_matches_host(descriptor));
         let descriptor = candidates.next().context("no manifest for host platform")?;
+        // Do not approximate skopeo's variant/compression ranking. Ambiguity falls
+        // back to skopeo selection with measured bytes but no manifest-derived total.
         anyhow::ensure!(
             candidates.next().is_none(),
             "ambiguous host platform manifests"
