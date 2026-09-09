@@ -270,7 +270,8 @@ fn runtime_setup_row(install: &InstallStatus, grouped: bool) -> Box {
     row.set_margin_start(if grouped { 54 } else { 12 });
     row.set_margin_end(12);
 
-    if !grouped {
+    let fraction = runtime_progress_fraction(install);
+    if fraction.is_none() && !install_is_terminal(install) {
         let spinner = Spinner::new();
         spinner.set_valign(gtk4::Align::Center);
         spinner.start();
@@ -293,6 +294,19 @@ fn runtime_setup_row(install: &InstallStatus, grouped: bool) -> Box {
 
     details.append(&title);
     details.append(&subtitle);
+
+    if let Some(text) = runtime_progress_text(install) {
+        let progress_label = Label::new(Some(&text));
+        configure_download_label(&progress_label, 64);
+        progress_label.add_css_class("dim-label");
+        details.append(&progress_label);
+    }
+    if let Some(fraction) = fraction {
+        let progress = ProgressBar::new();
+        progress.set_hexpand(true);
+        progress.set_fraction(fraction);
+        details.append(&progress);
+    }
 
     row.append(&details);
     row
@@ -397,17 +411,52 @@ fn download_subtitle(
 }
 
 fn runtime_profile_subtitle(install: &InstallStatus) -> String {
-    let image_ref = runtime_download_image_ref(&install.profile_id);
-    let phase = runtime_phase(&install.status);
-    let progress = if install.total_bytes > 0 {
-        format!(
-            " · {:.0}%",
-            (install.bytes_pulled as f64 / install.total_bytes as f64 * 100.0).clamp(0.0, 100.0)
-        )
+    let title = runtime_setup_title(install);
+    match runtime_progress_text(install) {
+        Some(progress) => format!("{title} · {progress}"),
+        None => title,
+    }
+}
+
+fn runtime_is_pulling(install: &InstallStatus) -> bool {
+    !install.cancel_requested && runtime_phase(&install.status) == "Pulling"
+}
+
+fn runtime_progress_fraction(install: &InstallStatus) -> Option<f64> {
+    (runtime_is_pulling(install) && install.total_bytes > 0)
+        .then(|| (install.bytes_pulled as f64 / install.total_bytes as f64).clamp(0.0, 1.0))
+}
+
+fn format_bytes(bytes: i64) -> String {
+    let bytes = bytes.max(0);
+    if bytes >= 1_000_000_000 {
+        format!("{:.1} GB", bytes as f64 / 1_000_000_000.0)
+    } else if bytes >= 1_000_000 {
+        format!("{:.1} MB", bytes as f64 / 1_000_000.0)
+    } else if bytes >= 1_000 {
+        format!("{:.1} KB", bytes as f64 / 1_000.0)
     } else {
-        String::new()
+        format!("{bytes} B")
+    }
+}
+
+fn runtime_progress_text(install: &InstallStatus) -> Option<String> {
+    if !runtime_is_pulling(install) {
+        return None;
+    }
+    let copied = format_bytes(install.bytes_pulled);
+    let mut text = if install.total_bytes > 0 {
+        format!("{copied} / {} copied", format_bytes(install.total_bytes))
+    } else {
+        format!("{copied} copied")
     };
-    format!("{phase} {}{progress}", runtime_name(image_ref))
+    if install.bytes_per_second > 0 {
+        text.push_str(&format!(" · {}", format_speed(install.bytes_per_second)));
+    }
+    if install.total_bytes > 0 && install.eta_seconds >= 0 {
+        text.push_str(&format!(" · {} left", format_duration(install.eta_seconds)));
+    }
+    Some(text)
 }
 
 fn is_runtime_setup_status(status: &str) -> bool {
@@ -416,7 +465,11 @@ fn is_runtime_setup_status(status: &str) -> bool {
 
 fn runtime_setup_title(install: &InstallStatus) -> String {
     let image_ref = runtime_download_image_ref(&install.profile_id);
-    let phase = runtime_phase(&install.status);
+    let phase = if install.cancel_requested && !install_is_terminal(install) {
+        "Cancelling"
+    } else {
+        runtime_phase(&install.status)
+    };
     format!("{phase} {}", runtime_name(image_ref))
 }
 
@@ -468,10 +521,16 @@ fn catalog_profile_runtime_ids() -> HashMap<String, String> {
 fn runtime_phase(status: &str) -> &'static str {
     if status.starts_with("Failed:") {
         "Failed to prepare"
-    } else if status.contains("Pulling") {
-        "Pulling"
+    } else if status == "Completed" {
+        "Prepared"
+    } else if status.contains("Cancelling") {
+        "Cancelling"
+    } else if status.contains("Finalizing") || status.contains("finalizing") {
+        "Finalizing"
     } else if status.contains("Unpacking") || status.contains("unpack") {
         "Unpacking"
+    } else if status.contains("Pulling") || status == "Copying runtime image blobs..." {
+        "Pulling"
     } else {
         "Preparing"
     }
@@ -638,7 +697,7 @@ mod tests {
     }
 
     #[test]
-    fn profile_subtitle_shows_runtime_percent() {
+    fn profile_subtitle_shows_runtime_bytes() {
         let runtime_install = InstallStatus {
             profile_id: "runtime:ghcr.io/razzeee/aileron-runtime-llm-vision-whisper:vulkan"
                 .to_string(),
@@ -652,12 +711,12 @@ mod tests {
 
         assert_eq!(
             runtime_profile_subtitle(&runtime_install),
-            "Pulling llm vision whisper runtime (vulkan) · 42%"
+            "Pulling llm vision whisper runtime (vulkan) · 42 B / 100 B copied"
         );
     }
 
     #[hegel::test]
-    fn runtime_percent_is_clamped_to_display_range(tc: TestCase) {
+    fn runtime_fraction_is_clamped_to_display_range(tc: TestCase) {
         let bytes_pulled = tc.draw(gs::integers::<i64>().min_value(-200).max_value(200));
         let runtime_install = InstallStatus {
             profile_id: "runtime:ghcr.io/razzeee/aileron-runtime-llm-vision-whisper:vulkan"
@@ -670,11 +729,107 @@ mod tests {
             cancel_requested: false,
         };
 
-        let expected = (bytes_pulled as f64).clamp(0.0, 100.0);
+        let expected = (bytes_pulled as f64 / 100.0).clamp(0.0, 1.0);
 
-        assert!(
-            runtime_profile_subtitle(&runtime_install).ends_with(&format!(" · {expected:.0}%"))
+        assert_eq!(runtime_progress_fraction(&runtime_install), Some(expected));
+    }
+
+    #[test]
+    fn runtime_bytes_use_adaptive_decimal_units() {
+        for (bytes, expected) in [
+            (-1, "0 B"),
+            (0, "0 B"),
+            (999, "999 B"),
+            (1_000, "1.0 KB"),
+            (1_500_000, "1.5 MB"),
+            (2_000_000_000, "2.0 GB"),
+        ] {
+            assert_eq!(format_bytes(bytes), expected);
+        }
+    }
+
+    #[test]
+    fn runtime_copy_progress_handles_known_unknown_and_zero_sizes() {
+        let mut install = install_status("runtime:stub:cpu", "Pulling runtime image...");
+        assert_eq!(runtime_progress_fraction(&install), None);
+        assert_eq!(
+            runtime_progress_text(&install).as_deref(),
+            Some("0 B copied")
         );
+
+        install.bytes_pulled = 1_500_000;
+        install.total_bytes = 3_000_000;
+        install.bytes_per_second = 1_000;
+        install.eta_seconds = 1_500;
+        assert_eq!(runtime_progress_fraction(&install), Some(0.5));
+        assert_eq!(
+            runtime_progress_text(&install).as_deref(),
+            Some("1.5 MB / 3.0 MB copied · 1.0 KB/s · 25m 0s left")
+        );
+
+        install.total_bytes = 0;
+        install.status = "Copying runtime image blobs...".to_string();
+        assert_eq!(runtime_phase(&install.status), "Pulling");
+        assert_eq!(runtime_progress_fraction(&install), None);
+        assert_eq!(
+            runtime_progress_text(&install).as_deref(),
+            Some("1.5 MB copied · 1.0 KB/s")
+        );
+
+        install.bytes_pulled = 0;
+        install.total_bytes = 100;
+        install.bytes_per_second = 0;
+        install.eta_seconds = -1;
+        assert_eq!(runtime_progress_fraction(&install), Some(0.0));
+        assert_eq!(
+            runtime_progress_text(&install).as_deref(),
+            Some("0 B / 100 B copied")
+        );
+    }
+
+    #[test]
+    fn runtime_non_copy_phases_hide_stale_progress() {
+        for (status, phase, terminal) in [
+            ("Preparing runtime image...", "Preparing", false),
+            ("Finalizing runtime image...", "Finalizing", false),
+            ("Unpacking runtime image...", "Unpacking", false),
+            ("Cancelling runtime setup...", "Cancelling", false),
+            ("Failed: cancelled", "Failed to prepare", true),
+            ("Failed: Pulling image failed", "Failed to prepare", true),
+            ("Completed", "Prepared", true),
+        ] {
+            let mut install = install_status("runtime:stub:cpu", status);
+            install.bytes_pulled = 100;
+            install.total_bytes = 100;
+            install.bytes_per_second = 10;
+            install.eta_seconds = 0;
+            assert_eq!(runtime_progress_fraction(&install), None, "{status}");
+            assert_eq!(runtime_progress_text(&install), None, "{status}");
+            assert_eq!(install_is_terminal(&install), terminal, "{status}");
+            assert_eq!(
+                runtime_profile_subtitle(&install),
+                format!("{phase} stub runtime (cpu)")
+            );
+            if status.starts_with("Failed:") {
+                assert!(runtime_detail_line(&install).contains(status));
+            }
+        }
+
+        let mut install = install_status("runtime:stub:cpu", "Pulling runtime image...");
+        install.total_bytes = 100;
+        install.cancel_requested = true;
+        assert_eq!(runtime_progress_fraction(&install), None);
+        assert_eq!(runtime_progress_text(&install), None);
+        assert_eq!(
+            runtime_setup_title(&install),
+            "Cancelling stub runtime (cpu)"
+        );
+        install.status = "Failed: cancelled".to_string();
+        assert_eq!(
+            runtime_setup_title(&install),
+            "Failed to prepare stub runtime (cpu)"
+        );
+        assert!(install_is_terminal(&install));
     }
 
     #[test]

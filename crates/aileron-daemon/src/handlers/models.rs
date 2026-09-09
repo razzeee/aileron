@@ -2,12 +2,10 @@
 use anyhow::Context;
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{
-    Arc, LazyLock, Mutex, Weak,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -1271,6 +1269,10 @@ struct OciIndex {
 struct OciDescriptor {
     digest: String,
     platform: Option<OciPlatform>,
+    #[serde(default, rename = "mediaType")]
+    media_type: String,
+    #[serde(default)]
+    size: Option<u64>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -1281,6 +1283,8 @@ struct OciPlatform {
 
 #[derive(Deserialize)]
 struct OciManifest {
+    #[serde(default, rename = "mediaType")]
+    media_type: String,
     #[serde(skip)]
     digest: Option<String>,
     config: OciDescriptor,
@@ -2032,7 +2036,7 @@ async fn begin_runtime_download(
         InstallRecord {
             bytes_pulled: 0,
             total_bytes: 0,
-            status: "Pulling runtime image...".to_string(),
+            status: "Preparing runtime image...".to_string(),
             cancel_requested: false,
             samples: std::collections::VecDeque::from([InstallSample {
                 at: chrono::Utc::now(),
@@ -2245,18 +2249,20 @@ fn pull_runtime_image_blocking(
 
     let result = (|| {
         ensure_runtime_pull_not_cancelled(state.as_ref(), image_ref, owner_profile_id.as_deref())?;
-        let copy_steps = remote_runtime_copy_steps(image_ref).ok().flatten();
+        let inspected = remote_runtime_manifest(image_ref).ok();
         let cancel_check =
             runtime_pull_cancel_check(state.clone(), image_ref, owner_profile_id.clone());
         copy_image_to_oci_layout(
-            image_ref,
+            inspected
+                .as_ref()
+                .map_or(image_ref, |(reference, _)| reference),
             &oci_layout,
             |progress| {
                 if let Some(state) = state.as_ref() {
                     update_runtime_download_sync(state, image_ref, progress);
                 }
             },
-            copy_steps,
+            inspected.as_ref().map(|(_, manifest)| manifest),
             cancel_check,
         )?;
         ensure_runtime_pull_not_cancelled(state.as_ref(), image_ref, owner_profile_id.as_deref())?;
@@ -2384,7 +2390,7 @@ fn rollback_runtime_rootfs(rootfs_final: &Path, old_rootfs: &Path, had_old: bool
 
 enum RuntimePullProgress {
     Status(String),
-    Percent(u64),
+    Bytes { pulled: u64, total: u64 },
 }
 
 fn update_runtime_download_sync(
@@ -2397,19 +2403,30 @@ fn update_runtime_download_sync(
     let Some(download) = guard.runtime_downloads.get_mut(&key) else {
         return;
     };
+    if download.cancel_requested {
+        return;
+    }
     match progress {
         RuntimePullProgress::Status(status) => {
-            if status.contains("Unpacking") {
+            if status.contains("Unpacking") || status.contains("Finalizing") {
                 download.bytes_pulled = 0;
                 download.total_bytes = 0;
                 download.samples.clear();
             }
             download.status = status;
         }
-        RuntimePullProgress::Percent(percent) => {
-            download.status = "Pulling runtime image...".to_string();
-            download.total_bytes = 100;
-            download.bytes_pulled = percent.min(100);
+        RuntimePullProgress::Bytes { pulled, total } => {
+            if download.status == "Preparing runtime image..." {
+                download.samples.clear();
+            }
+            download.status = if total == 0 {
+                "Copying runtime image blobs..."
+            } else {
+                "Pulling runtime image..."
+            }
+            .to_string();
+            download.total_bytes = total;
+            download.bytes_pulled = pulled;
             download.samples.push_back(InstallSample {
                 at: chrono::Utc::now(),
                 bytes_pulled: download.bytes_pulled,
@@ -2425,7 +2442,7 @@ fn copy_image_to_oci_layout(
     image_ref: &str,
     oci_layout: &Path,
     mut on_progress: impl FnMut(RuntimePullProgress),
-    copy_steps: Option<usize>,
+    manifest: Option<&OciManifest>,
     cancel_check: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
 ) -> anyhow::Result<()> {
     let source = if image_ref.contains("://") {
@@ -2448,25 +2465,6 @@ fn copy_image_to_oci_layout(
         .stderr(Stdio::piped())
         .spawn()
         .with_context(|| format!("failed to run skopeo for {image_ref}"))?;
-    let child_done = Arc::new(AtomicBool::new(false));
-    let child_cancelled = Arc::new(AtomicBool::new(false));
-    let cancel_reader = cancel_check.map(|cancel_check| {
-        let child_done = child_done.clone();
-        let child_cancelled = child_cancelled.clone();
-        let pid = child.id().to_string();
-        thread::spawn(move || {
-            while !child_done.load(Ordering::Relaxed) {
-                if cancel_check() {
-                    child_cancelled.store(true, Ordering::Relaxed);
-                    let _ = std::process::Command::new("kill")
-                        .args(["-TERM", &pid])
-                        .status();
-                    break;
-                }
-                thread::sleep(Duration::from_millis(250));
-            }
-        })
-    });
     let stdout = child
         .stdout
         .take()
@@ -2476,22 +2474,43 @@ fn copy_image_to_oci_layout(
         .take()
         .ok_or_else(|| anyhow::anyhow!("failed to capture skopeo errors"))?;
     let stderr_reader = thread::spawn(move || read_stream_to_string(stderr));
-    let mut progress_log = String::new();
-    let progress_result =
-        read_skopeo_progress(stdout, &mut progress_log, &mut on_progress, copy_steps);
-    let status = child.wait()?;
-    child_done.store(true, Ordering::Relaxed);
-    if let Some(cancel_reader) = cancel_reader {
-        let _ = cancel_reader.join();
-    }
-    progress_result?;
-    let error_log = stderr_reader
-        .join()
-        .map_err(|_| anyhow::anyhow!("skopeo error reader panicked"))??;
-    if child_cancelled.load(Ordering::Relaxed) {
+    let stdout_reader = thread::spawn(move || read_stream_to_string(stdout));
+    let mut pulled = 0;
+    let mut total = manifest.and_then(runtime_blob_total).unwrap_or(0);
+    let mut cancelled = false;
+    let result = loop {
+        if cancel_check.as_ref().is_some_and(|check| check()) {
+            cancelled = true;
+            let _ = child.kill();
+            break child.wait();
+        }
+        match sample_runtime_blob_bytes(oci_layout, manifest) {
+            Ok(bytes) => pulled = pulled.max(bytes),
+            Err(_) => total = 0,
+        }
+        if pulled > total {
+            total = 0;
+        }
+        on_progress(RuntimePullProgress::Bytes { pulled, total });
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) => thread::sleep(Duration::from_millis(250)),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break Err(error);
+            }
+        }
+    };
+    let progress_log = stdout_reader.join();
+    let error_log = stderr_reader.join();
+    let progress_log =
+        progress_log.map_err(|_| anyhow::anyhow!("skopeo output reader panicked"))??;
+    let error_log = error_log.map_err(|_| anyhow::anyhow!("skopeo error reader panicked"))??;
+    if cancelled {
         anyhow::bail!("runtime image pull cancelled for {image_ref}");
     }
-    if !status.success() {
+    if !result?.success() {
         anyhow::bail!(
             "skopeo copy failed for {image_ref}: {}",
             [progress_log.as_str(), error_log.as_str()]
@@ -2501,7 +2520,16 @@ fn copy_image_to_oci_layout(
                 .join("\n")
         );
     }
-    on_progress(RuntimePullProgress::Percent(100));
+    if let Ok(bytes) = sample_runtime_blob_bytes(oci_layout, manifest) {
+        pulled = pulled.max(bytes);
+        if pulled > total {
+            total = 0;
+        }
+        on_progress(RuntimePullProgress::Bytes { pulled, total });
+    }
+    on_progress(RuntimePullProgress::Status(
+        "Finalizing runtime image...".to_string(),
+    ));
     Ok(())
 }
 
@@ -2511,105 +2539,167 @@ fn read_stream_to_string(mut reader: impl Read) -> anyhow::Result<String> {
     Ok(buffer)
 }
 
-fn read_skopeo_progress(
-    mut reader: impl Read,
-    progress_log: &mut String,
-    on_progress: &mut impl FnMut(RuntimePullProgress),
-    copy_steps: Option<usize>,
-) -> anyhow::Result<()> {
-    let mut line = Vec::new();
-    let mut byte = [0];
-    let mut completed_steps = 0;
-    loop {
-        match reader.read(&mut byte)? {
-            0 => {
-                process_skopeo_progress_line(
-                    &line,
-                    progress_log,
-                    on_progress,
-                    copy_steps,
-                    &mut completed_steps,
-                );
-                break;
-            }
-            _ if byte[0] == b'\n' || byte[0] == b'\r' => {
-                process_skopeo_progress_line(
-                    &line,
-                    progress_log,
-                    on_progress,
-                    copy_steps,
-                    &mut completed_steps,
-                );
-                line.clear();
-            }
-            _ => line.push(byte[0]),
-        }
-    }
-    Ok(())
-}
+fn remote_runtime_manifest(image_ref: &str) -> anyhow::Result<(String, OciManifest)> {
+    use sha2::{Digest, Sha256};
 
-fn process_skopeo_progress_line(
-    line: &[u8],
-    progress_log: &mut String,
-    on_progress: &mut impl FnMut(RuntimePullProgress),
-    copy_steps: Option<usize>,
-    completed_steps: &mut usize,
-) {
-    let line = String::from_utf8_lossy(line);
-    let line = line.trim();
-    if line.is_empty() {
-        return;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut raw = skopeo_raw_manifest_with_timeout(
+        image_ref,
+        deadline.saturating_duration_since(Instant::now()),
+    )?;
+    if let Some((_, expected)) = image_ref.split_once('@') {
+        anyhow::ensure!(
+            format!("sha256:{}", hex_digest(&Sha256::digest(&raw))) == expected,
+            "source manifest digest mismatch"
+        );
     }
-    progress_log.push_str(line);
-    progress_log.push('\n');
-    if let Some(percent) = skopeo_progress_percent(line) {
-        on_progress(RuntimePullProgress::Percent(percent));
-    } else if let Some(status) = skopeo_progress_status(line) {
-        on_progress(RuntimePullProgress::Status(status));
-        if let Some(copy_steps) = copy_steps
-            && skopeo_progress_is_copy_step(line)
-        {
-            *completed_steps = completed_steps.saturating_add(1);
-            let percent = ((*completed_steps as f64 / copy_steps.max(1) as f64) * 100.0)
-                .round()
-                .clamp(1.0, 99.0) as u64;
-            on_progress(RuntimePullProgress::Percent(percent));
-        }
-    }
-}
-
-fn remote_runtime_copy_steps(image_ref: &str) -> anyhow::Result<Option<usize>> {
-    let raw = skopeo_raw_manifest(image_ref)?;
     let value: serde_json::Value = serde_json::from_slice(&raw)?;
-    let manifest = if value.get("layers").is_some() {
-        value
+    let digest = if value.get("layers").is_some() {
+        selected_manifest_digest_from_raw(&raw)?
     } else {
         let index: OciIndex = serde_json::from_value(value)?;
-        let Some(descriptor) = index
+        let mut candidates = index
             .manifests
             .iter()
-            .find(|descriptor| descriptor_matches_host(descriptor))
-            .or_else(|| index.manifests.first())
-        else {
-            return Ok(None);
-        };
-        let Some(digest_ref) = image_ref_with_digest(image_ref, &descriptor.digest) else {
-            return Ok(None);
-        };
-        serde_json::from_slice(&skopeo_raw_manifest(&digest_ref)?)?
+            .filter(|descriptor| descriptor_matches_host(descriptor));
+        let descriptor = candidates.next().context("no manifest for host platform")?;
+        anyhow::ensure!(
+            candidates.next().is_none(),
+            "ambiguous host platform manifests"
+        );
+        let digest_ref = image_ref_with_digest(image_ref, &descriptor.digest)
+            .context("unsupported image reference")?;
+        raw = skopeo_raw_manifest_with_timeout(
+            &digest_ref,
+            deadline.saturating_duration_since(Instant::now()),
+        )?;
+        anyhow::ensure!(
+            format!("sha256:{}", hex_digest(&Sha256::digest(&raw))) == descriptor.digest,
+            "selected manifest digest mismatch"
+        );
+        descriptor.digest.clone()
     };
-    let manifest: OciManifest = serde_json::from_value(manifest)?;
-    Ok(Some(manifest.layers.len() + 2))
+    let manifest: OciManifest = serde_json::from_slice(&raw)?;
+    Ok((
+        image_ref_with_digest(image_ref, &digest).context("unsupported image reference")?,
+        manifest,
+    ))
 }
 
-fn skopeo_raw_manifest(image_ref: &str) -> anyhow::Result<Vec<u8>> {
-    let output = std::process::Command::new("skopeo")
-        .args(["inspect", "--raw", &transport_ref(image_ref)])
-        .output()?;
-    if !output.status.success() {
-        anyhow::bail!("skopeo raw inspect failed for {image_ref}");
+fn runtime_blob_total(manifest: &OciManifest) -> Option<u64> {
+    if !matches!(
+        manifest.media_type.as_str(),
+        "application/vnd.oci.image.manifest.v1+json"
+            | "application/vnd.docker.distribution.manifest.v2+json"
+    ) || !matches!(
+        manifest.config.media_type.as_str(),
+        "application/vnd.oci.image.config.v1+json"
+            | "application/vnd.docker.container.image.v1+json"
+    ) || manifest.layers.iter().any(|layer| {
+        !matches!(
+            layer.media_type.as_str(),
+            "application/vnd.oci.image.layer.v1.tar+gzip"
+                | "application/vnd.docker.image.rootfs.diff.tar.gzip"
+        )
+    }) {
+        return None;
     }
-    Ok(output.stdout)
+    let mut sizes = HashMap::new();
+    let mut total = 0u64;
+    for descriptor in std::iter::once(&manifest.config).chain(&manifest.layers) {
+        let hash = descriptor.digest.strip_prefix("sha256:")?;
+        if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return None;
+        }
+        let size = descriptor.size?;
+        if let Some(previous) = sizes.insert(&descriptor.digest, size) {
+            if previous != size {
+                return None;
+            }
+        } else {
+            total = total.checked_add(size)?;
+        }
+    }
+    (total <= i64::MAX as u64).then_some(total)
+}
+
+fn sample_runtime_blob_bytes(layout: &Path, manifest: Option<&OciManifest>) -> anyhow::Result<u64> {
+    // Read temporary files first: a concurrent rename may then expose the same inode
+    // at its digest path. Count its largest observed length only once.
+    let mut files = HashMap::new();
+    let mut paths = Vec::new();
+    match std::fs::read_dir(layout) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry?;
+                if entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("oci-put-blob")
+                {
+                    paths.push(entry.path());
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error.into()),
+    }
+    // The destination manifest also identifies transformed blobs, without counting
+    // the manifest or index themselves as transfer payload.
+    let destination = read_selected_manifest(layout).ok();
+    for manifest in manifest.into_iter().chain(destination.as_ref()) {
+        for descriptor in std::iter::once(&manifest.config).chain(&manifest.layers) {
+            paths.push(blob_path(layout, &descriptor.digest)?);
+        }
+    }
+    if manifest.and_then(runtime_blob_total).is_none() {
+        #[derive(Deserialize)]
+        struct MetadataBlob {
+            layers: Option<serde::de::IgnoredAny>,
+            manifests: Option<serde::de::IgnoredAny>,
+        }
+        match std::fs::read_dir(layout.join("blobs/sha256")) {
+            Ok(entries) => {
+                for entry in entries {
+                    let path = entry?.path();
+                    if !std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_file()) {
+                        continue;
+                    }
+                    let file = match std::fs::File::open(&path) {
+                        Ok(file) => file,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(error) => return Err(error.into()),
+                    };
+                    let metadata =
+                        serde_json::from_reader::<_, MetadataBlob>(std::io::BufReader::new(file));
+                    if metadata.is_ok_and(|metadata| {
+                        metadata.layers.is_some() || metadata.manifests.is_some()
+                    }) {
+                        continue;
+                    }
+                    paths.push(path);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    for path in paths {
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.is_file() => {
+                let length = files
+                    .entry((metadata.dev(), metadata.ino()))
+                    .or_insert(0u64);
+                *length = (*length).max(metadata.len());
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(files
+        .values()
+        .fold(0u64, |total, size| total.saturating_add(*size)))
 }
 
 fn remote_selected_manifest_digest(image_ref: &str) -> anyhow::Result<String> {
@@ -2680,9 +2770,12 @@ fn hex_digest(bytes: &[u8]) -> String {
 }
 
 fn image_ref_with_digest(image_ref: &str, digest: &str) -> Option<String> {
-    if image_ref.contains('@') {
-        return Some(image_ref.to_string());
+    if image_ref.contains("://") && !image_ref.starts_with("docker://") {
+        return None;
     }
+    let image_ref = image_ref
+        .split_once('@')
+        .map_or(image_ref, |(name, _)| name);
     let (prefix, image) = image_ref.rsplit_once('/').unwrap_or(("", image_ref));
     let image = image.rsplit_once(':').map_or(image, |(name, _)| name);
     if prefix.is_empty() {
@@ -2690,39 +2783,6 @@ fn image_ref_with_digest(image_ref: &str, digest: &str) -> Option<String> {
     } else {
         Some(format!("{prefix}/{image}@{digest}"))
     }
-}
-
-fn skopeo_progress_percent(line: &str) -> Option<u64> {
-    let percent_index = line.find('%')?;
-    let before_percent = &line[..percent_index];
-    let start = before_percent
-        .rfind(|ch: char| !(ch.is_ascii_digit() || ch == '.'))
-        .map(|index| index + 1)
-        .unwrap_or(0);
-    before_percent[start..]
-        .parse::<f64>()
-        .ok()
-        .map(|percent| percent.round().clamp(0.0, 100.0) as u64)
-}
-
-fn skopeo_progress_status(line: &str) -> Option<String> {
-    if line.starts_with("Copying blob ") {
-        Some("Pulling runtime image layer...".to_string())
-    } else if line.starts_with("Copying config ") {
-        Some("Pulling runtime image config...".to_string())
-    } else if line.starts_with("Writing manifest") {
-        Some("Writing runtime image manifest...".to_string())
-    } else if line.starts_with("Storing signatures") {
-        Some("Storing runtime image signatures...".to_string())
-    } else {
-        None
-    }
-}
-
-fn skopeo_progress_is_copy_step(line: &str) -> bool {
-    line.starts_with("Copying blob ")
-        || line.starts_with("Copying config ")
-        || line.starts_with("Writing manifest")
 }
 
 fn transport_ref(image_ref: &str) -> String {
@@ -4064,87 +4124,192 @@ mod tests {
     }
 
     #[test]
-    fn skopeo_progress_percent_parses_percentage_text() {
-        assert_eq!(skopeo_progress_percent("Copying blob abc 42%"), Some(42));
-        assert_eq!(skopeo_progress_percent("Copying blob abc 42.6%"), Some(43));
-        assert_eq!(skopeo_progress_percent("Copying blob abc"), None);
-    }
-
-    #[hegel::test]
-    fn skopeo_progress_percent_rounds_and_clamps_generated_values(tc: TestCase) {
-        let tenths = tc.draw(gs::integers::<i64>().min_value(0).max_value(1500));
-        let percent = tenths as f64 / 10.0;
-        let expected = percent.round().clamp(0.0, 100.0) as u64;
-
-        assert_eq!(
-            skopeo_progress_percent(&format!("Copying blob sha256:abc {percent:.1}%")),
-            Some(expected)
-        );
-    }
-
-    #[test]
-    fn skopeo_progress_status_maps_copy_phases() {
-        assert_eq!(
-            skopeo_progress_status("Copying blob sha256:abc").as_deref(),
-            Some("Pulling runtime image layer...")
-        );
-        assert_eq!(
-            skopeo_progress_status("Writing manifest to image destination").as_deref(),
-            Some("Writing runtime image manifest...")
-        );
-        assert_eq!(
-            skopeo_progress_status("Getting image source signatures"),
-            None
-        );
-    }
-
-    #[test]
-    fn skopeo_progress_reader_derives_progress_from_stdout_lines() {
-        let output = b"Getting image source signatures\n\
-Copying blob sha256:one\n\
-Copying blob sha256:two\n\
-Copying config sha256:config\n\
-Writing manifest to image destination\n";
-        let mut events = Vec::new();
-        let mut log = String::new();
-
-        read_skopeo_progress(
-            &output[..],
-            &mut log,
-            &mut |progress| match progress {
-                RuntimePullProgress::Status(status) => events.push(format!("status:{status}")),
-                RuntimePullProgress::Percent(percent) => events.push(format!("percent:{percent}")),
-            },
-            Some(4),
+    fn runtime_blob_samples_count_growth_and_rename_without_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = temp.path();
+        std::fs::create_dir_all(layout.join("blobs/sha256")).unwrap();
+        let partial = layout.join("oci-put-blob123");
+        let file = std::fs::File::create(&partial).unwrap();
+        file.set_len(1024).unwrap();
+        assert_eq!(sample_runtime_blob_bytes(layout, None).unwrap(), 1024);
+        file.set_len(4096).unwrap();
+        assert_eq!(sample_runtime_blob_bytes(layout, None).unwrap(), 4096);
+        let complete = layout.join("blobs/sha256/layer");
+        std::fs::hard_link(&partial, &complete).unwrap();
+        assert_eq!(sample_runtime_blob_bytes(layout, None).unwrap(), 4096);
+        std::fs::remove_file(&complete).unwrap();
+        std::fs::rename(&partial, &complete).unwrap();
+        std::fs::write(
+            layout.join("blobs/sha256/manifest"),
+            br#"{"layers":[],"config":{"digest":"sha256:config"}}"#,
         )
-        .expect("read skopeo progress");
-
-        assert!(log.contains("Copying blob sha256:one"));
+        .unwrap();
+        std::fs::write(layout.join("blobs/sha256/index"), br#"{"manifests":[]}"#).unwrap();
+        std::fs::write(layout.join("index.json"), b"ignored").unwrap();
+        std::os::unix::fs::symlink(&complete, layout.join("oci-put-blob-link")).unwrap();
+        assert_eq!(sample_runtime_blob_bytes(layout, None).unwrap(), 4096);
         assert_eq!(
-            events,
-            vec![
-                "status:Pulling runtime image layer...",
-                "percent:25",
-                "status:Pulling runtime image layer...",
-                "percent:50",
-                "status:Pulling runtime image config...",
-                "percent:75",
-                "status:Writing runtime image manifest...",
-                "percent:99",
-            ]
+            sample_runtime_blob_bytes(&layout.join("missing"), None).unwrap(),
+            0
+        );
+    }
+
+    fn progress_manifest() -> OciManifest {
+        serde_json::from_value(serde_json::json!({
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {"digest": format!("sha256:{}", "a".repeat(64)), "size": 1024,
+                "mediaType": "application/vnd.oci.image.config.v1+json"},
+            "layers": [{"digest": format!("sha256:{}", "b".repeat(64)), "size": 4096,
+                "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip"}]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn runtime_blob_totals_require_preserved_sizes_and_unique_descriptors() {
+        let mut manifest = progress_manifest();
+        manifest.layers.push(manifest.layers[0].clone());
+        assert_eq!(runtime_blob_total(&manifest), Some(5120));
+        manifest.layers[1].size = Some(1);
+        assert_eq!(runtime_blob_total(&manifest), None);
+        manifest.layers.pop();
+        manifest.layers[0].media_type = "application/vnd.oci.image.layer.v1.tar".into();
+        assert_eq!(runtime_blob_total(&manifest), None);
+        manifest.layers[0].media_type = "application/vnd.oci.image.layer.v1.tar+zstd".into();
+        assert_eq!(runtime_blob_total(&manifest), None);
+        manifest = progress_manifest();
+        manifest.config.size = None;
+        assert_eq!(runtime_blob_total(&manifest), None);
+        manifest = progress_manifest();
+        manifest.media_type.clear();
+        assert_eq!(runtime_blob_total(&manifest), None);
+        manifest = progress_manifest();
+        manifest.media_type = "application/vnd.docker.distribution.manifest.v2+json".into();
+        manifest.config.media_type = "application/vnd.docker.container.image.v1+json".into();
+        manifest.layers[0].media_type = "application/vnd.docker.image.rootfs.diff.tar.gzip".into();
+        assert_eq!(runtime_blob_total(&manifest), Some(5120));
+    }
+
+    #[test]
+    fn runtime_known_blob_samples_exclude_unexpected_files_and_duplicate_descriptors() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut manifest = progress_manifest();
+        manifest.layers.push(manifest.layers[0].clone());
+        std::fs::create_dir_all(temp.path().join("blobs/sha256")).unwrap();
+        for descriptor in std::iter::once(&manifest.config).chain(&manifest.layers) {
+            std::fs::File::create(blob_path(temp.path(), &descriptor.digest).unwrap())
+                .unwrap()
+                .set_len(descriptor.size.unwrap())
+                .unwrap();
+        }
+        std::fs::write(temp.path().join("blobs/sha256/manifest"), b"not payload").unwrap();
+        assert_eq!(
+            sample_runtime_blob_bytes(temp.path(), Some(&manifest)).unwrap(),
+            5120
         );
     }
 
     #[test]
-    fn skopeo_copy_step_detection_ignores_non_copy_lines() {
-        assert!(skopeo_progress_is_copy_step("Copying blob sha256:abc"));
-        assert!(skopeo_progress_is_copy_step("Copying config sha256:abc"));
-        assert!(skopeo_progress_is_copy_step(
-            "Writing manifest to image destination"
-        ));
-        assert!(!skopeo_progress_is_copy_step(
-            "Getting image source signatures"
-        ));
+    fn image_ref_with_digest_replaces_parent_digest() {
+        assert_eq!(
+            image_ref_with_digest(
+                "docker://registry.example:5000/ns/image:tag@sha256:parent",
+                "sha256:child"
+            ),
+            Some("docker://registry.example:5000/ns/image@sha256:child".into())
+        );
+        assert_eq!(
+            image_ref_with_digest("registry.example/ns/image@sha256:parent", "sha256:child"),
+            Some("registry.example/ns/image@sha256:child".into())
+        );
+        assert_eq!(image_ref_with_digest("other://image", "sha256:child"), None);
+    }
+
+    #[test]
+    fn runtime_byte_samples_produce_real_speed_and_eta() {
+        let mut record = install_record();
+        let now = chrono::Utc::now();
+        record.bytes_pulled = 4096;
+        record.total_bytes = 8192;
+        record.samples = std::collections::VecDeque::from([
+            InstallSample {
+                at: now - chrono::Duration::seconds(2),
+                bytes_pulled: 1024,
+            },
+            InstallSample {
+                at: now,
+                bytes_pulled: 4096,
+            },
+        ]);
+        assert_eq!(install_bytes_per_second(&record), 1536);
+        assert_eq!(install_eta_seconds(&record, 1536), 3);
+        record.total_bytes = 0;
+        assert_eq!(install_eta_seconds(&record, 1536), -1);
+    }
+
+    #[test]
+    #[ignore = "requires skopeo and public registry access; writes only to a temporary directory"]
+    fn runtime_real_copy_progress_and_cancellation() {
+        let temp = tempfile::tempdir().unwrap();
+        let (reference, manifest) =
+            remote_runtime_manifest("docker.io/library/alpine:latest").unwrap();
+        let total = runtime_blob_total(&manifest).unwrap();
+        let mut previous = 0;
+        copy_image_to_oci_layout(
+            &reference,
+            &temp.path().join("copy"),
+            |event| {
+                if let RuntimePullProgress::Bytes {
+                    pulled,
+                    total: reported,
+                } = event
+                {
+                    assert!(pulled >= previous);
+                    assert_eq!(reported, total);
+                    previous = pulled;
+                }
+            },
+            Some(&manifest),
+            None,
+        )
+        .unwrap();
+        assert_eq!(previous, total);
+        eprintln!("Alpine copy measured {previous} / {total} blob bytes");
+        let cancel_layout = temp.path().join("cancelled");
+        let watched_layout = cancel_layout.clone();
+        let cancel =
+            Arc::new(move || sample_runtime_blob_bytes(&watched_layout, None).unwrap_or(0) > 0);
+        let result = copy_image_to_oci_layout(
+            &reference,
+            &cancel_layout,
+            |event| assert!(!matches!(event, RuntimePullProgress::Status(_))),
+            Some(&manifest),
+            Some(cancel),
+        );
+        assert!(result.unwrap_err().to_string().contains("cancelled"));
+        assert!(sample_runtime_blob_bytes(&cancel_layout, None).unwrap() > 0);
+        for (reference, cancel) in [
+            (
+                reference.as_str(),
+                Some(Arc::new(|| true) as Arc<dyn Fn() -> bool + Send + Sync>),
+            ),
+            ("unknown-transport://invalid", None),
+        ] {
+            let mut finalized = false;
+            let result = copy_image_to_oci_layout(
+                reference,
+                &temp.path().join("failed"),
+                |event| {
+                    if let RuntimePullProgress::Status(_) = event {
+                        finalized = true;
+                    }
+                },
+                Some(&manifest),
+                cancel,
+            );
+            assert!(result.is_err());
+            assert!(!finalized);
+        }
     }
 
     #[test]
