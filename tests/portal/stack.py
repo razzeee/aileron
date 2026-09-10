@@ -303,6 +303,52 @@ def main():
             ), tokens
             assert "hello stack" in "".join(str(event[2]) for event in tokens), tokens
 
+            # Exercise both guided methods through the real daemon/runtime, not
+            # only the frontend's mock backend or a Varlink contract fixture.
+            guided_events = {}
+            for name in ("GuidedSnapshotReceived", "GuidedToolCallsReceived"):
+                events = guided_events[name] = []
+                match = bus.add_signal_receiver(
+                    lambda *event, events=events: events.append(event),
+                    signal_name=name,
+                    dbus_interface="org.freedesktop.portal.Language",
+                    bus_name="org.freedesktop.portal.Desktop",
+                    path="/org/freedesktop/portal/desktop",
+                )
+                stack.callback(match.remove)
+            fields = dbus.Array([("summary", "string", "Short summary", True)], signature="(sssb)")
+            tools = dbus.Array([("lookup", "Look up a value", '{"type":"object"}')], signature="(sss)")
+            tool_results = None
+            for method, selected_tools, signal_name in (
+                ("StreamRespondGuided", dbus.Array([], signature="(sss)"), "GuidedSnapshotReceived"),
+                ("StreamRespondGuided", tools, "GuidedToolCallsReceived"),
+                ("StreamSubmitToolResultsGuided", tools, "GuidedSnapshotReceived"),
+            ):
+                for events in guided_events.values():
+                    events.clear()
+                request = xdp.Request(bus, interface)
+                parameters = dict(
+                    session_handle=session.handle,
+                    prompt="Summarize the lookup result",
+                    media_fds=dbus.Array([], signature="h"),
+                )
+                if method == "StreamSubmitToolResultsGuided":
+                    parameters["results"] = tool_results
+                parameters.update(fields=fields, tools=selected_tools, options={})
+                response = request.call(method, **parameters)
+                assert response is not None and response.response == 0, response
+                events = guided_events[signal_name]
+                assert events and events[-1][3], (method, guided_events)
+                assert all(str(event[0]) == request.handle and str(event[1]) == str(session.handle) for event in events)
+                if signal_name == "GuidedToolCallsReceived":
+                    calls = events[-1][2]
+                    assert len(calls) == 1 and str(calls[0][1]) == "lookup", calls
+                    tool_results = dbus.Array([(str(calls[0][0]), "lookup complete", '{"ok":true}')], signature="(sss)")
+                else:
+                    assert "summary" in json.loads(str(events[-1][2])), events
+                    assert not guided_events["GuidedToolCallsReceived"], guided_events
+            print("PASS: guided snapshots, terminal tool calls and tool-result continuation through the real stub")
+
             if args.check_cancellation:
                 # Stop only our own container's stub, then wait for bytes in its
                 # input pipe. Cancellation must happen after the daemon sent work.

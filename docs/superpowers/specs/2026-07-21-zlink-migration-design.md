@@ -54,11 +54,13 @@ The contract layer will provide:
 - stable module boundaries or deliberate consumer updates that keep protocol
   details out of UI and portal code.
 
-The existing `.varlink` files remain the protocol source of truth. The
-contract crate will contain reviewed, handwritten bindings because
-`zlink-codegen` cannot express the required streaming annotations and emits
-borrowed outputs that are unsuitable for streams. Structural introspection
-tests prevent the handwritten Rust contract from drifting from the IDLs.
+The existing `.varlink` files remain the protocol source of truth. The original
+handwritten-binding choice is superseded by build-time `zlink-codegen` output
+in Cargo's `OUT_DIR`. A small syntax-tree adaptation adds owned messages,
+introspection derives, and streaming annotations without restating IDL fields
+or types. Generated inference stream methods share a connection-owning cursor;
+ordinary methods and install streams use zlink's native proxies. Structural
+introspection and wire tests validate the generated contracts.
 
 A dual old/new server will not be retained. It would add socket ownership and
 behavioral complexity without providing a shipped compatibility requirement.

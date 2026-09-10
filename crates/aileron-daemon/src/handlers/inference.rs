@@ -2,6 +2,7 @@
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::future::Future;
 use std::io::Read;
 use std::path::PathBuf;
 use std::sync::{
@@ -74,81 +75,10 @@ impl<T> ChannelCall<T> {
         self.continues = continues;
     }
 
-    fn error(&self, error: Error) {
-        let _ = tokio::task::block_in_place(|| self.sender.blocking_send(Err(error)));
+    fn disconnected(&self) -> bool {
+        self.sender.is_closed()
     }
 }
-
-macro_rules! token_call {
-    ($trait_name:ident, $reply:ident) => {
-        trait $trait_name: Send {
-            fn wants_more(&self) -> bool;
-            fn disconnected(&self) -> bool;
-            fn set_continues(&mut self, continues: bool);
-            fn reply(&mut self, token: String) -> Result<(), StreamClosed>;
-        }
-
-        impl $trait_name for ChannelCall<$reply> {
-            fn wants_more(&self) -> bool {
-                self.more
-            }
-            fn disconnected(&self) -> bool {
-                self.sender.is_closed()
-            }
-            fn set_continues(&mut self, continues: bool) {
-                self.continues = continues;
-            }
-            fn reply(&mut self, token: String) -> Result<(), StreamClosed> {
-                self.send($reply { token })
-            }
-        }
-    };
-}
-
-token_call!(ResponseCall, StreamResponse_Reply);
-token_call!(TranscribeCall, StreamTranscribe_Reply);
-token_call!(DescribeCall, StreamDescribe_Reply);
-token_call!(OcrCall, StreamOcr_Reply);
-
-macro_rules! guided_call {
-    ($trait_name:ident, $reply:ident) => {
-        trait $trait_name: Send {
-            fn wants_more(&self) -> bool;
-            fn disconnected(&self) -> bool;
-            fn set_continues(&mut self, continues: bool);
-            fn reply(
-                &mut self,
-                snapshot_json: String,
-                tool_calls: Vec<ToolCall>,
-            ) -> Result<(), StreamClosed>;
-        }
-
-        impl $trait_name for ChannelCall<$reply> {
-            fn wants_more(&self) -> bool {
-                self.more
-            }
-            fn disconnected(&self) -> bool {
-                self.sender.is_closed()
-            }
-            fn set_continues(&mut self, continues: bool) {
-                self.continues = continues;
-            }
-            fn reply(
-                &mut self,
-                snapshot_json: String,
-                tool_calls: Vec<ToolCall>,
-            ) -> Result<(), StreamClosed> {
-                self.send($reply {
-                    snapshot_json,
-                    tool_calls,
-                })
-            }
-        }
-    };
-}
-
-guided_call!(GuidedResponseCall, StreamRespondGuided_Reply);
-guided_call!(GuidedToolResultsCall, StreamSubmitToolResultsGuided_Reply);
 
 type ProfileRuntime = (
     String,
@@ -292,6 +222,43 @@ enum ResolveSessionError {
 impl InferenceHandler {
     pub fn new(state: SharedState) -> Self {
         Self { state }
+    }
+
+    fn reply_stream<T: Send + 'static, F: Future<Output = Option<Error>> + Send + 'static>(
+        &self,
+        more: bool,
+        capacity: usize,
+        operation: impl FnOnce(SharedState, OperationCancellation, ChannelCall<T>) -> F + Send + 'static,
+    ) -> InferenceStream<T> {
+        let (sender, receiver) = mpsc::channel(capacity);
+        let state = self.state.clone();
+        tokio::spawn(async move {
+            let cancellation = OperationCancellation::default();
+            let _disconnect_watcher = cancellation.watch_sender(&sender);
+            let call = ChannelCall::new(sender.clone(), more);
+            if let Some(error) = operation(state, cancellation, call).await {
+                let _ = sender.send(Err(error)).await;
+            }
+        });
+        ReceiverStream::new(receiver)
+    }
+
+    fn single_reply<T: Send + 'static, F: Future<Output = Result<T, Error>> + Send + 'static>(
+        &self,
+        operation: impl FnOnce(SharedState, OperationCancellation) -> F + Send + 'static,
+    ) -> InferenceStream<T> {
+        self.reply_stream(false, 1, |state, cancellation, call| async move {
+            match operation(state, cancellation).await {
+                Ok(reply) => {
+                    let _ = call
+                        .sender
+                        .send(Ok(zlink::Reply::from(reply).set_continues(Some(false))))
+                        .await;
+                    None
+                }
+                Err(error) => Some(error),
+            }
+        })
     }
 
     pub async fn get_use_case_availability(
@@ -449,13 +416,8 @@ impl InferenceHandler {
         media_paths: Vec<String>,
         options: ResponseOptions,
     ) -> InferenceStream<StreamResponse_Reply> {
-        let (sender, receiver) = mpsc::channel(8);
-        let state = self.state.clone();
-        tokio::spawn(async move {
-            let cancellation = OperationCancellation::default();
-            let _disconnect_watcher = cancellation.watch_sender(&sender);
-            let mut call = ChannelCall::new(sender, more);
-            let error = stream_tokens(
+        self.reply_stream(more, 8, move |state, cancellation, mut call| async move {
+            stream_tokens(
                 &state,
                 &cancellation,
                 &mut call,
@@ -466,12 +428,8 @@ impl InferenceHandler {
             )
             .await
             .err()
-            .and_then(|error| generation_error(error, false));
-            if let Some(error) = error {
-                call.error(error);
-            }
-        });
-        ReceiverStream::new(receiver)
+            .and_then(|error| generation_error(error, false))
+        })
     }
 
     pub fn stream_transcribe(
@@ -481,13 +439,8 @@ impl InferenceHandler {
         audio_path: String,
         options: SpeechOptions,
     ) -> InferenceStream<StreamTranscribe_Reply> {
-        let (sender, receiver) = mpsc::channel(8);
-        let state = self.state.clone();
-        tokio::spawn(async move {
-            let cancellation = OperationCancellation::default();
-            let _disconnect_watcher = cancellation.watch_sender(&sender);
-            let mut call = ChannelCall::new(sender, more);
-            let error = stream_transcription(
+        self.reply_stream(more, 8, move |state, cancellation, mut call| async move {
+            stream_transcription(
                 &state,
                 &cancellation,
                 &mut call,
@@ -497,12 +450,8 @@ impl InferenceHandler {
             )
             .await
             .err()
-            .and_then(speech_error);
-            if let Some(error) = error {
-                call.error(error);
-            }
-        });
-        ReceiverStream::new(receiver)
+            .and_then(speech_error)
+        })
     }
 
     pub fn stream_describe(
@@ -513,13 +462,8 @@ impl InferenceHandler {
         instructions: String,
         options: VisionOptions,
     ) -> InferenceStream<StreamDescribe_Reply> {
-        let (sender, receiver) = mpsc::channel(8);
-        let state = self.state.clone();
-        tokio::spawn(async move {
-            let cancellation = OperationCancellation::default();
-            let _disconnect_watcher = cancellation.watch_sender(&sender);
-            let mut call = ChannelCall::new(sender, more);
-            let error = stream_vision_text(
+        self.reply_stream(more, 8, move |state, cancellation, mut call| async move {
+            stream_vision_text(
                 &state,
                 &cancellation,
                 &mut call,
@@ -528,15 +472,12 @@ impl InferenceHandler {
                 instructions,
                 options,
                 "vision.describe",
+                |token| StreamDescribe_Reply { token },
             )
             .await
             .err()
-            .and_then(vision_error);
-            if let Some(error) = error {
-                call.error(error);
-            }
-        });
-        ReceiverStream::new(receiver)
+            .and_then(vision_error)
+        })
     }
 
     pub fn stream_synthesize(
@@ -546,22 +487,12 @@ impl InferenceHandler {
         text: String,
         options: SynthesisOptions,
     ) -> InferenceStream<StreamSynthesize_Reply> {
-        let (sender, receiver) = mpsc::channel(8);
-        let state = self.state.clone();
-        tokio::spawn(async move {
-            let cancellation = OperationCancellation::default();
-            let _disconnect_watcher = cancellation.watch_sender(&sender);
-            let mut call = ChannelCall::new(sender, more);
-            let error =
-                stream_synthesis(&state, &cancellation, &mut call, session_id, text, options)
-                    .await
-                    .err()
-                    .and_then(speech_error);
-            if let Some(error) = error {
-                call.error(error);
-            }
-        });
-        ReceiverStream::new(receiver)
+        self.reply_stream(more, 8, move |state, cancellation, mut call| async move {
+            stream_synthesis(&state, &cancellation, &mut call, session_id, text, options)
+                .await
+                .err()
+                .and_then(speech_error)
+        })
     }
 
     pub fn stream_ocr(
@@ -572,13 +503,8 @@ impl InferenceHandler {
         instructions: String,
         options: VisionOptions,
     ) -> InferenceStream<StreamOcr_Reply> {
-        let (sender, receiver) = mpsc::channel(8);
-        let state = self.state.clone();
-        tokio::spawn(async move {
-            let cancellation = OperationCancellation::default();
-            let _disconnect_watcher = cancellation.watch_sender(&sender);
-            let mut call = ChannelCall::new(sender, more);
-            let error = stream_vision_text(
+        self.reply_stream(more, 8, move |state, cancellation, mut call| async move {
+            stream_vision_text(
                 &state,
                 &cancellation,
                 &mut call,
@@ -587,15 +513,12 @@ impl InferenceHandler {
                 instructions,
                 options,
                 "vision.ocr",
+                |token| StreamOcr_Reply { token },
             )
             .await
             .err()
-            .and_then(vision_error);
-            if let Some(error) = error {
-                call.error(error);
-            }
-        });
-        ReceiverStream::new(receiver)
+            .and_then(vision_error)
+        })
     }
 
     pub fn stream_detect(
@@ -606,12 +529,8 @@ impl InferenceHandler {
         instructions: String,
         options: VisionOptions,
     ) -> InferenceStream<StreamDetect_Reply> {
-        let (sender, receiver) = mpsc::channel(1);
-        let state = self.state.clone();
-        tokio::spawn(async move {
-            let cancellation = OperationCancellation::default();
-            let _disconnect_watcher = cancellation.watch_sender(&sender);
-            let item = vision_detections(
+        self.single_reply(move |state, cancellation| async move {
+            vision_detections(
                 &state,
                 &cancellation,
                 session_id,
@@ -620,15 +539,11 @@ impl InferenceHandler {
                 options,
             )
             .await
-            .map(|detections| {
-                zlink::Reply::from(StreamDetect_Reply { detections }).set_continues(Some(false))
-            })
+            .map(|detections| StreamDetect_Reply { detections })
             .map_err(|error| {
                 vision_error(error).expect("single-result operation has no send error")
-            });
-            let _ = sender.send(item).await;
-        });
-        ReceiverStream::new(receiver)
+            })
+        })
     }
 
     pub fn stream_segment(
@@ -639,12 +554,8 @@ impl InferenceHandler {
         instructions: String,
         options: VisionSegmentOptions,
     ) -> InferenceStream<StreamSegment_Reply> {
-        let (sender, receiver) = mpsc::channel(1);
-        let state = self.state.clone();
-        tokio::spawn(async move {
-            let cancellation = OperationCancellation::default();
-            let _disconnect_watcher = cancellation.watch_sender(&sender);
-            let item = vision_masks(
+        self.single_reply(move |state, cancellation| async move {
+            vision_masks(
                 &state,
                 &cancellation,
                 session_id,
@@ -653,15 +564,11 @@ impl InferenceHandler {
                 options,
             )
             .await
-            .map(|masks| {
-                zlink::Reply::from(StreamSegment_Reply { masks }).set_continues(Some(false))
-            })
+            .map(|masks| StreamSegment_Reply { masks })
             .map_err(|error| {
                 vision_error(error).expect("single-result operation has no send error")
-            });
-            let _ = sender.send(item).await;
-        });
-        ReceiverStream::new(receiver)
+            })
+        })
     }
 
     pub fn stream_depth(
@@ -672,12 +579,8 @@ impl InferenceHandler {
         instructions: String,
         options: VisionOptions,
     ) -> InferenceStream<StreamDepth_Reply> {
-        let (sender, receiver) = mpsc::channel(1);
-        let state = self.state.clone();
-        tokio::spawn(async move {
-            let cancellation = OperationCancellation::default();
-            let _disconnect_watcher = cancellation.watch_sender(&sender);
-            let item = vision_depth(
+        self.single_reply(move |state, cancellation| async move {
+            vision_depth(
                 &state,
                 &cancellation,
                 session_id,
@@ -686,13 +589,11 @@ impl InferenceHandler {
                 options,
             )
             .await
-            .map(|depth| zlink::Reply::from(StreamDepth_Reply { depth }).set_continues(Some(false)))
+            .map(|depth| StreamDepth_Reply { depth })
             .map_err(|error| {
                 vision_error(error).expect("single-result operation has no send error")
-            });
-            let _ = sender.send(item).await;
-        });
-        ReceiverStream::new(receiver)
+            })
+        })
     }
 
     pub fn stream_embed(
@@ -702,27 +603,18 @@ impl InferenceHandler {
         text: String,
         options: EmbedOptions,
     ) -> InferenceStream<StreamEmbed_Reply> {
-        let (sender, receiver) = mpsc::channel(1);
-        let state = self.state.clone();
-        tokio::spawn(async move {
-            let cancellation = OperationCancellation::default();
-            let _disconnect_watcher = cancellation.watch_sender(&sender);
-            let item = embedding_vector(&state, &cancellation, session_id, text, options)
+        self.single_reply(move |state, cancellation| async move {
+            embedding_vector(&state, &cancellation, session_id, text, options)
                 .await
-                .map(|result| {
-                    zlink::Reply::from(StreamEmbed_Reply {
-                        embedding: result.embedding,
-                        embedding_pipeline_id: result.pipeline_id,
-                    })
-                    .set_continues(Some(false))
+                .map(|result| StreamEmbed_Reply {
+                    embedding: result.embedding,
+                    embedding_pipeline_id: result.pipeline_id,
                 })
                 .map_err(|error| {
                     generation_error(error, false)
                         .expect("single-result operation has no send error")
-                });
-            let _ = sender.send(item).await;
-        });
-        ReceiverStream::new(receiver)
+                })
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -736,17 +628,14 @@ impl InferenceHandler {
         tools: Vec<ToolDefinition>,
         options: GuidedOptions,
     ) -> InferenceStream<StreamRespondGuided_Reply> {
-        let (sender, receiver) = mpsc::channel(8);
-        let state = self.state.clone();
-        tokio::spawn(async move {
-            let cancellation = OperationCancellation::default();
-            let _disconnect_watcher = cancellation.watch_sender(&sender);
-            let mut call = ChannelCall::new(sender, more);
-            let error = stream_guided_snapshots(
+        self.reply_stream(more, 8, move |state, cancellation, mut call| async move {
+            stream_guided_snapshots(
                 &state,
                 &cancellation,
                 &mut call,
                 GuidedStreamRequest {
+                    method: "StreamRespondGuided",
+                    results: Vec::new(),
                     session_id,
                     prompt,
                     media_paths,
@@ -754,15 +643,15 @@ impl InferenceHandler {
                     tools,
                     options,
                 },
+                |snapshot_json, tool_calls| StreamRespondGuided_Reply {
+                    snapshot_json,
+                    tool_calls,
+                },
             )
             .await
             .err()
-            .and_then(|error| generation_error(error, true));
-            if let Some(error) = error {
-                call.error(error);
-            }
-        });
-        ReceiverStream::new(receiver)
+            .and_then(|error| generation_error(error, true))
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -777,32 +666,30 @@ impl InferenceHandler {
         tools: Vec<ToolDefinition>,
         options: GuidedOptions,
     ) -> InferenceStream<StreamSubmitToolResultsGuided_Reply> {
-        let (sender, receiver) = mpsc::channel(8);
-        let state = self.state.clone();
-        tokio::spawn(async move {
-            let cancellation = OperationCancellation::default();
-            let _disconnect_watcher = cancellation.watch_sender(&sender);
-            let mut call = ChannelCall::new(sender, more);
-            let error = stream_guided_tool_results(
+        self.reply_stream(more, 8, move |state, cancellation, mut call| async move {
+            stream_guided_snapshots(
                 &state,
                 &cancellation,
                 &mut call,
-                session_id,
-                prompt,
-                media_paths,
-                results,
-                fields,
-                tools,
-                options,
+                GuidedStreamRequest {
+                    method: "StreamSubmitToolResultsGuided",
+                    session_id,
+                    prompt,
+                    media_paths,
+                    results,
+                    fields,
+                    tools,
+                    options,
+                },
+                |snapshot_json, tool_calls| StreamSubmitToolResultsGuided_Reply {
+                    snapshot_json,
+                    tool_calls,
+                },
             )
             .await
             .err()
-            .and_then(|error| generation_error(error, true));
-            if let Some(error) = error {
-                call.error(error);
-            }
-        });
-        ReceiverStream::new(receiver)
+            .and_then(|error| generation_error(error, true))
+        })
     }
 
     pub async fn end_session(&self, session_id: String) -> Result<(), Error> {
@@ -965,7 +852,7 @@ fn assigned_profile_id_for_use_case(guard: &crate::state::Inner, use_case: &str)
 async fn stream_transcription(
     state: &SharedState,
     cancellation: &OperationCancellation,
-    call: &mut dyn TranscribeCall,
+    call: &mut ChannelCall<StreamTranscribe_Reply>,
     session_id: String,
     audio_path: String,
     options: SpeechOptions,
@@ -1024,7 +911,7 @@ async fn stream_transcription(
 
                     if let Some(previous) = pending_token.replace(token) {
                         call.set_continues(true);
-                        if let Err(e) = call.reply(previous) {
+                        if let Err(e) = call.send(StreamTranscribe_Reply { token: previous }) {
                             handle.terminate();
                             reply_error = Some(e);
                         }
@@ -1054,8 +941,10 @@ async fn stream_transcription(
             if wants_more {
                 call.set_continues(false);
             }
-            call.reply(pending_token.unwrap_or_default())
-                .map_err(SpeechError::Reply)
+            call.send(StreamTranscribe_Reply {
+                token: pending_token.unwrap_or_default(),
+            })
+            .map_err(SpeechError::Reply)
         },
     )
     .await
@@ -1209,15 +1098,16 @@ fn validate_synthesis_option(name: &str, value: &str, max_bytes: usize) -> Resul
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn stream_vision_text<C: TextStreamCall + ?Sized>(
+async fn stream_vision_text<R: Send>(
     state: &SharedState,
     cancellation: &OperationCancellation,
-    call: &mut C,
+    call: &mut ChannelCall<R>,
     session_id: String,
     image_path: String,
     instructions: String,
     options: VisionOptions,
     expected_use_case: &str,
+    make_reply: fn(String) -> R,
 ) -> Result<(), VisionError> {
     let execution_mode =
         parse_execution_mode(&options.execution_mode).map_err(VisionError::InvalidInput)?;
@@ -1273,6 +1163,7 @@ async fn stream_vision_text<C: TextStreamCall + ?Sized>(
                             &mut pending_token,
                             &mut saw_token,
                             &mut reply_error,
+                            make_reply,
                         );
                         if reply_error.is_some() {
                             handle.terminate();
@@ -1303,6 +1194,7 @@ async fn stream_vision_text<C: TextStreamCall + ?Sized>(
                             &mut pending_token,
                             &mut saw_token,
                             &mut reply_error,
+                            make_reply,
                         );
                         if reply_error.is_some() {
                             handle.terminate();
@@ -1335,20 +1227,21 @@ async fn stream_vision_text<C: TextStreamCall + ?Sized>(
             if wants_more {
                 call.set_continues(false);
             }
-            call.reply_token(pending_token.unwrap_or_default())
+            call.send(make_reply(pending_token.unwrap_or_default()))
                 .map_err(VisionError::Reply)
         },
     )
     .await
 }
 
-fn forward_text_stream_token<C: TextStreamCall + ?Sized>(
-    call: &mut C,
+fn forward_text_stream_token<R>(
+    call: &mut ChannelCall<R>,
     wants_more: bool,
     token: String,
     pending_token: &mut Option<String>,
     saw_token: &mut bool,
     reply_error: &mut Option<StreamClosed>,
+    make_reply: fn(String) -> R,
 ) {
     if !token.is_empty() {
         *saw_token = true;
@@ -1364,7 +1257,7 @@ fn forward_text_stream_token<C: TextStreamCall + ?Sized>(
 
     if let Some(previous) = pending_token.replace(token) {
         call.set_continues(true);
-        if let Err(e) = call.reply_token(previous) {
+        if let Err(e) = call.send(make_reply(previous)) {
             *reply_error = Some(e);
         }
     }
@@ -1842,7 +1735,7 @@ fn base64_encode(data: &[u8]) -> String {
 async fn stream_tokens(
     state: &SharedState,
     cancellation: &OperationCancellation,
-    call: &mut dyn ResponseCall,
+    call: &mut ChannelCall<StreamResponse_Reply>,
     session_id: String,
     input_json: String,
     media_paths: Vec<String>,
@@ -1906,7 +1799,7 @@ async fn stream_tokens(
 
                         if let Some(previous) = pending_token.replace(token) {
                             call.set_continues(true);
-                            if let Err(e) = call.reply(previous) {
+                            if let Err(e) = call.send(StreamResponse_Reply { token: previous }) {
                                 handle.terminate();
                                 reply_error = Some(e);
                             }
@@ -1950,7 +1843,7 @@ async fn stream_tokens(
             if wants_more {
                 call.set_continues(false);
             }
-            call.reply(pending_token.unwrap_or_default())
+            call.send(StreamResponse_Reply { token: pending_token.unwrap_or_default() })
                 .map_err(GenerationError::Reply)
         },
     )
@@ -2820,49 +2713,6 @@ async fn profile_is_missing(state: &SharedState, profile_id: &str) -> bool {
     guard.profiles.get(profile_id).is_none()
 }
 
-trait TextStreamCall {
-    fn wants_more(&self) -> bool;
-    fn disconnected(&self) -> bool;
-    fn set_continues(&mut self, continues: bool);
-    fn reply_token(&mut self, token: String) -> Result<(), StreamClosed>;
-}
-
-impl TextStreamCall for ChannelCall<StreamDescribe_Reply> {
-    fn wants_more(&self) -> bool {
-        DescribeCall::wants_more(self)
-    }
-
-    fn disconnected(&self) -> bool {
-        DescribeCall::disconnected(self)
-    }
-
-    fn set_continues(&mut self, continues: bool) {
-        DescribeCall::set_continues(self, continues);
-    }
-
-    fn reply_token(&mut self, token: String) -> Result<(), StreamClosed> {
-        DescribeCall::reply(self, token)
-    }
-}
-
-impl TextStreamCall for ChannelCall<StreamOcr_Reply> {
-    fn wants_more(&self) -> bool {
-        OcrCall::wants_more(self)
-    }
-
-    fn disconnected(&self) -> bool {
-        OcrCall::disconnected(self)
-    }
-
-    fn set_continues(&mut self, continues: bool) {
-        OcrCall::set_continues(self, continues);
-    }
-
-    fn reply_token(&mut self, token: String) -> Result<(), StreamClosed> {
-        OcrCall::reply(self, token)
-    }
-}
-
 fn generation_failure_error(reason: String) -> Error {
     match generation_failure_reply(&reason) {
         FailureReply::ContextWindowExceeded => Error::ContextWindowExceeded { reason },
@@ -2917,26 +2767,31 @@ fn guided_failure_reply(reason: &str) -> FailureReply {
 }
 
 struct GuidedStreamRequest {
+    method: &'static str,
     session_id: String,
     prompt: String,
     media_paths: Vec<String>,
     fields: Vec<GuidedField>,
     tools: Vec<ToolDefinition>,
+    results: Vec<ToolResult>,
     options: GuidedOptions,
 }
 
-async fn stream_guided_snapshots(
+async fn stream_guided_snapshots<R: Send>(
     state: &SharedState,
     cancellation: &OperationCancellation,
-    call: &mut dyn GuidedResponseCall,
+    call: &mut ChannelCall<R>,
     request: GuidedStreamRequest,
+    make_reply: fn(String, Vec<ToolCall>) -> R,
 ) -> Result<(), GenerationError> {
     let GuidedStreamRequest {
+        method,
         session_id,
         prompt,
         media_paths,
         fields,
         tools,
+        results,
         options,
     } = request;
     let (max_tokens, execution_mode) = validate_token_options(
@@ -2954,7 +2809,7 @@ async fn stream_guided_snapshots(
         .map_err(GenerationError::InvalidInput)?;
     let prompt = input.as_deref().map(render_text_prompt).unwrap_or(prompt);
     with_locked_container(
-        "StreamRespondGuided",
+        method,
         state,
         &session_id,
         resolved.clone(),
@@ -2978,7 +2833,7 @@ async fn stream_guided_snapshots(
                 &schema,
                 execution_mode.as_str(),
                 tools,
-                Vec::new(),
+                results.into_iter().map(varlink_tool_result).collect(),
                 |snapshot, tool_calls, done| {
                     if call.disconnected() {
                         handle.terminate();
@@ -3011,7 +2866,9 @@ async fn stream_guided_snapshots(
                     if !tool_calls.is_empty() {
                         call.set_continues(false);
                         emitted_tool_calls = true;
-                        if let Err(e) = call.reply(String::new(), varlink_tool_calls(tool_calls)) {
+                        if let Err(e) =
+                            call.send(make_reply(String::new(), varlink_tool_calls(tool_calls)))
+                        {
                             handle.terminate();
                             reply_error = Some(e);
                         }
@@ -3019,7 +2876,7 @@ async fn stream_guided_snapshots(
                     }
                     if let Some(previous) = pending_snapshot.replace(snapshot) {
                         call.set_continues(true);
-                        if let Err(e) = call.reply(previous, Vec::new()) {
+                        if let Err(e) = call.send(make_reply(previous, Vec::new())) {
                             handle.terminate();
                             reply_error = Some(e);
                         }
@@ -3056,157 +2913,16 @@ async fn stream_guided_snapshots(
                 call.set_continues(false);
             }
             if let Some(tool_calls) = pending_tool_calls {
-                call.reply(String::new(), tool_calls)
+                call.send(make_reply(String::new(), tool_calls))
                     .map_err(GenerationError::Reply)
             } else if emitted_tool_calls {
                 Ok(())
             } else {
-                call.reply(pending_snapshot.unwrap_or(final_snapshot), Vec::new())
-                    .map_err(GenerationError::Reply)
-            }
-        },
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn stream_guided_tool_results(
-    state: &SharedState,
-    cancellation: &OperationCancellation,
-    call: &mut dyn GuidedToolResultsCall,
-    session_id: String,
-    prompt: String,
-    media_paths: Vec<String>,
-    results: Vec<ToolResult>,
-    fields: Vec<GuidedField>,
-    tools: Vec<ToolDefinition>,
-    options: GuidedOptions,
-) -> Result<(), GenerationError> {
-    let (max_tokens, execution_mode) = validate_token_options(
-        options.maximum_response_tokens,
-        options.temperature,
-        &options.execution_mode,
-    )
-    .map_err(GenerationError::InvalidOptions)?;
-    let schema = guided_fields_schema(&fields).map_err(GenerationError::Failed)?;
-    let resolved = resolve_session_runtime(state, &session_id, ensure_language_generation_use_case)
-        .await
-        .map_err(GenerationError::from)?;
-    let mut media_budget = MediaBudget::default();
-    let input = normalize_guided_input(&prompt, &media_paths, &mut media_budget)
-        .map_err(GenerationError::InvalidInput)?;
-    let prompt = input.as_deref().map(render_text_prompt).unwrap_or(prompt);
-    with_locked_container(
-        "StreamSubmitToolResultsGuided",
-        state,
-        &session_id,
-        resolved.clone(),
-        execution_mode,
-        Some(cancellation),
-        GenerationError::Failed,
-        |container, handle, _spawned| {
-            let wants_more = call.wants_more();
-            let mut pending_snapshot: Option<String> = None;
-            let mut pending_tool_calls: Option<Vec<ToolCall>> = None;
-            let mut final_snapshot = String::new();
-            let mut emitted_tool_calls = false;
-            let mut reply_error: Option<StreamClosed> = None;
-            let mut cancelled = false;
-            let tools = tools.into_iter().map(varlink_tool_definition).collect();
-            let tool_results = results.into_iter().map(varlink_tool_result).collect();
-            let result = container.stream_structured(
-                Some(&resolved.instructions),
-                &prompt,
-                input.as_deref(),
-                max_tokens,
-                &schema,
-                execution_mode.as_str(),
-                tools,
-                tool_results,
-                |snapshot, tool_calls, done| {
-                    if call.disconnected() {
-                        handle.terminate();
-                        cancelled = true;
-                        return;
-                    }
-                    if cancelled
-                        || RequestCancellation::for_session(state, &session_id).is_cancelled()
-                    {
-                        cancelled = true;
-                        return;
-                    }
-                    if emitted_tool_calls {
-                        return;
-                    }
-                    if !snapshot.is_empty() {
-                        final_snapshot = snapshot.clone();
-                    }
-                    if !wants_more {
-                        if tool_calls.is_empty() {
-                            pending_snapshot = Some(snapshot);
-                        } else {
-                            pending_tool_calls = Some(varlink_tool_calls(tool_calls));
-                        }
-                        return;
-                    }
-                    if reply_error.is_some() {
-                        return;
-                    }
-                    if !tool_calls.is_empty() {
-                        call.set_continues(false);
-                        emitted_tool_calls = true;
-                        if let Err(e) = call.reply(String::new(), varlink_tool_calls(tool_calls)) {
-                            handle.terminate();
-                            reply_error = Some(e);
-                        }
-                        return;
-                    }
-                    if let Some(previous) = pending_snapshot.replace(snapshot) {
-                        call.set_continues(true);
-                        if let Err(e) = call.reply(previous, Vec::new()) {
-                            handle.terminate();
-                            reply_error = Some(e);
-                        }
-                    }
-                    if done {
-                        call.set_continues(false);
-                    }
-                },
-            );
-
-            if let Some(e) = reply_error {
-                return Err(GenerationError::Reply(e));
-            }
-            if cancelled || RequestCancellation::for_session(state, &session_id).is_cancelled() {
-                if wants_more {
-                    call.set_continues(false);
-                }
-                return Err(GenerationError::Failed(
-                    request_execution::request_cancelled_reason(),
-                ));
-            }
-            if let Err(e) = result {
-                if wants_more {
-                    call.set_continues(false);
-                }
-                return Err(GenerationError::Failed(e.to_string()));
-            }
-            if final_snapshot.is_empty() && !emitted_tool_calls && pending_tool_calls.is_none() {
-                return Err(GenerationError::Failed(
-                    "model returned no guided snapshots".to_string(),
-                ));
-            }
-            if wants_more {
-                call.set_continues(false);
-            }
-            if let Some(tool_calls) = pending_tool_calls {
-                call.reply(String::new(), tool_calls)
-                    .map_err(GenerationError::Reply)
-            } else if emitted_tool_calls {
-                Ok(())
-            } else {
-                call.reply(pending_snapshot.unwrap_or(final_snapshot), Vec::new())
-                    .map_err(GenerationError::Reply)
+                call.send(make_reply(
+                    pending_snapshot.unwrap_or(final_snapshot),
+                    Vec::new(),
+                ))
+                .map_err(GenerationError::Reply)
             }
         },
     )

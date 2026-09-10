@@ -141,12 +141,16 @@ dependencies = [
 name = "aileron-varlink"
 version = "0.1.0"
 dependencies = [
+ "prettyplease",
+ "quote",
  "serde",
  "serde_json",
+ "syn 2.0.119",
  "tempfile",
  "tokio",
  "tokio-stream",
  "zlink",
+ "zlink-codegen",
 ]
 
 [[package]]
@@ -4419,6 +4423,17 @@ dependencies = [
  "zlink-core",
  "zlink-smol",
  "zlink-tokio",
+]
+
+[[package]]
+name = "zlink-codegen"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a2721eb2975676882535609db63ad89c2868510c0db1663b245757e21b6cdc96"
+dependencies = [
+ "clap",
+ "heck",
+ "zlink",
 ]
 
 [[package]]
