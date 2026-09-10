@@ -49,6 +49,7 @@ jobs:
           -p aileron-ipc
           -p aileron-daemon
           -p aileron-portal
+          -p aileron-runtime
 
       - name: cargo test (core crates only)
         run: >
@@ -57,6 +58,7 @@ jobs:
           -p aileron-ipc
           -p aileron-daemon
           -p aileron-portal
+          -p aileron-runtime
 
       - name: cargo clippy (core crates only)
         run: >
@@ -65,6 +67,7 @@ jobs:
           -p aileron-ipc
           -p aileron-daemon
           -p aileron-portal
+          -p aileron-runtime
           -- -D warnings
 
       - name: VITS runtime unit tests
@@ -79,7 +82,7 @@ jobs:
 
   # ── GTK crates ──────────────────────────────────────────────────────────────
   # Runs inside Fedora because Ubuntu 24.04 only ships libadwaita 1.5, while the
-  # UI uses newer libadwaita APIs. Tests are skipped because they need a display.
+  # UI uses newer libadwaita APIs. Current unit tests do not need a display.
   gtk:
     name: GTK — check / clippy
     runs-on: ubuntu-24.04
@@ -129,8 +132,55 @@ jobs:
           -p aileron-demo
           -- -D warnings
 
-      - name: cargo test (display-independent demo tests)
-        run: cargo test -p aileron-demo
+      - name: cargo test (display-independent UI tests)
+        run: cargo test -p aileron -p aileron-demo
+
+  model-portals:
+    name: Patched frontend and real stub stack
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    # The patched frontend requires GLib 2.88 and a newer libdex API.
+    container:
+      image: fedora:rawhide
+      # crun creates nested mount, PID and network namespaces for the stub.
+      options: --privileged --cgroupns=private
+    steps:
+      - name: Install build and test dependencies
+        run: >
+          dnf install -y ca-certificates curl gcc git tar xz
+          meson ninja-build pkgconf-pkg-config gettext
+          glib2-devel liburing-devel json-glib-devel fuse3-devel
+          gdk-pixbuf2-devel gstreamer1 gstreamer1-plugins-base-devel
+          gstreamer1-plugins-good
+          pipewire-devel wireplumber-devel dbus-devel dbus-daemon
+          umockdev-devel python3-gobject python3-dbus python3-dbusmock
+          python3-pytest bubblewrap crun gsettings-desktop-schemas
+
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Portal harness unit tests
+        run: python3 -B -m unittest discover -s tests/portal -p 'test_*.py'
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build patched frontend (without installing services)
+        run: python3 tests/portal/build_frontend.py "$RUNNER_TEMP/xdp"
+
+      - name: Existing patched model frontend suite
+        run: python3 tests/portal/run_frontend.py "$RUNNER_TEMP/xdp/build"
+
+      - name: Build real stack binaries
+        run: cargo build --locked -p aileron-daemon -p aileron-portal -p aileron-runtime
+
+      - name: Real backend, daemon and stub lifecycle
+        run: >
+          python3 tests/portal/ci_cgroups.py
+          python3 tests/portal/stack.py "$RUNNER_TEMP/xdp/build" --check-cancellation
 
   # ── Stub container image ────────────────────────────────────────────────────
   # Verifies the stub Dockerfile builds successfully, then smoke-tests the

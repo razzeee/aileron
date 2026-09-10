@@ -55,8 +55,10 @@ impl VarlinkInterface for SessionsHandler {
             )
             .await;
             if let Some(unused_profile_id) = unused_profile_id {
-                let mut containers = self.state.2.lock().await;
-                containers.kill(&unused_profile_id);
+                let killed = self.state.2.lock().await.kill(&unused_profile_id);
+                if let Some(handle) = killed {
+                    handle.wait_terminated().await;
+                }
             }
             observability::log_session_ended(observability::SessionFields {
                 session_id: &session_id,

@@ -100,6 +100,7 @@ pub const MAX_SYNTHESIS_LANGUAGE_HINT_BYTES: usize = 64;
 pub const MAX_AUDIO_CHUNK_DECODED_BYTES: usize = 256 * 1024;
 pub const MAX_AUDIO_CHANNELS: i64 = 2;
 pub const MAX_AUDIO_SAMPLE_RATE: i64 = 192_000;
+pub(crate) const STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 const MIN_AUDIO_SAMPLE_RATE: i64 = 8_000;
 const NVIDIA_DRIVER_LIBRARIES: &[&str] = &[
     "libcuda.so.1",
@@ -148,9 +149,7 @@ pub struct Container {
     pub artifact_path: PathBuf,
     #[allow(dead_code)]
     runtime_options: HashMap<String, String>,
-    /// Kept alive to prevent the container process from being killed on drop.
-    #[allow(dead_code)]
-    child: Arc<Mutex<Child>>,
+    process: Arc<RuntimeProcessHandle>,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     pub last_used: std::time::Instant,
@@ -158,10 +157,137 @@ pub struct Container {
 
 impl Drop for Container {
     fn drop(&mut self) {
-        if let Ok(mut child) = self.child.lock() {
-            let _ = child.kill();
-            let _ = child.wait();
+        self.process.terminate();
+    }
+}
+
+struct RuntimeProcessHandle {
+    process: Mutex<Option<RuntimeProcess>>,
+    terminating: AtomicBool,
+    finished: tokio::sync::watch::Sender<bool>,
+}
+
+// Drop and synchronous lifecycle callers cannot await backpressure. Queue at most
+// one job per process, on a fixed number of workers independent of Tokio's lifetime.
+static CLEANUP_QUEUE: std::sync::LazyLock<std::sync::mpsc::Sender<Arc<RuntimeProcessHandle>>> =
+    std::sync::LazyLock::new(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<Arc<RuntimeProcessHandle>>();
+        let rx = Arc::new(Mutex::new(rx));
+        for index in 0..2 {
+            let rx = rx.clone();
+            thread::Builder::new()
+                .name(format!("runtime-cleanup-{index}"))
+                .spawn(move || {
+                    loop {
+                        let job = rx.lock().unwrap_or_else(|e| e.into_inner()).recv();
+                        let Ok(handle) = job else { break };
+                        let process = handle
+                            .process
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .take();
+                        // RuntimeProcess::drop kills the payload and reaps the monitor.
+                        // No process or pool mutex is held during cleanup.
+                        drop(process);
+                        handle.finished.send_replace(true);
+                    }
+                })
+                .expect("spawn runtime cleanup worker");
         }
+        tx
+    });
+
+impl RuntimeProcessHandle {
+    fn new(process: RuntimeProcess) -> Arc<Self> {
+        std::sync::LazyLock::force(&CLEANUP_QUEUE);
+        Arc::new(Self {
+            process: Mutex::new(Some(process)),
+            terminating: AtomicBool::new(false),
+            finished: tokio::sync::watch::channel(false).0,
+        })
+    }
+
+    fn terminate(self: &Arc<Self>) {
+        if !self.terminating.swap(true, Ordering::SeqCst) {
+            CLEANUP_QUEUE
+                .send(self.clone())
+                .unwrap_or_else(|_| panic!("runtime cleanup workers stopped"));
+        }
+    }
+
+    async fn wait_terminated(&self) {
+        let mut finished = self.finished.subscribe();
+        let _ = finished.wait_for(|finished| *finished).await;
+    }
+
+    // Only startup workers use this, before trying a replacement/fallback runtime.
+    fn wait_terminated_blocking(&self) {
+        while !*self.finished.borrow() {
+            thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+}
+
+struct RuntimeProcess {
+    child: Child,
+    // None for direct subprocess tests, or after OCI cleanup has completed.
+    container_id: Option<String>,
+    #[cfg(test)]
+    before_terminate: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl RuntimeProcess {
+    fn terminate(&mut self) {
+        #[cfg(test)]
+        if let Some(before_terminate) = self.before_terminate.take() {
+            before_terminate();
+        }
+        if let Some(container_id) = self.container_id.take() {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            loop {
+                // Killing the crun monitor alone leaves the OCI payload alive.
+                // Retry if cancellation arrived before crun registered its state.
+                let killed = std::process::Command::new("crun")
+                    .args(["kill", "--all", &container_id, "KILL"])
+                    .output();
+                if matches!(self.child.try_wait(), Ok(Some(_))) {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    warn!(
+                        container_id,
+                        ?killed,
+                        "runtime monitor did not exit after OCI termination"
+                    );
+                    let _ = self.child.kill();
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            // Let crun reap the payload before reaping crun itself. Force deletion
+            // also handles state left by a failed or forcibly stopped monitor.
+            let _ = self.child.wait();
+            let deleted = std::process::Command::new("crun")
+                .args(["delete", "--force", &container_id])
+                .output();
+            match deleted {
+                Ok(output) if !output.status.success() => {
+                    warn!(container_id, status = %output.status,
+                        error = %String::from_utf8_lossy(&output.stderr), "OCI cleanup failed");
+                }
+                Err(error) => warn!(container_id, %error, "failed to run OCI cleanup"),
+                Ok(_) => {}
+            }
+        } else {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+impl Drop for RuntimeProcess {
+    fn drop(&mut self) {
+        self.terminate();
     }
 }
 
@@ -303,6 +429,15 @@ impl Container {
         mut on_status: impl FnMut(String) + Send + 'static,
         mut should_continue: impl FnMut() -> Result<(), String>,
     ) -> Result<Self> {
+        let deadline = std::time::Instant::now() + STARTUP_TIMEOUT;
+        let mut should_continue = || {
+            should_continue()?;
+            if std::time::Instant::now() >= deadline {
+                return Err("container startup timed out".to_string());
+            }
+            Ok(())
+        };
+        should_continue().map_err(anyhow::Error::msg)?;
         let image_ref = candidate.image_ref.as_str();
         let started_at = observability::log_runtime_starting(
             runtime_id,
@@ -318,7 +453,8 @@ impl Container {
             memory_limit,
         )?;
         let container_id = format!("aileron-{}", Uuid::new_v4());
-        let mut child = std::process::Command::new("crun")
+        should_continue().map_err(anyhow::Error::msg)?;
+        let child = std::process::Command::new("crun")
             .args(["run", "--bundle"])
             .arg(&bundle.bundle_dir)
             .arg(&container_id)
@@ -327,10 +463,28 @@ impl Container {
             .stderr(Stdio::piped())
             .spawn()
             .with_context(|| format!("failed to spawn crun for {}", image_ref))?;
+        let mut process = RuntimeProcess {
+            child,
+            container_id: Some(container_id),
+            #[cfg(test)]
+            before_terminate: None,
+        };
 
-        let stdin = child.stdin.take().expect("piped stdin");
-        let stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
-        let stderr = BufReader::new(child.stderr.take().expect("piped stderr"));
+        let stdin = process.child.stdin.take().expect("piped stdin");
+        let stdout = BufReader::new(process.child.stdout.take().expect("piped stdout"));
+        let stderr = BufReader::new(process.child.stderr.take().expect("piped stderr"));
+        let mut container = Self {
+            variant: candidate.variant,
+            runtime_id: runtime_id.to_string(),
+            profile_epoch,
+            image_ref: image_ref.to_string(),
+            artifact_path: artifact_path.to_path_buf(),
+            runtime_options: runtime_options.clone(),
+            process: RuntimeProcessHandle::new(process),
+            stdin,
+            stdout,
+            last_used: std::time::Instant::now(),
+        };
 
         // Read stderr lines in a background thread, forwarding them to
         // `on_status` and watching for the "ready" sentinel.
@@ -383,55 +537,19 @@ impl Container {
             }
         });
 
-        // Block until the container is ready or fails, but poll cancellation so
-        // session close/kill can abort a cold start before the ready sentinel.
-        loop {
-            if let Err(reason) = should_continue() {
-                let _ = child.kill();
-                let _ = child.wait();
-                bail!(reason);
-            }
-            match ready_rx.recv_timeout(std::time::Duration::from_millis(100)) {
-                Ok(Ok(())) => {
-                    if let Err(reason) = should_continue() {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        bail!(reason);
-                    }
-                    observability::log_runtime_ready(
-                        runtime_id,
-                        image_ref,
-                        candidate.variant.as_tag(),
-                        started_at,
-                    );
-                    break;
-                }
-                Ok(Err(e)) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    bail!("container failed to start: {}", e);
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    bail!("container stderr thread dropped before ready");
-                }
-            }
+        if let Err(error) = wait_for_runtime_ready(&ready_rx, &mut should_continue, deadline) {
+            container.process.terminate();
+            container.process.wait_terminated_blocking();
+            return Err(error);
         }
-
-        Ok(Self {
-            variant: candidate.variant,
-            runtime_id: runtime_id.to_string(),
-            profile_epoch,
-            image_ref: image_ref.to_string(),
-            artifact_path: artifact_path.to_path_buf(),
-            runtime_options: runtime_options.clone(),
-            child: Arc::new(Mutex::new(child)),
-            stdin,
-            stdout,
-            last_used: std::time::Instant::now(),
-        })
+        container.last_used = std::time::Instant::now();
+        observability::log_runtime_ready(
+            runtime_id,
+            image_ref,
+            candidate.variant.as_tag(),
+            started_at,
+        );
+        Ok(container)
     }
 
     /// Send a generate request and collect streamed token responses.
@@ -900,6 +1018,34 @@ impl Container {
         write_request_line(&mut self.stdin, &req)?;
         self.last_used = std::time::Instant::now();
         read_text_stream_response(&mut self.stdout, &id, on_token)
+    }
+}
+
+fn wait_for_runtime_ready(
+    ready_rx: &std::sync::mpsc::Receiver<Result<(), String>>,
+    mut should_continue: impl FnMut() -> Result<(), String>,
+    deadline: std::time::Instant,
+) -> Result<()> {
+    loop {
+        should_continue().map_err(anyhow::Error::msg)?;
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            bail!("container startup timed out");
+        }
+        match ready_rx.recv_timeout(remaining.min(std::time::Duration::from_millis(100))) {
+            Ok(Ok(())) => {
+                should_continue().map_err(anyhow::Error::msg)?;
+                if std::time::Instant::now() >= deadline {
+                    bail!("container startup timed out");
+                }
+                return Ok(());
+            }
+            Ok(Err(error)) => bail!("container failed to start: {error}"),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                bail!("container stderr thread dropped before ready");
+            }
+        }
     }
 }
 
@@ -2276,8 +2422,7 @@ fn base64_encode(data: &[u8]) -> String {
 #[derive(Clone)]
 pub struct ContainerHandle {
     inner: Arc<Mutex<Container>>,
-    child: Arc<Mutex<Child>>,
-    terminating: Arc<AtomicBool>,
+    process: Arc<RuntimeProcessHandle>,
     published: Arc<AtomicBool>,
 }
 
@@ -2291,11 +2436,10 @@ impl ContainerHandle {
     }
 
     fn new_with_published(container: Container, published: bool) -> Self {
-        let child = container.child.clone();
+        let process = container.process.clone();
         Self {
             inner: Arc::new(Mutex::new(container)),
-            child,
-            terminating: Arc::new(AtomicBool::new(false)),
+            process,
             published: Arc::new(AtomicBool::new(published)),
         }
     }
@@ -2320,37 +2464,33 @@ impl ContainerHandle {
         self.published.load(Ordering::SeqCst)
     }
 
+    /// Mark unusable immediately and queue payload termination and reaping once.
     pub(crate) fn terminate(&self) {
-        self.terminating.store(true, Ordering::SeqCst);
-        if let Ok(mut child) = self.child.lock() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+        self.process.terminate();
+    }
+
+    /// Wait for queued cleanup without holding pool or request-state locks.
+    pub(crate) async fn wait_terminated(&self) {
+        self.process.wait_terminated().await;
     }
 
     pub(crate) fn is_terminating(&self) -> bool {
-        if self.terminating.load(Ordering::SeqCst) {
+        if self.process.terminating.load(Ordering::SeqCst) {
             return true;
         }
 
-        match self.child.try_lock() {
-            Ok(mut child) => match child.try_wait() {
-                Ok(Some(_)) => {
-                    self.terminating.store(true, Ordering::SeqCst);
-                    true
-                }
-                Ok(None) => false,
-                Err(e) => {
+        match self.process.process.try_lock() {
+            Ok(mut process) => match process.as_mut().map(|process| process.child.try_wait()) {
+                None => true,
+                Some(Ok(Some(_))) => true,
+                Some(Ok(None)) => false,
+                Some(Err(e)) => {
                     warn!("failed to inspect container child status: {e}");
-                    self.terminating.store(true, Ordering::SeqCst);
                     true
                 }
             },
             Err(TryLockError::WouldBlock) => false,
-            Err(TryLockError::Poisoned(_)) => {
-                self.terminating.store(true, Ordering::SeqCst);
-                true
-            }
+            Err(TryLockError::Poisoned(_)) => true,
         }
     }
 
@@ -2361,6 +2501,7 @@ impl ContainerHandle {
 
 pub struct ContainerPool {
     containers: HashMap<String, ContainerHandle>,
+    startups: HashMap<String, std::sync::Weak<AtomicBool>>,
     /// Idle timeout in seconds (default 300 = 5 min).
     pub idle_timeout_secs: u64,
     /// OCI memory limit applied to each model runtime.
@@ -2381,6 +2522,7 @@ impl ContainerPool {
     pub fn new() -> Self {
         Self {
             containers: HashMap::new(),
+            startups: HashMap::new(),
             idle_timeout_secs: 300,
             memory_limit: "8g".to_string(),
             oci_store: default_oci_store(),
@@ -2400,6 +2542,18 @@ impl ContainerPool {
         runtime_options: &HashMap<String, String>,
         on_status: impl FnMut(String) + Send + 'static,
     ) -> Result<ContainerHandle> {
+        if self
+            .startups
+            .get(profile_id)
+            .and_then(|entry| entry.upgrade())
+            .is_some()
+            || self
+                .containers
+                .get(profile_id)
+                .is_some_and(|handle| !handle.is_published())
+        {
+            bail!("container startup is being finalized for profile {profile_id}; retry request");
+        }
         let should_replace = self.containers.get(profile_id).is_some_and(|container| {
             if container.is_terminating() {
                 return true;
@@ -2487,11 +2641,50 @@ impl ContainerPool {
         on_status: impl FnMut(String) + Send + 'static,
         mut should_continue: impl FnMut() -> Result<(), String>,
     ) -> Result<(ContainerHandle, bool)> {
+        let deadline = std::time::Instant::now() + STARTUP_TIMEOUT;
+        should_continue().map_err(anyhow::Error::msg)?;
+        match self.prepare_startup(
+            profile_id,
+            profile_epoch,
+            runtime_id,
+            candidates,
+            artifact_path,
+            runtime_options,
+        )? {
+            PreparedStartup::Warm(handle) => {
+                should_continue().map_err(anyhow::Error::msg)?;
+                Ok((handle, false))
+            }
+            PreparedStartup::Cold(plan) => {
+                let handle = plan.spawn(on_status, &mut should_continue, deadline)?;
+                should_continue().map_err(anyhow::Error::msg)?;
+                self.publish_startup(&plan, &handle)?;
+                Ok((handle, true))
+            }
+        }
+    }
+
+    /// Reserve a cold start under the pool lock; run the returned plan without that lock.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prepare_startup(
+        &mut self,
+        profile_id: &str,
+        profile_epoch: u64,
+        runtime_id: &str,
+        candidates: &[RuntimeCandidate],
+        artifact_path: &Path,
+        runtime_options: &HashMap<String, String>,
+    ) -> Result<PreparedStartup> {
         if candidates.is_empty() {
             bail!("no runtime images resolved for profile {profile_id}");
         }
-        if let Err(reason) = should_continue() {
-            bail!(reason);
+        if self
+            .startups
+            .get(profile_id)
+            .and_then(|entry| entry.upgrade())
+            .is_some()
+        {
+            bail!("container startup is being finalized for profile {profile_id}; retry request");
         }
         let attempts = runtime_spawn_attempts(runtime_id, candidates, runtime_options);
 
@@ -2516,37 +2709,132 @@ impl ContainerPool {
                         });
                         if matches {
                             container.last_used = std::time::Instant::now();
-                            return Ok((handle.clone(), false));
+                            return Ok(PreparedStartup::Warm(handle.clone()));
                         }
                         replace_existing = true;
                     }
                     Err(TryLockError::WouldBlock) => {
-                        return Ok((handle.clone(), false));
+                        return Ok(PreparedStartup::Warm(handle.clone()));
                     }
                     Err(TryLockError::Poisoned(_)) => bail!("container mutex poisoned"),
                 }
             }
         }
 
-        if replace_existing {
-            if let Err(reason) = should_continue() {
-                bail!(reason);
-            }
+        let previous = if replace_existing {
             observability::log_runtime_replacing_candidates(
                 profile_id,
                 runtime_id,
                 candidates.len(),
             );
-            if let Some(container) = self.containers.remove(profile_id) {
-                container.terminate();
-            }
-        }
+            self.containers.remove(profile_id)
+        } else {
+            None
+        };
+        let cancelled = Arc::new(AtomicBool::new(false));
+        self.startups.retain(|_, entry| entry.strong_count() > 0);
+        self.startups
+            .insert(profile_id.to_string(), Arc::downgrade(&cancelled));
+        Ok(PreparedStartup::Cold(Box::new(ContainerStartup {
+            profile_id: profile_id.to_string(),
+            profile_epoch,
+            runtime_id: runtime_id.to_string(),
+            candidates: candidates.to_vec(),
+            attempts,
+            artifact_path: artifact_path.to_path_buf(),
+            memory_limit: self.memory_limit.clone(),
+            oci_store: self.oci_store.clone(),
+            system_oci_store: self.system_oci_store.clone(),
+            cancelled,
+            previous,
+        })))
+    }
 
+    /// Insert only after the caller revalidates its session and profile epoch.
+    /// The handle remains pending until request activation calls `publish`.
+    pub(crate) fn publish_startup(
+        &mut self,
+        plan: &ContainerStartup,
+        handle: &ContainerHandle,
+    ) -> Result<()> {
+        if plan.cancelled.load(Ordering::SeqCst) {
+            bail!("container startup cancelled; retry request");
+        }
+        self.containers
+            .insert(plan.profile_id.clone(), handle.clone());
+        Ok(())
+    }
+
+    /// Remove and queue termination. Await the returned handle outside the pool lock
+    /// when the caller needs cleanup to complete before returning.
+    pub fn kill(&mut self, profile_id: &str) -> Option<ContainerHandle> {
+        if let Some(startup) = self
+            .startups
+            .get(profile_id)
+            .and_then(|entry| entry.upgrade())
+        {
+            startup.store(true, Ordering::SeqCst);
+        }
+        let container = self.containers.remove(profile_id);
+        if let Some(container) = &container {
+            container.terminate();
+            info!("queued container termination for profile {}", profile_id);
+        }
+        container
+    }
+}
+
+pub(crate) enum PreparedStartup {
+    Warm(ContainerHandle),
+    Cold(Box<ContainerStartup>),
+}
+
+pub(crate) struct ContainerStartup {
+    profile_id: String,
+    profile_epoch: u64,
+    runtime_id: String,
+    candidates: Vec<RuntimeCandidate>,
+    attempts: Vec<RuntimeSpawnAttempt>,
+    artifact_path: PathBuf,
+    memory_limit: String,
+    oci_store: PathBuf,
+    system_oci_store: PathBuf,
+    // The pool holds only a Weak reference, so dropping the plan releases the reservation.
+    cancelled: Arc<AtomicBool>,
+    previous: Option<ContainerHandle>,
+}
+
+impl ContainerStartup {
+    pub(crate) fn spawn(
+        &self,
+        on_status: impl FnMut(String) + Send + 'static,
+        mut should_continue: impl FnMut() -> Result<(), String>,
+        deadline: std::time::Instant,
+    ) -> Result<ContainerHandle> {
+        let mut should_continue = || {
+            should_continue()?;
+            if self.cancelled.load(Ordering::SeqCst) {
+                return Err("container startup cancelled; retry request".to_string());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err("container startup timed out".to_string());
+            }
+            Ok(())
+        };
+        should_continue().map_err(anyhow::Error::msg)?;
+        if let Some(previous) = &self.previous {
+            previous.terminate();
+            previous.process.wait_terminated_blocking();
+        }
+        let profile_id = &self.profile_id;
+        let runtime_id = &self.runtime_id;
+        let candidates = &self.candidates;
         let on_status = std::sync::Arc::new(std::sync::Mutex::new(on_status));
         let mut errors = Vec::new();
         let mut missing = Vec::new();
         let mut attempted = false;
-        for attempt in attempts {
+        for attempt in &self.attempts {
+            should_continue().map_err(anyhow::Error::msg)?;
             if runtime_rootfs_path_in_stores(
                 &self.oci_store,
                 &self.system_oci_store,
@@ -2581,9 +2869,9 @@ impl ContainerPool {
             };
             match Container::spawn(
                 runtime_id,
-                profile_epoch,
+                self.profile_epoch,
                 &candidate,
-                artifact_path,
+                &self.artifact_path,
                 &attempt.runtime_options,
                 &self.memory_limit,
                 &self.oci_store,
@@ -2596,12 +2884,15 @@ impl ContainerPool {
                 &mut should_continue,
             ) {
                 Ok(container) => {
-                    let handle = ContainerHandle::new_pending(container);
-                    self.containers
-                        .insert(profile_id.to_string(), handle.clone());
-                    return Ok((handle, true));
+                    if let Err(reason) = should_continue() {
+                        container.process.terminate();
+                        container.process.wait_terminated_blocking();
+                        bail!(reason);
+                    }
+                    return Ok(ContainerHandle::new_pending(container));
                 }
                 Err(error) => {
+                    should_continue().map_err(anyhow::Error::msg)?;
                     let error_text = error.to_string();
                     if error_text.starts_with("container returned error request_cancelled:")
                         || error_text.ends_with("; retry request")
@@ -2626,7 +2917,7 @@ impl ContainerPool {
                     };
                     errors.push(format!(
                         "{role} runtime image {} failed to start: {error_text}",
-                        describe_spawn_attempt(&attempt)
+                        describe_spawn_attempt(attempt)
                     ));
                 }
             }
@@ -2644,22 +2935,16 @@ impl ContainerPool {
             )
         }
     }
+}
 
-    /// Kill and remove the container for a profile.
-    pub fn kill(&mut self, profile_id: &str) {
-        if let Some(container) = self.containers.remove(profile_id) {
-            container.terminate();
-            info!("terminated container for profile {}", profile_id);
-        }
-    }
-
+impl ContainerPool {
     pub fn kill_handle(&mut self, profile_id: &str, handle: &ContainerHandle) {
         let should_remove = self
             .containers
             .get(profile_id)
             .is_some_and(|current| current.ptr_eq(handle));
         if should_remove {
-            self.kill(profile_id);
+            let _ = self.kill(profile_id);
         } else {
             handle.terminate();
         }
@@ -2668,9 +2953,12 @@ impl ContainerPool {
     /// Kill all containers.
     #[allow(dead_code)]
     pub fn kill_all(&mut self) {
+        for startup in self.startups.values().filter_map(|entry| entry.upgrade()) {
+            startup.store(true, Ordering::SeqCst);
+        }
         let keys: Vec<_> = self.containers.keys().cloned().collect();
         for k in keys {
-            self.kill(&k);
+            let _ = self.kill(&k);
         }
     }
 
@@ -3445,6 +3733,7 @@ mod tests {
                     &artifact_path,
                 )),
             )]),
+            startups: HashMap::new(),
             idle_timeout_secs: 300,
             memory_limit: "512m".to_string(),
             oci_store: test_dir("variant-reuse-user-store"),
@@ -3486,6 +3775,7 @@ mod tests {
         std::fs::create_dir_all(&artifact_path).expect("create artifact path");
         let mut pool = ContainerPool {
             containers: HashMap::new(),
+            startups: HashMap::new(),
             idle_timeout_secs: 300,
             memory_limit: "512m".to_string(),
             oci_store: user_store.clone(),
@@ -3954,7 +4244,8 @@ mod tests {
     }
 
     fn test_container(variant: Variant, image_ref: &str, artifact_path: &Path) -> Container {
-        let child = std::process::Command::new("true")
+        let child = std::process::Command::new("sleep")
+            .arg("60")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
@@ -3969,11 +4260,258 @@ mod tests {
             image_ref: image_ref.to_string(),
             artifact_path: artifact_path.to_path_buf(),
             runtime_options: HashMap::new(),
-            child: Arc::new(Mutex::new(child)),
+            process: RuntimeProcessHandle::new(RuntimeProcess {
+                child,
+                container_id: None,
+                before_terminate: None,
+            }),
             stdin,
             stdout,
             last_used: std::time::Instant::now(),
         }
+    }
+
+    #[test]
+    fn startup_reservation_allows_other_warm_profile_and_coalesces_same_profile() {
+        let pool = Arc::new(Mutex::new(ContainerPool::new()));
+        let warm = ContainerHandle::new(test_container(
+            Variant::Cpu,
+            "test-image",
+            Path::new("/model"),
+        ));
+        pool.lock()
+            .unwrap()
+            .containers
+            .insert("warm".to_string(), warm.clone());
+        let prepare = |pool: &mut ContainerPool, profile| {
+            pool.prepare_startup(
+                profile,
+                0,
+                ML_RUNTIME_ID,
+                &[RuntimeCandidate {
+                    variant: Variant::Cpu,
+                    image_ref: "test-image".to_string(),
+                }],
+                Path::new("/model"),
+                &HashMap::new(),
+            )
+        };
+        let PreparedStartup::Cold(plan) = prepare(&mut pool.lock().unwrap(), "cold").unwrap()
+        else {
+            panic!("expected cold startup");
+        };
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let worker_pool = pool.clone();
+        let worker = thread::spawn(move || {
+            let container = test_container(Variant::Cpu, "test-image", Path::new("/model"));
+            started_tx.send(()).unwrap();
+            wait_for_runtime_ready(
+                &ready_rx,
+                || Ok(()),
+                std::time::Instant::now() + STARTUP_TIMEOUT,
+            )
+            .unwrap();
+            let handle = ContainerHandle::new(container);
+            worker_pool
+                .lock()
+                .unwrap()
+                .publish_startup(&plan, &handle)
+                .unwrap();
+            handle
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        let mut guard = pool
+            .try_lock()
+            .expect("startup must not hold the pool lock");
+        let PreparedStartup::Warm(reused) = prepare(&mut guard, "warm").unwrap() else {
+            panic!("expected warm container");
+        };
+        assert!(warm.ptr_eq(&reused));
+        assert!(prepare(&mut guard, "cold").is_err());
+        drop(guard);
+        ready_tx.send(Ok(())).unwrap();
+        let started = worker.join().unwrap();
+        let PreparedStartup::Warm(reused) = prepare(&mut pool.lock().unwrap(), "cold").unwrap()
+        else {
+            panic!("same profile should reuse completed startup");
+        };
+        assert!(started.ptr_eq(&reused));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn slow_termination_does_not_block_executor_or_pool() {
+        for evict in [false, true] {
+            let container = test_container(Variant::Cpu, "test-image", Path::new("/model"));
+            let process = container.process.clone();
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            container
+                .process
+                .process
+                .lock()
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .before_terminate = Some(Box::new(move || {
+                started_tx.send(()).unwrap();
+                thread::sleep(std::time::Duration::from_millis(500));
+            }));
+            let mut pool = ContainerPool::new();
+            pool.idle_timeout_secs = 0;
+            pool.containers
+                .insert("slow".to_string(), ContainerHandle::new(container));
+            let pool = Arc::new(tokio::sync::Mutex::new(pool));
+            let probe_pool = pool.clone();
+            let probe = thread::spawn(move || {
+                started_rx
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+                loop {
+                    if probe_pool.try_lock().is_ok() {
+                        break true;
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        break false;
+                    }
+                    thread::sleep(std::time::Duration::from_millis(1));
+                }
+            });
+            let started = std::time::Instant::now();
+            let cleanup = tokio::spawn(async move {
+                let mut pool = pool.lock().await;
+                if evict {
+                    pool.evict_idle();
+                } else {
+                    let handle = pool.containers["slow"].clone();
+                    pool.kill_handle("slow", &handle);
+                    // Repeated requests must not schedule duplicate cleanup.
+                    handle.terminate();
+                }
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let responsive = started.elapsed() < std::time::Duration::from_millis(250);
+            cleanup.await.unwrap();
+            let pool_available = probe.join().unwrap();
+            process.wait_terminated().await;
+            assert!(responsive, "termination blocked the single-thread executor");
+            assert!(pool_available, "termination held the global pool mutex");
+        }
+    }
+
+    #[test]
+    fn direct_subprocess_termination_is_repeatable_while_container_is_locked() {
+        let handle = ContainerHandle::new(test_container(
+            Variant::Cpu,
+            "test-image",
+            Path::new("/model"),
+        ));
+        let container = handle.lock().unwrap();
+        let pid = container
+            .process
+            .process
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .child
+            .id();
+        handle.terminate();
+        handle.terminate();
+        assert!(handle.is_terminating());
+        handle.process.wait_terminated_blocking();
+        assert!(container.process.process.lock().unwrap().is_none());
+        assert!(
+            !Path::new(&format!("/proc/{pid}")).exists(),
+            "child must be reaped"
+        );
+    }
+
+    #[test]
+    fn startup_timeout_and_cancellation_reap_child() {
+        for cancel in [false, true] {
+            let container = test_container(Variant::Cpu, "test-image", Path::new("/model"));
+            let process = container.process.clone();
+            let pid = process.process.lock().unwrap().as_ref().unwrap().child.id();
+            let (_tx, rx) = std::sync::mpsc::channel();
+            let started = std::time::Instant::now();
+            let result = wait_for_runtime_ready(
+                &rx,
+                || {
+                    if cancel {
+                        Err("request cancelled".to_string())
+                    } else {
+                        Ok(())
+                    }
+                },
+                started + std::time::Duration::from_millis(30),
+            );
+            assert!(result.unwrap_err().to_string().contains(if cancel {
+                "cancelled"
+            } else {
+                "timed out"
+            }));
+            drop(container);
+            process.wait_terminated_blocking();
+            assert!(process.process.lock().unwrap().is_none());
+            assert!(
+                !Path::new(&format!("/proc/{pid}")).exists(),
+                "child must be reaped"
+            );
+            assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        }
+    }
+
+    #[test]
+    fn abandoned_or_killed_startup_releases_reservation_without_publishing() {
+        let mut pool = ContainerPool::new();
+        let prepare = |pool: &mut ContainerPool| {
+            pool.prepare_startup(
+                "cold",
+                0,
+                ML_RUNTIME_ID,
+                &[RuntimeCandidate {
+                    variant: Variant::Cpu,
+                    image_ref: "test-image".to_string(),
+                }],
+                Path::new("/model"),
+                &HashMap::new(),
+            )
+        };
+        let PreparedStartup::Cold(plan) = prepare(&mut pool).unwrap() else {
+            panic!("cold");
+        };
+        assert!(
+            plan.spawn(|_| {}, || Ok(()), std::time::Instant::now())
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("timed out")
+        );
+        drop(plan);
+        let PreparedStartup::Cold(plan) = prepare(&mut pool).unwrap() else {
+            panic!("cold");
+        };
+        let _ = pool.kill("cold");
+        let handle = ContainerHandle::new_pending(test_container(
+            Variant::Cpu,
+            "test-image",
+            Path::new("/model"),
+        ));
+        assert!(pool.publish_startup(&plan, &handle).is_err());
+        assert!(
+            plan.spawn(
+                |_| {},
+                || Ok(()),
+                std::time::Instant::now() + STARTUP_TIMEOUT
+            )
+            .is_err()
+        );
+        drop(plan);
+        assert!(prepare(&mut pool).is_ok());
+        assert!(pool.containers.is_empty());
     }
 
     #[test]
