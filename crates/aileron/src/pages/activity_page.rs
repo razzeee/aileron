@@ -148,9 +148,16 @@ fn confirm_kill_session(session_id: &str, list_box: &ListBox, window: Option<&gt
             return;
         }
         use aileron_varlink::aileron_Sessions::VarlinkClientInterface;
-        if let Ok(conn) = aileron_ipc::client::connect() {
-            let mut c = aileron_varlink::aileron_Sessions::VarlinkClient::new(conn);
-            let _ = c.kill_session(session_id.clone()).call();
+        let result = aileron_ipc::client::connect()
+            .map_err(|error| error.to_string())
+            .and_then(|conn| {
+                let mut c = aileron_varlink::aileron_Sessions::VarlinkClient::new(conn);
+                c.kill_session(session_id.clone())
+                    .call()
+                    .map_err(|error| error.to_string())
+            });
+        if let Err(reason) = result {
+            tracing::error!(%session_id, %reason, "failed to kill session");
         }
         refresh_sessions(&list_box);
     });
