@@ -5,18 +5,19 @@ use aileron_varlink::aileron_Permissions::{
     AppPermission, Call_ListAppPermissions, Call_SetAppPermission, VarlinkInterface,
 };
 
-fn io_err(_msg: impl std::fmt::Display) -> varlink::Error {
-    varlink::Error::from(varlink::ErrorKind::Io(std::io::ErrorKind::Other))
-}
-
 pub struct PermissionsHandler {
     state: SharedState,
     rt: tokio::runtime::Handle,
+    path: std::path::PathBuf,
 }
 
 impl PermissionsHandler {
     pub fn new(state: SharedState, rt: tokio::runtime::Handle) -> Self {
-        Self { state, rt }
+        Self {
+            state,
+            rt,
+            path: PermissionStore::path(),
+        }
     }
 }
 
@@ -36,16 +37,13 @@ impl VarlinkInterface for PermissionsHandler {
         allowed: bool,
     ) -> varlink::Result<()> {
         self.rt.block_on(async {
-            set_permission(
-                &self.state,
-                &app_id,
-                &use_case,
-                allowed,
-                &PermissionStore::path(),
-            )
-            .await
-            .map_err(io_err)?;
-            call.reply()
+            match set_permission(&self.state, &app_id, &use_case, allowed, &self.path).await {
+                Ok(()) => call.reply(),
+                Err(error) => call.reply_update_failed(
+                    error.to_string(),
+                    error.is::<crate::permissions::UncertainCommit>(),
+                ),
+            }
         })
     }
 }
@@ -143,6 +141,49 @@ mod tests {
     use hegel::TestCase;
     use hegel::generators as gs;
     use std::collections::HashMap;
+
+    #[test]
+    fn failed_permission_write_returns_a_typed_wire_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = dir.path().join("blocked");
+        std::fs::write(&blocked, b"not a directory").unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let state = test_state();
+        let handler = PermissionsHandler {
+            state: state.clone(),
+            rt: rt.handle().clone(),
+            path: blocked.join("permissions.json"),
+        };
+        let request = varlink::Request::create(
+            "aileron.Permissions.SetAppPermission",
+            Some(serde_json::json!({
+                "app_id": "app", "use_case": "language.analyze", "allowed": false
+            })),
+        );
+        let mut response = Vec::new();
+        let mut call = varlink::Call::new(&mut response, &request);
+        varlink::Interface::call(
+            &aileron_varlink::aileron_Permissions::new(Box::new(handler)),
+            &mut call,
+        )
+        .unwrap();
+        assert_eq!(response.pop(), Some(0));
+        let reply: serde_json::Value = serde_json::from_slice(&response).unwrap();
+        assert_eq!(reply["error"], "aileron.Permissions.UpdateFailed");
+        assert_eq!(reply["parameters"]["applied"], false);
+        assert!(!reply["parameters"]["reason"].as_str().unwrap().is_empty());
+        assert_eq!(
+            rt.block_on(async {
+                state
+                    .0
+                    .lock()
+                    .await
+                    .permissions
+                    .check("app", "language.analyze")
+            }),
+            None
+        );
+    }
 
     fn test_state() -> SharedState {
         use std::sync::{Arc, Mutex};
