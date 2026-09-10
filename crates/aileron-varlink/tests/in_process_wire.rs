@@ -450,11 +450,23 @@ impl WireFixture {
         }
     }
 
-    async fn set_app_permission(&self, app_id: String, use_case: String, allowed: bool) {
+    async fn set_app_permission(
+        &self,
+        app_id: String,
+        use_case: String,
+        allowed: bool,
+    ) -> Result<(), permissions::Error> {
+        if app_id == "error" {
+            return Err(permissions::Error::UpdateFailed {
+                reason: "directory sync failed".into(),
+                applied: allowed,
+            });
+        }
         assert_eq!(
             (app_id, use_case, allowed),
             ("app".into(), "use-case".into(), true)
         );
+        Ok(())
     }
 
     #[zlink(interface = "aileron.Sessions", types = [sessions::SessionInfo])]
@@ -483,9 +495,9 @@ async fn exhaustive_hardware_free_wire_contract() {
     let state = FixtureState::default();
     let server = zlink::Server::new(
         listener,
-        WireFixture {
+        aileron_varlink::service::CompatibleService(WireFixture {
             state: state.clone(),
-        },
+        }),
     );
     let clients = exercise_wire_contract(socket.clone(), state);
     let mut server = Box::pin(server.run());
@@ -636,6 +648,19 @@ async fn ordinary_methods_round_trip(socket: &std::path::Path) {
         .await
         .unwrap()
         .unwrap();
+    for applied in [false, true] {
+        assert_eq!(
+            client
+                .set_app_permission("error".into(), "use-case".into(), applied)
+                .await
+                .unwrap()
+                .unwrap_err(),
+            permissions::Error::UpdateFailed {
+                reason: "directory sync failed".into(),
+                applied
+            }
+        );
+    }
     assert_eq!(
         client.list_active().await.unwrap().unwrap().sessions,
         [session()]
@@ -720,6 +745,7 @@ async fn streams_round_trip_and_terminate(socket: &std::path::Path) {
         ["session-1", "session-2"]
     );
 
+    client = response.into_connection().unwrap();
     let mut guided = client
         .stream_respond_guided(
             "session".into(),
@@ -736,6 +762,7 @@ async fn streams_round_trip_and_terminate(socket: &std::path::Path) {
         ["guided-1", "guided-2"]
     );
 
+    client = guided.into_connection().unwrap();
     let mut submit = client
         .stream_submit_tool_results_guided(
             "session".into(),
@@ -753,6 +780,7 @@ async fn streams_round_trip_and_terminate(socket: &std::path::Path) {
         ["submit-1", "submit-2"]
     );
 
+    client = submit.into_connection().unwrap();
     let mut embed = client
         .stream_embed("session".into(), "text".into(), embed_options())
         .await
@@ -761,6 +789,7 @@ async fn streams_round_trip_and_terminate(socket: &std::path::Path) {
         collect_inference(&mut embed, |reply| reply.embedding_pipeline_id.clone()).await,
         ["embed-1"]
     );
+    client = embed.into_connection().unwrap();
     let mut speech = client
         .stream_transcribe("session".into(), "audio".into(), speech_options())
         .await
@@ -769,6 +798,7 @@ async fn streams_round_trip_and_terminate(socket: &std::path::Path) {
         collect_inference(&mut speech, |reply| reply.token.clone()).await,
         ["speech-1", "speech-2"]
     );
+    client = speech.into_connection().unwrap();
     let mut synthesis = client
         .stream_synthesize("session".into(), "hello".into(), synthesis_options())
         .await
@@ -777,6 +807,7 @@ async fn streams_round_trip_and_terminate(socket: &std::path::Path) {
         collect_inference(&mut synthesis, |reply| reply.chunk.audio_base64.clone()).await,
         ["AQACAA==", ""]
     );
+    client = synthesis.into_connection().unwrap();
     let mut describe = client
         .stream_describe(
             "session".into(),
@@ -790,6 +821,7 @@ async fn streams_round_trip_and_terminate(socket: &std::path::Path) {
         collect_inference(&mut describe, |reply| reply.token.clone()).await,
         ["describe-1", "describe-2"]
     );
+    client = describe.into_connection().unwrap();
     let mut ocr = client
         .stream_ocr(
             "session".into(),
@@ -803,6 +835,7 @@ async fn streams_round_trip_and_terminate(socket: &std::path::Path) {
         collect_inference(&mut ocr, |reply| reply.token.clone()).await,
         ["ocr-1", "ocr-2"]
     );
+    client = ocr.into_connection().unwrap();
     let mut detect = client
         .stream_detect(
             "session".into(),
@@ -816,6 +849,7 @@ async fn streams_round_trip_and_terminate(socket: &std::path::Path) {
         collect_inference(&mut detect, |reply| reply.detections[0].label.clone()).await,
         ["detect-1"]
     );
+    client = detect.into_connection().unwrap();
     let mut segment = client
         .stream_segment(
             "session".into(),
@@ -829,6 +863,7 @@ async fn streams_round_trip_and_terminate(socket: &std::path::Path) {
         collect_inference(&mut segment, |reply| reply.masks[0].label.clone()).await,
         ["segment-1"]
     );
+    client = segment.into_connection().unwrap();
     let mut depth = client
         .stream_depth(
             "session".into(),
@@ -843,6 +878,7 @@ async fn streams_round_trip_and_terminate(socket: &std::path::Path) {
         [1.0]
     );
 
+    client = depth.into_connection().unwrap();
     let install = client.install_manifest("profile".into()).await.unwrap();
     assert_eq!(
         collect_generated(install, |reply| reply.progress.bytes_pulled).await,
@@ -867,7 +903,7 @@ async fn streams_round_trip_and_terminate(socket: &std::path::Path) {
 }
 
 async fn collect_inference<R, T>(
-    stream: &mut inference::InferenceReplyStream<'_, R>,
+    stream: &mut inference::InferenceReplyStream<R>,
     map: impl Fn(&R) -> T,
 ) -> Vec<T>
 where

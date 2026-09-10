@@ -3,7 +3,7 @@ use chrono::{DateTime, Local, TimeZone};
 use gtk4::prelude::*;
 use gtk4::{ListBox, ScrolledWindow};
 use libadwaita::prelude::*;
-use libadwaita::{ActionRow, PreferencesGroup, PreferencesPage, SwitchRow};
+use libadwaita::{ActionRow, AlertDialog, PreferencesGroup, PreferencesPage, SwitchRow};
 use relm4::{ComponentParts, ComponentSender, SimpleComponent};
 
 pub struct PermissionsPage;
@@ -117,19 +117,50 @@ fn refresh_permissions(list_box: &ListBox) {
 
                     let app_id = perm.app_id.clone();
                     let use_case = perm.use_case.clone();
+                    let permissions_list = list_box.clone();
                     row.connect_active_notify(move |switch| {
+                        if !switch.is_sensitive() {
+                            return;
+                        }
                         let allowed = switch.is_active();
+                        switch.set_sensitive(false);
+                        let switch = switch.clone();
+                        let permissions_list = permissions_list.clone();
                         let app_id = app_id.clone();
                         let use_case = use_case.clone();
                         crate::async_runtime::spawn(
                             async move {
                                 use aileron_varlink::aileron_Permissions::VarlinkClientInterface;
-                                if let Ok(mut client) = aileron_ipc::client::connect().await {
-                                    let _ =
-                                        client.set_app_permission(app_id, use_case, allowed).await;
+                                let mut client = aileron_ipc::client::connect()
+                                    .await
+                                    .map_err(|error| error.to_string())?;
+                                client
+                                    .set_app_permission(app_id, use_case, allowed)
+                                    .await
+                                    .map_err(|error| error.to_string())?
+                                    .map_err(|error| format!("{error:?}"))
+                            },
+                            move |result: Result<(), String>| {
+                                if let Err(reason) = result {
+                                    // Re-read the daemon's state: a failed directory sync can
+                                    // still have applied a denial. Never blindly undo it.
+                                    refresh_permissions(&permissions_list);
+                                    let dialog = AlertDialog::builder()
+                                        .heading("Permission update failed")
+                                        .body(&reason)
+                                        .build();
+                                    dialog.add_response("close", "Close");
+                                    dialog.set_close_response("close");
+                                    dialog.present(
+                                        permissions_list
+                                            .root()
+                                            .and_downcast::<gtk4::Window>()
+                                            .as_ref(),
+                                    );
+                                } else {
+                                    switch.set_sensitive(true);
                                 }
                             },
-                            |_| {},
                         );
                     });
                     list_box.append(&row);

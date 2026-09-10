@@ -38,7 +38,7 @@ impl ModelsHandler {
 
     pub async fn list(&self) -> List_Reply {
         let guard = self.state.0.lock().await;
-        let profiles: Vec<ProfileInfo> = guard
+        let (mut profiles, paths): (Vec<ProfileInfo>, Vec<PathBuf>) = guard
             .profiles
             .all()
             .map(|profile| {
@@ -64,27 +64,46 @@ impl ModelsHandler {
                 } else {
                     profile.runtime_images.clone()
                 };
-                ProfileInfo {
-                    profile_id: profile.profile_id.clone(),
-                    model_id: profile.model_id.clone(),
-                    runtime_id: profile.runtime_id.clone(),
-                    artifact_path: profile.artifact_path.display().to_string(),
-                    runtime_images: runtime_images
-                        .iter()
-                        .map(|image| RuntimeImage {
-                            variant: image.variant.clone(),
-                            image_ref: image.image_ref.clone(),
-                        })
-                        .collect(),
-                    use_cases: profile.effective_use_cases(),
-                    specializations: Some(profile.specializations.clone()),
-                    assigned_use_cases,
-                    size_bytes: profile_artifact_size_bytes(&profile.artifact_path),
-                    installed_at: profile.installed_at.clone(),
-                    source: profile.source.clone(),
-                }
+                (
+                    ProfileInfo {
+                        profile_id: profile.profile_id.clone(),
+                        model_id: profile.model_id.clone(),
+                        runtime_id: profile.runtime_id.clone(),
+                        artifact_path: profile.artifact_path.display().to_string(),
+                        runtime_images: runtime_images
+                            .iter()
+                            .map(|image| RuntimeImage {
+                                variant: image.variant.clone(),
+                                image_ref: image.image_ref.clone(),
+                            })
+                            .collect(),
+                        use_cases: profile.effective_use_cases(),
+                        specializations: Some(profile.specializations.clone()),
+                        assigned_use_cases,
+                        size_bytes: 0,
+                        installed_at: profile.installed_at.clone(),
+                        source: profile.source.clone(),
+                    },
+                    profile.artifact_path.clone(),
+                )
             })
-            .collect();
+            .unzip();
+        drop(guard);
+        match tokio::task::spawn_blocking(move || {
+            paths
+                .iter()
+                .map(|path| profile_artifact_size_bytes(path))
+                .collect::<Vec<_>>()
+        })
+        .await
+        {
+            Ok(sizes) => {
+                for (profile, size) in profiles.iter_mut().zip(sizes) {
+                    profile.size_bytes = size;
+                }
+            }
+            Err(error) => tracing::warn!(%error, "failed to measure model artifact sizes"),
+        }
 
         List_Reply { profiles }
     }
@@ -549,6 +568,10 @@ impl ModelsHandler {
             )
             .await;
         }
+        // Keep the pool locked across the existence check and kill: a reinstall
+        // must not publish a new container between them. Callers must release
+        // the inner-state lock before awaiting the pool, as the session and
+        // inference paths do.
         let mut containers = self.state.2.lock().await;
         let profile_still_missing = {
             let guard = self.state.0.lock().await;
@@ -1070,7 +1093,11 @@ async fn schedule_runtime_update_checks(
         let state = state.clone();
         let image_ref = image.image_ref.clone();
         tokio::spawn(async move {
-            let result = remote_selected_manifest_digest(&image_ref);
+            let inspect_image_ref = image_ref.clone();
+            let result = spawn_runtime_pull_blocking(move || {
+                remote_selected_manifest_digest(&inspect_image_ref)
+            })
+            .await;
             finish_runtime_update_check(&state, &image_ref, &local_digest, result).await;
         });
     }

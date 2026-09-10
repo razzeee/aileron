@@ -11,6 +11,7 @@ pub mod aileron_Models;
 pub mod aileron_Permissions;
 #[allow(non_snake_case)]
 pub mod aileron_Sessions;
+pub mod service;
 
 pub use aileron_Inference as inference;
 pub use aileron_Models as models;

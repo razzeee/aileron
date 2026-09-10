@@ -204,13 +204,13 @@ type TokioConnection = zlink::tokio::unix::Connection;
 /// Request-owned streaming cursor that avoids zlink 0.7's non-`Send`
 /// `ReplyStream` wrapper while retaining native async framing.
 #[derive(Debug)]
-pub struct InferenceReplyStream<'a, R> {
-    connection: &'a mut TokioConnection,
+pub struct InferenceReplyStream<R> {
+    connection: Option<TokioConnection>,
     finished: bool,
     reply: std::marker::PhantomData<R>,
 }
 
-impl<R> InferenceReplyStream<'_, R>
+impl<R> InferenceReplyStream<R>
 where
     R: serde::de::DeserializeOwned + std::fmt::Debug,
 {
@@ -219,14 +219,23 @@ where
             return None;
         }
 
-        let received = self.connection.receive_reply::<R, Error>().await;
+        let received = self
+            .connection
+            .as_mut()
+            .expect("active stream has a connection")
+            .receive_reply::<R, Error>()
+            .await;
         Some(match received {
             Ok((Ok(reply), _fds)) => {
                 self.finished = reply.continues() != Some(true);
-                reply
-                    .into_parameters()
-                    .ok_or(zlink::Error::MissingParameters)
-                    .map(Ok)
+                match reply.into_parameters() {
+                    Some(parameters) => Ok(Ok(parameters)),
+                    None => {
+                        self.finished = true;
+                        self.connection.take();
+                        Err(zlink::Error::MissingParameters)
+                    }
+                }
             }
             Ok((Err(error), _fds)) => {
                 self.finished = true;
@@ -234,9 +243,22 @@ where
             }
             Err(error) => {
                 self.finished = true;
+                self.connection.take();
                 Err(error)
             }
         })
+    }
+}
+
+impl<R> InferenceReplyStream<R> {
+    pub fn is_finished(&self) -> bool {
+        self.finished
+    }
+
+    /// Recover a connection only after receiving a terminal success or typed
+    /// error. Abandoning a stream or failing to decode a reply closes it instead.
+    pub fn into_connection(self) -> Option<TokioConnection> {
+        if self.finished { self.connection } else { None }
     }
 }
 
@@ -246,18 +268,18 @@ struct MethodCall<P> {
     parameters: P,
 }
 
-async fn start_stream<'a, R, P>(
-    connection: &'a mut TokioConnection,
+async fn start_stream<R, P>(
+    mut connection: TokioConnection,
     method: &'static str,
     parameters: P,
-) -> zlink::Result<InferenceReplyStream<'a, R>>
+) -> zlink::Result<InferenceReplyStream<R>>
 where
     P: Serialize + std::fmt::Debug,
 {
     let call = zlink::Call::new(MethodCall { method, parameters }).set_more(true);
     connection.send_call(&call, Vec::new()).await?;
     Ok(InferenceReplyStream {
-        connection,
+        connection: Some(connection),
         finished: false,
         reply: std::marker::PhantomData,
     })
@@ -302,25 +324,25 @@ stream_params!(StreamSegment_Params {
 });
 
 #[allow(async_fn_in_trait)]
-pub trait VarlinkStreamingClientInterface {
+pub trait VarlinkStreamingClientInterface: Sized {
     async fn stream_response(
-        &mut self,
+        self,
         session_id: String,
         input_json: String,
         media_paths: Vec<String>,
         options: ResponseOptions,
-    ) -> zlink::Result<InferenceReplyStream<'_, StreamResponse_Reply>>;
+    ) -> zlink::Result<InferenceReplyStream<StreamResponse_Reply>>;
     async fn stream_respond_guided(
-        &mut self,
+        self,
         session_id: String,
         prompt: String,
         media_paths: Vec<String>,
         fields: Vec<GuidedField>,
         tools: Vec<ToolDefinition>,
         options: GuidedOptions,
-    ) -> zlink::Result<InferenceReplyStream<'_, StreamRespondGuided_Reply>>;
+    ) -> zlink::Result<InferenceReplyStream<StreamRespondGuided_Reply>>;
     async fn stream_submit_tool_results_guided(
-        &mut self,
+        self,
         session_id: String,
         prompt: String,
         media_paths: Vec<String>,
@@ -328,70 +350,70 @@ pub trait VarlinkStreamingClientInterface {
         fields: Vec<GuidedField>,
         tools: Vec<ToolDefinition>,
         options: GuidedOptions,
-    ) -> zlink::Result<InferenceReplyStream<'_, StreamSubmitToolResultsGuided_Reply>>;
+    ) -> zlink::Result<InferenceReplyStream<StreamSubmitToolResultsGuided_Reply>>;
     async fn stream_embed(
-        &mut self,
+        self,
         session_id: String,
         text: String,
         options: EmbedOptions,
-    ) -> zlink::Result<InferenceReplyStream<'_, StreamEmbed_Reply>>;
+    ) -> zlink::Result<InferenceReplyStream<StreamEmbed_Reply>>;
     async fn stream_transcribe(
-        &mut self,
+        self,
         session_id: String,
         audio_path: String,
         options: SpeechOptions,
-    ) -> zlink::Result<InferenceReplyStream<'_, StreamTranscribe_Reply>>;
+    ) -> zlink::Result<InferenceReplyStream<StreamTranscribe_Reply>>;
     async fn stream_synthesize(
-        &mut self,
+        self,
         session_id: String,
         text: String,
         options: SynthesisOptions,
-    ) -> zlink::Result<InferenceReplyStream<'_, StreamSynthesize_Reply>>;
+    ) -> zlink::Result<InferenceReplyStream<StreamSynthesize_Reply>>;
     async fn stream_describe(
-        &mut self,
+        self,
         session_id: String,
         image_path: String,
         instructions: String,
         options: VisionOptions,
-    ) -> zlink::Result<InferenceReplyStream<'_, StreamDescribe_Reply>>;
+    ) -> zlink::Result<InferenceReplyStream<StreamDescribe_Reply>>;
     async fn stream_ocr(
-        &mut self,
+        self,
         session_id: String,
         image_path: String,
         instructions: String,
         options: VisionOptions,
-    ) -> zlink::Result<InferenceReplyStream<'_, StreamOcr_Reply>>;
+    ) -> zlink::Result<InferenceReplyStream<StreamOcr_Reply>>;
     async fn stream_detect(
-        &mut self,
+        self,
         session_id: String,
         image_path: String,
         instructions: String,
         options: VisionOptions,
-    ) -> zlink::Result<InferenceReplyStream<'_, StreamDetect_Reply>>;
+    ) -> zlink::Result<InferenceReplyStream<StreamDetect_Reply>>;
     async fn stream_segment(
-        &mut self,
+        self,
         session_id: String,
         image_path: String,
         instructions: String,
         options: VisionSegmentOptions,
-    ) -> zlink::Result<InferenceReplyStream<'_, StreamSegment_Reply>>;
+    ) -> zlink::Result<InferenceReplyStream<StreamSegment_Reply>>;
     async fn stream_depth(
-        &mut self,
+        self,
         session_id: String,
         image_path: String,
         instructions: String,
         options: VisionOptions,
-    ) -> zlink::Result<InferenceReplyStream<'_, StreamDepth_Reply>>;
+    ) -> zlink::Result<InferenceReplyStream<StreamDepth_Reply>>;
 }
 
 impl VarlinkStreamingClientInterface for TokioConnection {
     async fn stream_response(
-        &mut self,
+        self,
         session_id: String,
         input_json: String,
         media_paths: Vec<String>,
         options: ResponseOptions,
-    ) -> zlink::Result<InferenceReplyStream<'_, StreamResponse_Reply>> {
+    ) -> zlink::Result<InferenceReplyStream<StreamResponse_Reply>> {
         start_stream(
             self,
             "aileron.Inference.StreamResponse",
@@ -405,14 +427,14 @@ impl VarlinkStreamingClientInterface for TokioConnection {
         .await
     }
     async fn stream_respond_guided(
-        &mut self,
+        self,
         session_id: String,
         prompt: String,
         media_paths: Vec<String>,
         fields: Vec<GuidedField>,
         tools: Vec<ToolDefinition>,
         options: GuidedOptions,
-    ) -> zlink::Result<InferenceReplyStream<'_, StreamRespondGuided_Reply>> {
+    ) -> zlink::Result<InferenceReplyStream<StreamRespondGuided_Reply>> {
         start_stream(
             self,
             "aileron.Inference.StreamRespondGuided",
@@ -428,7 +450,7 @@ impl VarlinkStreamingClientInterface for TokioConnection {
         .await
     }
     async fn stream_submit_tool_results_guided(
-        &mut self,
+        self,
         session_id: String,
         prompt: String,
         media_paths: Vec<String>,
@@ -436,7 +458,7 @@ impl VarlinkStreamingClientInterface for TokioConnection {
         fields: Vec<GuidedField>,
         tools: Vec<ToolDefinition>,
         options: GuidedOptions,
-    ) -> zlink::Result<InferenceReplyStream<'_, StreamSubmitToolResultsGuided_Reply>> {
+    ) -> zlink::Result<InferenceReplyStream<StreamSubmitToolResultsGuided_Reply>> {
         start_stream(
             self,
             "aileron.Inference.StreamSubmitToolResultsGuided",
@@ -453,11 +475,11 @@ impl VarlinkStreamingClientInterface for TokioConnection {
         .await
     }
     async fn stream_embed(
-        &mut self,
+        self,
         session_id: String,
         text: String,
         options: EmbedOptions,
-    ) -> zlink::Result<InferenceReplyStream<'_, StreamEmbed_Reply>> {
+    ) -> zlink::Result<InferenceReplyStream<StreamEmbed_Reply>> {
         start_stream(
             self,
             "aileron.Inference.StreamEmbed",
@@ -470,11 +492,11 @@ impl VarlinkStreamingClientInterface for TokioConnection {
         .await
     }
     async fn stream_transcribe(
-        &mut self,
+        self,
         session_id: String,
         audio_path: String,
         options: SpeechOptions,
-    ) -> zlink::Result<InferenceReplyStream<'_, StreamTranscribe_Reply>> {
+    ) -> zlink::Result<InferenceReplyStream<StreamTranscribe_Reply>> {
         start_stream(
             self,
             "aileron.Inference.StreamTranscribe",
@@ -487,11 +509,11 @@ impl VarlinkStreamingClientInterface for TokioConnection {
         .await
     }
     async fn stream_synthesize(
-        &mut self,
+        self,
         session_id: String,
         text: String,
         options: SynthesisOptions,
-    ) -> zlink::Result<InferenceReplyStream<'_, StreamSynthesize_Reply>> {
+    ) -> zlink::Result<InferenceReplyStream<StreamSynthesize_Reply>> {
         start_stream(
             self,
             "aileron.Inference.StreamSynthesize",
@@ -504,12 +526,12 @@ impl VarlinkStreamingClientInterface for TokioConnection {
         .await
     }
     async fn stream_describe(
-        &mut self,
+        self,
         session_id: String,
         image_path: String,
         instructions: String,
         options: VisionOptions,
-    ) -> zlink::Result<InferenceReplyStream<'_, StreamDescribe_Reply>> {
+    ) -> zlink::Result<InferenceReplyStream<StreamDescribe_Reply>> {
         start_stream(
             self,
             "aileron.Inference.StreamDescribe",
@@ -523,12 +545,12 @@ impl VarlinkStreamingClientInterface for TokioConnection {
         .await
     }
     async fn stream_ocr(
-        &mut self,
+        self,
         session_id: String,
         image_path: String,
         instructions: String,
         options: VisionOptions,
-    ) -> zlink::Result<InferenceReplyStream<'_, StreamOcr_Reply>> {
+    ) -> zlink::Result<InferenceReplyStream<StreamOcr_Reply>> {
         start_stream(
             self,
             "aileron.Inference.StreamOcr",
@@ -542,12 +564,12 @@ impl VarlinkStreamingClientInterface for TokioConnection {
         .await
     }
     async fn stream_detect(
-        &mut self,
+        self,
         session_id: String,
         image_path: String,
         instructions: String,
         options: VisionOptions,
-    ) -> zlink::Result<InferenceReplyStream<'_, StreamDetect_Reply>> {
+    ) -> zlink::Result<InferenceReplyStream<StreamDetect_Reply>> {
         start_stream(
             self,
             "aileron.Inference.StreamDetect",
@@ -561,12 +583,12 @@ impl VarlinkStreamingClientInterface for TokioConnection {
         .await
     }
     async fn stream_segment(
-        &mut self,
+        self,
         session_id: String,
         image_path: String,
         instructions: String,
         options: VisionSegmentOptions,
-    ) -> zlink::Result<InferenceReplyStream<'_, StreamSegment_Reply>> {
+    ) -> zlink::Result<InferenceReplyStream<StreamSegment_Reply>> {
         start_stream(
             self,
             "aileron.Inference.StreamSegment",
@@ -580,12 +602,12 @@ impl VarlinkStreamingClientInterface for TokioConnection {
         .await
     }
     async fn stream_depth(
-        &mut self,
+        self,
         session_id: String,
         image_path: String,
         instructions: String,
         options: VisionOptions,
-    ) -> zlink::Result<InferenceReplyStream<'_, StreamDepth_Reply>> {
+    ) -> zlink::Result<InferenceReplyStream<StreamDepth_Reply>> {
         start_stream(
             self,
             "aileron.Inference.StreamDepth",
@@ -603,6 +625,84 @@ impl VarlinkStreamingClientInterface for TokioConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn abandoned_stream_closes_socket_and_cannot_return_connection() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        for read_first in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("stream.socket");
+            let listener = tokio::net::UnixListener::bind(&path).unwrap();
+            let connection = zlink::tokio::unix::connect(&path).await.unwrap();
+            let mut stream = connection
+                .stream_embed(
+                    "session".into(),
+                    "text".into(),
+                    EmbedOptions {
+                        execution_mode: "interactive".into(),
+                    },
+                )
+                .await
+                .unwrap();
+            let (peer, _) = listener.accept().await.unwrap();
+            let mut peer = BufReader::new(peer);
+            peer.read_until(0, &mut Vec::new()).await.unwrap();
+            if read_first {
+                peer.get_mut().write_all(b"{\"parameters\":{\"embedding\":[1.0],\"embedding_pipeline_id\":\"old\"},\"continues\":true}\0{\"parameters\":{\"embedding\":[2.0],\"embedding_pipeline_id\":\"old\"}}\0").await.unwrap();
+                assert_eq!(
+                    stream.next().await.unwrap().unwrap().unwrap().embedding,
+                    [1.0]
+                );
+            }
+            assert!(stream.into_connection().is_none());
+            let mut byte = [0];
+            match tokio::time::timeout(std::time::Duration::from_secs(1), peer.read(&mut byte))
+                .await
+                .unwrap()
+            {
+                Ok(count) => assert_eq!(count, 0),
+                Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_connection_reuse_requires_a_valid_terminal_reply() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        for (reply, reusable) in [
+            (
+                "{\"parameters\":{\"embedding\":[1.0],\"embedding_pipeline_id\":\"done\"}}\0",
+                true,
+            ),
+            (
+                "{\"error\":\"aileron.Inference.GenerationFailed\",\"parameters\":{\"reason\":\"failed\"}}\0",
+                true,
+            ),
+            ("{\"parameters\":{\"unexpected\":1}}\0", false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("stream.socket");
+            let listener = tokio::net::UnixListener::bind(&path).unwrap();
+            let connection = zlink::tokio::unix::connect(&path).await.unwrap();
+            let mut stream = connection
+                .stream_embed(
+                    "session".into(),
+                    "text".into(),
+                    EmbedOptions {
+                        execution_mode: "interactive".into(),
+                    },
+                )
+                .await
+                .unwrap();
+            let (peer, _) = listener.accept().await.unwrap();
+            let mut peer = BufReader::new(peer);
+            peer.read_until(0, &mut Vec::new()).await.unwrap();
+            peer.get_mut().write_all(reply.as_bytes()).await.unwrap();
+            assert!(stream.next().await.is_some());
+            assert!(stream.next().await.is_none());
+            assert_eq!(stream.into_connection().is_some(), reusable);
+        }
+    }
 
     #[test]
     fn streaming_call_uses_more_and_the_declared_wire_shape() {
@@ -635,7 +735,7 @@ mod tests {
     #[test]
     fn portal_streaming_cursor_is_send() {
         fn assert_send<T: Send>() {}
-        assert_send::<InferenceReplyStream<'static, StreamResponse_Reply>>();
+        assert_send::<InferenceReplyStream<StreamResponse_Reply>>();
     }
 
     #[test]

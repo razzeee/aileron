@@ -447,14 +447,19 @@ impl AileronService {
         self.permissions.list_app_permissions().await
     }
 
-    async fn set_app_permission(&self, app_id: String, use_case: String, allowed: bool) {
-        if let Err(error) = self
-            .permissions
+    async fn set_app_permission(
+        &self,
+        app_id: String,
+        use_case: String,
+        allowed: bool,
+    ) -> Result<(), permissions::Error> {
+        self.permissions
             .set_app_permission(app_id, use_case, allowed)
             .await
-        {
-            tracing::error!(%error, "failed to persist app permission");
-        }
+            .map_err(|error| permissions::Error::UpdateFailed {
+                applied: error.is::<crate::permissions::UncertainCommit>(),
+                reason: error.to_string(),
+            })
     }
 
     #[zlink(interface = "aileron.Sessions", types = [sessions::SessionInfo])]
@@ -481,9 +486,12 @@ pub async fn run(state: SharedState) -> anyhow::Result<()> {
     });
 
     let listener = zlink::tokio::unix::bind(&path)?;
-    zlink::Server::new(listener, AileronService::new(state))
-        .run()
-        .await?;
+    zlink::Server::new(
+        listener,
+        aileron_varlink::service::CompatibleService(AileronService::new(state)),
+    )
+    .run()
+    .await?;
     Ok(())
 }
 
@@ -546,12 +554,73 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn permission_persistence_failure_is_a_wire_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = dir.path().join("blocked");
+        std::fs::write(&blocked, b"not a directory").unwrap();
+        let socket = dir.path().join("permissions.socket");
+        let state = test_state(dir.path());
+        let mut service = AileronService::new(state.clone());
+        service.permissions =
+            PermissionsHandler::with_path(state, blocked.join("permissions.json"));
+        let listener = zlink::tokio::unix::bind(&socket).unwrap();
+        let server = zlink::Server::new(
+            listener,
+            aileron_varlink::service::CompatibleService(service),
+        );
+        let client = async {
+            let mut client = zlink::tokio::unix::connect(&socket).await.unwrap();
+            let error = client
+                .set_app_permission("app".into(), "language.analyze".into(), false)
+                .await
+                .unwrap()
+                .unwrap_err();
+            assert!(
+                matches!(error, permissions::Error::UpdateFailed { applied: false, reason } if !reason.is_empty())
+            );
+            assert!(
+                client
+                    .list_app_permissions()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .permissions
+                    .is_empty()
+            );
+        };
+        tokio::select! {
+            result = server.run() => panic!("server exited: {result:?}"),
+            () = client => {},
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn wire_introspection_calls_errors_streams_and_concurrency() {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("service.socket");
         let listener = zlink::tokio::unix::bind(&socket).unwrap();
-        let server = zlink::Server::new(listener, AileronService::new(test_state(dir.path())));
+        let server = zlink::Server::new(
+            listener,
+            aileron_varlink::service::CompatibleService(AileronService::new(test_state(
+                dir.path(),
+            ))),
+        );
         let client_test = async {
+            // systemd 255 sends an explicit empty object for argument-free calls.
+            use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+            let mut raw = tokio::net::UnixStream::connect(&socket).await.unwrap();
+            raw.write_all(b"{\"method\":\"org.varlink.service.GetInfo\",\"parameters\":{}}\0")
+                .await
+                .unwrap();
+            let mut reply = Vec::new();
+            BufReader::new(raw).read_until(0, &mut reply).await.unwrap();
+            assert_eq!(
+                reply.pop(),
+                Some(0),
+                "empty parameters must receive a reply"
+            );
+            let reply: serde_json::Value = serde_json::from_slice(&reply).unwrap();
+            assert_eq!(reply["parameters"]["vendor"], "aileron");
             let mut info_conn = zlink::tokio::unix::connect(&socket).await.unwrap();
             let info = info_conn.get_info().await.unwrap().unwrap();
             assert_eq!(info.vendor, "aileron");
@@ -614,7 +683,7 @@ mod tests {
             );
 
             let connection = zlink::tokio::unix::connect(&socket).await.unwrap();
-            let mut inference_client = connection;
+            let inference_client = connection;
             let stream = inference_client
                 .stream_embed(
                     "missing".into(),

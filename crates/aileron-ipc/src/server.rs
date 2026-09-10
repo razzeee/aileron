@@ -12,10 +12,30 @@ pub fn socket_path() -> PathBuf {
     PathBuf::from(crate::socket_path())
 }
 
-/// Remove a stale socket file if it exists (called before binding).
-pub fn remove_stale_socket() -> Result<()> {
+/// Serialize daemon startup and remove a stale socket before binding.
+/// Keep the returned lock alive for the lifetime of the listener. The lock file
+/// must not be unlinked, because another process may already have it open.
+pub fn prepare_socket() -> Result<std::fs::File> {
     let path = socket_path();
-    remove_stale_socket_at(&path)
+    prepare_socket_at(&path)
+}
+
+fn prepare_socket_at(path: &std::path::Path) -> Result<std::fs::File> {
+    let mut lock_path = path.as_os_str().to_os_string();
+    lock_path.push(".lock");
+    let lock = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)?;
+    lock.try_lock().map_err(|error| {
+        anyhow::anyhow!(
+            "another daemon holds the startup lock for {}: {error}",
+            path.display()
+        )
+    })?;
+    remove_stale_socket_at(path)?;
+    Ok(lock)
 }
 
 fn remove_stale_socket_at(path: &std::path::Path) -> Result<()> {
@@ -60,6 +80,33 @@ fn remove_stale_socket_at(path: &std::path::Path) -> Result<()> {
 mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;
+
+    #[test]
+    fn startup_lock_covers_cleanup_and_listener_lifetime() {
+        let path = test_path("startup-lock");
+        let lock = prepare_socket_at(&path).unwrap();
+        assert!(
+            prepare_socket_at(&path).is_err(),
+            "second startup must not pass cleanup before bind"
+        );
+        let listener = UnixListener::bind(&path).unwrap();
+        assert!(prepare_socket_at(&path).is_err());
+        assert!(
+            UnixStream::connect(&path).is_ok(),
+            "losing startup must not unlink the listener"
+        );
+        drop(listener);
+        drop(lock);
+        let replacement = prepare_socket_at(&path).unwrap();
+        assert!(
+            !path.exists(),
+            "stale socket is removed after the first daemon exits"
+        );
+        drop(replacement);
+        let mut lock_path = path.into_os_string();
+        lock_path.push(".lock");
+        std::fs::remove_file(lock_path).unwrap();
+    }
 
     #[test]
     fn remove_stale_socket_preserves_live_listener() {

@@ -2480,13 +2480,15 @@ async fn with_locked_container<T, E: ObservabilityFailure>(
             }
         };
         {
-            let mut container = match lock_container_for_session(
-                state,
-                session_id,
-                &handle,
-                spawned,
-                operation_cancellation,
-            ) {
+            let mut container = match tokio::task::block_in_place(|| {
+                lock_container_for_session(
+                    state,
+                    session_id,
+                    &handle,
+                    spawned,
+                    operation_cancellation,
+                )
+            }) {
                 Ok(container) => container,
                 Err(LockContainerError::Retry) => continue,
                 Err(LockContainerError::Failed(reason)) => {
@@ -2633,10 +2635,16 @@ async fn with_locked_container<T, E: ObservabilityFailure>(
                 };
 
                 let op = op.take().expect("container operation called once");
-                let cancel_watcher =
-                    RequestCancellation::for_session(state, session_id).spawn_watcher(&handle);
-                let mut result = op(&mut container, &handle, spawned);
-                cancel_watcher.stop();
+                // Container stdio and watcher shutdown are synchronous. Let Tokio
+                // hand async work to a replacement worker for the whole operation,
+                // not just while a bounded reply channel is full.
+                let mut result = tokio::task::block_in_place(|| {
+                    let cancel_watcher =
+                        RequestCancellation::for_session(state, session_id).spawn_watcher(&handle);
+                    let result = op(&mut container, &handle, spawned);
+                    cancel_watcher.stop();
+                    result
+                });
                 if result.is_err()
                     && _background_execution
                         .as_ref()
@@ -4381,7 +4389,7 @@ mod tests {
             .await
             .expect("silent StreamResponse producer should stop promptly")
             .expect("silent StreamResponse producer should exit cleanly");
-        watcher.stop();
+        drop(watcher);
     }
 
     #[tokio::test(flavor = "multi_thread")]

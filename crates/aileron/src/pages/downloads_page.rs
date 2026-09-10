@@ -14,6 +14,7 @@ use super::{format_duration, format_speed, install_is_terminal_status};
 
 pub struct DownloadsPage {
     poll_active: Rc<Cell<bool>>,
+    refresh_pending: Rc<Cell<bool>>,
 }
 
 #[derive(Debug)]
@@ -42,9 +43,9 @@ impl SimpleComponent for DownloadsPage {
         sender: ComponentSender<Self>,
     ) -> ComponentParts<Self> {
         let list_box = build_page(&page);
-        refresh_downloads_list(&list_box);
         let model = DownloadsPage {
             poll_active: Rc::new(Cell::new(false)),
+            refresh_pending: Rc::new(Cell::new(false)),
         };
         let mut widgets = DownloadsWidgets { list_box };
         model.update_view(&mut widgets, sender);
@@ -58,21 +59,18 @@ impl SimpleComponent for DownloadsPage {
     }
 
     fn update_view(&self, widgets: &mut Self::Widgets, sender: ComponentSender<Self>) {
-        refresh_downloads_list(&widgets.list_box);
-        start_poll(&widgets.list_box, self.poll_active.clone(), sender);
+        if !self.refresh_pending.replace(true) {
+            refresh_downloads_list(&widgets.list_box, self.refresh_pending.clone());
+        }
+        start_poll(self.poll_active.clone(), sender);
     }
 }
 
-fn start_poll(
-    list_box: &ListBox,
-    poll_active: Rc<Cell<bool>>,
-    sender: ComponentSender<DownloadsPage>,
-) {
+fn start_poll(poll_active: Rc<Cell<bool>>, sender: ComponentSender<DownloadsPage>) {
     if poll_active.get() {
         return;
     }
     poll_active.set(true);
-    refresh_downloads_list(list_box);
 
     glib::timeout_add_seconds_local(2, move || {
         sender.input(DownloadsMsg::Refresh);
@@ -103,9 +101,7 @@ fn build_page(page: &PreferencesPage) -> ListBox {
     list_box
 }
 
-fn refresh_downloads_list(list: &ListBox) {
-    clear_list(list);
-
+fn refresh_downloads_list(list: &ListBox, pending: Rc<Cell<bool>>) {
     let list = list.clone();
     crate::async_runtime::spawn(
         async {
@@ -130,7 +126,10 @@ fn refresh_downloads_list(list: &ListBox) {
                 .collect();
             Ok((installs, profile_runtime_ids))
         },
-        move |result| render_downloads_list(&list, result),
+        move |result| {
+            pending.set(false);
+            render_downloads_list(&list, result);
+        },
     );
 }
 

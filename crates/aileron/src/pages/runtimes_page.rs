@@ -349,11 +349,27 @@ fn prune_unused_runtime_images(list_box: &ListBox) {
                 .prune_unused_runtime_images()
                 .await
                 .map_err(|e| e.to_string())?
-                .map(|_| ())
                 .map_err(|e| format!("{e:?}"))
         },
         move |result| match result {
-            Ok(()) => refresh_runtime_images(&list_box),
+            Ok(reply) => {
+                refresh_runtime_images(&list_box);
+                if !reply.errors.is_empty() {
+                    let reason = reply
+                        .errors
+                        .iter()
+                        .map(|error| format!("{}: {}", error.image_ref, error.reason))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let dialog = AlertDialog::builder()
+                        .heading("Some runtime images could not be removed")
+                        .body(&reason)
+                        .build();
+                    dialog.add_response("close", "Close");
+                    dialog.set_close_response("close");
+                    dialog.present(list_box.root().and_downcast::<gtk4::Window>().as_ref());
+                }
+            }
             Err(e) => {
                 clear_list(&list_box);
                 append_message(&list_box, &format!("Cleanup failed: {e}"));

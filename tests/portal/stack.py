@@ -115,6 +115,8 @@ def main():
             AILERON_VARIANT="cpu",
             AILERON_OCI_STORE=str(root / "oci"),
             AILERON_CONTAINER_MEMORY="512m",
+            # Stalled container I/O must not starve the async dispatcher.
+            TOKIO_WORKER_THREADS="1",
             XDG_CURRENT_DESKTOP="aileron-test",
             XDG_DESKTOP_PORTAL_TEST_APP_INFO_KIND="host",
             XDG_DESKTOP_PORTAL_TEST_HOST_APPID=app_id,
@@ -156,11 +158,10 @@ def main():
                 connection.connect(
                     str(Path(env["AILERON_RUNTIME_DIR"]) / "aileron.socket")
                 )
-                # zlink encodes argument-free methods without a parameters field.
-                request = {"method": method}
-                if parameters:
-                    request["parameters"] = parameters
-                connection.sendall(json.dumps(request).encode() + b"\0")
+                connection.sendall(
+                    json.dumps({"method": method, "parameters": parameters}).encode()
+                    + b"\0"
+                )
                 response = b""
                 while b"\0" not in response:
                     chunk = connection.recv(65536)

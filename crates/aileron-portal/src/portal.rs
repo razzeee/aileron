@@ -11,7 +11,10 @@ use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::future::Future;
 use std::os::fd::AsRawFd;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 use tokio::process::Command;
 use tracing::{info, warn};
@@ -22,6 +25,7 @@ const BUS_NAME: &str = "org.freedesktop.impl.portal.desktop.aileron";
 const OBJECT_PATH: &str = "/org/freedesktop/portal/desktop";
 const FRONTEND_BUS_NAME: &str = "org.freedesktop.portal.Desktop";
 const MAX_PREWARM_WORKERS: usize = 4;
+const CANCEL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_TRANSPORT_WORKERS: usize = 16;
 const MAX_BACKGROUND_WORKERS: usize = 8;
 static TRANSPORT_WORKERS: tokio::sync::Semaphore =
@@ -190,6 +194,7 @@ struct AsyncReplies<T> {
     worker: Option<tokio::task::JoinHandle<()>>,
     state: Arc<PortalState>,
     request_id: String,
+    completed: Arc<AtomicBool>,
 }
 
 impl<T> AsyncReplies<T> {
@@ -223,7 +228,7 @@ impl<T> AsyncReplies<T> {
 impl<T> Drop for AsyncReplies<T> {
     fn drop(&mut self) {
         self.receiver.close();
-        if self.worker.is_some() {
+        if self.worker.is_some() && !self.completed.load(Ordering::Acquire) {
             let cancellation = cancel_request_record(&self.state, &self.request_id);
             let state = self.state.clone();
             let request_id = self.request_id.clone();
@@ -237,8 +242,8 @@ impl<T> Drop for AsyncReplies<T> {
     }
 }
 
-type StreamFuture<'a, R> = std::pin::Pin<
-    Box<dyn Future<Output = zlink::Result<inference::InferenceReplyStream<'a, R>>> + Send + 'a>,
+type StreamFuture<R> = std::pin::Pin<
+    Box<dyn Future<Output = zlink::Result<inference::InferenceReplyStream<R>>> + Send>,
 >;
 
 async fn stream_replies<R>(
@@ -246,9 +251,7 @@ async fn stream_replies<R>(
     request_id: &str,
     fds: Vec<OwnedFd>,
     background: bool,
-    make_call: impl for<'a> FnOnce(&'a mut zlink::tokio::unix::Connection) -> StreamFuture<'a, R>
-    + Send
-    + 'static,
+    make_call: impl FnOnce(zlink::tokio::unix::Connection) -> StreamFuture<R> + Send + 'static,
 ) -> zbus::fdo::Result<AsyncReplies<R>>
 where
     R: serde::de::DeserializeOwned + std::fmt::Debug + Send + 'static,
@@ -274,7 +277,9 @@ where
         worker: None,
         state: state.clone(),
         request_id: request_id.to_string(),
+        completed: Arc::new(AtomicBool::new(false)),
     };
+    let completed = replies.completed.clone();
     let request_id = request_id.to_string();
     replies.worker = Some(tokio::spawn(async move {
         let _permit = permit;
@@ -282,11 +287,20 @@ where
         // The daemon opens /proc paths lazily, so retain the fds through the last read.
         let _fds = fds;
         let result = async {
-            let mut connection = connect_request_daemon(&state, &request_id).await?;
-            let mut stream = await_request(&state, &request_id, make_call(&mut connection))
+            let connection = connect_request_daemon(&state, &request_id).await?;
+            let mut stream = await_request(&state, &request_id, make_call(connection))
                 .await?
                 .map_err(|e| map_request_transport_error(&state, &request_id, e))?;
             while let Some(reply) = await_request(&state, &request_id, stream.next()).await? {
+                if stream.is_finished() {
+                    // Publish completion before a terminal reply can block in the
+                    // bounded channel. A delayed drop must not cancel newer work
+                    // on this daemon session.
+                    if let Some(record) = state.requests.lock().unwrap().get_mut(&request_id) {
+                        record.daemon_session_id = None;
+                    }
+                    completed.store(true, Ordering::Release);
+                }
                 ensure_request_active(&state, &request_id)?;
                 let reply = reply
                     .map_err(|e| map_request_transport_error(&state, &request_id, e))?
@@ -2105,14 +2119,22 @@ async fn complete_request_cancellation(
         return;
     };
     if let Some(session_id) = daemon_session_id {
-        let _permit = CONTROL_WORKERS.acquire().await.unwrap();
-        match connect_daemon(state).await {
-            Ok(mut client) => match client.cancel_active_request(session_id).await {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => warn!("failed to cancel active daemon request: {error:?}"),
-                Err(error) => warn!("failed to cancel active daemon request: {error}"),
-            },
-            Err(error) => warn!("failed to connect while cancelling daemon request: {error}"),
+        let cancel = async {
+            let _permit = CONTROL_WORKERS.acquire().await.unwrap();
+            match connect_daemon(state).await {
+                Ok(mut client) => match client.cancel_active_request(session_id).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => warn!("failed to cancel active daemon request: {error:?}"),
+                    Err(error) => warn!("failed to cancel active daemon request: {error}"),
+                },
+                Err(error) => warn!("failed to connect while cancelling daemon request: {error}"),
+            }
+        };
+        if tokio::time::timeout(CANCEL_REQUEST_TIMEOUT, cancel)
+            .await
+            .is_err()
+        {
+            warn!("timed out while cancelling active daemon request");
         }
     }
     if let Some(session_handle) = session_handle {
@@ -2767,7 +2789,11 @@ async fn set_permission_for_request(
 }
 
 fn map_permissions_error(error: permissions::Error) -> zbus::fdo::Error {
-    match error {}
+    match error {
+        permissions::Error::UpdateFailed { reason, applied } => zbus::fdo::Error::Failed(format!(
+            "aileron.Permissions.UpdateFailed: {reason} (applied: {applied})"
+        )),
+    }
 }
 
 async fn prompt_permission(
@@ -2836,19 +2862,14 @@ async fn run_prompt_command(
     request_id: &str,
     command: &mut Command,
 ) -> std::io::Result<zbus::fdo::Result<bool>> {
-    let mut child = command.spawn()?;
-    loop {
-        if let Err(e) = ensure_request_active(state, request_id) {
+    let mut child = command.kill_on_drop(true).spawn()?;
+    match await_request(state, request_id, child.wait()).await {
+        Ok(status) => Ok(Ok(status?.success())),
+        Err(e) => {
             let _ = child.kill().await;
             let _ = child.wait().await;
-            return Ok(Err(e));
+            Ok(Err(e))
         }
-
-        if let Some(status) = child.try_wait()? {
-            return Ok(Ok(status.success()));
-        }
-
-        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
@@ -3494,6 +3515,41 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn cancellation_deadline_releases_synthesis_slot_when_daemon_never_replies() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+        let daemon = TestDaemon::new();
+        daemon.listener.set_nonblocking(true).unwrap();
+        let listener =
+            tokio::net::UnixListener::from_std(daemon.listener.try_clone().unwrap()).unwrap();
+        attach_request_daemon_session(&daemon.state, "request", "daemon-session").unwrap();
+        begin_synthesis_request(&daemon.state, "session", "request").unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut request = Vec::new();
+            reader.read_until(0, &mut request).await.unwrap();
+            let mut byte = [0];
+            assert_eq!(reader.read(&mut byte).await.unwrap(), 0);
+        });
+        tokio::time::timeout(
+            CANCEL_REQUEST_TIMEOUT + Duration::from_secs(1),
+            cancel_request(&daemon.state, "request"),
+        )
+        .await
+        .expect("Close must have a bounded deadline");
+        assert!(request_is_cancelled(&daemon.state, "request"));
+        assert!(
+            daemon
+                .state
+                .active_synthesis_requests
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn cancelled_request_does_not_wait_for_worker_capacity() {
         static WORKERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(0);
         let daemon = TestDaemon::new();
@@ -3601,6 +3657,90 @@ mod tests {
         })
         .await
         .unwrap();
+        server.join().unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropping_completed_buffered_reply_does_not_cancel_new_session_work() {
+        use std::io::Write;
+        let daemon = TestDaemon::new();
+        let listener = daemon.listener.try_clone().unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut first, _) = listener.accept().unwrap();
+            read_request(&mut first);
+            first
+                .write_all(
+                    b"{\"parameters\":{\"embedding\":[1],\"embedding_pipeline_id\":\"first\"}}\0",
+                )
+                .unwrap();
+            let (mut second, _) = listener.accept().unwrap();
+            assert_eq!(
+                read_request(&mut second)["method"],
+                "aileron.Inference.StreamEmbed"
+            );
+            started_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            assert_eq!(
+                listener.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock,
+                "dropping a completed stream must not send session-wide cancellation"
+            );
+            second
+                .write_all(
+                    b"{\"parameters\":{\"embedding\":[2],\"embedding_pipeline_id\":\"second\"}}\0",
+                )
+                .unwrap();
+        });
+        let make_call =
+            |client: zlink::tokio::unix::Connection| -> StreamFuture<inference::StreamEmbed_Reply> {
+                Box::pin(async move {
+                    client
+                        .stream_embed(
+                            "daemon-session".into(),
+                            "text".into(),
+                            inference::EmbedOptions {
+                                execution_mode: "interactive".into(),
+                            },
+                        )
+                        .await
+                })
+            };
+        let first = stream_replies(daemon.state.clone(), "request", vec![], false, make_call)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !first.worker.as_ref().unwrap().is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            !first.receiver.is_empty(),
+            "terminal reply must remain buffered"
+        );
+        daemon
+            .state
+            .requests
+            .lock()
+            .unwrap()
+            .insert("second".into(), test_request_record(Some("session")));
+        let mut second = stream_replies(daemon.state.clone(), "second", vec![], false, make_call)
+            .await
+            .unwrap();
+        started_rx.await.unwrap();
+        drop(first);
+        assert!(!request_is_cancelled(&daemon.state, "request"));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            second.recv().await.unwrap().unwrap().embedding_pipeline_id,
+            "second"
+        );
+        assert!(second.recv().await.is_none());
         server.join().unwrap();
     }
 

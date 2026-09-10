@@ -80,10 +80,6 @@ fn build_page(page: &PreferencesPage, sender: ComponentSender<ActivityPage>) -> 
 }
 
 fn refresh_sessions(list_box: &ListBox) {
-    while let Some(child) = list_box.first_child() {
-        list_box.remove(&child);
-    }
-
     let list_box = list_box.clone();
     crate::async_runtime::spawn(
         async {
@@ -98,36 +94,41 @@ fn refresh_sessions(list_box: &ListBox) {
                 .map_err(|error| error.to_string())?
                 .map_err(|error| format!("{error:?}"))
         },
-        move |result| match result {
-            Err(_) => {
-                let row = ActionRow::new();
-                row.set_title("Sessions unavailable");
-                row.set_subtitle("Start aileron-daemon, then refresh this page.");
-                list_box.append(&row);
+        move |result| {
+            while let Some(child) = list_box.first_child() {
+                list_box.remove(&child);
             }
-            Ok(reply) => {
-                if reply.sessions.is_empty() {
+            match result {
+                Err(_) => {
                     let row = ActionRow::new();
-                    row.set_title("No active sessions");
+                    row.set_title("Sessions unavailable");
+                    row.set_subtitle("Start aileron-daemon, then refresh this page.");
                     list_box.append(&row);
-                    return;
                 }
-                for session in &reply.sessions {
-                    let row = ActionRow::new();
-                    row.set_title(&format!("{} — {}", session.app_id, session.use_case));
-                    row.set_subtitle(&format!("started: {}", session.started_at));
+                Ok(reply) => {
+                    if reply.sessions.is_empty() {
+                        let row = ActionRow::new();
+                        row.set_title("No active sessions");
+                        list_box.append(&row);
+                        return;
+                    }
+                    for session in &reply.sessions {
+                        let row = ActionRow::new();
+                        row.set_title(&format!("{} — {}", session.app_id, session.use_case));
+                        row.set_subtitle(&format!("started: {}", session.started_at));
 
-                    let kill_btn = Button::with_label("Kill");
-                    kill_btn.add_css_class("destructive-action");
-                    kill_btn.set_valign(gtk4::Align::Center);
-                    let session_id = session.session_id.clone();
-                    let list_box_ref = list_box.clone();
-                    kill_btn.connect_clicked(move |btn| {
-                        let window = btn.root().and_then(|r| r.downcast::<gtk4::Window>().ok());
-                        confirm_kill_session(&session_id, &list_box_ref, window.as_ref());
-                    });
-                    row.add_suffix(&kill_btn);
-                    list_box.append(&row);
+                        let kill_btn = Button::with_label("Kill");
+                        kill_btn.add_css_class("destructive-action");
+                        kill_btn.set_valign(gtk4::Align::Center);
+                        let session_id = session.session_id.clone();
+                        let list_box_ref = list_box.clone();
+                        kill_btn.connect_clicked(move |btn| {
+                            let window = btn.root().and_then(|r| r.downcast::<gtk4::Window>().ok());
+                            confirm_kill_session(&session_id, &list_box_ref, window.as_ref());
+                        });
+                        row.add_suffix(&kill_btn);
+                        list_box.append(&row);
+                    }
                 }
             }
         },
@@ -151,15 +152,22 @@ fn confirm_kill_session(session_id: &str, list_box: &ListBox, window: Option<&gt
             return;
         }
         let session_id = session_id.clone();
+        let logged_session_id = session_id.clone();
         let list_box = list_box.clone();
         crate::async_runtime::spawn(
             async move {
                 use aileron_varlink::aileron_Sessions::VarlinkClientInterface;
-                if let Ok(mut client) = aileron_ipc::client::connect().await {
-                    let _ = client.kill_session(session_id).await;
-                }
+                let mut client = aileron_ipc::client::connect().await.map_err(|error| error.to_string())?;
+                client.kill_session(session_id).await
+                    .map_err(|error| error.to_string())?
+                    .map_err(|error| format!("{error:?}"))
             },
-            move |_| refresh_sessions(&list_box),
+            move |result: Result<(), String>| {
+                if let Err(reason) = result {
+                    tracing::error!(session_id = %logged_session_id, %reason, "failed to kill session");
+                }
+                refresh_sessions(&list_box);
+            },
         );
     });
     dialog.present(window);

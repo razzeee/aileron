@@ -110,7 +110,10 @@ async fn external_clients_interoperate_with_zlink() {
     let directory = tempfile::tempdir().unwrap();
     let socket = directory.path().join("interop.socket");
     let listener = zlink::tokio::unix::bind(&socket).unwrap();
-    let server = zlink::Server::new(listener, InteropFixture);
+    let server = zlink::Server::new(
+        listener,
+        aileron_varlink::service::CompatibleService(InteropFixture),
+    );
     let client_test = async {
         for client in clients {
             let socket = socket.clone();

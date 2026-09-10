@@ -12,3 +12,6 @@ type AppPermission (
 method ListAppPermissions() -> (permissions: []AppPermission)
 
 method SetAppPermission(app_id: string, use_case: string, allowed: bool) -> ()
+
+# applied is true when the change is visible but directory durability is uncertain.
+error UpdateFailed(reason: string, applied: bool)

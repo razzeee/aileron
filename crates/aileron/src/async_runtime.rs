@@ -72,8 +72,9 @@ where
         return;
     }
     glib::spawn_future_local(async move {
-        if let Ok(output) = receiver.await {
-            callback(output);
+        match receiver.await {
+            Ok(output) => callback(output),
+            Err(error) => tracing::error!(%error, "manager streaming task dropped its result"),
         }
     });
 }

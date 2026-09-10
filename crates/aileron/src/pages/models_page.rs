@@ -1896,11 +1896,6 @@ fn use_case_kind(use_case: &str) -> &'static str {
 }
 
 fn refresh_downloads_list(lists: &ModelLists) {
-    let list = &lists.downloads;
-    while let Some(child) = list.first_child() {
-        list.remove(&child);
-    }
-
     let lists = lists.clone();
     crate::async_runtime::spawn(
         async {

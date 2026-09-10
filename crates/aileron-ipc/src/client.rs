@@ -13,7 +13,12 @@ async fn connect_to(path: &std::path::Path) -> Result<zlink::tokio::unix::Connec
     zlink::tokio::unix::connect(path)
         .await
         .map_err(|error| match error {
-            zlink::Error::Io(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            zlink::Error::Io(source)
+                if matches!(
+                    source.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                ) =>
+            {
                 IpcError::NotConnected {
                     path: path.to_string_lossy().into_owned(),
                 }
@@ -25,6 +30,19 @@ async fn connect_to(path: &std::path::Path) -> Result<zlink::tokio::unix::Connec
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn stale_socket_is_reported_as_not_connected() {
+        let path =
+            std::env::temp_dir().join(format!("aileron-ipc-stale-{}.socket", std::process::id()));
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        drop(listener);
+        let error = connect_to(&path).await.unwrap_err();
+        assert!(
+            matches!(error, IpcError::NotConnected { path: actual } if actual == path.to_string_lossy())
+        );
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[tokio::test]
     async fn missing_socket_preserves_the_resolved_path() {

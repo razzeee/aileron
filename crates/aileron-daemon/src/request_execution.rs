@@ -65,24 +65,22 @@ impl OperationCancellation {
     ) -> DisconnectWatcher {
         let cancellation = self.clone();
         let sender = sender.clone();
-        spawn_watcher(move || {
-            if sender.is_closed() {
+        DisconnectWatcher {
+            task: tokio::spawn(async move {
+                sender.closed().await;
                 cancellation.cancel();
-                true
-            } else {
-                false
-            }
-        })
+            }),
+        }
     }
 
     fn cancel(&self) {
         self.cancelled.store(true, Ordering::SeqCst);
-        if let Some(handle) = self
+        let handle = self
             .active_handle
             .lock()
             .expect("operation handle mutex poisoned")
-            .as_ref()
-        {
+            .clone();
+        if let Some(handle) = handle {
             handle.terminate();
         }
     }
@@ -228,7 +226,15 @@ pub(crate) struct CancelWatcher {
     thread: Option<thread::JoinHandle<()>>,
 }
 
-pub(crate) type DisconnectWatcher = CancelWatcher;
+pub(crate) struct DisconnectWatcher {
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for DisconnectWatcher {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
 
 impl CancelWatcher {
     pub(crate) fn stop(mut self) {
@@ -391,7 +397,7 @@ mod tests {
         .await
         .expect("disconnect watcher should cancel startup promptly");
         assert!(!state.is_session_cancelled("session-a"));
-        watcher.stop();
+        drop(watcher);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -412,7 +418,7 @@ mod tests {
             .await
             .expect("in-flight operation should stop promptly")
             .expect("worker should exit cleanly");
-        watcher.stop();
+        drop(watcher);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -424,7 +430,7 @@ mod tests {
         tokio::time::timeout(
             Duration::from_secs(2),
             tokio::task::spawn_blocking(move || {
-                watcher.stop();
+                drop(watcher);
             }),
         )
         .await

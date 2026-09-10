@@ -18,10 +18,11 @@ pub struct ListAppPermissions_Reply {
     pub permissions: Vec<AppPermission>,
 }
 
-/// This interface currently declares no application errors.
 #[derive(Clone, Debug, PartialEq, zlink::ReplyError, zlink::introspect::ReplyError)]
 #[zlink(interface = "aileron.Permissions")]
-pub enum Error {}
+pub enum Error {
+    UpdateFailed { reason: String, applied: bool },
+}
 
 pub type Result<T> = std::result::Result<T, Error>;
 

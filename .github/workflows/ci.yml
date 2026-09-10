@@ -37,9 +37,13 @@ jobs:
           restore-keys: core-${{ runner.os }}-
 
       - name: Install system deps and external Varlink client
-        run: sudo apt-get install -y --no-install-recommends libdbus-1-dev pkg-config systemd
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libdbus-1-dev pkg-config systemd
 
       - name: Install Rust Varlink client
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target/varlink-cli
         run: cargo install varlink-cli --locked
 
       - name: cargo fmt

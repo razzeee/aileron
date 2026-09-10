@@ -6,11 +6,20 @@ use aileron_varlink::permissions::{AppPermission, ListAppPermissions_Reply};
 
 pub struct PermissionsHandler {
     state: SharedState,
+    path: std::path::PathBuf,
 }
 
 impl PermissionsHandler {
     pub fn new(state: SharedState) -> Self {
-        Self { state }
+        Self {
+            state,
+            path: PermissionStore::path(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_path(state: SharedState, path: std::path::PathBuf) -> Self {
+        Self { state, path }
     }
 
     pub async fn list_app_permissions(&self) -> ListAppPermissions_Reply {
@@ -26,14 +35,7 @@ impl PermissionsHandler {
         use_case: String,
         allowed: bool,
     ) -> anyhow::Result<()> {
-        set_permission(
-            &self.state,
-            &app_id,
-            &use_case,
-            allowed,
-            &PermissionStore::path(),
-        )
-        .await
+        set_permission(&self.state, &app_id, &use_case, allowed, &self.path).await
     }
 }
 

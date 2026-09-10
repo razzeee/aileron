@@ -76,7 +76,12 @@ async fn external_clients_interoperate_with_production_service() {
     let directory = tempfile::tempdir().unwrap();
     let socket = directory.path().join("aileron.socket");
     let listener = zlink::tokio::unix::bind(&socket).unwrap();
-    let server = zlink::Server::new(listener, AileronService::new(empty_state(directory.path())));
+    let server = zlink::Server::new(
+        listener,
+        aileron_varlink::service::CompatibleService(AileronService::new(empty_state(
+            directory.path(),
+        ))),
+    );
     let client_test = async {
         for client in clients {
             let socket = socket.clone();
