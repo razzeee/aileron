@@ -102,6 +102,7 @@ struct RequestRecord {
     active_connection: Option<Arc<Mutex<Box<dyn varlink::Stream>>>>,
 }
 
+#[cfg_attr(test, derive(hegel::PrettyPrintable))]
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum PortalInterface {
     Language,

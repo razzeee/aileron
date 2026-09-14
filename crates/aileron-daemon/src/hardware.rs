@@ -13,6 +13,7 @@
 ///   5. CPU   — no accelerator detected
 use tracing::info;
 
+#[cfg_attr(test, derive(hegel::PrettyPrintable))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Variant {
     Cpu,
