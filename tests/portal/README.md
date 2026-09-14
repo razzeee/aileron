@@ -32,6 +32,8 @@ inside the daemon's real crun container wrapper. Its CI checks cover:
 - Persisted permission denial returned through public D-Bus, with no daemon session.
 - Permission grant through the management API followed by public session creation.
 - Language `StreamResponse` tokens, request/session correlation and terminal success.
+- Guided snapshots, terminal tool calls, and `StreamSubmitToolResultsGuided`
+  continuation through the real stub runtime.
 - Public `Request.Close` after work reaches the stub, terminating the stopped payload
   process, without a response or tokens for the cancelled request; the session remains.
 - Explicit public session close removing the daemon session.

@@ -3,7 +3,7 @@ use chrono::{DateTime, Local, TimeZone};
 use gtk4::prelude::*;
 use gtk4::{ListBox, ScrolledWindow};
 use libadwaita::prelude::*;
-use libadwaita::{ActionRow, PreferencesGroup, PreferencesPage, SwitchRow};
+use libadwaita::{ActionRow, AlertDialog, PreferencesGroup, PreferencesPage, SwitchRow};
 use relm4::{ComponentParts, ComponentSender, SimpleComponent};
 
 pub struct PermissionsPage;
@@ -111,14 +111,35 @@ fn refresh_permissions(list_box: &ListBox) {
 
                 let app_id = perm.app_id.clone();
                 let use_case = perm.use_case.clone();
+                let permissions_list = list_box.clone();
                 row.connect_active_notify(move |switch| {
                     use aileron_varlink::aileron_Permissions::VarlinkClientInterface;
                     let allowed = switch.is_active();
-                    if let Ok(conn) = aileron_ipc::client::connect() {
-                        let mut c = aileron_varlink::aileron_Permissions::VarlinkClient::new(conn);
-                        let _ = c
-                            .set_app_permission(app_id.clone(), use_case.clone(), allowed)
-                            .call();
+                    let result = aileron_ipc::client::connect()
+                        .map_err(|error| error.to_string())
+                        .and_then(|conn| {
+                            let mut c =
+                                aileron_varlink::aileron_Permissions::VarlinkClient::new(conn);
+                            c.set_app_permission(app_id.clone(), use_case.clone(), allowed)
+                                .call()
+                                .map_err(|error| error.to_string())
+                        });
+                    if let Err(reason) = result {
+                        // A directory-sync failure may still have applied the change.
+                        // Re-read authoritative state instead of toggling it back.
+                        refresh_permissions(&permissions_list);
+                        let dialog = AlertDialog::builder()
+                            .heading("Permission update failed")
+                            .body(&reason)
+                            .build();
+                        dialog.add_response("close", "Close");
+                        dialog.set_close_response("close");
+                        dialog.present(
+                            permissions_list
+                                .root()
+                                .and_downcast::<gtk4::Window>()
+                                .as_ref(),
+                        );
                     }
                 });
                 list_box.append(&row);

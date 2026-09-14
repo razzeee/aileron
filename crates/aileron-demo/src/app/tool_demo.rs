@@ -190,8 +190,9 @@ fn run_character_tool_demo(
 
     let fields = guided_tool_loop_fields();
     let tools = count_tool_definitions()?;
-    let options = generation_options(128, "", "");
-    let mut loop_prompt = format!(
+    // Reasoning models need room to finish thinking before emitting guided JSON.
+    let options = generation_options(1024, "", "");
+    let loop_prompt = format!(
         "Available app tool:\n- count_character_occurrences(word: string, character: string): exact deterministic count.\n\nUser request: {prompt}\n\nReturn action=call_tool with tool_name=count_character_occurrences, word, and character if this needs exact counting. Return action=final only if no tool is needed."
     );
 
@@ -294,12 +295,11 @@ fn run_character_tool_demo(
     };
 
     tx.send(ToolEvent::Trace(
-        "before_llm_call: append tool_result to prompt and stream guided response again"
-            .to_string(),
+        "before_llm_call: provide tool_result and request the final guided answer".to_string(),
     ))?;
-    loop_prompt.push_str("\n\ntool_result from count_character_occurrences:\n");
-    loop_prompt.push_str(&result_json.to_string());
-    loop_prompt.push_str("\n\nNow return action=final and put the user-facing answer in answer.");
+    let loop_prompt = format!(
+        "User request: {prompt}\n\nThe app has already executed count_character_occurrences. Its tool_result is:\n{result_json}\n\nThe tool is finished; do not call it again. Return action=final, tool_name=\"\", word and character from the result, and put the user-facing answer in answer."
+    );
     let final_content = if results.is_empty() {
         let (content, _) =
             stream_guided_response(&session_handle, &loop_prompt, fields, tools, options)?;
@@ -1399,6 +1399,57 @@ fn infer_character_from_prompt(prompt: &str) -> Option<char> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[ignore = "requires running model portals and an authorized language.analyze model"]
+    fn character_counter_with_real_portal_and_model() {
+        use super::*;
+        use std::time::Duration;
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = run_character_tool_demo(
+                ToolDemoCase::CharacterCounter.default_prompt(),
+                tx.clone(),
+            );
+            if let Err(error) = &result {
+                let _ = tx.send(ToolEvent::Error(error.to_string()));
+            }
+            result
+        });
+        let mut approved = false;
+        let mut final_answer = None;
+        loop {
+            match rx
+                .recv_timeout(Duration::from_secs(240))
+                .expect("tool demo timed out or exited before completion")
+            {
+                ToolEvent::ConfirmationRequested {
+                    tool_name,
+                    arguments_json,
+                    response_tx,
+                } => {
+                    assert_eq!(tool_name, "count_character_occurrences");
+                    let args: serde_json::Value = serde_json::from_str(&arguments_json).unwrap();
+                    assert_eq!(args["word"], "strawrberrry");
+                    assert_eq!(args["character"], "r");
+                    response_tx.send(true).unwrap();
+                    approved = true;
+                }
+                ToolEvent::Final(answer) => final_answer = Some(answer),
+                ToolEvent::Done => break,
+                ToolEvent::Trace(trace) => eprintln!("{trace}"),
+                ToolEvent::Cancelled(reason) | ToolEvent::Error(reason) => panic!("{reason}"),
+            }
+        }
+        worker.join().unwrap().unwrap();
+        assert!(approved, "the counter tool must actually execute");
+        let answer = final_answer.expect("missing final answer");
+        assert!(
+            answer.contains('5') || answer.to_lowercase().contains("five"),
+            "{answer}"
+        );
+    }
+
     use super::{
         build_linux_pc_diagnostics_plan, compact_diagnostics_result_for_model,
         diagnostics_arguments_from_response, execute_count_tool,

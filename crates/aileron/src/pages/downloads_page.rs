@@ -43,7 +43,6 @@ impl SimpleComponent for DownloadsPage {
         sender: ComponentSender<Self>,
     ) -> ComponentParts<Self> {
         let list_box = build_page(&page);
-        refresh_downloads_list(&list_box);
         let model = DownloadsPage {
             poll_active: Rc::new(Cell::new(false)),
             start_poll: has_active_downloads(),
@@ -64,21 +63,16 @@ impl SimpleComponent for DownloadsPage {
     fn update_view(&self, widgets: &mut Self::Widgets, sender: ComponentSender<Self>) {
         refresh_downloads_list(&widgets.list_box);
         if self.start_poll {
-            start_poll(&widgets.list_box, self.poll_active.clone(), sender);
+            start_poll(self.poll_active.clone(), sender);
         }
     }
 }
 
-fn start_poll(
-    list_box: &ListBox,
-    poll_active: Rc<Cell<bool>>,
-    sender: ComponentSender<DownloadsPage>,
-) {
+fn start_poll(poll_active: Rc<Cell<bool>>, sender: ComponentSender<DownloadsPage>) {
     if poll_active.get() {
         return;
     }
     poll_active.set(true);
-    refresh_downloads_list(list_box);
 
     let mut grace_ticks = 15;
     glib::timeout_add_seconds_local(2, move || {

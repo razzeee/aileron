@@ -6,7 +6,10 @@ use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::os::fd::AsRawFd;
 use std::process::Command;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{
+    Arc, Mutex, RwLock,
+    atomic::{AtomicBool, Ordering},
+};
 use std::thread;
 use std::time::Duration;
 use tracing::{info, warn};
@@ -17,6 +20,7 @@ const BUS_NAME: &str = "org.freedesktop.impl.portal.desktop.aileron";
 const OBJECT_PATH: &str = "/org/freedesktop/portal/desktop";
 const FRONTEND_BUS_NAME: &str = "org.freedesktop.portal.Desktop";
 const MAX_PREWARM_WORKERS: usize = 4;
+const CANCEL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_TRANSPORT_WORKERS: usize = 16;
 const MAX_BACKGROUND_WORKERS: usize = 8;
 static TRANSPORT_WORKERS: tokio::sync::Semaphore =
@@ -184,6 +188,7 @@ struct AsyncReplies<T> {
     worker: Option<tokio::task::JoinHandle<()>>,
     state: Arc<PortalState>,
     request_id: String,
+    completed: Arc<AtomicBool>,
 }
 
 impl<T> AsyncReplies<T> {
@@ -213,7 +218,7 @@ impl<T> AsyncReplies<T> {
 impl<T> Drop for AsyncReplies<T> {
     fn drop(&mut self) {
         self.receiver.close();
-        if self.worker.is_some() {
+        if self.worker.is_some() && !self.completed.load(Ordering::Acquire) {
             let cancellation = cancel_request_record(&self.state, &self.request_id);
             let state = self.state.clone();
             let request_id = self.request_id.clone();
@@ -271,7 +276,9 @@ where
         worker: None,
         state: state.clone(),
         request_id: request_id.to_string(),
+        completed: Arc::new(AtomicBool::new(false)),
     };
+    let completed = replies.completed.clone();
     let request_id = request_id.to_string();
     replies.worker = Some(tokio::task::spawn_blocking(move || {
         let _permit = permit;
@@ -281,12 +288,21 @@ where
         let result = (|| {
             let connection = connect_request_daemon(&state, &request_id)?;
             let mut call = make_call(aileron_varlink::aileron_Inference::VarlinkClient::new(
-                connection,
+                connection.clone(),
             ));
             let iter = call
                 .more()
                 .map_err(|e| map_request_error(&state, &request_id, e))?;
             for reply in iter {
+                // MethodCall restores the reader to its connection on a terminal
+                // reply. Record completion before buffering that reply, so dropping
+                // it later cannot cancel newer work on the same daemon session.
+                if connection.read().unwrap().reader.is_some() {
+                    if let Some(record) = state.requests.lock().unwrap().get_mut(&request_id) {
+                        record.daemon_session_id = None;
+                    }
+                    completed.store(true, Ordering::Release);
+                }
                 ensure_request_active(&state, &request_id)?;
                 let reply = reply.map_err(|e| map_request_error(&state, &request_id, e))?;
                 if sender.blocking_send(Ok(reply)).is_err() {
@@ -2095,13 +2111,28 @@ async fn complete_request_cancellation(
     };
     if let Some(session_id) = daemon_session_id {
         let daemon_address = state.daemon_address();
-        let result = blocking(&CONTROL_WORKERS, None, move || {
+        let cancel = blocking(&CONTROL_WORKERS, None, move || {
             use aileron_varlink::aileron_Inference::VarlinkClientInterface;
 
             let connection =
                 varlink::Connection::with_address(&daemon_address).map_err(anyhow::Error::from);
             connection
                 .and_then(|connection| {
+                    {
+                        let guard = connection.read().unwrap();
+                        let stream = guard
+                            .stream
+                            .as_ref()
+                            .ok_or_else(|| anyhow::anyhow!("missing Varlink stream"))?;
+                        // The connection guard keeps the descriptor alive while it
+                        // is duplicated. Socket timeouts also apply to the library's
+                        // reader/writer clones, so a silent daemon cannot leak a worker.
+                        let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(stream.as_raw_fd()) }
+                            .try_clone_to_owned()?;
+                        let socket = std::os::unix::net::UnixStream::from(fd);
+                        socket.set_read_timeout(Some(CANCEL_REQUEST_TIMEOUT))?;
+                        socket.set_write_timeout(Some(CANCEL_REQUEST_TIMEOUT))?;
+                    }
                     let mut client =
                         aileron_varlink::aileron_Inference::VarlinkClient::new(connection);
                     client
@@ -2111,10 +2142,11 @@ async fn complete_request_cancellation(
                         .map_err(anyhow::Error::from)
                 })
                 .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))
-        })
-        .await;
-        if let Err(error) = result {
-            warn!("failed to cancel active daemon request: {error}");
+        });
+        match tokio::time::timeout(CANCEL_REQUEST_TIMEOUT, cancel).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => warn!("failed to cancel active daemon request: {error}"),
+            Err(_) => warn!("timed out while cancelling active daemon request"),
         }
     }
     if let Some(session_handle) = session_handle {
@@ -3535,6 +3567,43 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn cancellation_deadline_releases_synthesis_slot_when_daemon_never_replies() {
+        use std::io::Read;
+        let daemon = TestDaemon::new();
+        let listener = daemon.listener.try_clone().unwrap();
+        attach_request_daemon_session(&daemon.state, "request", "daemon-session").unwrap();
+        begin_synthesis_request(&daemon.state, "session", "request").unwrap();
+        let server = tokio::task::spawn_blocking(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_request(&mut stream);
+            stream
+                .set_read_timeout(Some(CANCEL_REQUEST_TIMEOUT + Duration::from_secs(2)))
+                .unwrap();
+            let mut byte = [0];
+            assert_eq!(stream.read(&mut byte).unwrap(), 0);
+        });
+        tokio::time::timeout(
+            CANCEL_REQUEST_TIMEOUT + Duration::from_secs(1),
+            cancel_request(&daemon.state, "request"),
+        )
+        .await
+        .expect("Close must have a bounded deadline");
+        assert!(request_is_cancelled(&daemon.state, "request"));
+        assert!(
+            daemon
+                .state
+                .active_synthesis_requests
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn cancelled_request_does_not_wait_for_worker_capacity() {
         static WORKERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(0);
         let daemon = TestDaemon::new();
@@ -3645,6 +3714,90 @@ mod tests {
         })
         .await
         .unwrap();
+        server.join().unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropping_completed_buffered_reply_does_not_cancel_new_session_work() {
+        use aileron_varlink::aileron_Inference::VarlinkClientInterface;
+        use std::io::Write;
+        let _admission_test = ADMISSION_TEST.lock().await;
+        let daemon = TestDaemon::new();
+        let listener = daemon.listener.try_clone().unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut first, _) = listener.accept().unwrap();
+            read_request(&mut first);
+            first
+                .write_all(
+                    b"{\"parameters\":{\"embedding\":[1],\"embedding_pipeline_id\":\"first\"}}\0",
+                )
+                .unwrap();
+            let (mut second, _) = listener.accept().unwrap();
+            assert_eq!(
+                read_request(&mut second)["method"],
+                "aileron.Inference.StreamEmbed"
+            );
+            started_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            assert_eq!(
+                listener.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock,
+                "dropping a completed stream must not send session-wide cancellation"
+            );
+            second
+                .write_all(
+                    b"{\"parameters\":{\"embedding\":[2],\"embedding_pipeline_id\":\"second\"}}\0",
+                )
+                .unwrap();
+        });
+        let make_call = |mut client: aileron_varlink::aileron_Inference::VarlinkClient| {
+            client.stream_embed(
+                "daemon-session".into(),
+                "text".into(),
+                aileron_varlink::aileron_Inference::EmbedOptions {
+                    execution_mode: "interactive".into(),
+                },
+            )
+        };
+        let first = stream_replies(daemon.state.clone(), "request", vec![], false, make_call)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !first.worker.as_ref().unwrap().is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            !first.receiver.is_empty(),
+            "terminal reply must remain buffered"
+        );
+        daemon.state.requests.lock().unwrap().insert(
+            "second".into(),
+            RequestRecord {
+                session_handle: Some("session".into()),
+                daemon_session_id: None,
+                cancelled: false,
+                active_connection: None,
+            },
+        );
+        let mut second = stream_replies(daemon.state.clone(), "second", vec![], false, make_call)
+            .await
+            .unwrap();
+        started_rx.await.unwrap();
+        drop(first);
+        assert!(!request_is_cancelled(&daemon.state, "request"));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            second.recv().await.unwrap().unwrap().embedding_pipeline_id,
+            "second"
+        );
+        assert!(second.recv().await.is_none());
         server.join().unwrap();
     }
 

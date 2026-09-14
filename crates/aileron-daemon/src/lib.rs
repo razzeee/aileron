@@ -38,7 +38,7 @@ pub async fn run_main() -> anyhow::Result<()> {
 
     info!("aileron-daemon starting");
 
-    aileron_ipc::server::remove_stale_socket()?;
+    let _socket_lock = aileron_ipc::server::prepare_socket()?;
 
     let shared = state::SharedState::load(config).await?;
     service::run(shared).await?;
