@@ -2140,9 +2140,9 @@ dependencies = [
 
 [[package]]
 name = "llmfit-core"
-version = "1.1.14"
+version = "1.1.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ed963fdeb0171547c7d11333a0e00c52d0d487852d7672a1d8b3ea2c2eccada9"
+checksum = "3f8315e9088cd09f7a8f2cd8cd9252fcba3993120a1edc2bc0d6be8b2ee1cac3"
 dependencies = [
  "base64 0.23.1",
  "dirs",
