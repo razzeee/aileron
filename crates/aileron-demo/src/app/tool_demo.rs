@@ -23,13 +23,15 @@ pub(crate) enum ToolEvent {
 pub(crate) enum ToolDemoCase {
     CharacterCounter,
     LinuxDiagnostics,
+    StorageCleanupAdvisor,
 }
 
 impl ToolDemoCase {
-    pub(crate) fn labels() -> [&'static str; 2] {
+    pub(crate) fn labels() -> [&'static str; 3] {
         [
             ToolDemoCase::CharacterCounter.label(),
             ToolDemoCase::LinuxDiagnostics.label(),
+            ToolDemoCase::StorageCleanupAdvisor.label(),
         ]
     }
 
@@ -37,6 +39,7 @@ impl ToolDemoCase {
         match self {
             ToolDemoCase::CharacterCounter => 0,
             ToolDemoCase::LinuxDiagnostics => 1,
+            ToolDemoCase::StorageCleanupAdvisor => 2,
         }
     }
 
@@ -44,6 +47,7 @@ impl ToolDemoCase {
         match index {
             0 => Some(ToolDemoCase::CharacterCounter),
             1 => Some(ToolDemoCase::LinuxDiagnostics),
+            2 => Some(ToolDemoCase::StorageCleanupAdvisor),
             _ => None,
         }
     }
@@ -52,6 +56,7 @@ impl ToolDemoCase {
         match self {
             ToolDemoCase::CharacterCounter => "Character counter",
             ToolDemoCase::LinuxDiagnostics => "Linux PC diagnostics",
+            ToolDemoCase::StorageCleanupAdvisor => "Storage cleanup advisor",
         }
     }
 
@@ -62,6 +67,9 @@ impl ToolDemoCase {
             }
             ToolDemoCase::LinuxDiagnostics => {
                 "Analyze this Linux PC for recent failures or resource problems and recommend safe bugfix steps."
+            }
+            ToolDemoCase::StorageCleanupAdvisor => {
+                "Inspect this Linux PC's storage usage and recommend safe commands to reclaim space."
             }
         }
     }
@@ -74,6 +82,9 @@ impl ToolDemoCase {
             ToolDemoCase::LinuxDiagnostics => {
                 "Collect read-only Linux PC diagnostics locally, then ask the model for fix guidance."
             }
+            ToolDemoCase::StorageCleanupAdvisor => {
+                "Collect real disk usage from fixed user-owned locations, then ask the model for cleanup guidance."
+            }
         }
     }
 
@@ -82,6 +93,9 @@ impl ToolDemoCase {
             ToolDemoCase::CharacterCounter => "The app owns the loop and executes tools locally.",
             ToolDemoCase::LinuxDiagnostics => {
                 "The app is waiting for approval before collecting bounded, read-only PC diagnostics."
+            }
+            ToolDemoCase::StorageCleanupAdvisor => {
+                "The app is waiting for approval before reading bounded, user-owned storage locations."
             }
         }
     }
@@ -138,6 +152,7 @@ pub(crate) fn run_tool_demo(
     match case {
         ToolDemoCase::CharacterCounter => run_character_tool_demo(prompt, tx),
         ToolDemoCase::LinuxDiagnostics => run_linux_diagnostics_tool_demo(prompt, tx),
+        ToolDemoCase::StorageCleanupAdvisor => run_storage_cleanup_demo(prompt, tx),
     }
 }
 
@@ -475,6 +490,199 @@ fn run_linux_diagnostics_tool_demo(
     close_public_session(&session_handle)?;
     tx.send(ToolEvent::Done)?;
     Ok(())
+}
+
+fn run_storage_cleanup_demo(
+    prompt: &str,
+    tx: std::sync::mpsc::Sender<ToolEvent>,
+) -> anyhow::Result<()> {
+    tx.send(ToolEvent::Trace(
+        "before_agent_loop: register the fixed-scope get_storage_usage tool".to_string(),
+    ))?;
+
+    let conn = portal_connection()?;
+    let proxy = zbus::blocking::Proxy::new(&conn, PORTAL_BUS, PORTAL_PATH, LANGUAGE_IFACE)?;
+    let session_handle = create_public_session(
+        &proxy,
+        "language.analyze",
+        "You are a local Linux storage advisor. Request the app-provided storage usage tool before making recommendations. Never ask the app to run a cleanup command. After receiving evidence, recommend specific safe commands for the user to review, explain what each command removes, and warn about commands that need extra care.",
+    )?;
+
+    let fields = guided_linux_pc_diagnostics_loop_fields();
+    let tools = storage_usage_tool_definitions()?;
+    let options = generation_options(512, "", "");
+    let loop_prompt = format!(
+        "Available read-only app tool:\n- get_storage_usage(): run bounded df and du commands against fixed user-owned storage locations.\n\nPolicy:\n- The app owns tool execution and validates the tool name.\n- The tool only reads storage usage; it never deletes or modifies files.\n- Use the evidence to recommend safe cleanup commands for the user to review.\n- Do not claim that cleanup happened.\n\nUser request: {prompt}\n\nCall get_storage_usage now, then return a concise storage cleanup plan."
+    );
+
+    tx.send(ToolEvent::Trace(
+        "before_llm_call: ask StreamRespondGuided for storage evidence".to_string(),
+    ))?;
+    let (content, tool_calls) = stream_guided_response(
+        &session_handle,
+        &loop_prompt,
+        fields.clone(),
+        tools.clone(),
+        options.clone(),
+    )?;
+
+    let should_call_tool = !tool_calls.is_empty()
+        || content.trim().is_empty()
+        || content.contains("call_tool")
+        || content.contains("get_storage_usage");
+    if !should_call_tool {
+        tx.send(ToolEvent::Trace(
+            "after_llm_call: storage demo requires local evidence; requesting the read-only tool"
+                .to_string(),
+        ))?;
+    }
+
+    let result_json = if tool_calls.is_empty() {
+        let arguments_json = "{}".to_string();
+        tx.send(ToolEvent::Trace(format!(
+            "before_tool_execution: get_storage_usage args={arguments_json}; awaiting user approval"
+        )))?;
+        if !request_tool_confirmation(&tx, "get_storage_usage", &arguments_json)? {
+            return cancel_tool_execution(&tx, &session_handle, "get_storage_usage");
+        }
+        tx.send(ToolEvent::Trace(
+            "before_tool_execution: user approved get_storage_usage".to_string(),
+        ))?;
+        let result_json = execute_storage_usage_tool()?;
+        tx.send(ToolEvent::Trace(format!(
+            "after_tool_execution: result={}",
+            format_diagnostics_tool_result_for_trace(&result_json)
+        )))?;
+        result_json
+    } else {
+        let mut command_results = Vec::new();
+        for call in tool_calls {
+            tx.send(ToolEvent::Trace(format!(
+                "before_tool_execution: {} id={} args={}; awaiting user approval",
+                call.name, call.id, call.arguments_json
+            )))?;
+            if call.name != "get_storage_usage" {
+                return Err(anyhow::anyhow!(
+                    "unexpected storage tool call: {}",
+                    call.name
+                ));
+            }
+            if !request_tool_confirmation(&tx, &call.name, &call.arguments_json)? {
+                return cancel_tool_execution(&tx, &session_handle, &call.name);
+            }
+            tx.send(ToolEvent::Trace(format!(
+                "before_tool_execution: user approved {} id={}",
+                call.name, call.id
+            )))?;
+            let result = execute_storage_usage_tool()?;
+            tx.send(ToolEvent::Trace(format!(
+                "after_tool_execution: result={}",
+                format_diagnostics_tool_result_for_trace(&result)
+            )))?;
+            command_results.extend(result["commands"].as_array().cloned().unwrap_or_default());
+        }
+        serde_json::json!({
+            "tool": "get_storage_usage",
+            "read_only": true,
+            "scope": "fixed user-owned storage locations",
+            "cleanup_policy": "No changes were applied.",
+            "commands": command_results,
+        })
+    };
+
+    let model_result_json = compact_diagnostics_result_for_model(&result_json);
+    tx.send(ToolEvent::Trace(
+        "before_llm_call: append storage evidence and request cleanup recommendations".to_string(),
+    ))?;
+    let final_prompt = format!(
+        "User request: {prompt}\n\nRead-only storage evidence follows. No changes were applied. Give a concise cleanup plan with: largest storage consumers, commands the user can review, what each command removes, and any risks. Never say that commands were run. Prefer commands that target caches, old logs, or clearly disposable data; do not recommend deleting personal files.\n\n{}",
+        model_result_json
+    );
+    let final_answer = stream_language_text(&session_handle, &final_prompt, options, None)?;
+    tx.send(ToolEvent::Trace(format!(
+        "after_llm_call: storage cleanup guidance={:?}",
+        final_answer
+    )))?;
+    tx.send(ToolEvent::Final(
+        if final_answer.trim().is_empty() || final_answer.trim() == "stub" {
+            format_storage_cleanup_answer(&result_json)
+        } else {
+            final_answer
+        },
+    ))?;
+    close_public_session(&session_handle)?;
+    tx.send(ToolEvent::Done)?;
+    Ok(())
+}
+
+fn storage_usage_tool_definitions() -> anyhow::Result<Vec<ToolDefinitionDbus>> {
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+    });
+    Ok(vec![ToolDefinitionDbus {
+        name: "get_storage_usage".to_string(),
+        description: "Read disk usage and bounded directory sizes for fixed user-owned storage locations. This tool never deletes or changes files.".to_string(),
+        schema_json: serde_json::to_string(&schema)?,
+    }])
+}
+
+fn storage_usage_commands() -> Vec<DiagnosticCommand> {
+    let mut commands = vec![diagnostic_command(
+        "mounted filesystem usage",
+        "df",
+        vec!["-h", "-x", "tmpfs", "-x", "devtmpfs"],
+    )];
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    for (label, relative) in [
+        ("home directory top-level usage", "."),
+        ("user cache usage", ".cache"),
+        ("user data usage", ".local/share"),
+        ("sandbox app data usage", ".var/app"),
+    ] {
+        let path = if relative == "." {
+            home.clone()
+        } else {
+            home.join(relative)
+        };
+        if path.exists() {
+            commands.push(DiagnosticCommand {
+                label: label.to_string(),
+                program: "du".to_string(),
+                args: vec![
+                    "-x".to_string(),
+                    "-h".to_string(),
+                    "--max-depth=1".to_string(),
+                    path.display().to_string(),
+                ],
+            });
+        }
+    }
+    commands
+}
+
+fn execute_storage_usage_tool() -> anyhow::Result<serde_json::Value> {
+    let commands = storage_usage_commands()
+        .iter()
+        .map(run_diagnostic_command)
+        .collect::<Vec<_>>();
+    Ok(serde_json::json!({
+        "tool": "get_storage_usage",
+        "read_only": true,
+        "scope": "fixed user-owned storage locations",
+        "cleanup_policy": "No changes were applied.",
+        "commands": commands,
+    }))
+}
+
+fn format_storage_cleanup_answer(result: &serde_json::Value) -> String {
+    let commands = result["commands"].as_array().map_or(0, Vec::len);
+    format!(
+        "Collected read-only storage usage from {commands} command(s). Review the trace for the evidence, then inspect caches and other disposable data before running any cleanup command. No files were changed."
+    )
 }
 
 fn execute_count_tool(prompt: &str, arguments_json: &str) -> anyhow::Result<serde_json::Value> {
@@ -1405,6 +1613,7 @@ mod tests {
         guided_linux_pc_diagnostics_loop_fields, guided_tool_loop_fields, initial_final_answer,
         is_safe_systemd_unit, linux_pc_diagnostics_tool_definitions,
         parse_guided_diagnostics_loop_response, parse_guided_tool_loop_response,
+        storage_usage_commands, storage_usage_tool_definitions,
     };
     use hegel::TestCase;
     use hegel::generators as gs;
@@ -1626,6 +1835,36 @@ mod tests {
         assert!(names.contains(&"get_disk_usage".to_string()));
         assert!(names.contains(&"get_recent_kernel_warnings".to_string()));
         assert!(!names.contains(&"collect_linux_pc_diagnostics".to_string()));
+    }
+
+    #[test]
+    fn storage_tool_is_narrow_and_read_only() {
+        let tools = storage_usage_tool_definitions().expect("storage tool should serialize");
+
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "get_storage_usage");
+        assert!(tools[0].description.contains("never deletes"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&tools[0].schema_json)
+                .expect("storage schema should be JSON")["additionalProperties"],
+            false
+        );
+    }
+
+    #[test]
+    fn storage_commands_have_no_mutating_programs() {
+        let commands = storage_usage_commands();
+
+        assert!(commands.iter().any(|command| command.program == "df"));
+        assert!(commands.iter().any(|command| command.program == "du"));
+        assert!(commands.iter().all(|command| {
+            !matches!(command.program.as_str(), "rm" | "rmdir" | "find")
+                && command.args.iter().all(|arg| {
+                    !matches!(arg.as_str(), "-delete" | "--delete")
+                        && !arg.contains(";")
+                        && !arg.contains("&&")
+                })
+        }));
     }
 
     #[test]
