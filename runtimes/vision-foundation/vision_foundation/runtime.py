@@ -222,23 +222,26 @@ def handle_detect(request: dict[str, Any]) -> dict[str, Any]:
         with contextlib.redirect_stdout(sys.stderr):
             model = _model_cache.get("yolo", model_path, YOLO)
             results = model.predict(decoded.image, verbose=False)
+
+        detections: list[dict[str, Any]] = []
+        names = getattr(model, "names", {}) or {}
+        for result in results:
+            boxes = getattr(result, "boxes", None)
+            if boxes is None:
+                continue
+            for box in boxes:
+                xyxy = box.xyxy[0].tolist()
+                cls = int(box.cls[0].item()) if getattr(box, "cls", None) is not None else -1
+                label = str(names.get(cls, cls if cls >= 0 else "object"))
+                confidence = float(box.conf[0].item()) if getattr(box, "conf", None) is not None else 0.0
+                detections.append({"label": label, "confidence": clamp01(confidence), **normalize_box(*xyxy, decoded.width, decoded.height)})
+        return result_response(str(request.get("id", "unknown")), {"detections": detections})
+    except RuntimeErrorCode:
+        _model_cache.clear()
+        raise
     except Exception as exc:  # noqa: BLE001
         _model_cache.clear()
         raise RuntimeErrorCode("inference_failed", f"YOLO inference failed: {exc}") from exc
-
-    detections: list[dict[str, Any]] = []
-    names = getattr(model, "names", {}) or {}
-    for result in results:
-        boxes = getattr(result, "boxes", None)
-        if boxes is None:
-            continue
-        for box in boxes:
-            xyxy = box.xyxy[0].tolist()
-            cls = int(box.cls[0].item()) if getattr(box, "cls", None) is not None else -1
-            label = str(names.get(cls, cls if cls >= 0 else "object"))
-            confidence = float(box.conf[0].item()) if getattr(box, "conf", None) is not None else 0.0
-            detections.append({"label": label, "confidence": clamp01(confidence), **normalize_box(*xyxy, decoded.width, decoded.height)})
-    return result_response(str(request.get("id", "unknown")), {"detections": detections})
 
 
 def handle_segment(request: dict[str, Any]) -> dict[str, Any]:
@@ -272,53 +275,56 @@ def handle_segment(request: dict[str, Any]) -> dict[str, Any]:
                 )
             finally:
                 reset_sam_request(model)
+
+        if len(results) != 1:
+            raise RuntimeErrorCode("inference_failed", "SAM returned an unexpected result count")
+        result = results[0]
+        masks = getattr(getattr(result, "masks", None), "data", None)
+        scores = getattr(getattr(result, "boxes", None), "conf", None)
+        if masks is None or scores is None:
+            raise RuntimeErrorCode("inference_failed", "SAM result is missing masks or mask scores")
+        mask_values = tensor_to_numpy(masks)
+        score_values = tensor_to_numpy(scores).reshape(-1)
+        if mask_values.ndim != 3 or mask_values.shape[0] == 0 or len(mask_values) != len(score_values):
+            raise RuntimeErrorCode("inference_failed", "SAM returned inconsistent masks and mask scores")
+        if len(mask_values) != 1 or not np.isfinite(score_values).all():
+            raise RuntimeErrorCode("inference_failed", "SAM must return one mask with a finite score")
+
+        response_masks: list[dict[str, Any]] = []
+        for mask, score in zip(mask_values, score_values, strict=True):
+            mask_arr = np.asarray(mask) > 0.5
+            if mask_arr.shape != (decoded.height, decoded.width):
+                resized = Image.fromarray(mask_arr.astype(np.uint8)).resize(
+                    (decoded.width, decoded.height),
+                    resample=Image.Resampling.NEAREST,
+                )
+                mask_arr = np.asarray(resized).astype(bool)
+            ys, xs = np.where(mask_arr)
+            if xs.size == 0 or ys.size == 0:
+                box = {"x": 0.0, "y": 0.0, "width": 0.0, "height": 0.0}
+                cropped_mask = mask_arr[:1, :1]
+            else:
+                x1 = int(xs.min())
+                y1 = int(ys.min())
+                x2 = int(xs.max() + 1)
+                y2 = int(ys.max() + 1)
+                box = normalize_box(float(x1), float(y1), float(x2), float(y2), decoded.width, decoded.height)
+                cropped_mask = mask_arr[y1:y2, x1:x2]
+            response_masks.append({
+                "label": "mask",
+                "confidence": clamp01(float(score)),
+                **box,
+                "mask_base64": encode_mask_png(cropped_mask),
+                "mask_width": int(cropped_mask.shape[1]),
+                "mask_height": int(cropped_mask.shape[0]),
+            })
+        return result_response(str(request.get("id", "unknown")), {"masks": response_masks})
+    except RuntimeErrorCode:
+        _model_cache.clear()
+        raise
     except Exception as exc:  # noqa: BLE001
         _model_cache.clear()
         raise RuntimeErrorCode("inference_failed", f"SAM inference failed: {exc}") from exc
-
-    if len(results) != 1:
-        raise RuntimeErrorCode("inference_failed", "SAM returned an unexpected result count")
-    result = results[0]
-    masks = getattr(getattr(result, "masks", None), "data", None)
-    scores = getattr(getattr(result, "boxes", None), "conf", None)
-    if masks is None or scores is None:
-        raise RuntimeErrorCode("inference_failed", "SAM result is missing masks or mask scores")
-    mask_values = tensor_to_numpy(masks)
-    score_values = tensor_to_numpy(scores).reshape(-1)
-    if mask_values.ndim != 3 or mask_values.shape[0] == 0 or len(mask_values) != len(score_values):
-        raise RuntimeErrorCode("inference_failed", "SAM returned inconsistent masks and mask scores")
-    if len(mask_values) != 1 or not np.isfinite(score_values).all():
-        raise RuntimeErrorCode("inference_failed", "SAM must return one mask with a finite score")
-
-    response_masks: list[dict[str, Any]] = []
-    for mask, score in zip(mask_values, score_values, strict=True):
-        mask_arr = np.asarray(mask) > 0.5
-        if mask_arr.shape != (decoded.height, decoded.width):
-            resized = Image.fromarray(mask_arr.astype(np.uint8)).resize(
-                (decoded.width, decoded.height),
-                resample=Image.Resampling.NEAREST,
-            )
-            mask_arr = np.asarray(resized).astype(bool)
-        ys, xs = np.where(mask_arr)
-        if xs.size == 0 or ys.size == 0:
-            box = {"x": 0.0, "y": 0.0, "width": 0.0, "height": 0.0}
-            cropped_mask = mask_arr[:1, :1]
-        else:
-            x1 = int(xs.min())
-            y1 = int(ys.min())
-            x2 = int(xs.max() + 1)
-            y2 = int(ys.max() + 1)
-            box = normalize_box(float(x1), float(y1), float(x2), float(y2), decoded.width, decoded.height)
-            cropped_mask = mask_arr[y1:y2, x1:x2]
-        response_masks.append({
-            "label": "mask",
-            "confidence": clamp01(float(score)),
-            **box,
-            "mask_base64": encode_mask_png(cropped_mask),
-            "mask_width": int(cropped_mask.shape[1]),
-            "mask_height": int(cropped_mask.shape[0]),
-        })
-    return result_response(str(request.get("id", "unknown")), {"masks": response_masks})
 
 
 def handle_depth(request: dict[str, Any]) -> dict[str, Any]:
@@ -335,18 +341,22 @@ def handle_depth(request: dict[str, Any]) -> dict[str, Any]:
         with contextlib.redirect_stdout(sys.stderr):
             model = _model_cache.get("yolo", model_path, YOLO)
             results = model.predict(decoded.image, verbose=False)
+
+        if len(results) != 1:
+            raise RuntimeErrorCode("inference_failed", "YOLO depth returned an unexpected result count")
+        depth = getattr(getattr(results[0], "depth", None), "data", None)
+        if depth is None:
+            raise RuntimeErrorCode("inference_failed", "YOLO depth result is missing depth.data")
+        return result_response(
+            str(request.get("id", "unknown")),
+            {"depth": prepare_depth_response(tensor_to_numpy(depth))},
+        )
+    except RuntimeErrorCode:
+        _model_cache.clear()
+        raise
     except Exception as exc:  # noqa: BLE001
         _model_cache.clear()
         raise RuntimeErrorCode("inference_failed", f"YOLO depth inference failed: {exc}") from exc
-    if len(results) != 1:
-        raise RuntimeErrorCode("inference_failed", "YOLO depth returned an unexpected result count")
-    depth = getattr(getattr(results[0], "depth", None), "data", None)
-    if depth is None:
-        raise RuntimeErrorCode("inference_failed", "YOLO depth result is missing depth.data")
-    return result_response(
-        str(request.get("id", "unknown")),
-        {"depth": prepare_depth_response(tensor_to_numpy(depth))},
-    )
 
 
 def tensor_to_numpy(value: Any) -> np.ndarray:

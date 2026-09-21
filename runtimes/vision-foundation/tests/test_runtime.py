@@ -429,6 +429,59 @@ class RuntimeHelpersTest(unittest.TestCase):
         runtime._model_cache.get("yolo", second, yolo)
         self.assertEqual(yolo.call_count, 2)
 
+    def test_result_processing_failures_evict_model_and_preserve_errors(self):
+        cases = [
+            ("detect", [types.SimpleNamespace(boxes=1)], "YOLO inference failed:"),
+            ("segment", [], "SAM returned an unexpected result count"),
+            ("segment", [types.SimpleNamespace(masks=types.SimpleNamespace(data=[[["bad"]]]),
+                                             boxes=types.SimpleNamespace(conf=[0.75]))], "SAM inference failed:"),
+            ("depth", [], "YOLO depth returned an unexpected result count"),
+            ("depth", [types.SimpleNamespace(depth=types.SimpleNamespace(data=[[float("nan")]]))],
+             "depth output must be finite, nonnegative and non-empty"),
+            ("depth", [types.SimpleNamespace(depth=types.SimpleNamespace(data=[["bad"]]))],
+             "YOLO depth inference failed:"),
+        ]
+        for task, malformed_results, expected_reason in cases:
+            with self.subTest(task=task, expected_reason=expected_reason):
+                runtime._model_cache.clear()
+                loads = []
+
+                class FakeModel:
+                    names = {}
+
+                    def __init__(self, path):
+                        loads.append(Path(path))
+                        self.malformed = len(loads) == 1
+
+                    def predict(self, _image, **_kwargs):
+                        if self.malformed:
+                            return malformed_results
+                        return [types.SimpleNamespace(
+                            boxes=types.SimpleNamespace(conf=np.asarray([0.75])) if task == "segment" else [],
+                            masks=types.SimpleNamespace(data=np.ones((1, 2, 2))),
+                            depth=types.SimpleNamespace(data=np.ones((2, 2))),
+                        )]
+
+                ultralytics = types.ModuleType("ultralytics")
+                ultralytics.YOLO = ultralytics.SAM = FakeModel
+                path = self.create_temp_model_dir(("model.pt",))
+                request = {"id": "retry", "type": task, "image": tiny_png_base64(),
+                           "points": [{"x": 0.5, "y": 0.5}]}
+                with unittest.mock.patch.dict(sys.modules, {"ultralytics": ultralytics}):
+                    with unittest.mock.patch.object(runtime, "MODEL_DIR", path):
+                        with self.assertRaises(runtime.RuntimeErrorCode) as raised:
+                            runtime.handle_request(request)
+                        self.assertEqual(raised.exception.code, "inference_failed")
+                        if expected_reason.endswith(":"):
+                            self.assertTrue(raised.exception.reason.startswith(expected_reason))
+                        else:
+                            self.assertEqual(raised.exception.reason, expected_reason)
+                        if task == "segment":
+                            self.assertFalse(loads[0].exists())
+                        self.assertTrue(runtime.handle_request(request)["done"])
+                        self.assertTrue(runtime.handle_request(request)["done"])
+                self.assertEqual(len(loads), 2)
+
     def test_failed_sam_load_removes_alias_and_can_retry(self):
         aliases = []
 
