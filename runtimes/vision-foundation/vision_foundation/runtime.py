@@ -8,6 +8,7 @@ import os
 import sys
 import tempfile
 import traceback
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -32,6 +33,54 @@ class DecodedImage:
     image: Image.Image
     width: int
     height: int
+
+
+class ModelCache:
+    """One loaded model for the sequential request loop and its mounted checkpoint."""
+
+    def __init__(self):
+        self.key: tuple[str, Path] | None = None
+        self.model: Any = None
+        self.alias_dir: tempfile.TemporaryDirectory | None = None
+
+    def clear(self):
+        self.model = None
+        self.key = None
+        if self.alias_dir is not None:
+            self.alias_dir.cleanup()
+            self.alias_dir = None
+
+    def get(self, kind: str, checkpoint: Path, factory: Callable[[str], Any]) -> Any:
+        key = (kind, checkpoint.resolve())
+        if self.key == key:
+            return self.model
+        self.clear()
+        try:
+            if kind == "sam":
+                self.alias_dir = tempfile.TemporaryDirectory()
+                alias = Path(self.alias_dir.name) / "sam2.1_t.pt"
+                alias.symlink_to(key[1])
+                model = factory(str(alias))
+                model.is_sam2 = True
+            else:
+                model = factory(str(checkpoint))
+        except Exception:
+            self.clear()
+            raise
+        self.model = model
+        self.key = key
+        return model
+
+
+_model_cache = ModelCache()
+
+
+def reset_sam_request(model: Any):
+    predictor = getattr(model, "predictor", None)
+    if predictor is not None:
+        predictor.reset_image()
+        predictor.set_prompts({})
+        predictor.segment_all = False
 
 
 def error_response(request_id: str, code: str, reason: str) -> dict[str, Any]:
@@ -171,9 +220,10 @@ def handle_detect(request: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeErrorCode("model_unavailable", "Ultralytics YOLO is not installed in this runtime image") from exc
     try:
         with contextlib.redirect_stdout(sys.stderr):
-            model = YOLO(str(model_path))
+            model = _model_cache.get("yolo", model_path, YOLO)
             results = model.predict(decoded.image, verbose=False)
     except Exception as exc:  # noqa: BLE001
+        _model_cache.clear()
         raise RuntimeErrorCode("inference_failed", f"YOLO inference failed: {exc}") from exc
 
     detections: list[dict[str, Any]] = []
@@ -209,11 +259,9 @@ def handle_segment(request: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeErrorCode("model_unavailable", "Ultralytics SAM is not installed in this runtime image") from exc
     try:
         with contextlib.redirect_stdout(sys.stderr):
-            with tempfile.TemporaryDirectory() as tempdir:
-                alias = Path(tempdir) / "sam2.1_t.pt"
-                alias.symlink_to(checkpoint)
-                model = SAM(str(alias))
-                model.is_sam2 = True
+            model = _model_cache.get("sam", checkpoint, SAM)
+            try:
+                reset_sam_request(model)
                 results = model.predict(
                     decoded.image,
                     points=[point_coords.tolist()] if len(point_coords) else None,
@@ -222,7 +270,10 @@ def handle_segment(request: dict[str, Any]) -> dict[str, Any]:
                     conf=0.0,
                     verbose=False,
                 )
+            finally:
+                reset_sam_request(model)
     except Exception as exc:  # noqa: BLE001
+        _model_cache.clear()
         raise RuntimeErrorCode("inference_failed", f"SAM inference failed: {exc}") from exc
 
     if len(results) != 1:
@@ -282,9 +333,10 @@ def handle_depth(request: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeErrorCode("model_unavailable", "Ultralytics YOLO is not installed in this runtime image") from exc
     try:
         with contextlib.redirect_stdout(sys.stderr):
-            model = YOLO(str(model_path))
+            model = _model_cache.get("yolo", model_path, YOLO)
             results = model.predict(decoded.image, verbose=False)
     except Exception as exc:  # noqa: BLE001
+        _model_cache.clear()
         raise RuntimeErrorCode("inference_failed", f"YOLO depth inference failed: {exc}") from exc
     if len(results) != 1:
         raise RuntimeErrorCode("inference_failed", "YOLO depth returned an unexpected result count")
@@ -320,24 +372,27 @@ def handle_request(request: dict[str, Any]) -> dict[str, Any]:
 
 def main() -> int:
     print("[aileron-vision-foundation] ready", file=sys.stderr, flush=True)
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
-        request_id = "unknown"
-        try:
-            request = json.loads(line)
-            if isinstance(request, dict):
-                request_id = str(request.get("id", "unknown"))
-            else:
-                raise RuntimeErrorCode("invalid_input", "request must be a JSON object")
-            response = handle_request(request)
-        except RuntimeErrorCode as exc:
-            response = error_response(request_id, exc.code, exc.reason)
-        except Exception as exc:  # noqa: BLE001
-            traceback.print_exc(file=sys.stderr)
-            response = error_response(request_id, "inference_failed", str(exc))
-        print(json.dumps(response, separators=(",", ":")), flush=True)
+    try:
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
+                continue
+            request_id = "unknown"
+            try:
+                request = json.loads(line)
+                if isinstance(request, dict):
+                    request_id = str(request.get("id", "unknown"))
+                else:
+                    raise RuntimeErrorCode("invalid_input", "request must be a JSON object")
+                response = handle_request(request)
+            except RuntimeErrorCode as exc:
+                response = error_response(request_id, exc.code, exc.reason)
+            except Exception as exc:  # noqa: BLE001
+                traceback.print_exc(file=sys.stderr)
+                response = error_response(request_id, "inference_failed", str(exc))
+            print(json.dumps(response, separators=(",", ":")), flush=True)
+    finally:
+        _model_cache.clear()
     return 0
 
 

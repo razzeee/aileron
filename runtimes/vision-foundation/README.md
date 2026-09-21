@@ -10,6 +10,25 @@ It implements the existing container stdio protocol for:
 
 The runtime never downloads checkpoints during inference. Missing artifacts or optional Python loaders return structured `model_unavailable` responses.
 
+## Model reuse
+
+The runtime loads its model lazily on the first valid request and reuses the model
+and predictor for subsequent requests. Each process retains at most one model,
+keyed by loader type and resolved checkpoint path. The mounted checkpoint is
+assumed to be immutable for the process lifetime; restart the runtime to replace
+a checkpoint at the same path.
+
+SAM's writable checkpoint alias lives as long as its cached model. Image features,
+prompts, and segmentation mode are reset between requests, including failed
+predictions. Repeated prompts on the same image still recompute image features.
+Model loading or prediction failures discard the cached model so the next request
+can retry with a fresh instance.
+
+This reduces repeated loading and predictor setup, not the first request's startup
+cost. Model memory remains allocated until the runtime exits or replaces the cached
+model. The daemon normally terminates idle runtime containers after 300 seconds,
+configurable through `--idle-timeout-secs`.
+
 ## Build
 
 Run from the repository root:
