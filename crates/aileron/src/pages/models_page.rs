@@ -2105,20 +2105,38 @@ fn better_catalog_candidate<'a>(
     use_case: &str,
 ) -> Option<&'a aileron_varlink::aileron_Models::CatalogProfileInfo> {
     let empty_assigned = HashSet::new();
-    let best = best_missing_candidate(catalog, &empty_assigned, use_case)?;
-    if best.profile_id == assigned_profile_id {
+    let current = catalog
+        .iter()
+        .find(|profile| profile.profile_id == assigned_profile_id)?;
+    let current_score = comparable_task_fit_score(current, use_case)?;
+
+    // Library ordering also uses size, language preferences and heuristic ranks.
+    // Those alone do not establish an improvement over an installed model.
+    catalog
+        .iter()
+        .filter(|candidate| candidate.profile_id != assigned_profile_id)
+        .filter(|candidate| {
+            comparable_task_fit_score(candidate, use_case)
+                .is_some_and(|score| score > current_score)
+                && compare_candidates(candidate, current, &empty_assigned, use_case)
+                    == std::cmp::Ordering::Less
+        })
+        .min_by(|a, b| compare_candidates(a, b, &empty_assigned, use_case))
+}
+
+fn comparable_task_fit_score(
+    profile: &aileron_varlink::aileron_Models::CatalogProfileInfo,
+    use_case: &str,
+) -> Option<f64> {
+    if !profile.use_cases.iter().any(|uc| uc == use_case) {
         return None;
     }
-
-    let Some(current) = catalog
+    profile
+        .use_case_fit_scores
         .iter()
-        .find(|profile| profile.profile_id == assigned_profile_id)
-    else {
-        return Some(best);
-    };
-
-    (compare_candidates(best, current, &empty_assigned, use_case) == std::cmp::Ordering::Less)
-        .then_some(best)
+        .find(|fit| fit.use_case == use_case)
+        .map(|fit| fit.score)
+        .filter(|score| score.is_finite() && *score > 0.0)
 }
 
 fn compare_candidates(
@@ -2983,6 +3001,10 @@ mod tests {
         installed.fit_level = "recommended".to_string();
         installed.fit_score = 60.0;
         installed.use_cases = vec!["language.summarize".to_string()];
+        installed.use_case_fit_scores = vec![aileron_varlink::aileron_Models::UseCaseFitScore {
+            use_case: "language.summarize".to_string(),
+            score: 60.0,
+        }];
 
         let mut better = catalog_profile("better", "balanced", 5.0);
         better.recommended = true;
@@ -2990,10 +3012,116 @@ mod tests {
         better.fit_score = 90.0;
         better.use_cases = vec!["language.summarize".to_string()];
 
+        better.use_case_fit_scores = vec![aileron_varlink::aileron_Models::UseCaseFitScore {
+            use_case: "language.summarize".to_string(),
+            score: 90.0,
+        }];
+
         let catalog = vec![installed, better];
 
         assert_eq!(
             better_catalog_candidate(&catalog, "installed", "language.summarize")
+                .map(|profile| profile.profile_id.as_str()),
+            Some("better")
+        );
+    }
+
+    #[test]
+    fn better_candidate_requires_comparable_task_scores() {
+        let mut current = catalog_profile("depth-current", "balanced", 2.0);
+        current.use_cases = vec!["vision.depth".to_string()];
+        let mut alternative = catalog_profile("depth-alternative", "balanced", 1.0);
+        alternative.use_cases = current.use_cases.clone();
+
+        let mut catalog = vec![current, alternative];
+        assert!(better_catalog_candidate(&catalog, "depth-current", "vision.depth").is_none());
+
+        catalog[1].recommended = true;
+        catalog[1].fit_level = "recommended".to_string();
+        assert!(better_catalog_candidate(&catalog, "depth-current", "vision.depth").is_none());
+
+        catalog[1].use_case_fit_scores = vec![aileron_varlink::aileron_Models::UseCaseFitScore {
+            use_case: "vision.depth".to_string(),
+            score: 90.0,
+        }];
+        assert!(better_catalog_candidate(&catalog, "depth-current", "vision.depth").is_none());
+    }
+
+    #[test]
+    fn better_candidate_requires_current_catalog_entry() {
+        let mut alternative = catalog_profile("depth-alternative", "balanced", 1.0);
+        alternative.use_cases = vec!["vision.depth".to_string()];
+        assert!(better_catalog_candidate(&[alternative], "local-depth", "vision.depth").is_none());
+    }
+
+    #[test]
+    fn better_candidate_ignores_overall_and_other_task_scores() {
+        let mut current = catalog_profile("current", "balanced", 2.0);
+        current.use_cases = vec!["vision.depth".to_string()];
+        current.fit_score = 60.0;
+        let mut alternative = current.clone();
+        alternative.profile_id = "alternative".to_string();
+        alternative.fit_score = 90.0;
+        alternative.use_case_fit_scores = vec![aileron_varlink::aileron_Models::UseCaseFitScore {
+            use_case: "vision.detect".to_string(),
+            score: 90.0,
+        }];
+        assert!(
+            better_catalog_candidate(&[current, alternative], "current", "vision.depth").is_none()
+        );
+    }
+
+    #[test]
+    fn better_candidate_requires_valid_strictly_higher_scores() {
+        for (current_score, alternative_score) in [
+            (70.0, 70.0),
+            (70.0, 60.0),
+            (0.0, 90.0),
+            (70.0, 0.0),
+            (-1.0, 90.0),
+            (70.0, -1.0),
+            (f64::NAN, 90.0),
+            (70.0, f64::NAN),
+            (f64::INFINITY, 90.0),
+            (70.0, f64::INFINITY),
+        ] {
+            let mut current = catalog_profile("current", "balanced", 2.0);
+            current.use_cases = vec!["vision.depth".to_string()];
+            current.use_case_fit_scores = vec![aileron_varlink::aileron_Models::UseCaseFitScore {
+                use_case: "vision.depth".to_string(),
+                score: current_score,
+            }];
+            let mut alternative = current.clone();
+            alternative.profile_id = "alternative".to_string();
+            alternative.disk_size_gb = 1.0;
+            alternative.recommended = true;
+            alternative.use_case_fit_scores[0].score = alternative_score;
+            assert!(
+                better_catalog_candidate(&[current, alternative], "current", "vision.depth")
+                    .is_none(),
+                "scores {current_score} and {alternative_score} should not imply an improvement"
+            );
+        }
+    }
+
+    #[test]
+    fn better_candidate_skips_unscored_library_favorite() {
+        let mut current = catalog_profile("current", "balanced", 2.0);
+        current.use_cases = vec!["vision.depth".to_string()];
+        current.use_case_fit_scores = vec![aileron_varlink::aileron_Models::UseCaseFitScore {
+            use_case: "vision.depth".to_string(),
+            score: 60.0,
+        }];
+        let mut better = current.clone();
+        better.profile_id = "better".to_string();
+        better.use_case_fit_scores[0].score = 90.0;
+        let mut unscored = current.clone();
+        unscored.profile_id = "unscored".to_string();
+        unscored.recommended = true;
+        unscored.use_case_fit_scores.clear();
+        let catalog = vec![current, unscored, better];
+        assert_eq!(
+            better_catalog_candidate(&catalog, "current", "vision.depth")
                 .map(|profile| profile.profile_id.as_str()),
             Some("better")
         );
