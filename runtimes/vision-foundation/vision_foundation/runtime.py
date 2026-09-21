@@ -8,6 +8,7 @@ import os
 import sys
 import tempfile
 import traceback
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -32,6 +33,54 @@ class DecodedImage:
     image: Image.Image
     width: int
     height: int
+
+
+class ModelCache:
+    """One loaded model for the sequential request loop and its mounted checkpoint."""
+
+    def __init__(self):
+        self.key: tuple[str, Path] | None = None
+        self.model: Any = None
+        self.alias_dir: tempfile.TemporaryDirectory | None = None
+
+    def clear(self):
+        self.model = None
+        self.key = None
+        if self.alias_dir is not None:
+            self.alias_dir.cleanup()
+            self.alias_dir = None
+
+    def get(self, kind: str, checkpoint: Path, factory: Callable[[str], Any]) -> Any:
+        key = (kind, checkpoint.resolve())
+        if self.key == key:
+            return self.model
+        self.clear()
+        try:
+            if kind == "sam":
+                self.alias_dir = tempfile.TemporaryDirectory()
+                alias = Path(self.alias_dir.name) / "sam2.1_t.pt"
+                alias.symlink_to(key[1])
+                model = factory(str(alias))
+                model.is_sam2 = True
+            else:
+                model = factory(str(checkpoint))
+        except Exception:
+            self.clear()
+            raise
+        self.model = model
+        self.key = key
+        return model
+
+
+_model_cache = ModelCache()
+
+
+def reset_sam_request(model: Any):
+    predictor = getattr(model, "predictor", None)
+    if predictor is not None:
+        predictor.reset_image()
+        predictor.set_prompts({})
+        predictor.segment_all = False
 
 
 def error_response(request_id: str, code: str, reason: str) -> dict[str, Any]:
@@ -171,24 +220,28 @@ def handle_detect(request: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeErrorCode("model_unavailable", "Ultralytics YOLO is not installed in this runtime image") from exc
     try:
         with contextlib.redirect_stdout(sys.stderr):
-            model = YOLO(str(model_path))
+            model = _model_cache.get("yolo", model_path, YOLO)
             results = model.predict(decoded.image, verbose=False)
-    except Exception as exc:  # noqa: BLE001
-        raise RuntimeErrorCode("inference_failed", f"YOLO inference failed: {exc}") from exc
 
-    detections: list[dict[str, Any]] = []
-    names = getattr(model, "names", {}) or {}
-    for result in results:
-        boxes = getattr(result, "boxes", None)
-        if boxes is None:
-            continue
-        for box in boxes:
-            xyxy = box.xyxy[0].tolist()
-            cls = int(box.cls[0].item()) if getattr(box, "cls", None) is not None else -1
-            label = str(names.get(cls, cls if cls >= 0 else "object"))
-            confidence = float(box.conf[0].item()) if getattr(box, "conf", None) is not None else 0.0
-            detections.append({"label": label, "confidence": clamp01(confidence), **normalize_box(*xyxy, decoded.width, decoded.height)})
-    return result_response(str(request.get("id", "unknown")), {"detections": detections})
+        detections: list[dict[str, Any]] = []
+        names = getattr(model, "names", {}) or {}
+        for result in results:
+            boxes = getattr(result, "boxes", None)
+            if boxes is None:
+                continue
+            for box in boxes:
+                xyxy = box.xyxy[0].tolist()
+                cls = int(box.cls[0].item()) if getattr(box, "cls", None) is not None else -1
+                label = str(names.get(cls, cls if cls >= 0 else "object"))
+                confidence = float(box.conf[0].item()) if getattr(box, "conf", None) is not None else 0.0
+                detections.append({"label": label, "confidence": clamp01(confidence), **normalize_box(*xyxy, decoded.width, decoded.height)})
+        return result_response(str(request.get("id", "unknown")), {"detections": detections})
+    except RuntimeErrorCode:
+        _model_cache.clear()
+        raise
+    except Exception as exc:  # noqa: BLE001
+        _model_cache.clear()
+        raise RuntimeErrorCode("inference_failed", f"YOLO inference failed: {exc}") from exc
 
 
 def handle_segment(request: dict[str, Any]) -> dict[str, Any]:
@@ -209,11 +262,9 @@ def handle_segment(request: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeErrorCode("model_unavailable", "Ultralytics SAM is not installed in this runtime image") from exc
     try:
         with contextlib.redirect_stdout(sys.stderr):
-            with tempfile.TemporaryDirectory() as tempdir:
-                alias = Path(tempdir) / "sam2.1_t.pt"
-                alias.symlink_to(checkpoint)
-                model = SAM(str(alias))
-                model.is_sam2 = True
+            model = _model_cache.get("sam", checkpoint, SAM)
+            try:
+                reset_sam_request(model)
                 results = model.predict(
                     decoded.image,
                     points=[point_coords.tolist()] if len(point_coords) else None,
@@ -222,52 +273,58 @@ def handle_segment(request: dict[str, Any]) -> dict[str, Any]:
                     conf=0.0,
                     verbose=False,
                 )
+            finally:
+                reset_sam_request(model)
+
+        if len(results) != 1:
+            raise RuntimeErrorCode("inference_failed", "SAM returned an unexpected result count")
+        result = results[0]
+        masks = getattr(getattr(result, "masks", None), "data", None)
+        scores = getattr(getattr(result, "boxes", None), "conf", None)
+        if masks is None or scores is None:
+            raise RuntimeErrorCode("inference_failed", "SAM result is missing masks or mask scores")
+        mask_values = tensor_to_numpy(masks)
+        score_values = tensor_to_numpy(scores).reshape(-1)
+        if mask_values.ndim != 3 or mask_values.shape[0] == 0 or len(mask_values) != len(score_values):
+            raise RuntimeErrorCode("inference_failed", "SAM returned inconsistent masks and mask scores")
+        if len(mask_values) != 1 or not np.isfinite(score_values).all():
+            raise RuntimeErrorCode("inference_failed", "SAM must return one mask with a finite score")
+
+        response_masks: list[dict[str, Any]] = []
+        for mask, score in zip(mask_values, score_values, strict=True):
+            mask_arr = np.asarray(mask) > 0.5
+            if mask_arr.shape != (decoded.height, decoded.width):
+                resized = Image.fromarray(mask_arr.astype(np.uint8)).resize(
+                    (decoded.width, decoded.height),
+                    resample=Image.Resampling.NEAREST,
+                )
+                mask_arr = np.asarray(resized).astype(bool)
+            ys, xs = np.where(mask_arr)
+            if xs.size == 0 or ys.size == 0:
+                box = {"x": 0.0, "y": 0.0, "width": 0.0, "height": 0.0}
+                cropped_mask = mask_arr[:1, :1]
+            else:
+                x1 = int(xs.min())
+                y1 = int(ys.min())
+                x2 = int(xs.max() + 1)
+                y2 = int(ys.max() + 1)
+                box = normalize_box(float(x1), float(y1), float(x2), float(y2), decoded.width, decoded.height)
+                cropped_mask = mask_arr[y1:y2, x1:x2]
+            response_masks.append({
+                "label": "mask",
+                "confidence": clamp01(float(score)),
+                **box,
+                "mask_base64": encode_mask_png(cropped_mask),
+                "mask_width": int(cropped_mask.shape[1]),
+                "mask_height": int(cropped_mask.shape[0]),
+            })
+        return result_response(str(request.get("id", "unknown")), {"masks": response_masks})
+    except RuntimeErrorCode:
+        _model_cache.clear()
+        raise
     except Exception as exc:  # noqa: BLE001
+        _model_cache.clear()
         raise RuntimeErrorCode("inference_failed", f"SAM inference failed: {exc}") from exc
-
-    if len(results) != 1:
-        raise RuntimeErrorCode("inference_failed", "SAM returned an unexpected result count")
-    result = results[0]
-    masks = getattr(getattr(result, "masks", None), "data", None)
-    scores = getattr(getattr(result, "boxes", None), "conf", None)
-    if masks is None or scores is None:
-        raise RuntimeErrorCode("inference_failed", "SAM result is missing masks or mask scores")
-    mask_values = tensor_to_numpy(masks)
-    score_values = tensor_to_numpy(scores).reshape(-1)
-    if mask_values.ndim != 3 or mask_values.shape[0] == 0 or len(mask_values) != len(score_values):
-        raise RuntimeErrorCode("inference_failed", "SAM returned inconsistent masks and mask scores")
-    if len(mask_values) != 1 or not np.isfinite(score_values).all():
-        raise RuntimeErrorCode("inference_failed", "SAM must return one mask with a finite score")
-
-    response_masks: list[dict[str, Any]] = []
-    for mask, score in zip(mask_values, score_values, strict=True):
-        mask_arr = np.asarray(mask) > 0.5
-        if mask_arr.shape != (decoded.height, decoded.width):
-            resized = Image.fromarray(mask_arr.astype(np.uint8)).resize(
-                (decoded.width, decoded.height),
-                resample=Image.Resampling.NEAREST,
-            )
-            mask_arr = np.asarray(resized).astype(bool)
-        ys, xs = np.where(mask_arr)
-        if xs.size == 0 or ys.size == 0:
-            box = {"x": 0.0, "y": 0.0, "width": 0.0, "height": 0.0}
-            cropped_mask = mask_arr[:1, :1]
-        else:
-            x1 = int(xs.min())
-            y1 = int(ys.min())
-            x2 = int(xs.max() + 1)
-            y2 = int(ys.max() + 1)
-            box = normalize_box(float(x1), float(y1), float(x2), float(y2), decoded.width, decoded.height)
-            cropped_mask = mask_arr[y1:y2, x1:x2]
-        response_masks.append({
-            "label": "mask",
-            "confidence": clamp01(float(score)),
-            **box,
-            "mask_base64": encode_mask_png(cropped_mask),
-            "mask_width": int(cropped_mask.shape[1]),
-            "mask_height": int(cropped_mask.shape[0]),
-        })
-    return result_response(str(request.get("id", "unknown")), {"masks": response_masks})
 
 
 def handle_depth(request: dict[str, Any]) -> dict[str, Any]:
@@ -282,19 +339,24 @@ def handle_depth(request: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeErrorCode("model_unavailable", "Ultralytics YOLO is not installed in this runtime image") from exc
     try:
         with contextlib.redirect_stdout(sys.stderr):
-            model = YOLO(str(model_path))
+            model = _model_cache.get("yolo", model_path, YOLO)
             results = model.predict(decoded.image, verbose=False)
+
+        if len(results) != 1:
+            raise RuntimeErrorCode("inference_failed", "YOLO depth returned an unexpected result count")
+        depth = getattr(getattr(results[0], "depth", None), "data", None)
+        if depth is None:
+            raise RuntimeErrorCode("inference_failed", "YOLO depth result is missing depth.data")
+        return result_response(
+            str(request.get("id", "unknown")),
+            {"depth": prepare_depth_response(tensor_to_numpy(depth))},
+        )
+    except RuntimeErrorCode:
+        _model_cache.clear()
+        raise
     except Exception as exc:  # noqa: BLE001
+        _model_cache.clear()
         raise RuntimeErrorCode("inference_failed", f"YOLO depth inference failed: {exc}") from exc
-    if len(results) != 1:
-        raise RuntimeErrorCode("inference_failed", "YOLO depth returned an unexpected result count")
-    depth = getattr(getattr(results[0], "depth", None), "data", None)
-    if depth is None:
-        raise RuntimeErrorCode("inference_failed", "YOLO depth result is missing depth.data")
-    return result_response(
-        str(request.get("id", "unknown")),
-        {"depth": prepare_depth_response(tensor_to_numpy(depth))},
-    )
 
 
 def tensor_to_numpy(value: Any) -> np.ndarray:
@@ -320,24 +382,27 @@ def handle_request(request: dict[str, Any]) -> dict[str, Any]:
 
 def main() -> int:
     print("[aileron-vision-foundation] ready", file=sys.stderr, flush=True)
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
-        request_id = "unknown"
-        try:
-            request = json.loads(line)
-            if isinstance(request, dict):
-                request_id = str(request.get("id", "unknown"))
-            else:
-                raise RuntimeErrorCode("invalid_input", "request must be a JSON object")
-            response = handle_request(request)
-        except RuntimeErrorCode as exc:
-            response = error_response(request_id, exc.code, exc.reason)
-        except Exception as exc:  # noqa: BLE001
-            traceback.print_exc(file=sys.stderr)
-            response = error_response(request_id, "inference_failed", str(exc))
-        print(json.dumps(response, separators=(",", ":")), flush=True)
+    try:
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
+                continue
+            request_id = "unknown"
+            try:
+                request = json.loads(line)
+                if isinstance(request, dict):
+                    request_id = str(request.get("id", "unknown"))
+                else:
+                    raise RuntimeErrorCode("invalid_input", "request must be a JSON object")
+                response = handle_request(request)
+            except RuntimeErrorCode as exc:
+                response = error_response(request_id, exc.code, exc.reason)
+            except Exception as exc:  # noqa: BLE001
+                traceback.print_exc(file=sys.stderr)
+                response = error_response(request_id, "inference_failed", str(exc))
+            print(json.dumps(response, separators=(",", ":")), flush=True)
+    finally:
+        _model_cache.clear()
     return 0
 
 
