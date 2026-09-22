@@ -562,6 +562,7 @@ fn run_storage_cleanup_demo(
                 call.name, call.id, call.arguments_json
             )))?;
             if call.name != "get_storage_usage" {
+                close_public_session(&session_handle)?;
                 return Err(anyhow::anyhow!(
                     "unexpected storage tool call: {}",
                     call.name
@@ -585,7 +586,7 @@ fn run_storage_cleanup_demo(
             "tool": "get_storage_usage",
             "read_only": true,
             "scope": "fixed user-owned storage locations",
-            "cleanup_policy": "No changes were applied.",
+            "fix_policy": "No changes were applied.",
             "commands": command_results,
         })
     };
@@ -629,14 +630,18 @@ fn storage_usage_tool_definitions() -> anyhow::Result<Vec<ToolDefinitionDbus>> {
 }
 
 fn storage_usage_commands() -> Vec<DiagnosticCommand> {
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    storage_usage_commands_for_home(&home)
+}
+
+fn storage_usage_commands_for_home(home: &std::path::Path) -> Vec<DiagnosticCommand> {
     let mut commands = vec![diagnostic_command(
         "mounted filesystem usage",
         "df",
         vec!["-h", "-x", "tmpfs", "-x", "devtmpfs"],
     )];
-    let home = std::env::var_os("HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
     for (label, relative) in [
         ("home directory top-level usage", "."),
         ("user cache usage", ".cache"),
@@ -644,7 +649,7 @@ fn storage_usage_commands() -> Vec<DiagnosticCommand> {
         ("sandbox app data usage", ".var/app"),
     ] {
         let path = if relative == "." {
-            home.clone()
+            home.to_path_buf()
         } else {
             home.join(relative)
         };
@@ -673,7 +678,7 @@ fn execute_storage_usage_tool() -> anyhow::Result<serde_json::Value> {
         "tool": "get_storage_usage",
         "read_only": true,
         "scope": "fixed user-owned storage locations",
-        "cleanup_policy": "No changes were applied.",
+        "fix_policy": "No changes were applied.",
         "commands": commands,
     }))
 }
@@ -1613,7 +1618,7 @@ mod tests {
         guided_linux_pc_diagnostics_loop_fields, guided_tool_loop_fields, initial_final_answer,
         is_safe_systemd_unit, linux_pc_diagnostics_tool_definitions,
         parse_guided_diagnostics_loop_response, parse_guided_tool_loop_response,
-        storage_usage_commands, storage_usage_tool_definitions,
+        storage_usage_commands_for_home, storage_usage_tool_definitions,
     };
     use hegel::TestCase;
     use hegel::generators as gs;
@@ -1853,7 +1858,7 @@ mod tests {
 
     #[test]
     fn storage_commands_have_no_mutating_programs() {
-        let commands = storage_usage_commands();
+        let commands = storage_usage_commands_for_home(std::path::Path::new("/tmp"));
 
         assert!(commands.iter().any(|command| command.program == "df"));
         assert!(commands.iter().any(|command| command.program == "du"));
