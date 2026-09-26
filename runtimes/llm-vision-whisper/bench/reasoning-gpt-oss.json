@@ -1,0 +1,9 @@
+[
+  {"name":"capabilities","request":{"type":"capabilities"},"expect":{"kind":"capabilities","thinking_modes":["auto","on"],"reasoning_efforts":["low","medium","high"]}},
+  {"name":"low","request":{"type":"generate","prompt":"Find the smallest prime factors of 91 and 143. Explain briefly.","thinking":"on","reasoning_effort":"low","include_reasoning":true,"temperature":0.0,"max_tokens":64},"expect":{"kind":"reasoning","trace":"required","max_tokens":64}},
+  {"name":"medium","request":{"type":"generate","prompt":"Find the smallest prime factors of 91 and 143. Explain briefly.","thinking":"on","reasoning_effort":"medium","include_reasoning":true,"temperature":0.0,"max_tokens":64},"expect":{"kind":"reasoning","trace":"required","max_tokens":64}},
+  {"name":"high","request":{"type":"generate","prompt":"Find the smallest prime factors of 91 and 143. Explain briefly.","thinking":"on","reasoning_effort":"high","include_reasoning":true,"temperature":0.0,"max_tokens":64},"expect":{"kind":"reasoning","trace":"required","max_tokens":64}},
+  {"name":"private-trace","request":{"type":"generate","prompt":"Find the smallest prime factors of 91 and 143. Explain briefly.","reasoning_effort":"low","include_reasoning":false,"temperature":0.0,"max_tokens":64},"expect":{"kind":"reasoning","trace":"forbidden","max_tokens":64}},
+  {"name":"unsupported-off","request":{"type":"generate","prompt":"Hello","thinking":"off","max_tokens":8},"expect":{"kind":"error","code":"invalid_input"}},
+  {"name":"unsupported-effort","request":{"type":"generate","prompt":"Hello","reasoning_effort":"max","max_tokens":8},"expect":{"kind":"error","code":"invalid_input"}}
+]

@@ -101,6 +101,7 @@ fn kill_session(guard: &mut crate::state::Inner, session_id: &str) -> KillSessio
         Some(s) => s,
         None => return KillSessionResult::NotFound,
     };
+    session.tools.lock().unwrap().cancel();
     let profile_still_used = guard
         .sessions
         .values()
@@ -154,6 +155,7 @@ mod tests {
 
     fn session(session_id: &str, profile_id: &str) -> Session {
         Session {
+            tools: Default::default(),
             session_id: session_id.to_string(),
             app_id: "org.aileron.Test".to_string(),
             use_case: "language.extract".to_string(),

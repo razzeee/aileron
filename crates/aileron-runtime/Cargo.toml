@@ -6,14 +6,7 @@ license.workspace = true
 
 [features]
 default = []
-llama = ["dep:encoding_rs", "dep:llama-cpp-2"]
-llama-cuda = ["llama", "llama-cpp-2/cuda"]
-llama-rocm = ["llama", "llama-cpp-2/rocm"]
-llama-vulkan = ["llama", "llama-cpp-2/vulkan"]
-vision = ["llama", "llama-cpp-2/mtmd"]
-vision-cuda = ["vision", "llama-cuda"]
-vision-rocm = ["vision", "llama-rocm"]
-vision-vulkan = ["vision", "llama-vulkan"]
+llama-server = ["dep:reqwest", "dep:tempfile", "dep:nix", "dep:signal-hook", "dep:uuid"]
 whisper = ["dep:whisper-rs"]
 whisper-cuda = ["whisper", "whisper-rs/cuda"]
 whisper-rocm = ["whisper", "whisper-rs/hipblas"]
@@ -24,23 +17,22 @@ anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 base64 = { workspace = true }
-encoding_rs = { version = "0.8.35", optional = true }
-llama-cpp-2 = { version = "0.1.154", optional = true }
+# Container-private HTTP needs neither TLS nor system proxy discovery.
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json"], optional = true }
+tempfile = { version = "3", optional = true }
+nix = { version = "0.31", features = ["signal"], optional = true }
+signal-hook = { version = "0.4", optional = true }
+uuid = { workspace = true, optional = true }
 whisper-rs = { version = "0.16.0", optional = true }
+
+[[bin]]
+name = "aileron-runtime-llm-llama-server"
+path = "src/bin/llm_llama_server.rs"
+required-features = ["llama-server"]
 
 [[bin]]
 name = "aileron-runtime-stub"
 path = "src/bin/stub.rs"
-
-[[bin]]
-name = "aileron-runtime-llm-llama-cpp"
-path = "src/bin/llm_llama_cpp.rs"
-required-features = ["llama"]
-
-[[bin]]
-name = "aileron-runtime-vision-llama-cpp"
-path = "src/bin/vision_llama_cpp.rs"
-required-features = ["vision"]
 
 [[bin]]
 name = "aileron-runtime-asr-whisper-cpp"

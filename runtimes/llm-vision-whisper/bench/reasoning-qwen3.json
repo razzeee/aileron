@@ -1,0 +1,7 @@
+[
+  {"name":"capabilities","request":{"type":"capabilities"},"expect":{"kind":"capabilities","thinking_modes":["auto","on","off"],"reasoning_efforts":[]}},
+  {"name":"thinking-on","request":{"type":"generate","prompt":"What is 3 times 4? Reason briefly.","thinking":"on","include_reasoning":true,"temperature":0.6,"max_tokens":128},"expect":{"kind":"reasoning","trace":"required","max_tokens":128}},
+  {"name":"thinking-off","request":{"type":"generate","prompt":"What is 3 times 4? Answer briefly.","thinking":"off","include_reasoning":true,"temperature":0.0,"max_tokens":32},"expect":{"kind":"reasoning","trace":"forbidden","contains_all":["12"],"max_tokens":32}},
+  {"name":"private-trace","request":{"type":"generate","prompt":"What is 3 times 4?","thinking":"on","temperature":0.6,"max_tokens":64},"expect":{"kind":"reasoning","trace":"forbidden","max_tokens":64}},
+  {"name":"unsupported-effort","request":{"type":"generate","prompt":"Hello","reasoning_effort":"high","max_tokens":8},"expect":{"kind":"error","code":"invalid_input"}}
+]
