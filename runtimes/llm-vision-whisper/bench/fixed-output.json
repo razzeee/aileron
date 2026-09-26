@@ -1,0 +1,3 @@
+[
+  {"name":"fixed-output","request":{"type":"generate","prompt":"Reply with exactly HELLO and nothing else.","temperature":0.0,"max_tokens":16},"expect":{"kind":"text","equals":"HELLO"}}
+]

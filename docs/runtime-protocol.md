@@ -70,6 +70,54 @@ The final response may include a token and `done: true`, or may be an empty fina
 {"id":"request-id","done":true}
 ```
 
+### Private-server terminal metadata
+
+The llama-server adapter includes `finish_reason` (`stop`, `length`, or
+`tool_calls`) and upstream `usage`, when supplied, on its terminal response:
+
+```json
+{"id":"request-id","done":true,"finish_reason":"length","usage":{"prompt_tokens":24,"completion_tokens":512,"total_tokens":536}}
+```
+
+The V2 daemon API forwards these fields in its completed event. The version 2
+Language portal includes them in successful Request.Response results. The
+output token limit includes both reasoning and the answer, so a `length`
+completion can contain no answer tokens.
+
+Generation requests accept optional `thinking` (`auto`, `on`, or `off`),
+`reasoning_effort` (a model-supported string), and `include_reasoning` (boolean,
+default false). Unsupported settings are rejected. Only answer content enters
+`token` and structured snapshots; opted-in reasoning uses separate events:
+
+```json
+{"id":"request-id","reasoning":"First, check the assumptions."}
+{"id":"request-id","token":"The result is 12."}
+```
+
+Discover verified model/template controls with a capabilities request:
+
+```json
+{"id":"capabilities-id","type":"capabilities"}
+{"id":"capabilities-id","capabilities":{"thinking_modes":["auto","on","off"],"reasoning_efforts":[],"reasoning_output":true},"done":true}
+```
+
+Empty control arrays mean unsupported or unverified capabilities. Explicit
+effort with thinking off is invalid. Internal reasoning needed for a tool
+continuation stays in daemon-owned history and is not exposed in public tool
+calls.
+
+The adapter rejects unsupported operations with `unsupported_request` and
+invalid reasoning options with `invalid_input`; malformed request JSON receives `invalid_request`
+with an `unknown` ID. A server rejection for an oversized prompt preserves
+`context_window_exceeded` and its prompt/context token counts; the loaded
+server stays available for a shorter request. Server failures or
+malformed/truncated streams produce `inference_failed`. This code is fatal
+for generation runtimes: the daemon retires the container before returning
+the error, and the adapter terminates its server and exits. A later request
+can load a fresh runtime; partially streamed responses are never replayed.
+An incomplete or invalid structured answer instead returns
+`schema_validation_failed` and leaves the runtime available for another request.
+
 ## Structured Generation
 
 Request:

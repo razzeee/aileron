@@ -15,6 +15,7 @@ use std::time::Duration;
 use tracing::{info, warn};
 use zbus::zvariant::{OwnedFd, OwnedObjectPath, Type};
 use zbus::{connection, interface, message::Header, object_server::SignalEmitter};
+mod language_v2;
 
 const BUS_NAME: &str = "org.freedesktop.impl.portal.desktop.aileron";
 const OBJECT_PATH: &str = "/org/freedesktop/portal/desktop";
@@ -552,8 +553,134 @@ impl SessionPortalBackend {
 impl LanguagePortalBackend {
     #[zbus(property, name = "version")]
     fn version(&self) -> u32 {
-        1
+        2
     }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn stream_response2(
+        &self,
+        request_handle: OwnedObjectPath,
+        session_handle: OwnedObjectPath,
+        input_json: String,
+        media_fds: Vec<OwnedFd>,
+        options: language_v2::Options,
+        #[zbus(connection)] conn: &zbus::Connection,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> zbus::fdo::Result<()> {
+        ensure_portal_frontend(conn, &header).await?;
+        language_v2::stream(
+            self,
+            conn,
+            &emitter,
+            request_handle,
+            session_handle,
+            language_v2::Request {
+                input: input_json,
+                fds: media_fds,
+                fields: None,
+                tools: Vec::new(),
+                results: None,
+                options,
+            },
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn stream_respond_guided2(
+        &self,
+        request_handle: OwnedObjectPath,
+        session_handle: OwnedObjectPath,
+        prompt: String,
+        media_fds: Vec<OwnedFd>,
+        fields: Vec<GuidedFieldDbus>,
+        tools: Vec<ToolDefinitionDbus>,
+        options: language_v2::Options,
+        #[zbus(connection)] conn: &zbus::Connection,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> zbus::fdo::Result<()> {
+        ensure_portal_frontend(conn, &header).await?;
+        language_v2::stream(
+            self,
+            conn,
+            &emitter,
+            request_handle,
+            session_handle,
+            language_v2::Request {
+                input: prompt,
+                fds: media_fds,
+                fields: Some(fields),
+                tools,
+                results: None,
+                options,
+            },
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn stream_submit_tool_results_guided2(
+        &self,
+        request_handle: OwnedObjectPath,
+        session_handle: OwnedObjectPath,
+        prompt: String,
+        media_fds: Vec<OwnedFd>,
+        results: Vec<ToolResultDbus>,
+        fields: Vec<GuidedFieldDbus>,
+        tools: Vec<ToolDefinitionDbus>,
+        options: language_v2::Options,
+        #[zbus(connection)] conn: &zbus::Connection,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> zbus::fdo::Result<()> {
+        ensure_portal_frontend(conn, &header).await?;
+        language_v2::stream(
+            self,
+            conn,
+            &emitter,
+            request_handle,
+            session_handle,
+            language_v2::Request {
+                input: prompt,
+                fds: media_fds,
+                fields: Some(fields),
+                tools,
+                results: Some(results),
+                options,
+            },
+        )
+        .await
+    }
+
+    async fn get_reasoning_capabilities(
+        &self,
+        request_handle: OwnedObjectPath,
+        session_handle: OwnedObjectPath,
+        #[zbus(connection)] conn: &zbus::Connection,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> zbus::fdo::Result<()> {
+        ensure_portal_frontend(conn, &header).await?;
+        language_v2::capabilities(self, conn, &emitter, request_handle, session_handle).await
+    }
+
+    #[zbus(signal)]
+    async fn reasoning_received(
+        emitter: &SignalEmitter<'_>,
+        request_handle: &OwnedObjectPath,
+        session_handle: &OwnedObjectPath,
+        text: &str,
+    ) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    async fn generation_completed(
+        emitter: &SignalEmitter<'_>,
+        request_handle: &OwnedObjectPath,
+        session_handle: &OwnedObjectPath,
+        metadata: language_v2::Options,
+    ) -> zbus::Result<()>;
 
     #[zbus(out_args("availability"))]
     async fn get_use_case_availability(

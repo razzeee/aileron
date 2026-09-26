@@ -1,0 +1,32 @@
+diff --git a/src/llama-context.h b/src/llama-context.h
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -285,2 +285,3 @@
+     llama_cparams cparams;
++    enum llama_pooling_type configured_pooling_type = LLAMA_POOLING_TYPE_NONE;
+ 
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -224,1 +224,3 @@
++    configured_pooling_type = cparams.pooling_type;
++
+     if (params.attention_type == LLAMA_ATTENTION_TYPE_UNSPECIFIED) {
+@@ -1222,5 +1224,11 @@
+     cparams.embeddings = value;
+ 
+-    // TODO: not sure yet if we want to reserve here
+-    //sched_need_reserve = true;
++    // Aileron serves generation and embeddings serially with one loaded model.
++    // Generation needs logits, not a pooled embedding graph. Restore the
++    // configured recipe before an embedding batch and rebuild on mode changes.
++    const auto pooling = value ? configured_pooling_type : LLAMA_POOLING_TYPE_NONE;
++    if (cparams.pooling_type != pooling) {
++        cparams.pooling_type = pooling;
++        // Invalidate the previous graph, then let process_ubatch allocate the
++        // actual graph. Reserving the maximum batch here allocates huge logits
++        // buffers and stalls GPU requests on every generation/embedding switch.
++        ggml_backend_sched_synchronize(sched.get());
++        gf_res_prev->reset();
++    }
+ }

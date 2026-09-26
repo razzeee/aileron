@@ -10,6 +10,11 @@ use std::sync::{
 };
 use std::time::Duration;
 use uuid::Uuid;
+mod generation_v2;
+use aileron_varlink::aileron_Inference::{
+    Call_GetReasoningCapabilities, Call_StreamRespondGuided2, Call_StreamResponse2,
+    Call_StreamSubmitToolResultsGuided2, GenerationOptions,
+};
 
 use crate::container::{
     AudioChunk as RuntimeAudioChunk, Container, ContainerHandle, InputMessage, InputPart,
@@ -98,6 +103,7 @@ impl Drop for MediaBudget<'_> {
 
 #[derive(Debug, Clone)]
 struct ResolvedSessionRuntime {
+    request_epoch: u64,
     app_id: String,
     use_case: String,
     profile_id: String,
@@ -183,6 +189,94 @@ impl InferenceHandler {
 }
 
 impl VarlinkInterface for InferenceHandler {
+    fn get_reasoning_capabilities(
+        &self,
+        call: &mut dyn Call_GetReasoningCapabilities,
+        session_id: String,
+    ) -> varlink::Result<()> {
+        match self
+            .rt
+            .block_on(generation_v2::capabilities(&self.state, &session_id))
+        {
+            Ok(capabilities) => call.reply(capabilities),
+            Err(error) => generation_v2::reply_error(call, error),
+        }
+    }
+
+    fn stream_response2(
+        &self,
+        call: &mut dyn Call_StreamResponse2,
+        session_id: String,
+        input_json: String,
+        media_paths: Vec<String>,
+        options: GenerationOptions,
+    ) -> varlink::Result<()> {
+        self.rt.block_on(generation_v2::serve(
+            &self.state,
+            call,
+            generation_v2::Request {
+                session_id,
+                input: input_json,
+                media_paths,
+                fields: None,
+                tools: Vec::new(),
+                results: None,
+                options,
+            },
+        ))
+    }
+
+    fn stream_respond_guided2(
+        &self,
+        call: &mut dyn Call_StreamRespondGuided2,
+        session_id: String,
+        prompt: String,
+        media_paths: Vec<String>,
+        fields: Vec<GuidedField>,
+        tools: Vec<ToolDefinition>,
+        options: GenerationOptions,
+    ) -> varlink::Result<()> {
+        self.rt.block_on(generation_v2::serve(
+            &self.state,
+            call,
+            generation_v2::Request {
+                session_id,
+                input: prompt,
+                media_paths,
+                fields: Some(fields),
+                tools,
+                results: None,
+                options,
+            },
+        ))
+    }
+
+    fn stream_submit_tool_results_guided2(
+        &self,
+        call: &mut dyn Call_StreamSubmitToolResultsGuided2,
+        session_id: String,
+        prompt: String,
+        media_paths: Vec<String>,
+        results: Vec<ToolResult>,
+        fields: Vec<GuidedField>,
+        tools: Vec<ToolDefinition>,
+        options: GenerationOptions,
+    ) -> varlink::Result<()> {
+        self.rt.block_on(generation_v2::serve(
+            &self.state,
+            call,
+            generation_v2::Request {
+                session_id,
+                input: prompt,
+                media_paths,
+                fields: Some(fields),
+                tools,
+                results: Some(results),
+                options,
+            },
+        ))
+    }
+
     fn get_use_case_availability(
         &self,
         call: &mut dyn Call_GetUseCaseAvailability,
@@ -658,6 +752,7 @@ impl VarlinkInterface for InferenceHandler {
                     return call.reply_session_not_found(session_id);
                 };
                 request_execution::mark_session_closed(&self.state, &session_id);
+                session.tools.lock().unwrap().cancel();
                 (session.profile_id, session.app_id, session.use_case)
             };
             request_execution::terminate_active_container_handles_for_session(
@@ -687,6 +782,8 @@ impl VarlinkInterface for InferenceHandler {
                 let Some(session) = guard.sessions.get(&session_id) else {
                     return call.reply_session_not_found(session_id);
                 };
+                self.state.cancel_active_requests(&session_id);
+                session.tools.lock().unwrap().cancel();
                 session.profile_id.clone()
             };
             request_execution::terminate_active_container_handles_for_session(
@@ -760,6 +857,7 @@ async fn create_session_record(
 
     let session_id = Uuid::new_v4().to_string();
     let session = crate::state::Session {
+        tools: Default::default(),
         session_id: session_id.clone(),
         app_id,
         use_case,
@@ -1665,42 +1763,45 @@ async fn stream_tokens(
 
             macro_rules! generate_with_instructions {
                 ($instructions:expr) => {
-                    container.generate(Some($instructions), &prompt, Some(&input), max_tokens, execution_mode.as_str(), |token| {
-                        if cancelled
-                            || RequestCancellation::for_session(state, &session_id).is_cancelled()
-                        {
-                            cancelled = true;
-                            return;
-                        }
-                        if !token.is_empty() {
-                            saw_token = true;
-                        }
-                        if !wants_more {
-                            pending_token = Some(token);
-                            return;
-                        }
-
-                        if reply_error.is_some() {
-                            return;
-                        }
-
-                        if let Some(previous) = pending_token.replace(token) {
-                            call.set_continues(true);
-                            if let Err(e) = call.reply(previous) {
-                                reply_error = Some(e);
+                    container.generate_with_temperature(
+                        Some($instructions),
+                        &prompt,
+                        Some(&input),
+                        max_tokens,
+                        execution_mode.as_str(),
+                        Some(options.temperature),
+                        |token| {
+                            if cancelled
+                                || RequestCancellation::for_session(state, &session_id)
+                                    .is_cancelled()
+                            {
+                                cancelled = true;
+                                return;
                             }
-                        }
-                    })
+                            if !token.is_empty() {
+                                saw_token = true;
+                            }
+                            if !wants_more {
+                                pending_token = Some(token);
+                                return;
+                            }
+
+                            if reply_error.is_some() {
+                                return;
+                            }
+
+                            if let Some(previous) = pending_token.replace(token) {
+                                call.set_continues(true);
+                                if let Err(e) = call.reply(previous) {
+                                    reply_error = Some(e);
+                                }
+                            }
+                        },
+                    )
                 };
             }
 
-            let mut result = generate_with_instructions!(&instructions);
-            if result.is_ok() && !saw_token && reply_error.is_none() && !cancelled {
-                let retry_instructions = format!(
-                    "{instructions}\nYou must produce a non-empty plain-text response. Do not return an empty answer."
-                );
-                result = generate_with_instructions!(&retry_instructions);
-            }
+            let result = generate_with_instructions!(&instructions);
 
             if let Some(e) = reply_error {
                 return Err(GenerationError::Reply(e));
@@ -1928,6 +2029,7 @@ async fn resolve_session_runtime(
             ) = profile_runtime(&guard, &session.profile_id, &session.use_case)
                 .map_err(ResolveSessionError::ModelUnavailable)?;
             ResolvedSessionRuntime {
+                request_epoch: state.request_epoch(session_id),
                 app_id: session.app_id.clone(),
                 use_case: session.use_case.clone(),
                 profile_id,
@@ -1974,7 +2076,8 @@ async fn model_container_before_deadline(
 ) -> Result<(ContainerHandle, bool), String> {
     ensure_resolved_session_active(state, session_id, resolved).await?;
     let prepared = loop {
-        RequestCancellation::for_session(state, session_id).ensure_not_cancelled()?;
+        RequestCancellation::for_epoch(state, session_id, resolved.request_epoch)
+            .ensure_not_cancelled()?;
         ensure_background_start_still_allowed(state, resolved, execution_mode)?;
         ensure_profile_epoch_current(state, resolved)?;
         if std::time::Instant::now() >= deadline {
@@ -2015,16 +2118,20 @@ async fn model_container_before_deadline(
                                     "container startup cancelled; retry request".to_string()
                                 );
                             }
-                            RequestCancellation::for_session(&state, &session_id)
-                                .ensure_not_cancelled()
-                                .and_then(|_| {
-                                    ensure_background_start_still_allowed(
-                                        &state,
-                                        &resolved,
-                                        execution_mode,
-                                    )
-                                })
-                                .and_then(|_| ensure_profile_epoch_current(&state, &resolved))
+                            RequestCancellation::for_epoch(
+                                &state,
+                                &session_id,
+                                resolved.request_epoch,
+                            )
+                            .ensure_not_cancelled()
+                            .and_then(|_| {
+                                ensure_background_start_still_allowed(
+                                    &state,
+                                    &resolved,
+                                    execution_mode,
+                                )
+                            })
+                            .and_then(|_| ensure_profile_epoch_current(&state, &resolved))
                         },
                         deadline,
                     )
@@ -2045,7 +2152,8 @@ async fn model_container_before_deadline(
     }
     if let Some(plan) = plan {
         let mut pool = state.2.lock().await;
-        RequestCancellation::for_session(state, session_id).ensure_not_cancelled()?;
+        RequestCancellation::for_epoch(state, session_id, resolved.request_epoch)
+            .ensure_not_cancelled()?;
         ensure_background_start_still_allowed(state, resolved, execution_mode)?;
         ensure_profile_epoch_current(state, resolved)?;
         if std::time::Instant::now() >= deadline {
@@ -2066,13 +2174,12 @@ impl Drop for StartupCancellation {
 }
 
 fn lock_container_for_session<'a>(
-    state: &SharedState,
-    session_id: &str,
+    cancellation: RequestCancellation<'_>,
     handle: &'a ContainerHandle,
     spawned: bool,
 ) -> Result<MutexGuard<'a, Container>, LockContainerError> {
     loop {
-        RequestCancellation::for_session(state, session_id)
+        cancellation
             .ensure_not_cancelled_or_terminate_spawned(handle, spawned)
             .map_err(LockContainerError::Failed)?;
         ensure_handle_ready_for_request(handle, spawned)?;
@@ -2099,6 +2206,7 @@ async fn with_locked_container<T, E: ObservabilityFailure>(
     map_failed: impl Fn(String) -> E,
     op: impl FnOnce(&mut Container, &ContainerHandle, bool) -> Result<T, E>,
 ) -> Result<T, E> {
+    let cancellation = RequestCancellation::for_epoch(state, session_id, resolved.request_epoch);
     let mut op = Some(op);
     let expected_use_case = resolved.use_case.clone();
     let started_at = observability::log_inference_request_started(inference_request_fields(
@@ -2116,6 +2224,7 @@ async fn with_locked_container<T, E: ObservabilityFailure>(
         RequestExecutionMode::Background => None,
     };
     loop {
+        cancellation.ensure_not_cancelled().map_err(&map_failed)?;
         if let Some(execution) = interactive_execution.as_mut()
             && !execution.active
             && execution.profile_id != resolved.profile_id
@@ -2127,19 +2236,17 @@ async fn with_locked_container<T, E: ObservabilityFailure>(
         if execution_mode == RequestExecutionMode::Background
             && !state.background_execution_can_start(&resolved.profile_id)
         {
-            RequestCancellation::for_session(state, session_id)
-                .ensure_not_cancelled()
-                .map_err(|reason| {
-                    map_observed_failure(
-                        method,
-                        session_id,
-                        &resolved,
-                        started_at,
-                        "unavailable",
-                        &map_failed,
-                        reason,
-                    )
-                })?;
+            cancellation.ensure_not_cancelled().map_err(|reason| {
+                map_observed_failure(
+                    method,
+                    session_id,
+                    &resolved,
+                    started_at,
+                    "unavailable",
+                    &map_failed,
+                    reason,
+                )
+            })?;
             tokio::time::sleep(Duration::from_millis(25)).await;
             continue;
         }
@@ -2184,24 +2291,23 @@ async fn with_locked_container<T, E: ObservabilityFailure>(
             }
         };
         {
-            let mut container =
-                match lock_container_for_session(state, session_id, &handle, spawned) {
-                    Ok(container) => container,
-                    Err(LockContainerError::Retry) => continue,
-                    Err(LockContainerError::Failed(reason)) => {
-                        return Err(map_observed_failure(
-                            method,
-                            session_id,
-                            &resolved,
-                            started_at,
-                            observability::container_source(spawned),
-                            &map_failed,
-                            reason,
-                        ));
-                    }
-                };
+            let mut container = match lock_container_for_session(cancellation, &handle, spawned) {
+                Ok(container) => container,
+                Err(LockContainerError::Retry) => continue,
+                Err(LockContainerError::Failed(reason)) => {
+                    return Err(map_observed_failure(
+                        method,
+                        session_id,
+                        &resolved,
+                        started_at,
+                        observability::container_source(spawned),
+                        &map_failed,
+                        reason,
+                    ));
+                }
+            };
 
-            RequestCancellation::for_session(state, session_id)
+            cancellation
                 .ensure_not_cancelled_or_terminate_spawned(&handle, spawned)
                 .map_err(|reason| {
                     map_observed_failure(
@@ -2260,7 +2366,7 @@ async fn with_locked_container<T, E: ObservabilityFailure>(
                     session_id,
                     handle.clone(),
                 );
-                RequestCancellation::for_session(state, session_id)
+                cancellation
                     .ensure_not_cancelled_or_terminate_spawned(&handle, spawned)
                     .map_err(|reason| {
                         map_observed_failure(
@@ -2302,10 +2408,14 @@ async fn with_locked_container<T, E: ObservabilityFailure>(
                 };
 
                 let op = op.take().expect("container operation called once");
-                let cancel_watcher =
-                    RequestCancellation::for_session(state, session_id).spawn_watcher(&handle);
+                let cancel_watcher = cancellation.spawn_watcher(&handle);
                 let mut result = op(&mut container, &handle, spawned);
                 cancel_watcher.stop();
+                if result.is_err()
+                    && let Err(reason) = cancellation.ensure_not_cancelled()
+                {
+                    result = Err(map_failed(reason));
+                }
                 if result.is_err()
                     && _background_execution
                         .as_ref()
@@ -2454,7 +2564,8 @@ async fn ensure_resolved_session_active(
     session_id: &str,
     resolved: &ResolvedSessionRuntime,
 ) -> Result<(), String> {
-    RequestCancellation::for_session(state, session_id).ensure_not_cancelled()?;
+    RequestCancellation::for_epoch(state, session_id, resolved.request_epoch)
+        .ensure_not_cancelled()?;
     let guard = state.0.lock().await;
     match guard.sessions.get(session_id) {
         Some(session) if session.profile_id == resolved.profile_id => {
@@ -2611,6 +2722,15 @@ async fn stream_guided_snapshots(
     let input = normalize_guided_input(&prompt, &media_paths, &mut media_budget)
         .map_err(GenerationError::InvalidInput)?;
     let prompt = input.as_deref().map(render_text_prompt).unwrap_or(prompt);
+    let conversation = state
+        .0
+        .lock()
+        .await
+        .sessions
+        .get(&session_id)
+        .ok_or_else(|| GenerationError::SessionNotFound(session_id.clone()))?
+        .tools
+        .clone();
     with_locked_container(
         "StreamRespondGuided",
         state,
@@ -2619,6 +2739,11 @@ async fn stream_guided_snapshots(
         execution_mode,
         GenerationError::Failed,
         |container, _handle, _spawned| {
+            let (tool_epoch, tool_context) = conversation
+                .lock()
+                .unwrap()
+                .start(&prompt, input.as_deref());
+            let mut tool_state_error = None;
             let wants_more = call.wants_more();
             let mut pending_snapshot: Option<String> = None;
             let mut pending_tool_calls: Option<Vec<ToolCall>> = None;
@@ -2636,11 +2761,28 @@ async fn stream_guided_snapshots(
                 execution_mode.as_str(),
                 tools,
                 Vec::new(),
+                Some(&tool_context),
+                Some(options.temperature),
                 |snapshot, tool_calls, done| {
                     if cancelled
                         || RequestCancellation::for_session(state, &session_id).is_cancelled()
                     {
                         cancelled = true;
+                        return;
+                    }
+                    let update = if !tool_calls.is_empty() {
+                        conversation.lock().unwrap().remember(
+                            tool_epoch,
+                            &tool_context,
+                            &tool_calls,
+                        )
+                    } else if done {
+                        conversation.lock().unwrap().complete(tool_epoch)
+                    } else {
+                        Ok(())
+                    };
+                    if let Err(error) = update {
+                        tool_state_error = Some(error.to_string());
                         return;
                     }
                     if !snapshot.is_empty() {
@@ -2677,6 +2819,9 @@ async fn stream_guided_snapshots(
                 },
             );
 
+            if let Some(error) = tool_state_error {
+                return Err(GenerationError::InvalidInput(error));
+            }
             if let Some(e) = reply_error {
                 return Err(GenerationError::Reply(e));
             }
@@ -2742,6 +2887,15 @@ async fn stream_guided_tool_results(
     let input = normalize_guided_input(&prompt, &media_paths, &mut media_budget)
         .map_err(GenerationError::InvalidInput)?;
     let prompt = input.as_deref().map(render_text_prompt).unwrap_or(prompt);
+    let conversation = state
+        .0
+        .lock()
+        .await
+        .sessions
+        .get(&session_id)
+        .ok_or_else(|| GenerationError::SessionNotFound(session_id.clone()))?
+        .tools
+        .clone();
     with_locked_container(
         "StreamSubmitToolResultsGuided",
         state,
@@ -2758,7 +2912,13 @@ async fn stream_guided_tool_results(
             let mut reply_error: Option<varlink::Error> = None;
             let mut cancelled = false;
             let tools = tools.into_iter().map(varlink_tool_definition).collect();
-            let tool_results = results.into_iter().map(varlink_tool_result).collect();
+            let tool_results: Vec<_> = results.into_iter().map(varlink_tool_result).collect();
+            let (tool_epoch, tool_context) = conversation
+                .lock()
+                .unwrap()
+                .continue_with(&tool_results, &prompt, input.as_deref())
+                .map_err(|error| GenerationError::InvalidInput(error.to_string()))?;
+            let mut tool_state_error = None;
             let result = container.stream_structured(
                 Some(&resolved.instructions),
                 &prompt,
@@ -2768,11 +2928,28 @@ async fn stream_guided_tool_results(
                 execution_mode.as_str(),
                 tools,
                 tool_results,
+                Some(&tool_context),
+                Some(options.temperature),
                 |snapshot, tool_calls, done| {
                     if cancelled
                         || RequestCancellation::for_session(state, &session_id).is_cancelled()
                     {
                         cancelled = true;
+                        return;
+                    }
+                    let update = if !tool_calls.is_empty() {
+                        conversation.lock().unwrap().remember(
+                            tool_epoch,
+                            &tool_context,
+                            &tool_calls,
+                        )
+                    } else if done {
+                        conversation.lock().unwrap().complete(tool_epoch)
+                    } else {
+                        Ok(())
+                    };
+                    if let Err(error) = update {
+                        tool_state_error = Some(error.to_string());
                         return;
                     }
                     if !snapshot.is_empty() {
@@ -2809,6 +2986,9 @@ async fn stream_guided_tool_results(
                 },
             );
 
+            if let Some(error) = tool_state_error {
+                return Err(GenerationError::InvalidInput(error));
+            }
             if let Some(e) = reply_error {
                 return Err(GenerationError::Reply(e));
             }
@@ -2985,6 +3165,14 @@ fn embedding_pipeline_id(resolved: &ResolvedSessionRuntime, container: &Containe
 
     update_hash_field(&mut hasher, "runtime_variant", container.variant.as_tag());
     update_hash_field(&mut hasher, "runtime_image", &container.image_ref);
+    update_hash_field(
+        &mut hasher,
+        "runtime_image_identity",
+        &container.image_identity,
+    );
+    if let Some(metadata) = &container.runtime_metadata {
+        update_hash_field(&mut hasher, "runtime_metadata", &metadata.to_string());
+    }
 
     let mut runtime_options = container.runtime_options().iter().collect::<Vec<_>>();
     runtime_options.sort_by_key(|(key, _)| *key);
@@ -3234,6 +3422,19 @@ fn read_media_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn public_tool_calls_do_not_expose_internal_reasoning() {
+        let calls = varlink_tool_calls(vec![crate::container::ToolCall {
+            id: "call".into(),
+            name: "lookup".into(),
+            arguments_json: "{}".into(),
+            reasoning: Some("private continuation context".into()),
+        }]);
+        let value = serde_json::to_value(calls).unwrap();
+        assert_eq!(value[0]["name"], "lookup");
+        assert!(value[0].get("reasoning").is_none());
+    }
     use hegel::TestCase;
     use hegel::generators as gs;
 

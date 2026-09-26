@@ -70,6 +70,12 @@ jobs:
           -p aileron-runtime
           -- -D warnings
 
+      - name: Private llama-server adapter tests
+        run: |
+          cargo test -p aileron-runtime --features llama-server
+          cargo clippy -p aileron-runtime --features llama-server --all-targets -- -D warnings
+          python3 -m unittest discover -s runtimes/llm-vision-whisper/tests
+
       - name: VITS runtime unit tests
         run: |
           python3 -m pip install --user numpy==2.3.1 pycountry==26.2.16
@@ -181,6 +187,86 @@ jobs:
         run: >
           python3 tests/portal/ci_cgroups.py
           python3 tests/portal/stack.py "$RUNNER_TEMP/xdp/build" --check-cancellation
+
+  model-portals:
+    name: Model portal integration
+    runs-on: ubuntu-24.04
+    container: ghcr.io/flatpak/xdg-desktop-portal:2026-07-31.0
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: true
+      - name: Build portal frontend and integration tests
+        run: meson setup target/portal-ci xdg-desktop-portal -Dtests=enabled -Dwerror=true
+      - name: Run model portal integration tests
+        run: meson test -C target/portal-ci integration/model_portals --print-errorlogs
+
+  llama-server-image:
+    name: Private llama-server image (${{ matrix.variant }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: cpu
+            build_args: RUNTIME_VARIANT=cpu
+          - variant: cuda
+            build_args: |
+              RUNTIME_VARIANT=cuda
+              BUILDER_IMAGE=nvidia/cuda:13.3.0-devel-ubuntu24.04
+              FINAL_IMAGE=nvidia/cuda:13.3.0-runtime-ubuntu24.04
+              CUDA_DOCKER_ARCH=all
+              CMAKE_ARGS=-DGGML_CUDA=on
+              LDFLAGS=-L/usr/local/cuda/lib64/stubs -Wl,-rpath-link,/usr/local/cuda/lib64/stubs
+          - variant: rocm
+            build_args: |
+              RUNTIME_VARIANT=rocm
+              BUILDER_IMAGE=rocm/dev-ubuntu-22.04:7.2.4
+              FINAL_IMAGE=rocm/dev-ubuntu-22.04:7.2.4
+              APT_PACKAGES=hipblas-dev rocblas-dev
+              RUNTIME_APT_PACKAGES=libgomp1 libstdc++6 libgcc-s1 ca-certificates hipblas-dev rocblas-dev
+              CMAKE_ARGS=-DGGML_HIP=on -DAMDGPU_TARGETS=gfx900;gfx906;gfx908;gfx90a;gfx942;gfx950;gfx1010;gfx1011;gfx1012;gfx1030;gfx1031;gfx1032;gfx1035;gfx1036;gfx1100;gfx1101;gfx1102;gfx1103;gfx1150;gfx1151;gfx1152;gfx1153;gfx1200;gfx1201
+              FORCE_CMAKE=1
+          - variant: vulkan
+            build_args: |
+              RUNTIME_VARIANT=vulkan
+              BUILDER_IMAGE=fedora:latest
+              FINAL_IMAGE=fedora:latest
+              APT_PACKAGES=vulkan-loader-devel glslc glslang spirv-headers-devel
+              RUNTIME_APT_PACKAGES=libgomp libstdc++ libgcc ca-certificates vulkan-loader mesa-vulkan-drivers
+              CMAKE_ARGS=-DGGML_VULKAN=on
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4.2.0
+
+      - name: Build combined runtime image
+        uses: docker/build-push-action@v7.3.0
+        with:
+          context: .
+          file: runtimes/llm-vision-whisper/Dockerfile
+          build-args: ${{ matrix.build_args }}
+          tags: aileron/llama-server:ci
+          load: true
+          push: false
+          cache-from: type=gha,scope=aileron-llama-server-ci-${{ matrix.variant }}
+          cache-to: type=gha,mode=max,scope=aileron-llama-server-ci-${{ matrix.variant }}
+
+      - name: Check packaged server without network or writable rootfs
+        # CUDA/ROCm inference checks need a host with the corresponding drivers.
+        if: matrix.variant == 'cpu' || matrix.variant == 'vulkan'
+        run: >
+          docker run --rm --network none --read-only --tmpfs /tmp --cap-drop=ALL
+          --entrypoint /usr/local/bin/llama-server aileron/llama-server:ci --version
+
+      - name: Check native llama executables are absent and Whisper remains
+        run: >
+          docker run --rm --network none --read-only --entrypoint /bin/sh
+          aileron/llama-server:ci -ec '
+          test -x /usr/local/bin/aileron-runtime-llm-llama-server;
+          test -x /usr/local/bin/aileron-runtime-asr-whisper-cpp;
+          test ! -e /usr/local/bin/aileron-runtime-llm-llama-cpp;
+          test ! -e /usr/local/bin/aileron-runtime-vision-llama-cpp'
 
   # ── Stub container image ────────────────────────────────────────────────────
   # Verifies the stub Dockerfile builds successfully, then smoke-tests the

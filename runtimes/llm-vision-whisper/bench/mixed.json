@@ -1,0 +1,6 @@
+[
+  {"name":"before-embedding","request":{"type":"generate","prompt":"Say hello briefly.","temperature":0.0,"max_tokens":16},"expect":{"kind":"text","contains_any":["hello","hi!","hi.","greetings"]}},
+  {"name":"embedding-first","request":{"type":"embed","prompt":"A cat sits on a mat."},"expect":{"kind":"embedding"}},
+  {"name":"after-embedding","request":{"type":"generate","prompt":"Say goodbye briefly.","temperature":0.0,"max_tokens":16},"expect":{"kind":"text","contains_any":["bye","farewell","see you"]}},
+  {"name":"embedding-again","request":{"type":"embed","prompt":"A cat sits on a mat."},"expect":{"kind":"embedding"}}
+]
