@@ -315,6 +315,12 @@ fn build_window(window: &ApplicationWindow) {
     );
     overview_page.set_icon_name(Some("view-grid-symbolic"));
     let text_page = stack.add_titled(&frontends::text::build_page(), Some("text"), "Text lab");
+    let reasoning_page = stack.add_titled(
+        &frontends::reasoning::build_page(),
+        Some("reasoning"),
+        "Reasoning lab",
+    );
+    reasoning_page.set_icon_name(Some("dialog-question-symbolic"));
     text_page.set_icon_name(Some("text-x-generic-symbolic"));
     let chat_page = stack.add_titled(&frontends::chat::build_page(), Some("chat"), "Chat lab");
     chat_page.set_icon_name(Some("user-available-symbolic"));
@@ -395,6 +401,7 @@ fn build_window(window: &ApplicationWindow) {
     stack.connect_visible_child_name_notify(move |stack| {
         title_for_stack.set_title(match stack.visible_child_name().as_deref() {
             Some("overview") => "Lab overview",
+            Some("reasoning") => "Reasoning lab",
             Some("text") => "Text lab",
             Some("chat") => "Chat lab",
             Some("tools") => "Tool lab",

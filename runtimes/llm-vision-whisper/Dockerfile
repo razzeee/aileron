@@ -1,5 +1,6 @@
 ARG BUILDER_IMAGE="rust:1-bookworm"
 ARG FINAL_IMAGE="debian:bookworm-slim"
+ARG LLAMA_SERVER_REVISION="5f55650a78f92aff4d48d671423e888fac0469ff"
 FROM ${BUILDER_IMAGE} AS builder
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
@@ -14,6 +15,8 @@ ARG LDFLAGS=""
 ARG ROCM_PATH="/opt/rocm"
 ARG AMDGPU_TARGETS="gfx900;gfx906;gfx908;gfx90a;gfx942;gfx950;gfx1010;gfx1011;gfx1012;gfx1030;gfx1031;gfx1032;gfx1035;gfx1036;gfx1100;gfx1101;gfx1102;gfx1103;gfx1150;gfx1151;gfx1152;gfx1153;gfx1200;gfx1201"
 ARG VULKAN_HEADERS_TAG="v1.4.354"
+ARG LLAMA_SERVER_REVISION
+ARG LLAMA_BUILD_JOBS="2"
 
 ENV CMAKE_ARGS="${CMAKE_ARGS}"
 ENV CUDA_DOCKER_ARCH="${CUDA_DOCKER_ARCH}"
@@ -28,11 +31,11 @@ ENV PATH="${ROCM_PATH}/bin:${PATH}"
 
 RUN set -eux; \
     if command -v apt-get >/dev/null 2>&1; then \
-    apt-get update; \
-    apt-get install -y --no-install-recommends ca-certificates curl build-essential cmake clang libclang-dev pkg-config git ninja-build ${APT_PACKAGES}; \
+    apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates curl build-essential cmake clang libclang-dev pkg-config git ninja-build ${APT_PACKAGES} && \
     rm -rf /var/lib/apt/lists/*; \
     elif command -v dnf >/dev/null 2>&1; then \
-    dnf install -y --setopt=install_weak_deps=False ca-certificates curl gcc gcc-c++ cmake clang-devel pkgconf-pkg-config git ninja-build ${APT_PACKAGES}; \
+    dnf install -y --allowerasing --setopt=install_weak_deps=False ca-certificates curl gcc gcc-c++ cmake clang-devel pkgconf-pkg-config git ninja-build ${APT_PACKAGES} && \
     dnf clean all; \
     else \
     echo "unsupported builder package manager" >&2; exit 1; \
@@ -53,37 +56,40 @@ RUN set -eux; \
 
 ENV PATH="/root/.cargo/bin:${PATH}"
 
+COPY runtimes/llm-vision-whisper/build-server.sh /build-server.sh
+COPY runtimes/llm-vision-whisper/patches/ /llama-server-patches/
+RUN bash /build-server.sh
+
+FROM builder AS runtime-builder
+ARG RUNTIME_VARIANT=cpu
+ARG RUNTIME_FEATURES=
+ARG LLAMA_BUILD_JOBS=2
+
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 
-RUN set -eux; \
+RUN --mount=type=cache,id=aileron-runtime-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=aileron-runtime-registry-root,target=/root/.cargo/registry \
+    --mount=type=cache,id=aileron-runtime-target-${RUNTIME_VARIANT},target=/src/target \
+    set -eux; \
+    export CARGO_BUILD_JOBS="${LLAMA_BUILD_JOBS}"; \
     case "$RUNTIME_VARIANT" in \
     cpu) \
-      features_llm="llama" \
-      features_vision="vision" \
       features_asr="whisper" \
       ;;\
     cuda) \
-      features_llm="llama-cuda" \
-      features_vision="vision-cuda" \
       features_asr="whisper-cuda" \
       ;;\
     rocm) \
-      features_llm="llama-rocm" \
-      features_vision="vision-rocm" \
       features_asr="whisper-rocm" \
       ;;\
     vulkan) \
-      features_llm="llama-vulkan" \
-      features_vision="vision-vulkan" \
       features_asr="whisper-vulkan" \
       ;;\
     *) echo "unsupported RUNTIME_VARIANT=$RUNTIME_VARIANT" >&2; exit 1 ;; \
     esac; \
     if [ -n "$RUNTIME_FEATURES" ]; then \
-      features_llm="$RUNTIME_FEATURES"; \
-      features_vision="$RUNTIME_FEATURES"; \
       features_asr="$RUNTIME_FEATURES"; \
     fi; \
     mkdir -p /runtime-bins; \
@@ -98,8 +104,7 @@ RUN set -eux; \
       fi; \
       cp "target/release/$bin" "/runtime-bins/$bin"; \
     }; \
-    build_runtime_bin aileron-runtime-llm-llama-cpp "$features_llm"; \
-    build_runtime_bin aileron-runtime-vision-llama-cpp "$features_vision"; \
+    build_runtime_bin aileron-runtime-llm-llama-server "llama-server"; \
     build_runtime_bin aileron-runtime-asr-whisper-cpp "$features_asr"
 
 FROM ${FINAL_IMAGE}
@@ -109,6 +114,7 @@ ARG RUNTIME_VARIANT="cpu"
 ARG RUNTIME_DESCRIPTION="Aileron combined LLM, vision, and Whisper runtime."
 ARG RUNTIME_APT_PACKAGES="libgomp1 libstdc++6 libgcc-s1 ca-certificates"
 ARG ROCM_PATH="/opt/rocm"
+ARG LLAMA_SERVER_REVISION
 
 ENV XDG_CACHE_HOME=/tmp
 ENV ROCM_PATH="${ROCM_PATH}"
@@ -118,11 +124,11 @@ ENV PATH="${ROCM_PATH}/bin:${PATH}"
 
 RUN set -eux; \
     if command -v apt-get >/dev/null 2>&1; then \
-    apt-get update; \
-    apt-get install -y --no-install-recommends ${RUNTIME_APT_PACKAGES}; \
+    apt-get update && \
+    apt-get install -y --no-install-recommends ${RUNTIME_APT_PACKAGES} && \
     rm -rf /var/lib/apt/lists/*; \
     elif command -v dnf >/dev/null 2>&1; then \
-    dnf install -y --setopt=install_weak_deps=False ${RUNTIME_APT_PACKAGES}; \
+    dnf install -y --setopt=install_weak_deps=False ${RUNTIME_APT_PACKAGES} && \
     dnf clean all; \
     else \
     echo "unsupported runtime package manager" >&2; exit 1; \
@@ -132,11 +138,14 @@ RUN set -eux; \
     fi \
     && mkdir -p /usr/local/nvidia/lib64
 
-COPY --from=builder /runtime-bins/* /usr/local/bin/
+COPY --from=runtime-builder /runtime-bins/* /usr/local/bin/
+COPY --from=runtime-builder /runtime-licenses/ /usr/share/licenses/aileron-runtime/
+COPY --from=runtime-builder /runtime-provenance.json /usr/share/aileron/runtime-provenance.json
 COPY runtimes/llm-vision-whisper/entrypoint.sh /entrypoint
 RUN chmod 0755 /entrypoint /usr/local/bin/aileron-runtime-*
 
 LABEL org.aileron.runtime="true" \
+    org.aileron.llama-server.revision="${LLAMA_SERVER_REVISION}" \
     org.aileron.runtime_id="${RUNTIME_ID}" \
     org.aileron.variant="${RUNTIME_VARIANT}" \
     org.opencontainers.image.description="${RUNTIME_DESCRIPTION}" \

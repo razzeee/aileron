@@ -58,6 +58,7 @@ pub struct RuntimeUpdateCheck {
 
 #[derive(Debug, Clone)]
 pub struct Session {
+    pub tools: Arc<StdMutex<crate::tool_conversations::ToolConversation>>,
     pub session_id: String,
     pub app_id: String,
     pub use_case: String,
@@ -93,6 +94,7 @@ pub struct SharedState(
     pub SharedActiveContainerRequests,
     pub Arc<StdMutex<HashMap<String, u64>>>,
     pub SharedProfileExecutionStates,
+    pub Arc<StdMutex<HashMap<String, u64>>>,
 );
 
 impl SharedState {
@@ -132,6 +134,7 @@ impl SharedState {
             Arc::new(StdMutex::new(HashMap::new())),
             Arc::new(StdMutex::new(HashMap::new())),
             Arc::new(StdMutex::new(HashMap::new())),
+            Arc::new(StdMutex::new(HashMap::new())),
         ))
     }
 
@@ -140,6 +143,17 @@ impl SharedState {
             .lock()
             .expect("session cancellation mutex poisoned")
             .insert(session_id.to_string());
+        self.7.lock().unwrap().remove(session_id);
+    }
+
+    pub fn request_epoch(&self, session_id: &str) -> u64 {
+        self.7.lock().unwrap().get(session_id).copied().unwrap_or(0)
+    }
+
+    pub fn cancel_active_requests(&self, session_id: &str) {
+        let mut epochs = self.7.lock().unwrap();
+        let epoch = epochs.entry(session_id.to_owned()).or_default();
+        *epoch = epoch.wrapping_add(1);
     }
 
     pub fn is_session_cancelled(&self, session_id: &str) -> bool {

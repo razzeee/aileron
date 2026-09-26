@@ -1,8 +1,8 @@
 //! Daemon request execution lifecycle helpers.
 //!
 //! This module owns cancellation vocabulary for inference requests. Session
-//! closure is the real cancellation seam today; the `RequestCancellation` shape
-//! leaves room for per-request cancellation if another adapter makes it real.
+//! closure and per-session request epochs stop both active and still-loading
+//! inference without cancelling later requests in the same session.
 
 use std::sync::{Arc, Condvar, Mutex as StdMutex};
 use std::thread;
@@ -46,20 +46,34 @@ impl Drop for ActiveContainerRequest<'_> {
 pub(crate) struct RequestCancellation<'a> {
     state: &'a SharedState,
     session_id: &'a str,
+    epoch: u64,
 }
 
 impl<'a> RequestCancellation<'a> {
     pub(crate) fn for_session(state: &'a SharedState, session_id: &'a str) -> Self {
-        Self { state, session_id }
+        Self::for_epoch(state, session_id, state.request_epoch(session_id))
+    }
+
+    pub(crate) fn for_epoch(state: &'a SharedState, session_id: &'a str, epoch: u64) -> Self {
+        Self {
+            state,
+            session_id,
+            epoch,
+        }
     }
 
     pub(crate) fn is_cancelled(self) -> bool {
         self.state.is_session_cancelled(self.session_id)
+            || self.state.request_epoch(self.session_id) != self.epoch
     }
 
     pub(crate) fn ensure_not_cancelled(self) -> Result<(), String> {
         if self.is_cancelled() {
-            Err(request_cancelled_reason())
+            Err(if self.state.is_session_cancelled(self.session_id) {
+                request_cancelled_reason()
+            } else {
+                "container returned error request_cancelled: active request was stopped".to_owned()
+            })
         } else {
             Ok(())
         }
@@ -81,7 +95,7 @@ impl<'a> RequestCancellation<'a> {
     }
 
     pub(crate) fn spawn_watcher(self, handle: &ContainerHandle) -> CancelWatcher {
-        spawn_cancel_watcher(self.state, self.session_id, handle)
+        spawn_cancel_watcher(self.state, self.session_id, self.epoch, handle)
     }
 }
 
@@ -148,6 +162,7 @@ impl Drop for CancelWatcher {
 fn spawn_cancel_watcher(
     state: &SharedState,
     session_id: &str,
+    epoch: u64,
     handle: &ContainerHandle,
 ) -> CancelWatcher {
     let state = state.clone();
@@ -157,7 +172,8 @@ fn spawn_cancel_watcher(
     let thread_stop = stop.clone();
     let thread = thread::spawn(move || {
         loop {
-            if state.is_session_cancelled(&session_id) {
+            if state.is_session_cancelled(&session_id) || state.request_epoch(&session_id) != epoch
+            {
                 handle.terminate();
                 break;
             }
@@ -234,6 +250,7 @@ mod tests {
             Arc::new(StdMutex::new(HashMap::new())),
             Arc::new(StdMutex::new(HashMap::new())),
             Arc::new(StdMutex::new(HashMap::new())),
+            Arc::new(StdMutex::new(HashMap::new())),
         )
     }
 
@@ -259,5 +276,22 @@ mod tests {
         assert!(!is_request_cancelled_failure(
             "container returned error invalid_input: bad"
         ));
+    }
+
+    #[test]
+    fn active_cancellation_stops_existing_work_but_not_a_later_request() {
+        let state = shared_state();
+        let first = RequestCancellation::for_session(&state, "session-a");
+        let unrelated = RequestCancellation::for_session(&state, "session-b");
+        state.cancel_active_requests("session-a");
+        assert!(first.is_cancelled());
+        assert!(!unrelated.is_cancelled());
+        assert!(!RequestCancellation::for_session(&state, "session-a").is_cancelled());
+        assert!(
+            first
+                .ensure_not_cancelled()
+                .unwrap_err()
+                .contains("request_cancelled")
+        );
     }
 }
