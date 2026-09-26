@@ -188,8 +188,8 @@ jobs:
           python3 tests/portal/ci_cgroups.py
           python3 tests/portal/stack.py "$RUNNER_TEMP/xdp/build" --check-cancellation
 
-  model-portals:
-    name: Model portal integration
+  model-portal-frontend:
+    name: Model portal frontend integration
     runs-on: ubuntu-24.04
     container: ghcr.io/flatpak/xdg-desktop-portal:2026-07-31.0
     steps:
