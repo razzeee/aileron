@@ -67,7 +67,7 @@ the text checks do not establish general ROCm support for this card.
 
 The portal frontend dependency is published in
 [razzeee/xdg-desktop-portal#12](https://github.com/razzeee/xdg-desktop-portal/pull/12).
-The submodule points to its `e81bca2e57ff6fd9a9b3ae5563fbfcce1e633002` commit.
+The submodule points to its `b9a5140b4f07e83af1a7dcb47d39b1823f088392` commit.
 
 ## Publication integration
 
@@ -79,6 +79,9 @@ termination. Cancellation epochs cover startup and queued requests.
 
 On this integrated revision, the workspace suite passes 432 tests with seven
 opt-in tests ignored; Clippy with warnings denied and formatting also pass.
+Both real-model OCI tests and the daemon/public-portal conformance checks were
+rerun with the integrated daemon and portal and passed. The CPU image was also
+rebuilt successfully with the integrated lockfile.
 The lockfile retains current main's dependency versions and adds only the
 adapter dependencies/removes the native llama dependency graph. Unrelated
 working-tree edits were excluded using a separate PR worktree.
