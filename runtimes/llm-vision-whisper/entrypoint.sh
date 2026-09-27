@@ -6,7 +6,7 @@ if [ -f "$default_mmproj_path" ]; then
     export MMPROJ_PATH="$default_mmproj_path"
     : "${MODEL_PATH:=/model/model.gguf}"
     export MODEL_PATH
-    exec /usr/local/bin/aileron-runtime-vision-llama-cpp
+    exec /usr/local/bin/aileron-runtime-llm-llama-server
 fi
 
 if [ -z "${MODEL_PATH:-}" ]; then
@@ -20,5 +20,5 @@ fi
 
 case "$MODEL_PATH" in
     *.bin) exec /usr/local/bin/aileron-runtime-asr-whisper-cpp ;;
-    *) exec /usr/local/bin/aileron-runtime-llm-llama-cpp ;;
+    *) exec /usr/local/bin/aileron-runtime-llm-llama-server ;;
 esac

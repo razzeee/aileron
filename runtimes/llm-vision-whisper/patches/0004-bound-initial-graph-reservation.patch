@@ -1,0 +1,16 @@
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -589,6 +589,11 @@
+     const uint32_t n_seqs = cparams.n_seq_max;
+-    const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
++    // Aileron uses a single sequence and permits whole-context embedding inputs.
++    // Reserving that worst-case graph eagerly wastes gigabytes on small requests.
++    // This bounds only the initial reservation, not decoding or embedding size:
++    // process_ubatch's sched_alloc_graph grows buffers for larger actual inputs.
++    const uint32_t n_tokens = std::min(std::min(cparams.n_ctx, cparams.n_ubatch), 512u);
+ 
+-    const size_t max_nodes = this->graph_max_nodes(n_tokens);
++    const size_t max_nodes = this->graph_max_nodes(std::min(cparams.n_ctx, cparams.n_ubatch));
+ 
+     LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);

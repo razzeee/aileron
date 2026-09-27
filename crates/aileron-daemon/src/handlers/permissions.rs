@@ -219,6 +219,7 @@ mod tests {
             Default::default(),
             Default::default(),
             Default::default(),
+            Default::default(),
         )
     }
 
@@ -240,6 +241,7 @@ mod tests {
                     profile_id: profile.into(),
                     instructions: String::new(),
                     started_at: chrono::Utc::now(),
+                    tools: Default::default(),
                 },
             );
         }

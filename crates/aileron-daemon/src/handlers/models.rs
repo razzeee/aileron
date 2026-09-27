@@ -3231,6 +3231,7 @@ mod tests {
             Default::default(),
             Default::default(),
             Default::default(),
+            Default::default(),
         );
         let root = tempfile::tempdir().unwrap();
         let target = root.path().join("model.1");

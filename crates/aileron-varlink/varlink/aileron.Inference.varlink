@@ -29,6 +29,38 @@ type EmbedOptions (
   execution_mode: string
 )
 
+type GenerationOptions (
+  maximum_response_tokens: ?int,
+  temperature: ?float,
+  source_language_hint: ?string,
+  target_language_hint: ?string,
+  execution_mode: ?string,
+  thinking: ?string,
+  reasoning_effort: ?string,
+  include_reasoning: ?bool
+)
+
+type GenerationUsage (
+  prompt_tokens: ?int,
+  completion_tokens: ?int,
+  total_tokens: ?int
+)
+
+type GenerationEvent (
+  kind: string,
+  text: ?string,
+  snapshot_json: ?string,
+  tool_calls: ?[]ToolCall,
+  finish_reason: ?string,
+  usage: ?GenerationUsage
+)
+
+type ReasoningCapabilities (
+  thinking_modes: []string,
+  reasoning_efforts: []string,
+  reasoning_output: bool
+)
+
 type SpeechOptions (
   source_language_hint: string,
   execution_mode: string
@@ -155,6 +187,12 @@ method StreamRespondGuided(session_id: string, prompt: string, media_paths: []st
 # Stream guided generation after the app executes or rejects requested tools.
 method StreamSubmitToolResultsGuided(session_id: string, prompt: string, media_paths: []string, results: []ToolResult, fields: []GuidedField, tools: []ToolDefinition, options: GuidedOptions) -> (snapshot_json: string, tool_calls: []ToolCall)
 
+# Version 2 streams explicit reasoning and completion metadata. Existing methods remain compatible.
+method StreamResponse2(session_id: string, input_json: string, media_paths: []string, options: GenerationOptions) -> (event: GenerationEvent)
+method StreamRespondGuided2(session_id: string, prompt: string, media_paths: []string, fields: []GuidedField, tools: []ToolDefinition, options: GenerationOptions) -> (event: GenerationEvent)
+method StreamSubmitToolResultsGuided2(session_id: string, prompt: string, media_paths: []string, results: []ToolResult, fields: []GuidedField, tools: []ToolDefinition, options: GenerationOptions) -> (event: GenerationEvent)
+method GetReasoningCapabilities(session_id: string) -> (capabilities: ReasoningCapabilities)
+
 # Stream embedding vectors for text. Session must have been created with use_case: language.embed
 # embedding: the embedding vector for the supplied text
 # embedding_pipeline_id: stable compatibility id; only compare vectors with the same value
@@ -197,7 +235,7 @@ method StreamSegment(session_id: string, image_path: string, instructions: strin
 # instructions: optional per-image instructions
 method StreamDepth(session_id: string, image_path: string, instructions: string, options: VisionOptions) -> (depth: VisionDepthMap)
 
-# Stop the active container request for a session without ending the session.
+# Stop active and pending work for a session without ending it. Later requests remain usable.
 method CancelActiveRequest(session_id: string) -> ()
 
 # End a session. The per-profile container remains pooled until idle timeout.

@@ -137,6 +137,10 @@ const VULKAN_ICD_DIRS: &[&str] = &[
 ];
 /// A running container for a single use-case.
 pub struct Container {
+    #[cfg(test)]
+    container_id: Option<String>,
+    pub runtime_metadata: Option<Value>,
+    pub image_identity: String,
     #[allow(dead_code)]
     pub variant: Variant,
     #[allow(dead_code)]
@@ -230,6 +234,8 @@ impl RuntimeProcessHandle {
 
 struct RuntimeProcess {
     child: Child,
+    // Keep the bundle until the cleanup worker has reaped the OCI payload.
+    _bundle: Option<PreparedBundle>,
     // None for direct subprocess tests, or after OCI cleanup has completed.
     container_id: Option<String>,
     #[cfg(test)]
@@ -358,6 +364,8 @@ pub struct ToolCall {
     pub id: String,
     pub name: String,
     pub arguments_json: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -382,6 +390,38 @@ pub struct AudioChunk {
 }
 
 impl Container {
+    pub(crate) fn stream_generation(
+        &mut self,
+        request: &ContainerRequest,
+        mut on_event: impl FnMut(Value) -> Result<()>,
+    ) -> Result<()> {
+        write_request_line(&mut self.stdin, request)?;
+        self.last_used = std::time::Instant::now();
+        loop {
+            let mut line = String::new();
+            if self.stdout.read_line(&mut line)? == 0 {
+                bail!("container stdout closed unexpectedly");
+            }
+            let value: Value = serde_json::from_str(&line)?;
+            let response: ContainerResponse = serde_json::from_value(value.clone())?;
+            if response.id != request.id {
+                continue;
+            }
+            self.check_response_error(&response)?;
+            if let Err(error) = on_event(value) {
+                self.process.terminate();
+                return Err(error);
+            }
+            if response.done.unwrap_or(false) {
+                return Ok(());
+            }
+        }
+    }
+
+    fn check_response_error(&self, response: &ContainerResponse) -> Result<()> {
+        check_response_error(response, Some(&self.process))
+    }
+
     pub fn runtime_options(&self) -> &HashMap<String, String> {
         &self.runtime_options
     }
@@ -463,9 +503,11 @@ impl Container {
             .stderr(Stdio::piped())
             .spawn()
             .with_context(|| format!("failed to spawn crun for {}", image_ref))?;
+        let image_identity = bundle.image_identity.clone();
         let mut process = RuntimeProcess {
             child,
-            container_id: Some(container_id),
+            container_id: Some(container_id.clone()),
+            _bundle: Some(bundle),
             #[cfg(test)]
             before_terminate: None,
         };
@@ -474,6 +516,10 @@ impl Container {
         let stdout = BufReader::new(process.child.stdout.take().expect("piped stdout"));
         let stderr = BufReader::new(process.child.stderr.take().expect("piped stderr"));
         let mut container = Self {
+            #[cfg(test)]
+            container_id: Some(container_id),
+            runtime_metadata: None,
+            image_identity,
             variant: candidate.variant,
             runtime_id: runtime_id.to_string(),
             profile_epoch,
@@ -489,6 +535,8 @@ impl Container {
         // Read stderr lines in a background thread, forwarding them to
         // `on_status` and watching for the "ready" sentinel.
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        let metadata = Arc::new(Mutex::new(None));
+        let status_metadata = metadata.clone();
         let status_runtime_id = runtime_id.to_string();
         let status_image_ref = image_ref.to_string();
         let status_variant = candidate.variant.as_tag().to_string();
@@ -498,6 +546,15 @@ impl Container {
             for line in stderr.lines() {
                 match line {
                     Ok(l) => {
+                        if let Some(value) = l.strip_prefix("[aileron-runtime-metadata] ") {
+                            if value.len() <= 8192
+                                && let Ok(value) = serde_json::from_str::<Value>(value)
+                                && value.is_object()
+                            {
+                                *status_metadata.lock().unwrap() = Some(value);
+                            }
+                            continue;
+                        }
                         observability::log_runtime_status(
                             &status_runtime_id,
                             &status_image_ref,
@@ -543,6 +600,7 @@ impl Container {
             return Err(error);
         }
         container.last_used = std::time::Instant::now();
+        container.runtime_metadata = metadata.lock().unwrap().clone();
         observability::log_runtime_ready(
             runtime_id,
             image_ref,
@@ -561,10 +619,33 @@ impl Container {
         input: Option<&[InputMessage]>,
         max_tokens: u32,
         execution_mode: &str,
+        on_token: impl FnMut(String),
+    ) -> Result<()> {
+        self.generate_with_temperature(
+            system,
+            prompt,
+            input,
+            max_tokens,
+            execution_mode,
+            None,
+            on_token,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_with_temperature(
+        &mut self,
+        system: Option<&str>,
+        prompt: &str,
+        input: Option<&[InputMessage]>,
+        max_tokens: u32,
+        execution_mode: &str,
+        temperature: Option<f64>,
         mut on_token: impl FnMut(String),
     ) -> Result<()> {
         let id = Uuid::new_v4().to_string();
         let mut req = ContainerRequest::new(id.clone(), "generate");
+        req.temperature = temperature;
         req.system = system.map(str::to_string);
         req.prompt = Some(prompt.to_string());
         req.input = input.map(|messages| messages.to_vec());
@@ -584,9 +665,7 @@ impl Container {
             if resp.id != id {
                 continue;
             }
-            if let Some((error, reason)) = response_error(&resp) {
-                bail!("container returned error {error}: {reason}");
-            }
+            self.check_response_error(&resp)?;
             if let Some(token) = resp.token {
                 on_token(token);
             }
@@ -636,6 +715,7 @@ impl Container {
             if resp.id != id {
                 continue;
             }
+            self.check_response_error(&resp)?;
             if let Some(result) = structured_response_result(resp, schema)? {
                 return Ok(result);
             }
@@ -683,9 +763,7 @@ impl Container {
             if resp.id != id {
                 continue;
             }
-            if let Some((error, reason)) = response_error(&resp) {
-                bail!("container returned error {error}: {reason}");
-            }
+            self.check_response_error(&resp)?;
             if let Some(tool_calls) = resp.tool_calls {
                 return Ok(GuidedToolResponse {
                     content: resp.result.unwrap_or_default(),
@@ -717,6 +795,8 @@ impl Container {
         execution_mode: &str,
         tools: Vec<ToolDefinition>,
         tool_results: Vec<ToolResult>,
+        tool_context: Option<&Value>,
+        temperature: Option<f64>,
         mut on_event: impl FnMut(String, Vec<ToolCall>, bool),
     ) -> Result<()> {
         let id = Uuid::new_v4().to_string();
@@ -725,6 +805,8 @@ impl Container {
         req.prompt = Some(prompt.to_string());
         req.input = input.map(|messages| messages.to_vec());
         req.max_tokens = Some(max_tokens);
+        req.tool_context = tool_context.cloned();
+        req.temperature = temperature;
         req.execution_mode = Some(execution_mode.to_string());
         req.response_format = Some(ResponseFormat {
             r#type: "json_schema".to_string(),
@@ -750,9 +832,7 @@ impl Container {
             if resp.id != id {
                 continue;
             }
-            if let Some((error, reason)) = response_error(&resp) {
-                bail!("container returned error {error}: {reason}");
-            }
+            self.check_response_error(&resp)?;
             if let Some(tool_calls) = resp.tool_calls {
                 on_event(String::new(), tool_calls, resp.done.unwrap_or(true));
             }
@@ -803,7 +883,7 @@ impl Container {
             execution_mode,
         )?;
         self.last_used = std::time::Instant::now();
-        read_text_stream_response(&mut self.stdout, &id, on_token)
+        read_text_stream_response(&mut self.stdout, &id, on_token, Some(&self.process))
     }
 
     pub fn stream_synthesize(
@@ -822,7 +902,7 @@ impl Container {
         req.execution_mode = Some(execution_mode.to_string());
         write_request_line(&mut self.stdin, &req)?;
         self.last_used = std::time::Instant::now();
-        read_synthesis_stream_response(&mut self.stdout, &id, on_chunk)
+        read_synthesis_stream_response(&mut self.stdout, &id, on_chunk, Some(&self.process))
     }
 
     /// Send a vision describe request and return the full description.
@@ -889,6 +969,7 @@ impl Container {
             if resp.id != id {
                 continue;
             }
+            self.check_response_error(&resp)?;
             if let Some(result) = structured_response_result(resp, &schema)? {
                 let value: VisionDetectResult = serde_json::from_str(&result)?;
                 return Ok(value.detections);
@@ -928,6 +1009,7 @@ impl Container {
             if resp.id != id {
                 continue;
             }
+            self.check_response_error(&resp)?;
             if let Some(result) = structured_response_result(resp, &schema)? {
                 let value: VisionSegmentResult = serde_json::from_str(&result)?;
                 return Ok(value.masks);
@@ -959,6 +1041,7 @@ impl Container {
             if resp.id != id {
                 continue;
             }
+            self.check_response_error(&resp)?;
             if let Some(result) = structured_response_result(resp, &schema)? {
                 let value: VisionDepthResult = serde_json::from_str(&result)?;
                 validate_depth_map(&value.depth)?;
@@ -987,9 +1070,7 @@ impl Container {
             if resp.id != id {
                 continue;
             }
-            if let Some((error, reason)) = response_error(&resp) {
-                bail!("container returned error {error}: {reason}");
-            }
+            self.check_response_error(&resp)?;
             if let Some(embedding) = resp.embedding {
                 return Ok(embedding);
             }
@@ -1017,7 +1098,7 @@ impl Container {
         );
         write_request_line(&mut self.stdin, &req)?;
         self.last_used = std::time::Instant::now();
-        read_text_stream_response(&mut self.stdout, &id, on_token)
+        read_text_stream_response(&mut self.stdout, &id, on_token, Some(&self.process))
     }
 }
 
@@ -1090,10 +1171,28 @@ fn write_transcribe_request(
     write_request_line(writer, &req)
 }
 
+fn check_response_error(
+    response: &ContainerResponse,
+    process: Option<&Arc<RuntimeProcessHandle>>,
+) -> Result<()> {
+    if let Some((error, reason)) = response_error(response) {
+        if error == "inference_failed"
+            && let Some(process) = process
+        {
+            // Mark the handle unusable before returning, even while the child
+            // is still alive and asynchronous cleanup has not finished.
+            process.terminate();
+        }
+        bail!("container returned error {error}: {reason}");
+    }
+    Ok(())
+}
+
 fn read_text_stream_response(
     reader: &mut impl BufRead,
     id: &str,
     mut on_token: impl FnMut(String),
+    process: Option<&Arc<RuntimeProcessHandle>>,
 ) -> Result<()> {
     let mut buf = String::new();
     loop {
@@ -1106,9 +1205,7 @@ fn read_text_stream_response(
         if resp.id != id {
             continue;
         }
-        if let Some((error, reason)) = response_error(&resp) {
-            bail!("container returned error {error}: {reason}");
-        }
+        check_response_error(&resp, process)?;
         if let Some(token) = resp.token
             && !token.is_empty()
         {
@@ -1125,6 +1222,7 @@ fn read_synthesis_stream_response(
     reader: &mut impl BufRead,
     id: &str,
     mut on_chunk: impl FnMut(AudioChunk) -> Result<()>,
+    process: Option<&Arc<RuntimeProcessHandle>>,
 ) -> Result<()> {
     let mut buf = String::new();
     let mut metadata: Option<(i64, i64, String)> = None;
@@ -1138,9 +1236,7 @@ fn read_synthesis_stream_response(
         if resp.id != id {
             continue;
         }
-        if let Some((error, reason)) = response_error(&resp) {
-            bail!("container returned error {error}: {reason}");
-        }
+        check_response_error(&resp, process)?;
 
         let done = resp.done.unwrap_or(false);
         let audio_base64 = resp
@@ -1258,7 +1354,7 @@ fn validate_stable_audio_metadata(
 pub fn benchmark_read_text_stream_response(input: &[u8], id: &str) -> Result<usize> {
     let mut reader = BufReader::new(std::io::Cursor::new(input));
     let mut token_count = 0;
-    read_text_stream_response(&mut reader, id, |_| token_count += 1)?;
+    read_text_stream_response(&mut reader, id, |_| token_count += 1, None)?;
     Ok(token_count)
 }
 
@@ -1268,7 +1364,7 @@ pub fn benchmark_read_response_for_use_case(use_case: &str, input: &[u8]) -> Res
     match use_case {
         "language.generate" | "speech.transcribe" | "vision.describe" | "vision.ocr" => {
             let mut token_count = 0;
-            read_text_stream_response(&mut reader, "request-1", |_| token_count += 1)?;
+            read_text_stream_response(&mut reader, "request-1", |_| token_count += 1, None)?;
             Ok(token_count)
         }
         "language.structured" | "language.tool" => {
@@ -1632,6 +1728,58 @@ fn validate_depth_map(depth: &VisionDepthMap) -> Result<()> {
 
 struct PreparedBundle {
     bundle_dir: PathBuf,
+    image_identity: String,
+}
+
+impl Drop for PreparedBundle {
+    fn drop(&mut self) {
+        // This directory belongs to this launch only. The model and image
+        // stores are separate and remain reusable after the runtime exits.
+        if let Err(error) = fs::remove_dir_all(&self.bundle_dir)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!(
+                "failed to remove runtime bundle {}: {error}",
+                self.bundle_dir.display()
+            );
+        }
+    }
+}
+
+fn image_identity(rootfs: &Path, image_ref: &str) -> String {
+    let read_metadata = |path: PathBuf| {
+        let stat = fs::symlink_metadata(&path).ok()?;
+        if !stat.is_file() || stat.len() > 8192 {
+            return None;
+        }
+        fs::read(path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+    };
+    let metadata = rootfs
+        .parent()
+        .and_then(Path::parent)
+        .map(|store| {
+            store
+                .join("metadata")
+                .join(format!("{}.json", store_key(image_ref)))
+        })
+        .and_then(read_metadata);
+    let digest = metadata
+        .as_ref()
+        .filter(|record| record["image_ref"].as_str() == Some(image_ref))
+        .and_then(|record| record["digest"].as_str());
+    if let Some(digest) = digest
+        && digest.starts_with("sha256:")
+        && digest.len() == 71
+        && digest[7..].bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return digest.to_owned();
+    }
+    // Only the external installation record binds a digest to this rootfs.
+    // A pinned reference or payload-supplied metadata is not evidence of what
+    // was installed. Unverified exports cannot promise reuse across launches.
+    format!("unverified:{}", Uuid::new_v4())
 }
 
 struct OciRuntimeManager {
@@ -1686,7 +1834,10 @@ impl OciRuntimeManager {
         fs::write(&config_path, serde_json::to_vec_pretty(&config)?)
             .with_context(|| format!("failed to write {}", config_path.display()))?;
 
-        Ok(PreparedBundle { bundle_dir })
+        Ok(PreparedBundle {
+            bundle_dir,
+            image_identity: image_identity(&rootfs, image_ref),
+        })
     }
 }
 
@@ -2244,7 +2395,7 @@ fn image_ref_uses_tag(image_ref: &str, tag: &str) -> bool {
 /// useful for structured output: type, required, properties, items,
 /// minLength/maxLength, minimum/maximum, enum.  It does not implement the full
 /// JSON Schema specification.
-fn validate_json_schema(json_str: &str, schema: &Value) -> Result<()> {
+pub(crate) fn validate_json_schema(json_str: &str, schema: &Value) -> Result<()> {
     let value: Value = serde_json::from_str(json_str).context("model output is not valid JSON")?;
     validate_value(&value, schema, "$")
 }
@@ -3040,21 +3191,29 @@ fn describe_spawn_attempt(attempt: &RuntimeSpawnAttempt) -> String {
 // ── Internal protocol types ───────────────────────────────────────────────────
 
 #[derive(Serialize)]
-struct ContainerRequest {
-    id: String,
+pub(crate) struct ContainerRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) tool_context: Option<Value>,
+    pub(crate) id: String,
     r#type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    system: Option<String>,
+    pub(crate) system: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    prompt: Option<String>,
+    pub(crate) prompt: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    input: Option<Vec<InputMessage>>,
+    pub(crate) input: Option<Vec<InputMessage>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    max_tokens: Option<u32>,
+    pub(crate) max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    temperature: Option<f64>,
+    pub(crate) temperature: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) thinking: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) reasoning_effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) include_reasoning: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     audio: Option<String>,
     /// Present only for `transcribe` requests: "transcribe" (verbatim) or
@@ -3072,19 +3231,23 @@ struct ContainerRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     voice_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    execution_mode: Option<String>,
+    pub(crate) execution_mode: Option<String>,
     /// Present only for `generate_structured` requests.
     #[serde(skip_serializing_if = "Option::is_none")]
-    response_format: Option<ResponseFormat>,
+    pub(crate) response_format: Option<ResponseFormat>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tools: Option<Vec<ToolDefinition>>,
+    pub(crate) tools: Option<Vec<ToolDefinition>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tool_results: Option<Vec<ToolResult>>,
+    pub(crate) tool_results: Option<Vec<ToolResult>>,
 }
 
 impl ContainerRequest {
-    fn new(id: String, request_type: &str) -> Self {
+    pub(crate) fn new(id: String, request_type: &str) -> Self {
         Self {
+            tool_context: None,
+            thinking: None,
+            reasoning_effort: None,
+            include_reasoning: None,
             id,
             r#type: request_type.to_string(),
             system: None,
@@ -3129,9 +3292,9 @@ pub enum InputPart {
 
 /// Instructs the container to constrain output to a JSON Schema.
 #[derive(Serialize)]
-struct ResponseFormat {
-    r#type: String, // always "json_schema"
-    schema: Value,
+pub(crate) struct ResponseFormat {
+    pub(crate) r#type: String, // always "json_schema"
+    pub(crate) schema: Value,
 }
 
 #[derive(Deserialize)]
@@ -3202,10 +3365,15 @@ mod tests {
         let input = lines.join("\n") + "\n";
         let mut reader = BufReader::new(std::io::Cursor::new(input));
         let mut chunks = Vec::new();
-        read_synthesis_stream_response(&mut reader, "request-1", |chunk| {
-            chunks.push(chunk);
-            Ok(())
-        })?;
+        read_synthesis_stream_response(
+            &mut reader,
+            "request-1",
+            |chunk| {
+                chunks.push(chunk);
+                Ok(())
+            },
+            None,
+        )?;
         Ok(chunks)
     }
 
@@ -4250,10 +4418,21 @@ mod tests {
             .stdout(Stdio::piped())
             .spawn()
             .expect("spawn inert test process");
-        let mut child = child;
+        test_container_with_child(variant, image_ref, artifact_path, child)
+    }
+
+    fn test_container_with_child(
+        variant: Variant,
+        image_ref: &str,
+        artifact_path: &Path,
+        mut child: Child,
+    ) -> Container {
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
         Container {
+            container_id: None,
+            runtime_metadata: None,
+            image_identity: "test-image".to_owned(),
             variant,
             runtime_id: ML_RUNTIME_ID.to_string(),
             profile_epoch: 0,
@@ -4262,12 +4441,61 @@ mod tests {
             runtime_options: HashMap::new(),
             process: RuntimeProcessHandle::new(RuntimeProcess {
                 child,
+                _bundle: None,
                 container_id: None,
                 before_terminate: None,
             }),
             stdin,
             stdout,
             last_used: std::time::Instant::now(),
+        }
+    }
+
+    #[test]
+    fn shared_readers_retire_fatal_responses_before_child_exit() {
+        for operation in ["describe", "ocr", "detect", "transcribe", "synthesize"] {
+            for (code, fatal) in [("inference_failed", true), ("invalid_input", false)] {
+                let child = std::process::Command::new("python3")
+                    .args([
+                        "-u",
+                        "-c",
+                        r#"
+import json, sys
+for line in sys.stdin:
+    request = json.loads(line)
+    print(json.dumps({"id": request["id"], "error": sys.argv[1],
+                      "reason": "fixture", "done": True}), flush=True)
+"#,
+                        code,
+                    ])
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                let mut container =
+                    test_container_with_child(Variant::Cpu, "test:cpu", Path::new("/model"), child);
+                let result = match operation {
+                    "describe" => container.describe(Vec::new(), "").map(|_| ()),
+                    "ocr" => container.ocr(Vec::new(), "").map(|_| ()),
+                    "detect" => container.detect(Vec::new(), "", "interactive").map(|_| ()),
+                    "transcribe" => container.stream_transcribe(
+                        Vec::new(),
+                        None,
+                        "transcribe",
+                        "interactive",
+                        |_| {},
+                    ),
+                    "synthesize" => {
+                        container.stream_synthesize("hello", "", "", "interactive", |_| Ok(()))
+                    }
+                    _ => unreachable!(),
+                };
+                assert!(result.unwrap_err().to_string().contains(code));
+                let handle = ContainerHandle::new(container);
+                assert_eq!(handle.is_terminating(), fatal, "{operation}: {code}");
+                handle.terminate();
+                handle.process.wait_terminated_blocking();
+            }
         }
     }
 
@@ -4426,6 +4654,98 @@ mod tests {
         assert!(
             !Path::new(&format!("/proc/{pid}")).exists(),
             "child must be reaped"
+        );
+    }
+
+    #[test]
+    fn only_fatal_generation_errors_retire_the_handle() {
+        for (code, fatal) in [
+            ("context_window_exceeded", false),
+            ("inference_failed", true),
+        ] {
+            let container = test_container(Variant::Cpu, "test:cpu", Path::new("/model"));
+            let response: ContainerResponse = serde_json::from_value(serde_json::json!({
+                "id":"request", "error":code, "reason":"test failure", "done":true
+            }))
+            .unwrap();
+            assert!(container.check_response_error(&response).is_err());
+            let handle = ContainerHandle::new(container);
+            assert_eq!(handle.is_terminating(), fatal);
+        }
+    }
+
+    #[test]
+    fn image_identity_does_not_trust_a_digest_reference_for_manual_rootfs() {
+        let store = tempfile::tempdir().unwrap();
+        let image_ref = format!("example/runtime@sha256:{}", "a".repeat(64));
+        let rootfs = store.path().join("rootfs").join(store_key(&image_ref));
+        fs::create_dir_all(&rootfs).unwrap();
+        fs::write(rootfs.join("runtime"), "original runtime").unwrap();
+        let original = image_identity(&rootfs, &image_ref);
+        assert!(original.starts_with("unverified:"));
+
+        fs::write(rootfs.join("runtime"), "replacement runtime").unwrap();
+        let replacement = image_identity(&rootfs, &image_ref);
+        assert!(replacement.starts_with("unverified:"));
+        assert_ne!(original, replacement);
+    }
+
+    #[test]
+    fn image_identity_requires_a_matching_external_installation_record() {
+        let store = tempfile::tempdir().unwrap();
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let image_ref = format!("example/runtime@{digest}");
+        let rootfs = store.path().join("rootfs").join(store_key(&image_ref));
+        fs::create_dir_all(&rootfs).unwrap();
+        let record = serde_json::json!({"image_ref":image_ref,"digest":digest});
+        // A file shipped inside the payload cannot verify that payload.
+        fs::write(
+            rootfs.join("metadata.json"),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+        assert!(image_identity(&rootfs, &image_ref).starts_with("unverified:"));
+
+        let metadata = store.path().join("metadata");
+        fs::create_dir_all(&metadata).unwrap();
+        let path = metadata.join(format!("{}.json", store_key(&image_ref)));
+        for invalid in [
+            serde_json::json!({"image_ref":"other/runtime:cpu","digest":digest}),
+            serde_json::json!({"digest":digest}),
+            serde_json::json!({"image_ref":image_ref,"digest":"sha256:invalid"}),
+        ] {
+            fs::write(&path, serde_json::to_vec(&invalid).unwrap()).unwrap();
+            assert!(image_identity(&rootfs, &image_ref).starts_with("unverified:"));
+        }
+        fs::write(&path, b"invalid JSON").unwrap();
+        assert!(image_identity(&rootfs, &image_ref).starts_with("unverified:"));
+        fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+        assert_eq!(image_identity(&rootfs, &image_ref), digest);
+        assert_eq!(image_identity(&rootfs, &image_ref), digest);
+    }
+
+    #[test]
+    fn image_identity_tracks_digest_changes_behind_a_mutable_tag() {
+        let store = test_dir("image-identity");
+        let metadata = store.join("metadata");
+        fs::create_dir_all(&metadata).unwrap();
+        let image_ref = "example/runtime:cpu";
+        let path = metadata.join(format!("{}.json", store_key(image_ref)));
+        let rootfs = store.join("rootfs").join(store_key(image_ref));
+        for byte in ['a', 'b'] {
+            let digest = format!("sha256:{}", byte.to_string().repeat(64));
+            fs::write(
+                &path,
+                serde_json::to_vec(&serde_json::json!({"image_ref":image_ref,"digest":digest}))
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(image_identity(&rootfs, image_ref), digest);
+        }
+        fs::remove_dir_all(store).unwrap();
+        assert_ne!(
+            image_identity(&rootfs, image_ref),
+            image_identity(&rootfs, image_ref)
         );
     }
 
@@ -4613,7 +4933,7 @@ mod tests {
         let mut reader = BufReader::new(std::io::Cursor::new(input.as_bytes()));
         let mut tokens = Vec::new();
 
-        read_text_stream_response(&mut reader, "request-1", |token| tokens.push(token))
+        read_text_stream_response(&mut reader, "request-1", |token| tokens.push(token), None)
             .expect("streamed tokens should be read");
 
         assert_eq!(tokens, vec!["Hello ".to_string(), "world".to_string()]);
@@ -4630,9 +4950,12 @@ mod tests {
         let mut reader = BufReader::new(std::io::Cursor::new(input.as_bytes()));
         let mut transcript = String::new();
 
-        read_text_stream_response(&mut reader, "request-1", |token| {
-            transcript.push_str(&token)
-        })
+        read_text_stream_response(
+            &mut reader,
+            "request-1",
+            |token| transcript.push_str(&token),
+            None,
+        )
         .expect("streamed tokens should aggregate");
 
         assert_eq!(transcript, "Segment one. Segment two.");
@@ -4772,6 +5095,255 @@ mod tests {
         ));
     }
 
+    fn running_llama_server_pid(container: &Container) -> u32 {
+        fn descendants(pid: u32, output: &mut Vec<u32>) {
+            let children = std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
+                .unwrap_or_default();
+            for child in children
+                .split_whitespace()
+                .filter_map(|s| s.parse::<u32>().ok())
+            {
+                output.push(child);
+                descendants(child, output);
+            }
+        }
+        let mut children = Vec::new();
+        descendants(
+            container
+                .process
+                .process
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .child
+                .id(),
+            &mut children,
+        );
+        *children
+            .iter()
+            .find(|pid| {
+                std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|cmd| {
+                    cmd.split(|b| *b == 0).next() == Some(b"/usr/local/bin/llama-server".as_slice())
+                })
+            })
+            .expect("server is a descendant of the container process")
+    }
+
+    #[test]
+    #[ignore = "requires exported llama-server rootfs, a local instruct model, and crun"]
+    fn llama_server_roundtrip_and_cancellation_through_container_wrapper() {
+        use std::time::Duration;
+        let image_ref = std::env::var("AILERON_LLAMA_SERVER_IMAGE")
+            .expect("set AILERON_LLAMA_SERVER_IMAGE to the exported image reference");
+        let artifact_path = PathBuf::from(
+            std::env::var("AILERON_LLAMA_SERVER_MODEL_DIR")
+                .expect("set AILERON_LLAMA_SERVER_MODEL_DIR to a directory containing model.gguf"),
+        );
+        let store =
+            PathBuf::from(std::env::var("AILERON_OCI_STORE").expect("set AILERON_OCI_STORE"));
+        let options = HashMap::from([
+            ("N_CTX".into(), "4096".into()),
+            ("N_THREADS".into(), "2".into()),
+        ]);
+        let mut container = Container::spawn(
+            ML_RUNTIME_ID,
+            0,
+            &RuntimeCandidate {
+                variant: Variant::Cpu,
+                image_ref,
+            },
+            &artifact_path,
+            &options,
+            "8g",
+            &store,
+            &default_system_oci_store(),
+            |status| eprintln!("{status}"),
+            || Ok(()),
+        )
+        .expect("spawn private server runtime");
+
+        let server_pid = running_llama_server_pid(&container);
+        for network_file in ["tcp", "tcp6"] {
+            let sockets =
+                std::fs::read_to_string(format!("/proc/{server_pid}/net/{network_file}")).unwrap();
+            assert!(
+                !sockets
+                    .lines()
+                    .skip(1)
+                    .any(|line| line.split_whitespace().nth(3) == Some("0A")),
+                "unexpected TCP listener"
+            );
+        }
+        assert_ne!(
+            std::fs::read_link(format!("/proc/{server_pid}/ns/mnt")).unwrap(),
+            std::fs::read_link("/proc/self/ns/mnt").unwrap()
+        );
+        let sockets = std::fs::read_to_string(format!("/proc/{server_pid}/net/unix")).unwrap();
+        let socket = sockets
+            .lines()
+            .filter_map(|line| line.split_whitespace().last())
+            .find(|path| path.starts_with("/tmp/aileron-llama-") && path.ends_with("/server.sock"))
+            .expect("private Unix listener exists");
+        assert!(
+            !Path::new(socket).exists(),
+            "socket must not be exposed on host /tmp"
+        );
+
+        let mut answer = String::new();
+        container
+            .generate(
+                None,
+                "Say hello briefly.",
+                None,
+                32,
+                "interactive",
+                |text| answer.push_str(&text),
+            )
+            .unwrap();
+        assert!(!answer.trim().is_empty());
+        let schema = serde_json::json!({"type":"object","required":["name"],"properties":{"name":{"type":"string"}},"additionalProperties":false});
+        let result = container
+            .generate_structured(None, "Return a JSON object with name Ada.", 128, &schema)
+            .unwrap();
+        validate_json_schema(&result, &schema).unwrap();
+
+        let mut snapshots = Vec::new();
+        container
+            .stream_structured(
+                None,
+                "Return a JSON object with name Ada.",
+                None,
+                128,
+                &schema,
+                "interactive",
+                Vec::new(),
+                Vec::new(),
+                None,
+                None,
+                |snapshot, tools, done| {
+                    assert!(tools.is_empty());
+                    snapshots.push((snapshot, done));
+                },
+            )
+            .unwrap();
+        assert_eq!(snapshots.len(), 2);
+        assert!(!snapshots[0].1);
+        assert!(snapshots[1].1);
+        assert_eq!(snapshots[0].0, snapshots[1].0);
+
+        let oversized = "word ".repeat(5000);
+        let error = container
+            .generate(None, &oversized, None, 16, "interactive", |_| {})
+            .expect_err("prompt must exceed the configured context window");
+        assert!(
+            error.to_string().contains("context_window_exceeded"),
+            "{error}"
+        );
+
+        let mut limited = ContainerRequest::new("one-token".into(), "generate");
+        limited.prompt = Some("Write a very long story about a journey.".into());
+        limited.max_tokens = Some(1);
+        write_request_line(&mut container.stdin, &limited).unwrap();
+        loop {
+            let mut line = String::new();
+            assert!(container.stdout.read_line(&mut line).unwrap() > 0);
+            let response: Value = serde_json::from_str(&line).unwrap();
+            assert!(response.get("error").is_none(), "{response}");
+            if response["done"] == true {
+                assert_eq!(response["finish_reason"], "length");
+                assert_eq!(response["usage"]["completion_tokens"], 1);
+                break;
+            }
+        }
+
+        let handle = ContainerHandle::new(container);
+        let worker_handle = handle.clone();
+        let (token_tx, token_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let result = worker_handle.lock().unwrap().generate(
+                None,
+                "Write a very long story about a journey.",
+                None,
+                2048,
+                "interactive",
+                |_| {
+                    let _ = token_tx.send(());
+                },
+            );
+            let _ = result_tx.send(result);
+        });
+        token_rx
+            .recv_timeout(Duration::from_secs(120))
+            .expect("generation started");
+        handle.terminate();
+        let _ = result_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("cancelled read unblocks");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while Path::new(&format!("/proc/{server_pid}")).exists()
+            && std::time::Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !Path::new(&format!("/proc/{server_pid}")).exists(),
+            "cancelled server process remains"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires exported llama-server rootfs, a local instruct model, and crun"]
+    fn llama_server_fatal_error_retires_container() {
+        let image_ref = std::env::var("AILERON_LLAMA_SERVER_IMAGE").unwrap();
+        let artifact_path = PathBuf::from(std::env::var("AILERON_LLAMA_SERVER_MODEL_DIR").unwrap());
+        let store = PathBuf::from(std::env::var("AILERON_OCI_STORE").unwrap());
+        let mut container = Container::spawn(
+            ML_RUNTIME_ID,
+            0,
+            &RuntimeCandidate {
+                variant: Variant::Cpu,
+                image_ref,
+            },
+            &artifact_path,
+            &HashMap::from([("N_THREADS".into(), "2".into())]),
+            "8g",
+            &store,
+            &default_system_oci_store(),
+            |_| {},
+            || Ok(()),
+        )
+        .unwrap();
+        let error = container.generate_structured(None, "Return name Ada in a JSON object.", 1,
+            &serde_json::json!({"type":"object","required":["name"],"properties":{"name":{"type":"string"}}}))
+            .expect_err("one output token cannot complete the required JSON object");
+        assert!(
+            error.to_string().contains("schema_validation_failed"),
+            "{error}"
+        );
+        container
+            .generate(None, "Say hello.", None, 16, "interactive", |_| {})
+            .expect("request errors preserve the loaded server");
+        let pid = running_llama_server_pid(&container);
+        assert!(
+            std::process::Command::new("kill")
+                .args(["-KILL", &pid.to_string()])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let error = container
+            .generate(None, "Say hello.", None, 16, "interactive", |_| {})
+            .expect_err("server crash must fail the request");
+        assert!(error.to_string().contains("inference_failed"), "{error}");
+        let handle = ContainerHandle::new(container);
+        assert!(
+            handle.is_terminating(),
+            "a fatal runtime error must retire the pooled handle before another request"
+        );
+    }
+
     #[test]
     #[ignore = "requires a prebuilt stub runtime rootfs and crun"]
     fn stub_runtime_roundtrip_through_container_wrapper() {
@@ -4892,6 +5464,101 @@ mod tests {
             .depth(Vec::new(), "", "interactive")
             .expect("depth through container wrapper");
         assert!(!depth.values.is_empty());
+
+        // The stub blocks on stdin between requests, just like a warm runtime.
+        // Killing only its crun monitor leaves stdout open and fails this test.
+        let container_id = container.container_id.clone().unwrap();
+        let bundle_dir = container
+            .process
+            .process
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            ._bundle
+            .as_ref()
+            .unwrap()
+            .bundle_dir
+            .clone();
+        let handle = ContainerHandle::new(container);
+        let reader = handle.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let reader_thread = thread::spawn(move || {
+            let result = reader.lock().unwrap().stdout.read_line(&mut String::new());
+            let _ = done_tx.send(result);
+        });
+        handle.terminate();
+        assert_eq!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("termination must close the container's stdout")
+                .unwrap(),
+            0
+        );
+        handle.process.wait_terminated_blocking();
+        assert!(
+            !std::process::Command::new("crun")
+                .args(["state", &container_id])
+                .output()
+                .unwrap()
+                .status
+                .success(),
+            "termination must remove OCI state"
+        );
+        handle.terminate(); // Repeated cancellation and subsequent drop are safe.
+        reader_thread.join().unwrap();
+        drop(handle);
+        assert!(
+            !bundle_dir.exists(),
+            "retired launch bundle must be removed"
+        );
+
+        let mut checks = 0;
+        let cancelled = Container::spawn(
+            ML_RUNTIME_ID,
+            0,
+            &candidate,
+            &artifact_path,
+            &HashMap::new(),
+            "512m",
+            &oci_store,
+            &default_system_oci_store(),
+            |_| {},
+            || {
+                checks += 1;
+                if checks > 1 {
+                    Err("cancelled in startup test".into())
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .err()
+        .expect("cancel before publishing the ready container");
+        assert!(cancelled.to_string().contains("cancelled in startup test"));
+        let listed = std::process::Command::new("crun")
+            .args(["list", "--format", "json"])
+            .output()
+            .unwrap();
+        assert!(listed.status.success());
+        let records: Vec<Value> = serde_json::from_slice(&listed.stdout).unwrap();
+        for record in records {
+            let Some(bundle) = record["bundle"].as_str() else {
+                continue;
+            };
+            let Ok(config) = std::fs::read(Path::new(bundle).join("config.json")) else {
+                continue;
+            };
+            let config: Value = serde_json::from_slice(&config).unwrap();
+            assert!(
+                !config["mounts"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|mount| { mount["source"].as_str() == artifact_path.to_str() }),
+                "startup cancellation left a container record: {record}"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&artifact_path);
     }
