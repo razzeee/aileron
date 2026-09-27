@@ -1764,12 +1764,11 @@ fn image_identity(rootfs: &Path, image_ref: &str) -> String {
                 .join("metadata")
                 .join(format!("{}.json", store_key(image_ref)))
         })
-        .and_then(&read_metadata)
-        .or_else(|| read_metadata(rootfs.join("metadata.json")));
+        .and_then(read_metadata);
     let digest = metadata
         .as_ref()
-        .and_then(|m| m["digest"].as_str())
-        .or_else(|| image_ref.split_once('@').map(|(_, digest)| digest));
+        .filter(|record| record["image_ref"].as_str() == Some(image_ref))
+        .and_then(|record| record["digest"].as_str());
     if let Some(digest) = digest
         && digest.starts_with("sha256:")
         && digest.len() == 71
@@ -1777,8 +1776,9 @@ fn image_identity(rootfs: &Path, image_ref: &str) -> String {
     {
         return digest.to_owned();
     }
-    // Unverified manually exported images cannot promise persistent vector
-    // compatibility across launches. Installed images carry their digest.
+    // Only the external installation record binds a digest to this rootfs.
+    // A pinned reference or payload-supplied metadata is not evidence of what
+    // was installed. Unverified exports cannot promise reuse across launches.
     format!("unverified:{}", Uuid::new_v4())
 }
 
@@ -4675,6 +4675,56 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn image_identity_does_not_trust_a_digest_reference_for_manual_rootfs() {
+        let store = tempfile::tempdir().unwrap();
+        let image_ref = format!("example/runtime@sha256:{}", "a".repeat(64));
+        let rootfs = store.path().join("rootfs").join(store_key(&image_ref));
+        fs::create_dir_all(&rootfs).unwrap();
+        fs::write(rootfs.join("runtime"), "original runtime").unwrap();
+        let original = image_identity(&rootfs, &image_ref);
+        assert!(original.starts_with("unverified:"));
+
+        fs::write(rootfs.join("runtime"), "replacement runtime").unwrap();
+        let replacement = image_identity(&rootfs, &image_ref);
+        assert!(replacement.starts_with("unverified:"));
+        assert_ne!(original, replacement);
+    }
+
+    #[test]
+    fn image_identity_requires_a_matching_external_installation_record() {
+        let store = tempfile::tempdir().unwrap();
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let image_ref = format!("example/runtime@{digest}");
+        let rootfs = store.path().join("rootfs").join(store_key(&image_ref));
+        fs::create_dir_all(&rootfs).unwrap();
+        let record = serde_json::json!({"image_ref":image_ref,"digest":digest});
+        // A file shipped inside the payload cannot verify that payload.
+        fs::write(
+            rootfs.join("metadata.json"),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+        assert!(image_identity(&rootfs, &image_ref).starts_with("unverified:"));
+
+        let metadata = store.path().join("metadata");
+        fs::create_dir_all(&metadata).unwrap();
+        let path = metadata.join(format!("{}.json", store_key(&image_ref)));
+        for invalid in [
+            serde_json::json!({"image_ref":"other/runtime:cpu","digest":digest}),
+            serde_json::json!({"digest":digest}),
+            serde_json::json!({"image_ref":image_ref,"digest":"sha256:invalid"}),
+        ] {
+            fs::write(&path, serde_json::to_vec(&invalid).unwrap()).unwrap();
+            assert!(image_identity(&rootfs, &image_ref).starts_with("unverified:"));
+        }
+        fs::write(&path, b"invalid JSON").unwrap();
+        assert!(image_identity(&rootfs, &image_ref).starts_with("unverified:"));
+        fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+        assert_eq!(image_identity(&rootfs, &image_ref), digest);
+        assert_eq!(image_identity(&rootfs, &image_ref), digest);
+    }
+
+    #[test]
     fn image_identity_tracks_digest_changes_behind_a_mutable_tag() {
         let store = test_dir("image-identity");
         let metadata = store.join("metadata");
@@ -4686,7 +4736,8 @@ for line in sys.stdin:
             let digest = format!("sha256:{}", byte.to_string().repeat(64));
             fs::write(
                 &path,
-                serde_json::to_vec(&serde_json::json!({"digest":digest})).unwrap(),
+                serde_json::to_vec(&serde_json::json!({"image_ref":image_ref,"digest":digest}))
+                    .unwrap(),
             )
             .unwrap();
             assert_eq!(image_identity(&rootfs, image_ref), digest);

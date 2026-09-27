@@ -126,6 +126,13 @@ Generation and embeddings share one loaded model. Embeddings use mean pooling
 without normalization, and generation disables pooling. Runtime provenance
 and the immutable image digest contribute to the embedding pipeline identity.
 
+A stable image identity requires the external installation record under the
+OCI store's `metadata/` directory, with a matching `image_ref` and valid digest.
+Manually exported rootfs directories without that record receive a fresh
+`unverified:` identity on each launch, even when the reference contains
+`@sha256:<digest>`. A `metadata.json` supplied inside the image is not trusted for this
+purpose.
+
 The server listens exclusively on a Unix socket under a private
 `/tmp/aileron-llama-*/` directory in the container. No port is published and
 container network access is unnecessary. The adapter waits for a successful
