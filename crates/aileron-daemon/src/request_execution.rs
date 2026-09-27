@@ -50,6 +50,7 @@ pub(crate) struct RequestCancellation<'a> {
 }
 
 impl<'a> RequestCancellation<'a> {
+    #[cfg(test)]
     pub(crate) fn for_session(state: &'a SharedState, session_id: &'a str) -> Self {
         Self::for_epoch(state, session_id, state.request_epoch(session_id))
     }
@@ -282,9 +283,13 @@ mod tests {
     fn active_cancellation_stops_existing_work_but_not_a_later_request() {
         let state = shared_state();
         let first = RequestCancellation::for_session(&state, "session-a");
+        let epoch = state.request_epoch("session-a");
         let unrelated = RequestCancellation::for_session(&state, "session-b");
         state.cancel_active_requests("session-a");
         assert!(first.is_cancelled());
+        // Legacy callbacks create their guard after receiving a token, which
+        // can happen after cancellation has advanced the session epoch.
+        assert!(RequestCancellation::for_epoch(&state, "session-a", epoch).is_cancelled());
         assert!(!unrelated.is_cancelled());
         assert!(!RequestCancellation::for_session(&state, "session-a").is_cancelled());
         assert!(

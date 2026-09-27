@@ -419,16 +419,7 @@ impl Container {
     }
 
     fn check_response_error(&self, response: &ContainerResponse) -> Result<()> {
-        if let Some((error, reason)) = response_error(response) {
-            if error == "inference_failed" {
-                // This terminal code means the runtime cannot accept another
-                // request. Retire it before releasing the pooled handle, not
-                // after the adapter's asynchronous shutdown eventually exits.
-                self.process.terminate();
-            }
-            bail!("container returned error {error}: {reason}");
-        }
-        Ok(())
+        check_response_error(response, Some(&self.process))
     }
 
     pub fn runtime_options(&self) -> &HashMap<String, String> {
@@ -892,7 +883,7 @@ impl Container {
             execution_mode,
         )?;
         self.last_used = std::time::Instant::now();
-        read_text_stream_response(&mut self.stdout, &id, on_token)
+        read_text_stream_response(&mut self.stdout, &id, on_token, Some(&self.process))
     }
 
     pub fn stream_synthesize(
@@ -911,7 +902,7 @@ impl Container {
         req.execution_mode = Some(execution_mode.to_string());
         write_request_line(&mut self.stdin, &req)?;
         self.last_used = std::time::Instant::now();
-        read_synthesis_stream_response(&mut self.stdout, &id, on_chunk)
+        read_synthesis_stream_response(&mut self.stdout, &id, on_chunk, Some(&self.process))
     }
 
     /// Send a vision describe request and return the full description.
@@ -978,6 +969,7 @@ impl Container {
             if resp.id != id {
                 continue;
             }
+            self.check_response_error(&resp)?;
             if let Some(result) = structured_response_result(resp, &schema)? {
                 let value: VisionDetectResult = serde_json::from_str(&result)?;
                 return Ok(value.detections);
@@ -1017,6 +1009,7 @@ impl Container {
             if resp.id != id {
                 continue;
             }
+            self.check_response_error(&resp)?;
             if let Some(result) = structured_response_result(resp, &schema)? {
                 let value: VisionSegmentResult = serde_json::from_str(&result)?;
                 return Ok(value.masks);
@@ -1048,6 +1041,7 @@ impl Container {
             if resp.id != id {
                 continue;
             }
+            self.check_response_error(&resp)?;
             if let Some(result) = structured_response_result(resp, &schema)? {
                 let value: VisionDepthResult = serde_json::from_str(&result)?;
                 validate_depth_map(&value.depth)?;
@@ -1104,7 +1098,7 @@ impl Container {
         );
         write_request_line(&mut self.stdin, &req)?;
         self.last_used = std::time::Instant::now();
-        read_text_stream_response(&mut self.stdout, &id, on_token)
+        read_text_stream_response(&mut self.stdout, &id, on_token, Some(&self.process))
     }
 }
 
@@ -1177,10 +1171,28 @@ fn write_transcribe_request(
     write_request_line(writer, &req)
 }
 
+fn check_response_error(
+    response: &ContainerResponse,
+    process: Option<&Arc<RuntimeProcessHandle>>,
+) -> Result<()> {
+    if let Some((error, reason)) = response_error(response) {
+        if error == "inference_failed"
+            && let Some(process) = process
+        {
+            // Mark the handle unusable before returning, even while the child
+            // is still alive and asynchronous cleanup has not finished.
+            process.terminate();
+        }
+        bail!("container returned error {error}: {reason}");
+    }
+    Ok(())
+}
+
 fn read_text_stream_response(
     reader: &mut impl BufRead,
     id: &str,
     mut on_token: impl FnMut(String),
+    process: Option<&Arc<RuntimeProcessHandle>>,
 ) -> Result<()> {
     let mut buf = String::new();
     loop {
@@ -1193,9 +1205,7 @@ fn read_text_stream_response(
         if resp.id != id {
             continue;
         }
-        if let Some((error, reason)) = response_error(&resp) {
-            bail!("container returned error {error}: {reason}");
-        }
+        check_response_error(&resp, process)?;
         if let Some(token) = resp.token
             && !token.is_empty()
         {
@@ -1212,6 +1222,7 @@ fn read_synthesis_stream_response(
     reader: &mut impl BufRead,
     id: &str,
     mut on_chunk: impl FnMut(AudioChunk) -> Result<()>,
+    process: Option<&Arc<RuntimeProcessHandle>>,
 ) -> Result<()> {
     let mut buf = String::new();
     let mut metadata: Option<(i64, i64, String)> = None;
@@ -1225,9 +1236,7 @@ fn read_synthesis_stream_response(
         if resp.id != id {
             continue;
         }
-        if let Some((error, reason)) = response_error(&resp) {
-            bail!("container returned error {error}: {reason}");
-        }
+        check_response_error(&resp, process)?;
 
         let done = resp.done.unwrap_or(false);
         let audio_base64 = resp
@@ -1345,7 +1354,7 @@ fn validate_stable_audio_metadata(
 pub fn benchmark_read_text_stream_response(input: &[u8], id: &str) -> Result<usize> {
     let mut reader = BufReader::new(std::io::Cursor::new(input));
     let mut token_count = 0;
-    read_text_stream_response(&mut reader, id, |_| token_count += 1)?;
+    read_text_stream_response(&mut reader, id, |_| token_count += 1, None)?;
     Ok(token_count)
 }
 
@@ -1355,7 +1364,7 @@ pub fn benchmark_read_response_for_use_case(use_case: &str, input: &[u8]) -> Res
     match use_case {
         "language.generate" | "speech.transcribe" | "vision.describe" | "vision.ocr" => {
             let mut token_count = 0;
-            read_text_stream_response(&mut reader, "request-1", |_| token_count += 1)?;
+            read_text_stream_response(&mut reader, "request-1", |_| token_count += 1, None)?;
             Ok(token_count)
         }
         "language.structured" | "language.tool" => {
@@ -3356,10 +3365,15 @@ mod tests {
         let input = lines.join("\n") + "\n";
         let mut reader = BufReader::new(std::io::Cursor::new(input));
         let mut chunks = Vec::new();
-        read_synthesis_stream_response(&mut reader, "request-1", |chunk| {
-            chunks.push(chunk);
-            Ok(())
-        })?;
+        read_synthesis_stream_response(
+            &mut reader,
+            "request-1",
+            |chunk| {
+                chunks.push(chunk);
+                Ok(())
+            },
+            None,
+        )?;
         Ok(chunks)
     }
 
@@ -4404,7 +4418,15 @@ mod tests {
             .stdout(Stdio::piped())
             .spawn()
             .expect("spawn inert test process");
-        let mut child = child;
+        test_container_with_child(variant, image_ref, artifact_path, child)
+    }
+
+    fn test_container_with_child(
+        variant: Variant,
+        image_ref: &str,
+        artifact_path: &Path,
+        mut child: Child,
+    ) -> Container {
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
         Container {
@@ -4426,6 +4448,54 @@ mod tests {
             stdin,
             stdout,
             last_used: std::time::Instant::now(),
+        }
+    }
+
+    #[test]
+    fn shared_readers_retire_fatal_responses_before_child_exit() {
+        for operation in ["describe", "ocr", "detect", "transcribe", "synthesize"] {
+            for (code, fatal) in [("inference_failed", true), ("invalid_input", false)] {
+                let child = std::process::Command::new("python3")
+                    .args([
+                        "-u",
+                        "-c",
+                        r#"
+import json, sys
+for line in sys.stdin:
+    request = json.loads(line)
+    print(json.dumps({"id": request["id"], "error": sys.argv[1],
+                      "reason": "fixture", "done": True}), flush=True)
+"#,
+                        code,
+                    ])
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                let mut container =
+                    test_container_with_child(Variant::Cpu, "test:cpu", Path::new("/model"), child);
+                let result = match operation {
+                    "describe" => container.describe(Vec::new(), "").map(|_| ()),
+                    "ocr" => container.ocr(Vec::new(), "").map(|_| ()),
+                    "detect" => container.detect(Vec::new(), "", "interactive").map(|_| ()),
+                    "transcribe" => container.stream_transcribe(
+                        Vec::new(),
+                        None,
+                        "transcribe",
+                        "interactive",
+                        |_| {},
+                    ),
+                    "synthesize" => {
+                        container.stream_synthesize("hello", "", "", "interactive", |_| Ok(()))
+                    }
+                    _ => unreachable!(),
+                };
+                assert!(result.unwrap_err().to_string().contains(code));
+                let handle = ContainerHandle::new(container);
+                assert_eq!(handle.is_terminating(), fatal, "{operation}: {code}");
+                handle.terminate();
+                handle.process.wait_terminated_blocking();
+            }
         }
     }
 
@@ -4812,7 +4882,7 @@ mod tests {
         let mut reader = BufReader::new(std::io::Cursor::new(input.as_bytes()));
         let mut tokens = Vec::new();
 
-        read_text_stream_response(&mut reader, "request-1", |token| tokens.push(token))
+        read_text_stream_response(&mut reader, "request-1", |token| tokens.push(token), None)
             .expect("streamed tokens should be read");
 
         assert_eq!(tokens, vec!["Hello ".to_string(), "world".to_string()]);
@@ -4829,9 +4899,12 @@ mod tests {
         let mut reader = BufReader::new(std::io::Cursor::new(input.as_bytes()));
         let mut transcript = String::new();
 
-        read_text_stream_response(&mut reader, "request-1", |token| {
-            transcript.push_str(&token)
-        })
+        read_text_stream_response(
+            &mut reader,
+            "request-1",
+            |token| transcript.push_str(&token),
+            None,
+        )
         .expect("streamed tokens should aggregate");
 
         assert_eq!(transcript, "Segment one. Segment two.");

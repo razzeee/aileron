@@ -110,7 +110,7 @@ impl Capabilities {
         }
         if mode != "auto" {
             body["chat_template_kwargs"]["enable_thinking"] = json!(mode == "on");
-        } else if req.thinking.is_none() && self.legacy_off {
+        } else if req.thinking.is_none() && !req.include_reasoning && self.legacy_off {
             // Gemma's native template path omitted the thinking prefix. Keep
             // existing calls usable with their existing output-token budgets.
             body["chat_template_kwargs"]["enable_thinking"] = json!(false);
@@ -196,5 +196,22 @@ mod tests {
         let mut body = json!({});
         caps.apply(&req, &mut body).unwrap();
         assert!(body.get("chat_template_kwargs").is_none());
+    }
+
+    #[test]
+    fn gemma_trace_opt_in_uses_auto_but_explicit_off_still_wins() {
+        let caps = Capabilities::from_props(
+            &json!({"chat_template":"<|channel>thought enable_thinking"}),
+            "Gemma-4",
+        );
+        let req: Request = serde_json::from_value(json!({"include_reasoning":true})).unwrap();
+        let mut body = json!({});
+        caps.apply(&req, &mut body).unwrap();
+        assert!(body.get("chat_template_kwargs").is_none());
+
+        let req: Request =
+            serde_json::from_value(json!({"include_reasoning":true,"thinking":"off"})).unwrap();
+        caps.apply(&req, &mut body).unwrap();
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
     }
 }
