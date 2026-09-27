@@ -118,6 +118,17 @@ struct ResolvedSessionRuntime {
     instructions: String,
 }
 
+impl ResolvedSessionRuntime {
+    /// Keep callbacks tied to the epoch captured when this request was resolved.
+    fn cancellation<'a>(
+        &self,
+        state: &'a SharedState,
+        session_id: &'a str,
+    ) -> RequestCancellation<'a> {
+        RequestCancellation::for_epoch(state, session_id, self.request_epoch)
+    }
+}
+
 struct EmbeddingResult {
     embedding: Vec<f64>,
     pipeline_id: String,
@@ -933,9 +944,7 @@ async fn stream_transcription(
                 task,
                 execution_mode.as_str(),
                 |token| {
-                    if cancelled
-                        || RequestCancellation::for_session(state, &session_id).is_cancelled()
-                    {
+                    if cancelled || resolved.cancellation(state, &session_id).is_cancelled() {
                         cancelled = true;
                         return;
                     }
@@ -961,7 +970,7 @@ async fn stream_transcription(
             if let Some(e) = reply_error {
                 return Err(SpeechError::Reply(e));
             }
-            if cancelled || RequestCancellation::for_session(state, &session_id).is_cancelled() {
+            if cancelled || resolved.cancellation(state, &session_id).is_cancelled() {
                 if wants_more {
                     call.set_continues(false);
                 }
@@ -1022,7 +1031,7 @@ async fn stream_synthesis(
                 &options.language_hint,
                 execution_mode.as_str(),
                 |chunk: RuntimeAudioChunk| {
-                    if RequestCancellation::for_session(state, &session_id).is_cancelled() {
+                    if resolved.cancellation(state, &session_id).is_cancelled() {
                         cancelled = true;
                         anyhow::bail!(request_execution::request_cancelled_reason());
                     }
@@ -1053,7 +1062,7 @@ async fn stream_synthesis(
             if let Some(error) = reply_error {
                 return Err(SpeechError::Reply(error));
             }
-            if cancelled || RequestCancellation::for_session(state, &session_id).is_cancelled() {
+            if cancelled || resolved.cancellation(state, &session_id).is_cancelled() {
                 if wants_more {
                     call.set_continues(false);
                 }
@@ -1164,9 +1173,7 @@ async fn stream_vision_text<C: TextStreamCall + ?Sized>(
                     &instructions,
                     execution_mode.as_str(),
                     |token| {
-                        if cancelled
-                            || RequestCancellation::for_session(state, &session_id).is_cancelled()
-                        {
+                        if cancelled || resolved.cancellation(state, &session_id).is_cancelled() {
                             cancelled = true;
                             return;
                         }
@@ -1186,9 +1193,7 @@ async fn stream_vision_text<C: TextStreamCall + ?Sized>(
                     &instructions,
                     execution_mode.as_str(),
                     |token| {
-                        if cancelled
-                            || RequestCancellation::for_session(state, &session_id).is_cancelled()
-                        {
+                        if cancelled || resolved.cancellation(state, &session_id).is_cancelled() {
                             cancelled = true;
                             return;
                         }
@@ -1207,7 +1212,7 @@ async fn stream_vision_text<C: TextStreamCall + ?Sized>(
             if let Some(e) = reply_error {
                 return Err(VisionError::Reply(e));
             }
-            if cancelled || RequestCancellation::for_session(state, &session_id).is_cancelled() {
+            if cancelled || resolved.cancellation(state, &session_id).is_cancelled() {
                 if wants_more {
                     call.set_continues(false);
                 }
@@ -1308,7 +1313,8 @@ async fn vision_detections(
                         .collect()
                 })
                 .map_err(|e| VisionError::Failed(e.to_string()));
-            RequestCancellation::for_session(state, &session_id)
+            resolved
+                .cancellation(state, &session_id)
                 .ensure_not_cancelled_or_terminate_spawned(handle, spawned)
                 .map_err(VisionError::Failed)?;
             result
@@ -1386,7 +1392,8 @@ async fn vision_masks(
                         .collect()
                 })
                 .map_err(|e| VisionError::Failed(e.to_string()));
-            RequestCancellation::for_session(state, &session_id)
+            resolved
+                .cancellation(state, &session_id)
                 .ensure_not_cancelled_or_terminate_spawned(handle, spawned)
                 .map_err(VisionError::Failed)?;
             result
@@ -1431,7 +1438,8 @@ async fn vision_depth(
                     maximum: depth.maximum,
                 })
                 .map_err(|e| VisionError::Failed(e.to_string()));
-            RequestCancellation::for_session(state, &session_id)
+            resolved
+                .cancellation(state, &session_id)
                 .ensure_not_cancelled_or_terminate_spawned(handle, spawned)
                 .map_err(VisionError::Failed)?;
             result
@@ -1466,7 +1474,8 @@ async fn embedding_vector(
                 .embed(&text, execution_mode.as_str())
                 .map(|embedding| (embedding.into_iter().map(f64::from).collect(), pipeline_id))
                 .map_err(|e| GenerationError::Failed(e.to_string()));
-            RequestCancellation::for_session(state, &session_id)
+            resolved
+                .cancellation(state, &session_id)
                 .ensure_not_cancelled_or_terminate_spawned(handle, spawned)
                 .map_err(GenerationError::Failed)?;
             result
@@ -1771,9 +1780,7 @@ async fn stream_tokens(
                         execution_mode.as_str(),
                         Some(options.temperature),
                         |token| {
-                            if cancelled
-                                || RequestCancellation::for_session(state, &session_id)
-                                    .is_cancelled()
+                            if cancelled || resolved.cancellation(state, &session_id).is_cancelled()
                             {
                                 cancelled = true;
                                 return;
@@ -1806,7 +1813,7 @@ async fn stream_tokens(
             if let Some(e) = reply_error {
                 return Err(GenerationError::Reply(e));
             }
-            if cancelled || RequestCancellation::for_session(state, &session_id).is_cancelled() {
+            if cancelled || resolved.cancellation(state, &session_id).is_cancelled() {
                 if wants_more {
                     call.set_continues(false);
                 }
@@ -2764,9 +2771,7 @@ async fn stream_guided_snapshots(
                 Some(&tool_context),
                 Some(options.temperature),
                 |snapshot, tool_calls, done| {
-                    if cancelled
-                        || RequestCancellation::for_session(state, &session_id).is_cancelled()
-                    {
+                    if cancelled || resolved.cancellation(state, &session_id).is_cancelled() {
                         cancelled = true;
                         return;
                     }
@@ -2825,7 +2830,7 @@ async fn stream_guided_snapshots(
             if let Some(e) = reply_error {
                 return Err(GenerationError::Reply(e));
             }
-            if cancelled || RequestCancellation::for_session(state, &session_id).is_cancelled() {
+            if cancelled || resolved.cancellation(state, &session_id).is_cancelled() {
                 if wants_more {
                     call.set_continues(false);
                 }
@@ -2931,9 +2936,7 @@ async fn stream_guided_tool_results(
                 Some(&tool_context),
                 Some(options.temperature),
                 |snapshot, tool_calls, done| {
-                    if cancelled
-                        || RequestCancellation::for_session(state, &session_id).is_cancelled()
-                    {
+                    if cancelled || resolved.cancellation(state, &session_id).is_cancelled() {
                         cancelled = true;
                         return;
                     }
@@ -2992,7 +2995,7 @@ async fn stream_guided_tool_results(
             if let Some(e) = reply_error {
                 return Err(GenerationError::Reply(e));
             }
-            if cancelled || RequestCancellation::for_session(state, &session_id).is_cancelled() {
+            if cancelled || resolved.cancellation(state, &session_id).is_cancelled() {
                 if wants_more {
                     call.set_continues(false);
                 }

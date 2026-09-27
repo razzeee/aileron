@@ -145,6 +145,8 @@ low/medium/high effort; hybrid Gemma and Qwen3 templates expose thinking
 on/off; DeepSeek R1 is thinking-only. Explicit reasoning requests use the
 recognized model family's sampling defaults unless temperature is supplied.
 Legacy calls preserve native sampling and single-turn Llama-3 prompt rendering.
+For Gemma, requesting reasoning output without specifying a thinking mode uses
+the template's automatic behavior. Explicit `thinking: off` still disables it.
 
 Structured streaming emits the completed JSON object as an initial and a final
 snapshot. The daemon continues to validate schemas. A malformed stream or a
