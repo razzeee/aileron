@@ -687,6 +687,7 @@ fn llmfit_inference_runtime_id(fit: &llmfit_core::ModelFit) -> String {
         llmfit_core::InferenceRuntime::LlamaCpp => "llama_cpp",
         llmfit_core::InferenceRuntime::Mlx => "mlx",
         llmfit_core::InferenceRuntime::Vllm => "vllm",
+        llmfit_core::InferenceRuntime::BitNet => "bitnet",
         llmfit_core::InferenceRuntime::Unsupported => "unsupported",
     }
     .to_string()
