@@ -71,7 +71,7 @@ impl Default for MediaBudget<'_> {
 impl MediaBudget<'_> {
     fn reserve(&mut self, bytes: usize) -> Result<(), String> {
         self.used
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
                 used.checked_add(bytes)
                     .filter(|total| *total <= IN_FLIGHT_MEDIA_MAX_BYTES)
             })
