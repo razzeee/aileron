@@ -1,0 +1,14 @@
+diff --git a/tools/server/server-common.cpp b/tools/server/server-common.cpp
+--- a/tools/server/server-common.cpp
++++ b/tools/server/server-common.cpp
+@@ -1357,1 +1357,11 @@
++    // Keep Aileron's existing single-turn Llama-3 prompts byte-compatible.
++    // Rich history, tools, multimodal input and reasoning continue to use Jinja.
++    if (json_value(body, "aileron_legacy_chat", false)) {
++        if (has_tools || !out_files.empty() || !json_schema.is_null() || !grammar.empty()) {
++            throw std::invalid_argument("legacy chat is only available for plain text generation");
++        }
++        inputs.use_jinja = false;
++    }
++
+     inputs.force_pure_content = opt.force_pure_content;

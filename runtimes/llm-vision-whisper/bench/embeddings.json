@@ -1,0 +1,6 @@
+[
+  {"name":"cat", "request":{"type":"embed","prompt":"A cat sits on a mat."}, "expect":{"kind":"embedding"}},
+  {"name":"kitten", "request":{"type":"embed","prompt":"A kitten rests on a rug."}, "expect":{"kind":"embedding"}},
+  {"name":"astronomy", "request":{"type":"embed","prompt":"Saturn has rings made of ice and rock."}, "expect":{"kind":"embedding"}},
+  {"name":"unicode", "request":{"type":"embed","prompt":"Grüße aus Köln. Bonjour à tous. 猫がいます。"}, "expect":{"kind":"embedding"}}
+]

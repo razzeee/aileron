@@ -1,0 +1,44 @@
+diff --git a/tools/server/server-task.h b/tools/server/server-task.h
+--- a/tools/server/server-task.h
++++ b/tools/server/server-task.h
+@@ -61,2 +61,4 @@
+     int32_t n_predict = -1; // new tokens to predict
++    int32_t aileron_decode_delay_ms = 0;
++    bool aileron_reserve_output = false;
+     int32_t n_indent  =  0; // minimum line indentation for the generated text in number of whitespace characters
+diff --git a/tools/server/server-schema.cpp b/tools/server/server-schema.cpp
+--- a/tools/server/server-schema.cpp
++++ b/tools/server/server-schema.cpp
+@@ -50,1 +50,8 @@
++    add((new field_num("aileron_decode_delay_ms", params.aileron_decode_delay_ms))
++        ->set_hard_limits(0, 20)
++        ->set_desc("Aileron background compute pacing between decoded tokens"));
++    add((new field_bool("aileron_reserve_output", params.aileron_reserve_output))
++        ->set_desc("Reject prompts whose full requested output budget cannot fit"));
++
+     add((new field_num("n_indent", params.n_indent))
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -28,2 +28,4 @@
+ #include <fstream>
++#include <thread>
++#include <chrono>
+ 
+@@ -1961,1 +1963,5 @@
++        if (slot.task->params.aileron_decode_delay_ms > 0 && !llama_vocab_is_eog(vocab, result.tok)) {
++            std::this_thread::sleep_for(std::chrono::milliseconds(slot.task->params.aileron_decode_delay_ms));
++        }
++
+         return slot.has_next_token; // continue
+@@ -3184,1 +3190,12 @@
++                        if (slot.task->need_logits() && slot.task->params.aileron_reserve_output &&
++                                slot.task->params.n_predict > 0 &&
++                                int64_t(slot.task->n_tokens()) + slot.task->params.n_predict > slot.n_ctx) {
++                            send_error(slot, "prompt plus requested output exceeds the context window",
++                                       ERROR_TYPE_EXCEED_CONTEXT_SIZE);
++                            slot.release();
++                            return;
++                        }
++
+                         if (!slot.can_split()) {

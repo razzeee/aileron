@@ -6,8 +6,8 @@ use anyhow::Result;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-#[cfg(feature = "llama")]
-pub mod llama_runtime;
+#[cfg(feature = "llama-server")]
+pub mod llama_server;
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Request {
@@ -27,6 +27,12 @@ pub struct Request {
     pub max_tokens: Option<u32>,
     #[serde(default)]
     pub temperature: Option<f64>,
+    #[serde(default)]
+    pub thinking: Option<String>,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub include_reasoning: bool,
     #[serde(default)]
     pub execution_mode: Option<String>,
     #[serde(default)]
@@ -49,6 +55,8 @@ pub struct Request {
     pub tools: Option<Vec<Value>>,
     #[serde(default)]
     pub tool_results: Option<Vec<Value>>,
+    #[serde(default)]
+    pub tool_context: Option<Value>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
