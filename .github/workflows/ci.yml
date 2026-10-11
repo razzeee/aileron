@@ -44,7 +44,7 @@ jobs:
 
       - name: cargo check (core crates only)
         run: >
-          cargo check
+          cargo check --locked
           -p aileron-varlink
           -p aileron-ipc
           -p aileron-daemon
@@ -53,7 +53,7 @@ jobs:
 
       - name: cargo test (core crates only)
         run: >
-          cargo test
+          cargo test --locked
           -p aileron-varlink
           -p aileron-ipc
           -p aileron-daemon
@@ -62,7 +62,7 @@ jobs:
 
       - name: cargo clippy (core crates only)
         run: >
-          cargo clippy
+          cargo clippy --locked
           -p aileron-varlink
           -p aileron-ipc
           -p aileron-daemon
@@ -72,8 +72,8 @@ jobs:
 
       - name: Private llama-server adapter tests
         run: |
-          cargo test -p aileron-runtime --features llama-server
-          cargo clippy -p aileron-runtime --features llama-server --all-targets -- -D warnings
+          cargo test --locked -p aileron-runtime --features llama-server
+          cargo clippy --locked -p aileron-runtime --features llama-server --all-targets -- -D warnings
           python3 -m unittest discover -s runtimes/llm-vision-whisper/tests
 
       - name: VITS runtime unit tests
@@ -129,17 +129,17 @@ jobs:
           restore-keys: gtk-fedora-${{ runner.os }}-
 
       - name: cargo check (all crates)
-        run: cargo check --workspace
+        run: cargo check --locked --workspace
 
       - name: cargo clippy (GTK crates)
         run: >
-          cargo clippy
+          cargo clippy --locked
           -p aileron
           -p aileron-demo
           -- -D warnings
 
       - name: cargo test (display-independent UI tests)
-        run: cargo test -p aileron -p aileron-demo
+        run: cargo test --locked -p aileron -p aileron-demo
 
   model-portals:
     name: Patched frontend and real stub stack
