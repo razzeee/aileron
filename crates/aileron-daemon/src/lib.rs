@@ -11,6 +11,7 @@ pub mod profiles;
 mod request_execution;
 pub mod service;
 pub mod state;
+pub mod tool_conversations;
 
 use clap::Parser;
 use tracing::info;

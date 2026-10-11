@@ -1,0 +1,12 @@
+[
+  {
+    "name": "short-answer",
+    "request": {"type":"generate", "prompt":"Explain why leaves are green in one sentence.", "max_tokens":64, "temperature":0.0},
+    "expect": {"kind":"text","contains_all":["chlorophyll"]}
+  },
+  {
+    "name": "structured",
+    "request": {"type":"generate_structured", "prompt":"Extract the person's name: Ada is a programmer.", "max_tokens":64, "temperature":0.0, "response_format":{"type":"json_schema", "schema":{"type":"object", "required":["name"], "properties":{"name":{"type":"string"}}, "additionalProperties":false}}},
+    "expect": {"kind":"json", "required":["name"], "equals":{"name":"Ada"}}
+  }
+]

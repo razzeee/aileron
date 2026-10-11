@@ -1,12 +1,13 @@
 # LLM, Vision, And Whisper Runtime
 
-This runtime image contains the Rust llama.cpp text runtime, the Rust llama.cpp vision runtime, and the Rust whisper.cpp runtime. Its entrypoint dispatches by mounted artifacts:
+This image contains a private llama-server, its Rust protocol adapter, and the
+Rust whisper.cpp runtime. Its entrypoint dispatches by mounted artifacts:
 
 | Artifacts under `/model` | Runtime binary |
 |---|---|
 | `model.bin` | Whisper speech transcription and translation |
-| `model.gguf` plus `mmproj.gguf` | llama.cpp vision, OCR, detection, and text operations |
-| `model.gguf` | llama.cpp text generation, structured output, completion, and embeddings |
+| `model.gguf` plus `mmproj.gguf` | Private server for vision, OCR, detection, and language operations |
+| `model.gguf` | Private server for generation, structured output, tools, and embeddings |
 
 Model weights are not baked into the image. Model manifests download artifacts separately and reference this runtime by `runtime_id`.
 
@@ -25,13 +26,14 @@ One Dockerfile builds all accelerator variants with build args:
 | Variant | Base/build args | Hardware | Notes |
 |---|---|---|---|
 | `cpu` | default | CPU | Default, works everywhere |
-| `cuda` | `BUILDER_IMAGE=nvidia/cuda:13.3.0-devel-ubuntu24.04`, `CMAKE_ARGS=-DGGML_CUDA=on` | NVIDIA GPU | Requires NVIDIA driver devices and `libcuda.so.1` on host |
-| `rocm` | `BUILDER_IMAGE=rocm/dev-ubuntu-22.04:7.2.4`, `CMAKE_ARGS=-DGGML_HIP=on ...` | AMD GPU | Requires ROCm devices on host and a ROCm-supported GPU architecture |
-| `vulkan` | `FINAL_IMAGE=fedora:latest`, `CMAKE_ARGS=-DGGML_VULKAN=on` plus Vulkan packages | Vulkan GPU | NVIDIA, AMD, Intel Arc, Xe, and integrated graphics; uses the image Mesa stack for AMD/Intel |
+| `cuda` | `BUILDER_IMAGE=docker.io/nvidia/cuda:13.3.0-devel-ubuntu24.04`, `CMAKE_ARGS=-DGGML_CUDA=on` | NVIDIA GPU | Requires NVIDIA driver devices and `libcuda.so.1` on host |
+| `rocm` | `BUILDER_IMAGE=docker.io/rocm/dev-ubuntu-22.04:7.2.4`, `CMAKE_ARGS=-DGGML_HIP=on ...` | AMD GPU | Requires ROCm devices on host and a ROCm-supported GPU architecture |
+| `vulkan` | `BUILDER_IMAGE=fedora:latest`, `FINAL_IMAGE=fedora:latest`, `CMAKE_ARGS=-DGGML_VULKAN=on` plus Vulkan packages | Vulkan GPU | NVIDIA, AMD, Intel Arc, Xe, and integrated graphics; needs a recent shader compiler for cooperative-matrix shaders |
 
 ## Build
 
-Run all commands from the repository root.
+Run all commands from the repository root. With Podman, add `--format docker`
+so the builder honors the Dockerfile's Bash `SHELL` directive.
 
 ```sh
 # CPU
@@ -44,8 +46,8 @@ podman build \
 # NVIDIA CUDA
 podman build \
     -f runtimes/llm-vision-whisper/Dockerfile \
-    --build-arg BUILDER_IMAGE=nvidia/cuda:13.3.0-devel-ubuntu24.04 \
-    --build-arg FINAL_IMAGE=nvidia/cuda:13.3.0-runtime-ubuntu24.04 \
+    --build-arg BUILDER_IMAGE=docker.io/nvidia/cuda:13.3.0-devel-ubuntu24.04 \
+    --build-arg FINAL_IMAGE=docker.io/nvidia/cuda:13.3.0-runtime-ubuntu24.04 \
     --build-arg CMAKE_ARGS="-DGGML_CUDA=on" \
     --build-arg CUDA_DOCKER_ARCH=all \
     --build-arg LDFLAGS="-L/usr/local/cuda/lib64/stubs -Wl,-rpath-link,/usr/local/cuda/lib64/stubs" \
@@ -56,8 +58,8 @@ podman build \
 # AMD ROCm
 podman build \
     -f runtimes/llm-vision-whisper/Dockerfile \
-    --build-arg BUILDER_IMAGE=rocm/dev-ubuntu-22.04:7.2.4 \
-    --build-arg FINAL_IMAGE=rocm/dev-ubuntu-22.04:7.2.4 \
+    --build-arg BUILDER_IMAGE=docker.io/rocm/dev-ubuntu-22.04:7.2.4 \
+    --build-arg FINAL_IMAGE=docker.io/rocm/dev-ubuntu-22.04:7.2.4 \
     --build-arg APT_PACKAGES="hipblas-dev rocblas-dev" \
     --build-arg RUNTIME_APT_PACKAGES="libgomp1 libstdc++6 libgcc-s1 ca-certificates hipblas-dev rocblas-dev" \
     --build-arg CMAKE_ARGS="-DGGML_HIP=on -DAMDGPU_TARGETS=gfx900;gfx906;gfx908;gfx90a;gfx942;gfx950;gfx1010;gfx1011;gfx1012;gfx1030;gfx1031;gfx1032;gfx1035;gfx1036;gfx1100;gfx1101;gfx1102;gfx1103;gfx1150;gfx1151;gfx1152;gfx1153;gfx1200;gfx1201" \
@@ -69,8 +71,9 @@ podman build \
 # Vulkan
 podman build \
     -f runtimes/llm-vision-whisper/Dockerfile \
+    --build-arg BUILDER_IMAGE=fedora:latest \
     --build-arg FINAL_IMAGE=fedora:latest \
-    --build-arg APT_PACKAGES="libvulkan-dev glslc glslang-tools spirv-headers" \
+    --build-arg APT_PACKAGES="vulkan-loader-devel glslc glslang spirv-headers-devel" \
     --build-arg RUNTIME_APT_PACKAGES="libgomp libstdc++ libgcc ca-certificates vulkan-loader mesa-vulkan-drivers" \
     --build-arg CMAKE_ARGS="-DGGML_VULKAN=on" \
     --build-arg RUNTIME_VARIANT=vulkan \

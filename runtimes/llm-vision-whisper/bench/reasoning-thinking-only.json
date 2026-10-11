@@ -1,0 +1,6 @@
+[
+  {"name":"capabilities","request":{"type":"capabilities"},"expect":{"kind":"capabilities","thinking_modes":["auto","on"],"reasoning_efforts":[]}},
+  {"name":"thinking","request":{"type":"generate","prompt":"Find the smallest prime factors of 91 and 143. Reason briefly.","thinking":"on","include_reasoning":true,"temperature":0.6,"max_tokens":64},"expect":{"kind":"reasoning","trace":"required","max_tokens":64}},
+  {"name":"unsupported-off","request":{"type":"generate","prompt":"Hello","thinking":"off","max_tokens":8},"expect":{"kind":"error","code":"invalid_input"}},
+  {"name":"unsupported-effort","request":{"type":"generate","prompt":"Hello","reasoning_effort":"high","max_tokens":8},"expect":{"kind":"error","code":"invalid_input"}}
+]

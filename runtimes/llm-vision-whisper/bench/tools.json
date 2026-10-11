@@ -1,0 +1,15 @@
+[
+  {
+    "name":"calendar-tool",
+    "request":{
+      "type":"generate_structured",
+      "system":"Use the provided tools whenever external information is needed. Do not invent calendar events.",
+      "prompt":"Call calendar_lookup to find my meetings on 2026-09-24. You must look up the calendar before answering.",
+      "max_tokens":256,
+      "temperature":0.0,
+      "tools":[{"name":"calendar_lookup","description":"Look up calendar events for a date.","schema_json":"{\"type\":\"object\",\"required\":[\"date\"],\"properties\":{\"date\":{\"type\":\"string\"}},\"additionalProperties\":false}"}],
+      "response_format":{"type":"json_schema","schema":{"type":"object","required":["answer"],"properties":{"answer":{"type":"string"}},"additionalProperties":false}}
+    },
+    "expect":{"kind":"tools","names":["calendar_lookup"]}
+  }
+]
