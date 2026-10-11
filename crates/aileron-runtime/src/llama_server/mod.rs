@@ -74,10 +74,6 @@ pub fn run() -> Result<()> {
     let mut server = process::Server::start()?;
     let properties = server.transport.get_json("/props")?;
     let capabilities = reasoning::Capabilities::from_props(&properties, &server.model_name);
-    let template = properties["chat_template"].as_str().unwrap_or_default();
-    let legacy_llama3 = template.contains("<|start_header_id|>")
-        && template.contains("<|eot_id|>")
-        && capabilities.thinking_modes.is_empty();
     let mut provenance: Value = serde_json::from_slice(&std::fs::read(
         "/usr/share/aileron/runtime-provenance.json",
     )?)?;
@@ -144,21 +140,6 @@ pub fn run() -> Result<()> {
                 json!({"id":req.id,"error":"invalid_input","reason":error.to_string(),"done":true}),
             )?;
             continue;
-        }
-        if legacy_llama3
-            && req.request_type == "generate"
-            && !vision::has_image(&req)
-            && req.tool_context.is_none()
-            && req.tools.as_ref().is_none_or(Vec::is_empty)
-            && req.thinking.is_none()
-            && req.reasoning_effort.is_none()
-            && !req.include_reasoning
-            && req
-                .input
-                .as_ref()
-                .is_none_or(|messages| messages.len() == 1 && messages[0].role == "user")
-        {
-            body["aileron_legacy_chat"] = json!(true);
         }
         // The rendered HTTP body owns the input now. Keep only response context
         // while decoding, especially for large base64 images and tool history.

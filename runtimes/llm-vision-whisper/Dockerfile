@@ -57,7 +57,6 @@ RUN set -eux; \
 ENV PATH="/root/.cargo/bin:${PATH}"
 
 COPY runtimes/llm-vision-whisper/build-server.sh /build-server.sh
-COPY runtimes/llm-vision-whisper/patches/ /llama-server-patches/
 RUN bash /build-server.sh
 
 FROM builder AS runtime-builder

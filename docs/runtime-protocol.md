@@ -115,6 +115,10 @@ malformed/truncated streams produce `inference_failed`. This code is fatal
 for generation runtimes: the daemon retires the container before returning
 the error, and the adapter terminates its server and exits. A later request
 can load a fresh runtime; partially streamed responses are never replayed.
+The server does not reserve `max_tokens` worth of context upfront. A fitting
+prompt can generate until its output limit or remaining context is exhausted,
+reported as `finish_reason: "length"`. Background execution retains daemon
+scheduling/preemption but has no fixed per-token delay in the server.
 An incomplete or invalid structured answer instead returns
 `schema_validation_failed` and leaves the runtime available for another request.
 

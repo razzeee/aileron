@@ -142,13 +142,6 @@ pub(super) fn convert(req: &Request) -> Result<Value> {
         "cache_prompt": false
     });
     body["messages"] = Value::Array(messages);
-    body["aileron_reserve_output"] = json!(true);
-    body["aileron_decode_delay_ms"] =
-        json!(if req.execution_mode.as_deref() == Some("background") {
-            20
-        } else {
-            0
-        });
     if structured {
         if req.request_type == "detect" {
             body["response_format"] = json!({"type":"json_schema", "json_schema":{"name":"detections", "schema":super::vision::detection_schema()}});
@@ -225,14 +218,12 @@ mod tests {
     }
 
     #[test]
-    fn background_policy_is_server_side_and_images_use_inline_content() {
+    fn images_use_inline_content() {
         let body = convert(&request(
             json!({"type":"describe", "execution_mode":"background",
             "image":[137,80,78,71,13,10,26,10]}),
         ))
         .unwrap();
-        assert_eq!(body["aileron_decode_delay_ms"], 20);
-        assert_eq!(body["aileron_reserve_output"], true);
         assert!(
             body["messages"][1]["content"][1]["image_url"]["url"]
                 .as_str()

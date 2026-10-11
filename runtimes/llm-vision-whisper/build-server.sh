@@ -11,13 +11,8 @@ git -C /llama-server-src remote add origin https://github.com/ggml-org/llama.cpp
 git -C /llama-server-src fetch --depth 1 origin "$LLAMA_SERVER_REVISION"
 git -C /llama-server-src checkout --detach FETCH_HEAD
 test "$(git -C /llama-server-src rev-parse HEAD)" = "$LLAMA_SERVER_REVISION"
-for patch in /llama-server-patches/*.patch; do
-    git -C /llama-server-src apply --check --recount "$patch"
-    git -C /llama-server-src apply --recount "$patch"
-done
-patch_hash=$(sha256sum /llama-server-patches/*.patch | sha256sum | cut -d ' ' -f 1)
-printf '{"engine":"llama-server","revision":"%s","patch_sha256":"%s","embedding_recipe":"mean-raw-special-v1"}\n' \
-    "$LLAMA_SERVER_REVISION" "$patch_hash" > /runtime-provenance.json
+printf '{"engine":"llama-server","revision":"%s","patches":[],"embedding_recipe":"mean-raw-special-v1"}\n' \
+    "$LLAMA_SERVER_REVISION" > /runtime-provenance.json
 
 backend=()
 case "$RUNTIME_VARIANT" in

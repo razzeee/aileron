@@ -39,11 +39,14 @@ def main():
     parser.add_argument("--model-dir", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--server-binary", default="/usr/local/bin/llama-server")
-    parser.add_argument("--resource-policy", action="store_true")
+    parser.add_argument("--context-limits", action="store_true")
+    parser.add_argument("--context", type=int, default=4096)
     parser.add_argument("--tools", action="store_true")
     parser.add_argument("--props-only", action="store_true", help="inspect template capabilities without inference")
     parser.add_argument("--memory", default="8g")
     args = parser.parse_args()
+    if args.context < 64:
+        parser.error("--context must be at least 64")
     args.output.parent.mkdir(parents=True, exist_ok=True)
     name = "aileron-probe-" + uuid.uuid4().hex
     with tempfile.TemporaryDirectory(dir=args.output.parent.resolve()) as directory:
@@ -56,7 +59,7 @@ def main():
                    "--entrypoint", args.server_binary, args.image,
                    "--model", "/model/model.gguf", "--host", "/probe/server.sock",
                    "--no-webui", "--jinja", "--fit", "off", "--no-warmup", "--parallel", "1", "--threads", "2", "--threads-http", "2",
-                   "--ctx-size", "4096", "--embeddings", "--pooling", "mean"]
+                   "--ctx-size", str(args.context), "--no-context-shift", "--embeddings", "--pooling", "mean"]
         with args.output.with_suffix(".log").open("w") as log:
             process = subprocess.Popen(command, stdout=log, stderr=log)
             try:
@@ -75,13 +78,12 @@ def main():
                 requests = [("/apply-template", chat, 200), ("/v1/chat/completions", chat, 200),
                             ("/embeddings", {"input":"A cat sits on a mat.", "embd_normalize":-1}, 200),
                             ("/v1/chat/completions", chat, 200)]
-                if args.resource_policy and not args.props_only:
-                    requests += [("/v1/chat/completions", {**chat, "max_tokens":4080,
-                                  "aileron_reserve_output":True}, 400),
-                                 ("/v1/chat/completions", {**chat, "max_tokens":32, "ignore_eos":True,
-                                  "cache_prompt":False,"aileron_decode_delay_ms":0}, 200),
-                                 ("/v1/chat/completions", {**chat, "max_tokens":32, "ignore_eos":True,
-                                  "cache_prompt":False,"aileron_decode_delay_ms":20}, 200)]
+                if args.context_limits and not args.props_only:
+                    requests += [("/v1/chat/completions", {**chat, "messages":[
+                                  {"role":"user", "content":"hello " * 10000}]}, 400),
+                                 ("/completion", {"prompt":[1] * (args.context - 4),
+                                  "n_predict":16, "ignore_eos":True, "cache_prompt":False}, 200),
+                                 ("/v1/chat/completions", chat, 200)]
                 if args.tools:
                     fixture=json.loads(Path(__file__).with_name("tools.json").read_text())[0]["request"]
                     requests.append(("/v1/chat/completions",{
@@ -96,16 +98,13 @@ def main():
                     started = time.monotonic()
                     results.append({"route":route, "request":body, "response":request(path, route, body),
                                     "seconds":time.monotonic() - started})
+                    args.output.write_text(json.dumps(results, indent=2) + "\n")
                     if results[-1]["response"]["status"] != expected:
                         raise RuntimeError(f"unexpected response: {results[-1]}")
-                args.output.write_text(json.dumps(results, indent=2) + "\n")
-                if args.resource_policy and not args.props_only:
-                    background=next(item for item in results if item.get("request",{}).get("aileron_decode_delay_ms")==20)
-                    interactive=next(item for item in results if item.get("request",{}).get("aileron_decode_delay_ms")==0)
-                    difference = (background["response"]["body"]["timings"]["predicted_ms"]
-                                  - interactive["response"]["body"]["timings"]["predicted_ms"])
-                    if difference < 400:
-                        raise RuntimeError(f"background decode pacing added only {difference} ms")
+                    if route == "/completion" and not results[-1]["response"]["body"].get("truncated"):
+                        raise RuntimeError("context exhaustion was not reported as truncation")
+                if args.props_only:
+                    args.output.write_text(json.dumps(results, indent=2) + "\n")
                 print([(result["route"], result["response"]["status"]) for result in results])
             finally:
                 subprocess.run(["podman", "rm", "--force", "--ignore", name], capture_output=True)
