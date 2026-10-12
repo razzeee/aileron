@@ -1,7 +1,7 @@
 use super::*;
 use crate::container::{ContainerRequest, ResponseFormat};
 use aileron_varlink::aileron_Inference::{
-    Call_StreamRespondGuided2, Call_StreamResponse2, Call_StreamSubmitToolResultsGuided2,
+    Call_StreamRespondGuided, Call_StreamResponse, Call_StreamSubmitToolResultsGuided,
     GenerationEvent, GenerationOptions, ReasoningCapabilities,
 };
 
@@ -31,9 +31,9 @@ macro_rules! event_call {
         }
     };
 }
-event_call!(Call_StreamResponse2);
-event_call!(Call_StreamRespondGuided2);
-event_call!(Call_StreamSubmitToolResultsGuided2);
+event_call!(Call_StreamResponse);
+event_call!(Call_StreamRespondGuided);
+event_call!(Call_StreamSubmitToolResultsGuided);
 
 pub(super) fn reply_error(
     call: &mut dyn VarlinkCallError,
@@ -240,13 +240,8 @@ async fn generate(
             runtime.system = Some(apply_translation_hints(
                 &resolved.use_case,
                 resolved.instructions.clone(),
-                &ResponseOptions {
-                    maximum_response_tokens: i64::from(max_tokens),
-                    temperature: options.temperature.unwrap_or(0.0),
-                    source_language_hint: options.source_language_hint.clone().unwrap_or_default(),
-                    target_language_hint: options.target_language_hint.clone().unwrap_or_default(),
-                    execution_mode: mode.as_str().into(),
-                },
+                options.source_language_hint.as_deref().unwrap_or_default(),
+                options.target_language_hint.as_deref().unwrap_or_default(),
             ));
             runtime.prompt = Some(prompt.clone());
             runtime.input = input.clone();

@@ -15,7 +15,7 @@ use std::time::Duration;
 use tracing::{info, warn};
 use zbus::zvariant::{OwnedFd, OwnedObjectPath, Type};
 use zbus::{connection, interface, message::Header, object_server::SignalEmitter};
-mod language_v2;
+mod language;
 
 const BUS_NAME: &str = "org.freedesktop.impl.portal.desktop.aileron";
 const OBJECT_PATH: &str = "/org/freedesktop/portal/desktop";
@@ -382,22 +382,6 @@ struct ModelAvailabilityDbus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
-struct ResponseOptionsDbus {
-    maximum_response_tokens: i64,
-    temperature: f64,
-    source_language_hint: String,
-    target_language_hint: String,
-    execution_mode: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Type)]
-struct GuidedOptionsDbus {
-    maximum_response_tokens: i64,
-    temperature: f64,
-    execution_mode: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Type)]
 struct EmbedOptionsDbus {
     execution_mode: String,
 }
@@ -553,29 +537,29 @@ impl SessionPortalBackend {
 impl LanguagePortalBackend {
     #[zbus(property, name = "version")]
     fn version(&self) -> u32 {
-        2
+        1
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn stream_response2(
+    async fn stream_response(
         &self,
         request_handle: OwnedObjectPath,
         session_handle: OwnedObjectPath,
         input_json: String,
         media_fds: Vec<OwnedFd>,
-        options: language_v2::Options,
+        options: language::Options,
         #[zbus(connection)] conn: &zbus::Connection,
         #[zbus(header)] header: Header<'_>,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) -> zbus::fdo::Result<()> {
         ensure_portal_frontend(conn, &header).await?;
-        language_v2::stream(
+        language::stream(
             self,
             conn,
             &emitter,
             request_handle,
             session_handle,
-            language_v2::Request {
+            language::Request {
                 input: input_json,
                 fds: media_fds,
                 fields: None,
@@ -588,7 +572,7 @@ impl LanguagePortalBackend {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn stream_respond_guided2(
+    async fn stream_respond_guided(
         &self,
         request_handle: OwnedObjectPath,
         session_handle: OwnedObjectPath,
@@ -596,19 +580,19 @@ impl LanguagePortalBackend {
         media_fds: Vec<OwnedFd>,
         fields: Vec<GuidedFieldDbus>,
         tools: Vec<ToolDefinitionDbus>,
-        options: language_v2::Options,
+        options: language::Options,
         #[zbus(connection)] conn: &zbus::Connection,
         #[zbus(header)] header: Header<'_>,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) -> zbus::fdo::Result<()> {
         ensure_portal_frontend(conn, &header).await?;
-        language_v2::stream(
+        language::stream(
             self,
             conn,
             &emitter,
             request_handle,
             session_handle,
-            language_v2::Request {
+            language::Request {
                 input: prompt,
                 fds: media_fds,
                 fields: Some(fields),
@@ -621,7 +605,7 @@ impl LanguagePortalBackend {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn stream_submit_tool_results_guided2(
+    async fn stream_submit_tool_results_guided(
         &self,
         request_handle: OwnedObjectPath,
         session_handle: OwnedObjectPath,
@@ -630,19 +614,19 @@ impl LanguagePortalBackend {
         results: Vec<ToolResultDbus>,
         fields: Vec<GuidedFieldDbus>,
         tools: Vec<ToolDefinitionDbus>,
-        options: language_v2::Options,
+        options: language::Options,
         #[zbus(connection)] conn: &zbus::Connection,
         #[zbus(header)] header: Header<'_>,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) -> zbus::fdo::Result<()> {
         ensure_portal_frontend(conn, &header).await?;
-        language_v2::stream(
+        language::stream(
             self,
             conn,
             &emitter,
             request_handle,
             session_handle,
-            language_v2::Request {
+            language::Request {
                 input: prompt,
                 fds: media_fds,
                 fields: Some(fields),
@@ -663,7 +647,7 @@ impl LanguagePortalBackend {
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) -> zbus::fdo::Result<()> {
         ensure_portal_frontend(conn, &header).await?;
-        language_v2::capabilities(self, conn, &emitter, request_handle, session_handle).await
+        language::capabilities(self, conn, &emitter, request_handle, session_handle).await
     }
 
     #[zbus(signal)]
@@ -679,7 +663,7 @@ impl LanguagePortalBackend {
         emitter: &SignalEmitter<'_>,
         request_handle: &OwnedObjectPath,
         session_handle: &OwnedObjectPath,
-        metadata: language_v2::Options,
+        metadata: language::Options,
     ) -> zbus::Result<()>;
 
     #[zbus(out_args("availability"))]
@@ -791,88 +775,6 @@ impl LanguagePortalBackend {
         message: &str,
     ) -> zbus::Result<()>;
 
-    #[allow(clippy::too_many_arguments)]
-    async fn stream_response(
-        &self,
-        request_handle: OwnedObjectPath,
-        session_handle: OwnedObjectPath,
-        input_json: &str,
-        media_fds: Vec<OwnedFd>,
-        options: ResponseOptionsDbus,
-        #[zbus(connection)] conn: &zbus::Connection,
-        #[zbus(header)] header: Header<'_>,
-        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
-    ) -> zbus::fdo::Result<()> {
-        use aileron_varlink::aileron_Inference::VarlinkClientInterface;
-
-        ensure_portal_frontend(conn, &header).await?;
-        let request_id = request_handle.as_str();
-        let session_id = session_handle.as_str();
-        begin_request(conn, &self.state, request_id, Some(session_id)).await?;
-        let result = async {
-            let record = ensure_known_session(&self.state, session_id, PortalInterface::Language)?;
-            ensure_language_generation_session(&record)?;
-            ensure_request_active(&self.state, request_id)?;
-            self.emit_loading(&request_handle, &session_handle, &emitter)
-                .await?;
-            ensure_request_active(&self.state, request_id)?;
-            let daemon_session_id = record.daemon_session_id;
-            let media_paths = media_fds.iter().map(fd_proc_path).collect::<Vec<_>>();
-            let input_json = input_json.to_string();
-            let mut replies = stream_replies(
-                self.state.clone(),
-                request_id,
-                media_fds,
-                options.execution_mode == "background",
-                move |mut client| {
-                    client.stream_response(
-                        daemon_session_id,
-                        input_json,
-                        media_paths,
-                        options.into_varlink(),
-                    )
-                },
-            )
-            .await?;
-
-            let mut pending_token: Option<String> = None;
-            while let Some(reply) = replies.recv().await {
-                ensure_request_active(&self.state, request_id)?;
-                let token = reply
-                    .map_err(|e| map_request_error(&self.state, request_id, e))?
-                    .token;
-
-                if let Some(previous) = pending_token.replace(token) {
-                    LanguagePortalBackend::token_received(
-                        &emitter,
-                        &request_handle,
-                        &session_handle,
-                        &previous,
-                        false,
-                    )
-                    .await
-                    .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-                }
-            }
-
-            ensure_request_active(&self.state, request_id)?;
-            LanguagePortalBackend::token_received(
-                &emitter,
-                &request_handle,
-                &session_handle,
-                pending_token.as_deref().unwrap_or_default(),
-                true,
-            )
-            .await
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-
-            Ok(())
-        }
-        .await;
-        finish_request(conn, &self.state, request_id).await;
-        result
-    }
-
     #[zbus(signal)]
     async fn token_received(
         emitter: &SignalEmitter<'_>,
@@ -881,120 +783,6 @@ impl LanguagePortalBackend {
         token: &str,
         done: bool,
     ) -> zbus::Result<()>;
-
-    #[allow(clippy::too_many_arguments)]
-    async fn stream_respond_guided(
-        &self,
-        request_handle: OwnedObjectPath,
-        session_handle: OwnedObjectPath,
-        prompt: &str,
-        media_fds: Vec<OwnedFd>,
-        fields: Vec<GuidedFieldDbus>,
-        tools: Vec<ToolDefinitionDbus>,
-        options: GuidedOptionsDbus,
-        #[zbus(connection)] conn: &zbus::Connection,
-        #[zbus(header)] header: Header<'_>,
-        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
-    ) -> zbus::fdo::Result<()> {
-        use aileron_varlink::aileron_Inference::VarlinkClientInterface;
-
-        ensure_portal_frontend(conn, &header).await?;
-        let request_id = request_handle.as_str();
-        let session_id = session_handle.as_str();
-        begin_request(conn, &self.state, request_id, Some(session_id)).await?;
-        let result = async {
-            let record = ensure_known_session(&self.state, session_id, PortalInterface::Language)?;
-            ensure_language_generation_session(&record)?;
-            ensure_request_active(&self.state, request_id)?;
-            self.emit_loading(&request_handle, &session_handle, &emitter)
-                .await?;
-            ensure_request_active(&self.state, request_id)?;
-            let daemon_session_id = record.daemon_session_id;
-            let media_paths = media_fds.iter().map(fd_proc_path).collect::<Vec<_>>();
-            let prompt = prompt.to_string();
-            let mut replies = stream_replies(
-                self.state.clone(),
-                request_id,
-                media_fds,
-                options.execution_mode == "background",
-                move |mut client| {
-                    client.stream_respond_guided(
-                        daemon_session_id,
-                        prompt,
-                        media_paths,
-                        fields
-                            .into_iter()
-                            .map(GuidedFieldDbus::into_varlink)
-                            .collect(),
-                        tools
-                            .into_iter()
-                            .map(ToolDefinitionDbus::into_varlink)
-                            .collect(),
-                        options.into_varlink(),
-                    )
-                },
-            )
-            .await?;
-
-            let mut pending_snapshot: Option<String> = None;
-            let mut emitted_terminal_tool_calls = false;
-            while let Some(reply) = replies.recv().await {
-                ensure_request_active(&self.state, request_id)?;
-                let reply = reply.map_err(|e| map_request_error(&self.state, request_id, e))?;
-                let snapshot = reply.snapshot_json;
-                let tool_calls = reply
-                    .tool_calls
-                    .into_iter()
-                    .map(ToolCallDbus::from_varlink)
-                    .collect::<Vec<_>>();
-
-                if !tool_calls.is_empty() {
-                    pending_snapshot = None;
-                    emitted_terminal_tool_calls = true;
-                    LanguagePortalBackend::guided_tool_calls_received(
-                        &emitter,
-                        &request_handle,
-                        &session_handle,
-                        &tool_calls,
-                        true,
-                    )
-                    .await
-                    .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-                    continue;
-                }
-
-                if let Some(previous) = pending_snapshot.replace(snapshot) {
-                    LanguagePortalBackend::guided_snapshot_received(
-                        &emitter,
-                        &request_handle,
-                        &session_handle,
-                        &previous,
-                        false,
-                    )
-                    .await
-                    .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-                }
-            }
-
-            ensure_request_active(&self.state, request_id)?;
-            if !emitted_terminal_tool_calls {
-                LanguagePortalBackend::guided_snapshot_received(
-                    &emitter,
-                    &request_handle,
-                    &session_handle,
-                    pending_snapshot.as_deref().unwrap_or_default(),
-                    true,
-                )
-                .await
-                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-            }
-
-            Ok(())
-        }
-        .await;
-        finish_request(conn, &self.state, request_id).await;
-        result
-    }
 
     #[zbus(signal)]
     async fn guided_snapshot_received(
@@ -1014,126 +802,6 @@ impl LanguagePortalBackend {
         done: bool,
     ) -> zbus::Result<()>;
 
-    #[allow(clippy::too_many_arguments)]
-    async fn stream_submit_tool_results_guided(
-        &self,
-        request_handle: OwnedObjectPath,
-        session_handle: OwnedObjectPath,
-        prompt: &str,
-        media_fds: Vec<OwnedFd>,
-        results: Vec<ToolResultDbus>,
-        fields: Vec<GuidedFieldDbus>,
-        tools: Vec<ToolDefinitionDbus>,
-        options: GuidedOptionsDbus,
-        #[zbus(connection)] conn: &zbus::Connection,
-        #[zbus(header)] header: Header<'_>,
-        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
-    ) -> zbus::fdo::Result<()> {
-        use aileron_varlink::aileron_Inference::VarlinkClientInterface;
-
-        ensure_portal_frontend(conn, &header).await?;
-        let request_id = request_handle.as_str();
-        let session_id = session_handle.as_str();
-        begin_request(conn, &self.state, request_id, Some(session_id)).await?;
-        let result = async {
-            let record = ensure_known_session(&self.state, session_id, PortalInterface::Language)?;
-            ensure_language_generation_session(&record)?;
-            ensure_request_active(&self.state, request_id)?;
-            self.emit_loading(&request_handle, &session_handle, &emitter)
-                .await?;
-            ensure_request_active(&self.state, request_id)?;
-            let daemon_session_id = record.daemon_session_id;
-            let media_paths = media_fds.iter().map(fd_proc_path).collect::<Vec<_>>();
-            let prompt = prompt.to_string();
-            let mut replies = stream_replies(
-                self.state.clone(),
-                request_id,
-                media_fds,
-                options.execution_mode == "background",
-                move |mut client| {
-                    client.stream_submit_tool_results_guided(
-                        daemon_session_id,
-                        prompt,
-                        media_paths,
-                        results
-                            .into_iter()
-                            .map(ToolResultDbus::into_varlink)
-                            .collect(),
-                        fields
-                            .into_iter()
-                            .map(GuidedFieldDbus::into_varlink)
-                            .collect(),
-                        tools
-                            .into_iter()
-                            .map(ToolDefinitionDbus::into_varlink)
-                            .collect(),
-                        options.into_varlink(),
-                    )
-                },
-            )
-            .await?;
-
-            let mut pending_snapshot: Option<String> = None;
-            let mut emitted_terminal_tool_calls = false;
-            while let Some(reply) = replies.recv().await {
-                ensure_request_active(&self.state, request_id)?;
-                let reply = reply.map_err(|e| map_request_error(&self.state, request_id, e))?;
-                let snapshot = reply.snapshot_json;
-                let tool_calls = reply
-                    .tool_calls
-                    .into_iter()
-                    .map(ToolCallDbus::from_varlink)
-                    .collect::<Vec<_>>();
-
-                if !tool_calls.is_empty() {
-                    pending_snapshot = None;
-                    emitted_terminal_tool_calls = true;
-                    LanguagePortalBackend::guided_tool_calls_received(
-                        &emitter,
-                        &request_handle,
-                        &session_handle,
-                        &tool_calls,
-                        true,
-                    )
-                    .await
-                    .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-                    continue;
-                }
-
-                if let Some(previous) = pending_snapshot.replace(snapshot) {
-                    LanguagePortalBackend::guided_snapshot_received(
-                        &emitter,
-                        &request_handle,
-                        &session_handle,
-                        &previous,
-                        false,
-                    )
-                    .await
-                    .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-                }
-            }
-
-            ensure_request_active(&self.state, request_id)?;
-            if !emitted_terminal_tool_calls {
-                LanguagePortalBackend::guided_snapshot_received(
-                    &emitter,
-                    &request_handle,
-                    &session_handle,
-                    pending_snapshot.as_deref().unwrap_or_default(),
-                    true,
-                )
-                .await
-                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-            }
-
-            Ok(())
-        }
-        .await;
-        finish_request(conn, &self.state, request_id).await;
-        result
-    }
-
-    #[allow(clippy::too_many_arguments)]
     async fn stream_embed(
         &self,
         request_handle: OwnedObjectPath,
@@ -3116,28 +2784,6 @@ impl VisionPortalBackend {
     }
 }
 
-impl ResponseOptionsDbus {
-    fn into_varlink(self) -> aileron_varlink::aileron_Inference::ResponseOptions {
-        aileron_varlink::aileron_Inference::ResponseOptions {
-            maximum_response_tokens: self.maximum_response_tokens,
-            temperature: self.temperature,
-            source_language_hint: self.source_language_hint,
-            target_language_hint: self.target_language_hint,
-            execution_mode: self.execution_mode,
-        }
-    }
-}
-
-impl GuidedOptionsDbus {
-    fn into_varlink(self) -> aileron_varlink::aileron_Inference::GuidedOptions {
-        aileron_varlink::aileron_Inference::GuidedOptions {
-            maximum_response_tokens: self.maximum_response_tokens,
-            temperature: self.temperature,
-            execution_mode: self.execution_mode,
-        }
-    }
-}
-
 impl EmbedOptionsDbus {
     fn into_varlink(self) -> aileron_varlink::aileron_Inference::EmbedOptions {
         aileron_varlink::aileron_Inference::EmbedOptions {
@@ -4030,27 +3676,6 @@ mod tests {
         assert!(err.to_string().contains(interface.label()));
         assert!(err.to_string().contains(use_case));
         assert!(err.to_string().contains("supported use-cases"));
-    }
-
-    #[hegel::test]
-    fn response_options_conversion_preserves_generated_fields(tc: TestCase) {
-        let maximum_response_tokens = tc.draw(gs::integers::<i64>().min_value(1).max_value(4096));
-        let temperature_tenths = tc.draw(gs::integers::<i64>().min_value(0).max_value(20));
-        let options = ResponseOptionsDbus {
-            maximum_response_tokens,
-            temperature: temperature_tenths as f64 / 10.0,
-            source_language_hint: "en".to_string(),
-            target_language_hint: "es".to_string(),
-            execution_mode: "background".to_string(),
-        };
-
-        let converted = options.into_varlink();
-
-        assert_eq!(converted.maximum_response_tokens, maximum_response_tokens);
-        assert_eq!(converted.temperature, temperature_tenths as f64 / 10.0);
-        assert_eq!(converted.source_language_hint, "en");
-        assert_eq!(converted.target_language_hint, "es");
-        assert_eq!(converted.execution_mode, "background");
     }
 
     #[test]

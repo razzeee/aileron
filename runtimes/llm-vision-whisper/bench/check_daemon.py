@@ -1,4 +1,4 @@
-"""Exercise real generation v2 and tool continuation through an isolated daemon.
+"""Exercise real generation and tool continuation through an isolated daemon.
 
 Requires an exported runtime rootfs and a local tool-capable model. This does
 not use the user's daemon socket, assignments, permissions, or profile store.
@@ -123,7 +123,7 @@ def main():
                 completed=queue.Queue()
                 def generate_until_cancelled():
                     try:
-                        completed.put(rpc(address,"aileron.Inference.StreamResponse2",{
+                        completed.put(rpc(address,"aileron.Inference.StreamResponse",{
                             "session_id":sessions[0],"input_json":json.dumps([{"type":"input_text","text":"Write a very long detailed story about exploring a distant planet."}]),
                             "media_paths":[],"options":{"maximum_response_tokens":1024,"temperature":0.0}},True,
                             on_response=lambda reply: running.set() if reply.get("parameters",{}).get("event",{}).get("kind")=="answer" else None))
@@ -151,7 +151,7 @@ def main():
                         "schema_json":json.dumps({"type":"object","required":["date"],"properties":{"date":{"type":"string"}}})}]
                 initial={"session_id":sessions[0],"prompt":"Look up my calendar for 2026-09-24 before answering. Use calendar_lookup.",
                          "media_paths":[],"fields":fields,"tools":tools,"options":options}
-                responses=rpc(address,"aileron.Inference.StreamRespondGuided2",initial,True)
+                responses=rpc(address,"aileron.Inference.StreamRespondGuided",initial,True)
                 report["initial"]=responses
                 success(responses)
                 calls=[call for response in responses for call in response["parameters"]["event"].get("tool_calls",[]) or []]
@@ -160,11 +160,11 @@ def main():
                 report["checks"].append("native tool calls")
                 results=[{"id":call["id"],"content":"Team sync at 10:00.","content_json":""} for call in calls]
                 continuation={**initial,"results":results,"prompt":"Use the supplied calendar result to answer. Do not call the tool again."}
-                crossed=rpc(address,"aileron.Inference.StreamSubmitToolResultsGuided2",{**continuation,"session_id":sessions[1]},True)
+                crossed=rpc(address,"aileron.Inference.StreamSubmitToolResultsGuided",{**continuation,"session_id":sessions[1]},True)
                 if crossed[-1].get("error") != "aileron.Inference.InvalidInput":
                     raise AssertionError(f"cross-session results accepted: {crossed}")
                 report["checks"].append("cross-session tool results rejected")
-                responses=rpc(address,"aileron.Inference.StreamSubmitToolResultsGuided2",continuation,True)
+                responses=rpc(address,"aileron.Inference.StreamSubmitToolResultsGuided",continuation,True)
                 report["continuation"]=responses
                 success(responses)
                 snapshots=[response["parameters"]["event"]["snapshot_json"] for response in responses
@@ -175,7 +175,7 @@ def main():
                 if final["kind"]!="completed" or final["usage"]["completion_tokens"]>256:
                     raise AssertionError("completion metadata or shared token budget invalid")
                 report["checks"].append("schema final answer and bounded aggregate usage")
-                replay=rpc(address,"aileron.Inference.StreamSubmitToolResultsGuided2",continuation,True)
+                replay=rpc(address,"aileron.Inference.StreamSubmitToolResultsGuided",continuation,True)
                 if replay[-1].get("error") != "aileron.Inference.InvalidInput":
                     raise AssertionError("completed tool results could be replayed")
                 report["checks"].append("completed tool results cannot be replayed")
@@ -184,7 +184,7 @@ def main():
                     for thinking, include in [("on",True),("on",False),("off",True)]:
                         if thinking not in modes:
                             continue
-                        responses=rpc(address,"aileron.Inference.StreamResponse2",{
+                        responses=rpc(address,"aileron.Inference.StreamResponse",{
                             "session_id":sessions[0],"input_json":json.dumps([{"type":"input_text","text":"Reason carefully about this puzzle before answering: a snail climbs 3 meters each day and slips 2 meters each night. How many days does it take to escape a 10-meter well? Check the final day separately, then give a short final answer."}]),
                             "media_paths":[],"options":{"thinking":thinking,"include_reasoning":include,"temperature":0.6,"maximum_response_tokens":512}},True)
                         report[f"reasoning_{thinking}_{include}"]=responses
@@ -198,7 +198,7 @@ def main():
                                 raise AssertionError("missing final answer was not reported as output exhaustion")
                         if events[-1]["usage"]["completion_tokens"]>512:
                             raise AssertionError("reasoning exceeded the total output budget")
-                    simple=rpc(address,"aileron.Inference.StreamResponse2",{
+                    simple=rpc(address,"aileron.Inference.StreamResponse",{
                         "session_id":sessions[0],"input_json":json.dumps([{"type":"input_text","text":"What is 2 + 2? Give a short answer."}]),
                         "media_paths":[],"options":{"thinking":"on","include_reasoning":True,"temperature":0.0,"maximum_response_tokens":128}},True)
                     success(simple)

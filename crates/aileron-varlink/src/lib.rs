@@ -64,8 +64,38 @@ pub use aileron_Sessions as sessions;
 
 #[cfg(test)]
 mod tests {
+    use crate::inference;
     use hegel::TestCase;
     use hegel::generators as gs;
+
+    #[test]
+    fn generation_api_has_only_original_method_names() {
+        let interface = include_str!("../varlink/aileron.Inference.varlink");
+        for name in [
+            "StreamResponse",
+            "StreamRespondGuided",
+            "StreamSubmitToolResultsGuided",
+        ] {
+            assert_eq!(interface.matches(&format!("method {name}(")).count(), 1);
+            assert!(!interface.contains(&format!("method {name}2(")));
+        }
+        // All three original methods now expose the event-based generation reply.
+        let value = serde_json::json!({"event": {
+            "kind": "completed", "finish_reason": "stop",
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+        }});
+        let response: inference::StreamResponse_Reply =
+            serde_json::from_value(value.clone()).unwrap();
+        let guided: inference::StreamRespondGuided_Reply =
+            serde_json::from_value(value.clone()).unwrap();
+        let continuation: inference::StreamSubmitToolResultsGuided_Reply =
+            serde_json::from_value(value).unwrap();
+        for event in [response.event, guided.event, continuation.event] {
+            assert_eq!(event.kind, "completed");
+            assert_eq!(event.finish_reason.as_deref(), Some("stop"));
+            assert_eq!(event.usage.unwrap().total_tokens, Some(15));
+        }
+    }
 
     #[test]
     fn catalog_profile_info_accepts_missing_license() {

@@ -11,20 +11,6 @@ type ModelAvailability (
   reason: string
 )
 
-type ResponseOptions (
-  maximum_response_tokens: int,
-  temperature: float,
-  source_language_hint: string,
-  target_language_hint: string,
-  execution_mode: string
-)
-
-type GuidedOptions (
-  maximum_response_tokens: int,
-  temperature: float,
-  execution_mode: string
-)
-
 type EmbedOptions (
   execution_mode: string
 )
@@ -174,23 +160,21 @@ method CreateSession(app_id: string, use_case: string, instructions: string) -> 
 # only moves that latency earlier and does not warm a specific method or payload.
 method Prewarm(session_id: string) -> ()
 
-# Stream response tokens. Session must have been created with a language generation use_case.
+# Stream generation events. Session must have been created with a language generation use_case.
 # input_json is either content-part shorthand or a role-message array. A role-message
 # array is [{"role":"user|assistant|system|tool","content":[parts...]}].
 # media_paths contains readable request-scoped media paths referenced by fd_index.
-method StreamResponse(session_id: string, input_json: string, media_paths: []string, options: ResponseOptions) -> (token: string)
+method StreamResponse(session_id: string, input_json: string, media_paths: []string, options: GenerationOptions) -> (event: GenerationEvent)
 
-# Stream schema-valid guided output snapshots. The final reply has continues=false.
+# Stream schema-valid guided output snapshots and tool calls as generation events.
+# The completed event is the final reply and has continues=false.
 # prompt is plain text or content-part/role-message JSON. media_paths contains readable request-scoped media paths referenced by fd_index.
-method StreamRespondGuided(session_id: string, prompt: string, media_paths: []string, fields: []GuidedField, tools: []ToolDefinition, options: GuidedOptions) -> (snapshot_json: string, tool_calls: []ToolCall)
+method StreamRespondGuided(session_id: string, prompt: string, media_paths: []string, fields: []GuidedField, tools: []ToolDefinition, options: GenerationOptions) -> (event: GenerationEvent)
 
 # Stream guided generation after the app executes or rejects requested tools.
-method StreamSubmitToolResultsGuided(session_id: string, prompt: string, media_paths: []string, results: []ToolResult, fields: []GuidedField, tools: []ToolDefinition, options: GuidedOptions) -> (snapshot_json: string, tool_calls: []ToolCall)
+method StreamSubmitToolResultsGuided(session_id: string, prompt: string, media_paths: []string, results: []ToolResult, fields: []GuidedField, tools: []ToolDefinition, options: GenerationOptions) -> (event: GenerationEvent)
 
-# Version 2 streams explicit reasoning and completion metadata. Existing methods remain compatible.
-method StreamResponse2(session_id: string, input_json: string, media_paths: []string, options: GenerationOptions) -> (event: GenerationEvent)
-method StreamRespondGuided2(session_id: string, prompt: string, media_paths: []string, fields: []GuidedField, tools: []ToolDefinition, options: GenerationOptions) -> (event: GenerationEvent)
-method StreamSubmitToolResultsGuided2(session_id: string, prompt: string, media_paths: []string, results: []ToolResult, fields: []GuidedField, tools: []ToolDefinition, options: GenerationOptions) -> (event: GenerationEvent)
+# Generation streams carry answer, reasoning, snapshot, tool-call and completion events.
 method GetReasoningCapabilities(session_id: string) -> (capabilities: ReasoningCapabilities)
 
 # Stream embedding vectors for text. Session must have been created with use_case: language.embed
