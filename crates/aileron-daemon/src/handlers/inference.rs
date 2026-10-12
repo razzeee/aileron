@@ -10,11 +10,8 @@ use std::sync::{
 };
 use std::time::Duration;
 use uuid::Uuid;
-mod generation_v2;
-use aileron_varlink::aileron_Inference::{
-    Call_GetReasoningCapabilities, Call_StreamRespondGuided2, Call_StreamResponse2,
-    Call_StreamSubmitToolResultsGuided2, GenerationOptions,
-};
+mod generation;
+use aileron_varlink::aileron_Inference::{Call_GetReasoningCapabilities, GenerationOptions};
 
 use crate::container::{
     AudioChunk as RuntimeAudioChunk, Container, ContainerHandle, InputMessage, InputPart,
@@ -31,10 +28,10 @@ use aileron_varlink::aileron_Inference::{
     Call_GetUseCaseAvailability, Call_Prewarm, Call_StreamDepth, Call_StreamDescribe,
     Call_StreamDetect, Call_StreamEmbed, Call_StreamOcr, Call_StreamRespondGuided,
     Call_StreamResponse, Call_StreamSegment, Call_StreamSubmitToolResultsGuided,
-    Call_StreamSynthesize, Call_StreamTranscribe, EmbedOptions, GuidedField, GuidedOptions,
-    ModelAvailability, ResponseOptions, SpeechOptions, SynthesisOptions, ToolCall, ToolDefinition,
-    ToolResult, VarlinkCallError, VarlinkInterface, VisionBoxPrompt, VisionDepthMap,
-    VisionDetection, VisionMask, VisionOptions, VisionPointPrompt, VisionSegmentOptions,
+    Call_StreamSynthesize, Call_StreamTranscribe, EmbedOptions, GuidedField, ModelAvailability,
+    SpeechOptions, SynthesisOptions, ToolCall, ToolDefinition, ToolResult, VarlinkCallError,
+    VarlinkInterface, VisionBoxPrompt, VisionDepthMap, VisionDetection, VisionMask, VisionOptions,
+    VisionPointPrompt, VisionSegmentOptions,
 };
 
 pub struct InferenceHandler {
@@ -207,25 +204,25 @@ impl VarlinkInterface for InferenceHandler {
     ) -> varlink::Result<()> {
         match self
             .rt
-            .block_on(generation_v2::capabilities(&self.state, &session_id))
+            .block_on(generation::capabilities(&self.state, &session_id))
         {
             Ok(capabilities) => call.reply(capabilities),
-            Err(error) => generation_v2::reply_error(call, error),
+            Err(error) => generation::reply_error(call, error),
         }
     }
 
-    fn stream_response2(
+    fn stream_response(
         &self,
-        call: &mut dyn Call_StreamResponse2,
+        call: &mut dyn Call_StreamResponse,
         session_id: String,
         input_json: String,
         media_paths: Vec<String>,
         options: GenerationOptions,
     ) -> varlink::Result<()> {
-        self.rt.block_on(generation_v2::serve(
+        self.rt.block_on(generation::serve(
             &self.state,
             call,
-            generation_v2::Request {
+            generation::Request {
                 session_id,
                 input: input_json,
                 media_paths,
@@ -237,9 +234,9 @@ impl VarlinkInterface for InferenceHandler {
         ))
     }
 
-    fn stream_respond_guided2(
+    fn stream_respond_guided(
         &self,
-        call: &mut dyn Call_StreamRespondGuided2,
+        call: &mut dyn Call_StreamRespondGuided,
         session_id: String,
         prompt: String,
         media_paths: Vec<String>,
@@ -247,10 +244,10 @@ impl VarlinkInterface for InferenceHandler {
         tools: Vec<ToolDefinition>,
         options: GenerationOptions,
     ) -> varlink::Result<()> {
-        self.rt.block_on(generation_v2::serve(
+        self.rt.block_on(generation::serve(
             &self.state,
             call,
-            generation_v2::Request {
+            generation::Request {
                 session_id,
                 input: prompt,
                 media_paths,
@@ -262,9 +259,9 @@ impl VarlinkInterface for InferenceHandler {
         ))
     }
 
-    fn stream_submit_tool_results_guided2(
+    fn stream_submit_tool_results_guided(
         &self,
-        call: &mut dyn Call_StreamSubmitToolResultsGuided2,
+        call: &mut dyn Call_StreamSubmitToolResultsGuided,
         session_id: String,
         prompt: String,
         media_paths: Vec<String>,
@@ -273,10 +270,10 @@ impl VarlinkInterface for InferenceHandler {
         tools: Vec<ToolDefinition>,
         options: GenerationOptions,
     ) -> varlink::Result<()> {
-        self.rt.block_on(generation_v2::serve(
+        self.rt.block_on(generation::serve(
             &self.state,
             call,
-            generation_v2::Request {
+            generation::Request {
                 session_id,
                 input: prompt,
                 media_paths,
@@ -450,40 +447,6 @@ impl VarlinkInterface for InferenceHandler {
             }
 
             call.reply()
-        })
-    }
-
-    fn stream_response(
-        &self,
-        call: &mut dyn Call_StreamResponse,
-        session_id: String,
-        input_json: String,
-        media_paths: Vec<String>,
-        options: ResponseOptions,
-    ) -> varlink::Result<()> {
-        self.rt.block_on(async {
-            match stream_tokens(
-                &self.state,
-                call,
-                session_id,
-                input_json,
-                media_paths,
-                options,
-            )
-            .await
-            {
-                Ok(()) => Ok(()),
-                Err(GenerationError::SessionNotFound(id)) => call.reply_session_not_found(id),
-                Err(GenerationError::ModelUnavailable(reason)) => {
-                    call.reply_model_unavailable(reason)
-                }
-                Err(GenerationError::InvalidOptions(reason)) => {
-                    call.reply_invalid_generation_options(reason)
-                }
-                Err(GenerationError::InvalidInput(reason)) => call.reply_invalid_input(reason),
-                Err(GenerationError::Failed(reason)) => reply_generation_failure(call, reason),
-                Err(GenerationError::Reply(e)) => Err(e),
-            }
         })
     }
 
@@ -666,86 +629,6 @@ impl VarlinkInterface for InferenceHandler {
                 }
                 Err(GenerationError::InvalidInput(reason)) => call.reply_invalid_input(reason),
                 Err(GenerationError::Failed(reason)) => reply_generation_failure(call, reason),
-                Err(GenerationError::Reply(e)) => Err(e),
-            }
-        })
-    }
-
-    fn stream_respond_guided(
-        &self,
-        call: &mut dyn Call_StreamRespondGuided,
-        session_id: String,
-        prompt: String,
-        media_paths: Vec<String>,
-        fields: Vec<GuidedField>,
-        tools: Vec<ToolDefinition>,
-        options: GuidedOptions,
-    ) -> varlink::Result<()> {
-        self.rt.block_on(async {
-            match stream_guided_snapshots(
-                &self.state,
-                call,
-                GuidedStreamRequest {
-                    session_id,
-                    prompt,
-                    media_paths,
-                    fields,
-                    tools,
-                    options,
-                },
-            )
-            .await
-            {
-                Ok(()) => Ok(()),
-                Err(GenerationError::SessionNotFound(id)) => call.reply_session_not_found(id),
-                Err(GenerationError::ModelUnavailable(reason)) => {
-                    call.reply_model_unavailable(reason)
-                }
-                Err(GenerationError::InvalidOptions(reason)) => {
-                    call.reply_invalid_generation_options(reason)
-                }
-                Err(GenerationError::InvalidInput(reason)) => call.reply_invalid_input(reason),
-                Err(GenerationError::Failed(reason)) => reply_guided_failure(call, reason),
-                Err(GenerationError::Reply(e)) => Err(e),
-            }
-        })
-    }
-
-    fn stream_submit_tool_results_guided(
-        &self,
-        call: &mut dyn Call_StreamSubmitToolResultsGuided,
-        session_id: String,
-        prompt: String,
-        media_paths: Vec<String>,
-        results: Vec<ToolResult>,
-        fields: Vec<GuidedField>,
-        tools: Vec<ToolDefinition>,
-        options: GuidedOptions,
-    ) -> varlink::Result<()> {
-        self.rt.block_on(async {
-            match stream_guided_tool_results(
-                &self.state,
-                call,
-                session_id,
-                prompt,
-                media_paths,
-                results,
-                fields,
-                tools,
-                options,
-            )
-            .await
-            {
-                Ok(()) => Ok(()),
-                Err(GenerationError::SessionNotFound(id)) => call.reply_session_not_found(id),
-                Err(GenerationError::ModelUnavailable(reason)) => {
-                    call.reply_model_unavailable(reason)
-                }
-                Err(GenerationError::InvalidOptions(reason)) => {
-                    call.reply_invalid_generation_options(reason)
-                }
-                Err(GenerationError::InvalidInput(reason)) => call.reply_invalid_input(reason),
-                Err(GenerationError::Failed(reason)) => reply_guided_failure(call, reason),
                 Err(GenerationError::Reply(e)) => Err(e),
             }
         })
@@ -1733,117 +1616,6 @@ fn base64_encode(data: &[u8]) -> String {
     out
 }
 
-async fn stream_tokens(
-    state: &SharedState,
-    call: &mut dyn Call_StreamResponse,
-    session_id: String,
-    input_json: String,
-    media_paths: Vec<String>,
-    options: ResponseOptions,
-) -> Result<(), GenerationError> {
-    let (max_tokens, execution_mode) = validate_token_options(
-        options.maximum_response_tokens,
-        options.temperature,
-        &options.execution_mode,
-    )
-    .map_err(GenerationError::InvalidOptions)?;
-    let resolved = resolve_session_runtime(state, &session_id, ensure_language_generation_use_case)
-        .await
-        .map_err(GenerationError::from)?;
-    let mut media_budget = MediaBudget::default();
-    let input = normalize_stream_input(&input_json, &media_paths, &mut media_budget)
-        .map_err(GenerationError::InvalidInput)?;
-    let prompt = render_text_prompt(&input);
-    let instructions =
-        apply_translation_hints(&resolved.use_case, resolved.instructions.clone(), &options);
-    with_locked_container(
-        "StreamResponse",
-        state,
-        &session_id,
-        resolved.clone(),
-        execution_mode,
-        GenerationError::Failed,
-        |container, _handle, _spawned| {
-            let wants_more = call.wants_more();
-            let mut pending_token: Option<String> = None;
-            let mut reply_error: Option<varlink::Error> = None;
-            let mut saw_token = false;
-            let mut cancelled = false;
-
-            macro_rules! generate_with_instructions {
-                ($instructions:expr) => {
-                    container.generate_with_temperature(
-                        Some($instructions),
-                        &prompt,
-                        Some(&input),
-                        max_tokens,
-                        execution_mode.as_str(),
-                        Some(options.temperature),
-                        |token| {
-                            if cancelled || resolved.cancellation(state, &session_id).is_cancelled()
-                            {
-                                cancelled = true;
-                                return;
-                            }
-                            if !token.is_empty() {
-                                saw_token = true;
-                            }
-                            if !wants_more {
-                                pending_token = Some(token);
-                                return;
-                            }
-
-                            if reply_error.is_some() {
-                                return;
-                            }
-
-                            if let Some(previous) = pending_token.replace(token) {
-                                call.set_continues(true);
-                                if let Err(e) = call.reply(previous) {
-                                    reply_error = Some(e);
-                                }
-                            }
-                        },
-                    )
-                };
-            }
-
-            let result = generate_with_instructions!(&instructions);
-
-            if let Some(e) = reply_error {
-                return Err(GenerationError::Reply(e));
-            }
-            if cancelled || resolved.cancellation(state, &session_id).is_cancelled() {
-                if wants_more {
-                    call.set_continues(false);
-                }
-                return Err(GenerationError::Failed(
-                    request_execution::request_cancelled_reason(),
-                ));
-            }
-
-            if let Err(e) = result {
-                if wants_more {
-                    call.set_continues(false);
-                }
-                return Err(GenerationError::Failed(e.to_string()));
-            }
-            if !saw_token {
-                return Err(GenerationError::Failed(
-                    "model returned no output".to_string(),
-                ));
-            }
-
-            if wants_more {
-                call.set_continues(false);
-            }
-            call.reply(pending_token.unwrap_or_default())
-                .map_err(GenerationError::Reply)
-        },
-    )
-    .await
-}
-
 enum GenerationError {
     SessionNotFound(String),
     ModelUnavailable(String),
@@ -2651,14 +2423,6 @@ fn reply_generation_failure(
     }
 }
 
-fn reply_guided_failure(call: &mut dyn VarlinkCallError, reason: String) -> varlink::Result<()> {
-    match guided_failure_reply(&reason) {
-        FailureReply::ContextWindowExceeded => call.reply_context_window_exceeded(reason),
-        FailureReply::RequestCancelled => call.reply_request_cancelled(reason),
-        _ => call.reply_guided_generation_failed(reason),
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FailureReply {
     ContextWindowExceeded,
@@ -2680,355 +2444,6 @@ fn generation_failure_reply(reason: &str) -> FailureReply {
         Some("invalid_input") => FailureReply::InvalidInput,
         _ => FailureReply::GenerationFailed,
     }
-}
-
-fn guided_failure_reply(reason: &str) -> FailureReply {
-    if request_execution::is_request_cancelled_failure(reason) {
-        return FailureReply::RequestCancelled;
-    }
-    match observability::runtime_error_code(reason) {
-        Some("context_window_exceeded") => FailureReply::ContextWindowExceeded,
-        Some("request_cancelled") => FailureReply::RequestCancelled,
-        _ => FailureReply::GenerationFailed,
-    }
-}
-
-struct GuidedStreamRequest {
-    session_id: String,
-    prompt: String,
-    media_paths: Vec<String>,
-    fields: Vec<GuidedField>,
-    tools: Vec<ToolDefinition>,
-    options: GuidedOptions,
-}
-
-async fn stream_guided_snapshots(
-    state: &SharedState,
-    call: &mut dyn Call_StreamRespondGuided,
-    request: GuidedStreamRequest,
-) -> Result<(), GenerationError> {
-    let GuidedStreamRequest {
-        session_id,
-        prompt,
-        media_paths,
-        fields,
-        tools,
-        options,
-    } = request;
-    let (max_tokens, execution_mode) = validate_token_options(
-        options.maximum_response_tokens,
-        options.temperature,
-        &options.execution_mode,
-    )
-    .map_err(GenerationError::InvalidOptions)?;
-    let schema = guided_fields_schema(&fields).map_err(GenerationError::Failed)?;
-    let resolved = resolve_session_runtime(state, &session_id, ensure_language_generation_use_case)
-        .await
-        .map_err(GenerationError::from)?;
-    let mut media_budget = MediaBudget::default();
-    let input = normalize_guided_input(&prompt, &media_paths, &mut media_budget)
-        .map_err(GenerationError::InvalidInput)?;
-    let prompt = input.as_deref().map(render_text_prompt).unwrap_or(prompt);
-    let conversation = state
-        .0
-        .lock()
-        .await
-        .sessions
-        .get(&session_id)
-        .ok_or_else(|| GenerationError::SessionNotFound(session_id.clone()))?
-        .tools
-        .clone();
-    with_locked_container(
-        "StreamRespondGuided",
-        state,
-        &session_id,
-        resolved.clone(),
-        execution_mode,
-        GenerationError::Failed,
-        |container, _handle, _spawned| {
-            let (tool_epoch, tool_context) = conversation
-                .lock()
-                .unwrap()
-                .start(&prompt, input.as_deref());
-            let mut tool_state_error = None;
-            let wants_more = call.wants_more();
-            let mut pending_snapshot: Option<String> = None;
-            let mut pending_tool_calls: Option<Vec<ToolCall>> = None;
-            let mut final_snapshot = String::new();
-            let mut emitted_tool_calls = false;
-            let mut reply_error: Option<varlink::Error> = None;
-            let mut cancelled = false;
-            let tools = tools.into_iter().map(varlink_tool_definition).collect();
-            let result = container.stream_structured(
-                Some(&resolved.instructions),
-                &prompt,
-                input.as_deref(),
-                max_tokens,
-                &schema,
-                execution_mode.as_str(),
-                tools,
-                Vec::new(),
-                Some(&tool_context),
-                Some(options.temperature),
-                |snapshot, tool_calls, done| {
-                    if cancelled || resolved.cancellation(state, &session_id).is_cancelled() {
-                        cancelled = true;
-                        return;
-                    }
-                    let update = if !tool_calls.is_empty() {
-                        conversation.lock().unwrap().remember(
-                            tool_epoch,
-                            &tool_context,
-                            &tool_calls,
-                        )
-                    } else if done {
-                        conversation.lock().unwrap().complete(tool_epoch)
-                    } else {
-                        Ok(())
-                    };
-                    if let Err(error) = update {
-                        tool_state_error = Some(error.to_string());
-                        return;
-                    }
-                    if !snapshot.is_empty() {
-                        final_snapshot = snapshot.clone();
-                    }
-                    if !wants_more {
-                        if tool_calls.is_empty() {
-                            pending_snapshot = Some(snapshot);
-                        } else {
-                            pending_tool_calls = Some(varlink_tool_calls(tool_calls));
-                        }
-                        return;
-                    }
-                    if reply_error.is_some() {
-                        return;
-                    }
-                    if !tool_calls.is_empty() {
-                        call.set_continues(false);
-                        emitted_tool_calls = true;
-                        if let Err(e) = call.reply(String::new(), varlink_tool_calls(tool_calls)) {
-                            reply_error = Some(e);
-                        }
-                        return;
-                    }
-                    if let Some(previous) = pending_snapshot.replace(snapshot) {
-                        call.set_continues(true);
-                        if let Err(e) = call.reply(previous, Vec::new()) {
-                            reply_error = Some(e);
-                        }
-                    }
-                    if done {
-                        call.set_continues(false);
-                    }
-                },
-            );
-
-            if let Some(error) = tool_state_error {
-                return Err(GenerationError::InvalidInput(error));
-            }
-            if let Some(e) = reply_error {
-                return Err(GenerationError::Reply(e));
-            }
-            if cancelled || resolved.cancellation(state, &session_id).is_cancelled() {
-                if wants_more {
-                    call.set_continues(false);
-                }
-                return Err(GenerationError::Failed(
-                    request_execution::request_cancelled_reason(),
-                ));
-            }
-            if let Err(e) = result {
-                if wants_more {
-                    call.set_continues(false);
-                }
-                return Err(GenerationError::Failed(e.to_string()));
-            }
-            if final_snapshot.is_empty() && !emitted_tool_calls && pending_tool_calls.is_none() {
-                return Err(GenerationError::Failed(
-                    "model returned no guided snapshots".to_string(),
-                ));
-            }
-            if wants_more {
-                call.set_continues(false);
-            }
-            if let Some(tool_calls) = pending_tool_calls {
-                call.reply(String::new(), tool_calls)
-                    .map_err(GenerationError::Reply)
-            } else if emitted_tool_calls {
-                Ok(())
-            } else {
-                call.reply(pending_snapshot.unwrap_or(final_snapshot), Vec::new())
-                    .map_err(GenerationError::Reply)
-            }
-        },
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn stream_guided_tool_results(
-    state: &SharedState,
-    call: &mut dyn Call_StreamSubmitToolResultsGuided,
-    session_id: String,
-    prompt: String,
-    media_paths: Vec<String>,
-    results: Vec<ToolResult>,
-    fields: Vec<GuidedField>,
-    tools: Vec<ToolDefinition>,
-    options: GuidedOptions,
-) -> Result<(), GenerationError> {
-    let (max_tokens, execution_mode) = validate_token_options(
-        options.maximum_response_tokens,
-        options.temperature,
-        &options.execution_mode,
-    )
-    .map_err(GenerationError::InvalidOptions)?;
-    let schema = guided_fields_schema(&fields).map_err(GenerationError::Failed)?;
-    let resolved = resolve_session_runtime(state, &session_id, ensure_language_generation_use_case)
-        .await
-        .map_err(GenerationError::from)?;
-    let mut media_budget = MediaBudget::default();
-    let input = normalize_guided_input(&prompt, &media_paths, &mut media_budget)
-        .map_err(GenerationError::InvalidInput)?;
-    let prompt = input.as_deref().map(render_text_prompt).unwrap_or(prompt);
-    let conversation = state
-        .0
-        .lock()
-        .await
-        .sessions
-        .get(&session_id)
-        .ok_or_else(|| GenerationError::SessionNotFound(session_id.clone()))?
-        .tools
-        .clone();
-    with_locked_container(
-        "StreamSubmitToolResultsGuided",
-        state,
-        &session_id,
-        resolved.clone(),
-        execution_mode,
-        GenerationError::Failed,
-        |container, _handle, _spawned| {
-            let wants_more = call.wants_more();
-            let mut pending_snapshot: Option<String> = None;
-            let mut pending_tool_calls: Option<Vec<ToolCall>> = None;
-            let mut final_snapshot = String::new();
-            let mut emitted_tool_calls = false;
-            let mut reply_error: Option<varlink::Error> = None;
-            let mut cancelled = false;
-            let tools = tools.into_iter().map(varlink_tool_definition).collect();
-            let tool_results: Vec<_> = results.into_iter().map(varlink_tool_result).collect();
-            let (tool_epoch, tool_context) = conversation
-                .lock()
-                .unwrap()
-                .continue_with(&tool_results, &prompt, input.as_deref())
-                .map_err(|error| GenerationError::InvalidInput(error.to_string()))?;
-            let mut tool_state_error = None;
-            let result = container.stream_structured(
-                Some(&resolved.instructions),
-                &prompt,
-                input.as_deref(),
-                max_tokens,
-                &schema,
-                execution_mode.as_str(),
-                tools,
-                tool_results,
-                Some(&tool_context),
-                Some(options.temperature),
-                |snapshot, tool_calls, done| {
-                    if cancelled || resolved.cancellation(state, &session_id).is_cancelled() {
-                        cancelled = true;
-                        return;
-                    }
-                    let update = if !tool_calls.is_empty() {
-                        conversation.lock().unwrap().remember(
-                            tool_epoch,
-                            &tool_context,
-                            &tool_calls,
-                        )
-                    } else if done {
-                        conversation.lock().unwrap().complete(tool_epoch)
-                    } else {
-                        Ok(())
-                    };
-                    if let Err(error) = update {
-                        tool_state_error = Some(error.to_string());
-                        return;
-                    }
-                    if !snapshot.is_empty() {
-                        final_snapshot = snapshot.clone();
-                    }
-                    if !wants_more {
-                        if tool_calls.is_empty() {
-                            pending_snapshot = Some(snapshot);
-                        } else {
-                            pending_tool_calls = Some(varlink_tool_calls(tool_calls));
-                        }
-                        return;
-                    }
-                    if reply_error.is_some() {
-                        return;
-                    }
-                    if !tool_calls.is_empty() {
-                        call.set_continues(false);
-                        emitted_tool_calls = true;
-                        if let Err(e) = call.reply(String::new(), varlink_tool_calls(tool_calls)) {
-                            reply_error = Some(e);
-                        }
-                        return;
-                    }
-                    if let Some(previous) = pending_snapshot.replace(snapshot) {
-                        call.set_continues(true);
-                        if let Err(e) = call.reply(previous, Vec::new()) {
-                            reply_error = Some(e);
-                        }
-                    }
-                    if done {
-                        call.set_continues(false);
-                    }
-                },
-            );
-
-            if let Some(error) = tool_state_error {
-                return Err(GenerationError::InvalidInput(error));
-            }
-            if let Some(e) = reply_error {
-                return Err(GenerationError::Reply(e));
-            }
-            if cancelled || resolved.cancellation(state, &session_id).is_cancelled() {
-                if wants_more {
-                    call.set_continues(false);
-                }
-                return Err(GenerationError::Failed(
-                    request_execution::request_cancelled_reason(),
-                ));
-            }
-            if let Err(e) = result {
-                if wants_more {
-                    call.set_continues(false);
-                }
-                return Err(GenerationError::Failed(e.to_string()));
-            }
-            if final_snapshot.is_empty() && !emitted_tool_calls && pending_tool_calls.is_none() {
-                return Err(GenerationError::Failed(
-                    "model returned no guided snapshots".to_string(),
-                ));
-            }
-            if wants_more {
-                call.set_continues(false);
-            }
-            if let Some(tool_calls) = pending_tool_calls {
-                call.reply(String::new(), tool_calls)
-                    .map_err(GenerationError::Reply)
-            } else if emitted_tool_calls {
-                Ok(())
-            } else {
-                call.reply(pending_snapshot.unwrap_or(final_snapshot), Vec::new())
-                    .map_err(GenerationError::Reply)
-            }
-        },
-    )
-    .await
 }
 
 fn varlink_tool_definition(tool: ToolDefinition) -> crate::container::ToolDefinition {
@@ -3061,14 +2476,15 @@ fn varlink_tool_calls(calls: Vec<crate::container::ToolCall>) -> Vec<ToolCall> {
 fn apply_translation_hints(
     use_case: &str,
     instructions: String,
-    options: &ResponseOptions,
+    source_language_hint: &str,
+    target_language_hint: &str,
 ) -> String {
     if use_case != "language.translate" {
         return instructions;
     }
 
-    let source = options.source_language_hint.trim();
-    let target = options.target_language_hint.trim();
+    let source = source_language_hint.trim();
+    let target = target_language_hint.trim();
     match (source.is_empty(), target.is_empty()) {
         (true, true) => instructions,
         (false, true) => format!("{instructions}\nSource language hint: {source}."),
@@ -3470,18 +2886,6 @@ mod tests {
         assert_eq!(
             generation_failure_reply(&request_execution::background_preempted_reason()),
             FailureReply::RequestCancelled
-        );
-    }
-
-    #[test]
-    fn guided_failure_reply_maps_only_request_cancelled_special_case() {
-        assert_eq!(
-            guided_failure_reply(&request_execution::request_cancelled_reason()),
-            FailureReply::RequestCancelled
-        );
-        assert_eq!(
-            guided_failure_reply("container returned error safety_refusal: no"),
-            FailureReply::GenerationFailed
         );
     }
 

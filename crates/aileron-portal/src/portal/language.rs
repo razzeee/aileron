@@ -108,11 +108,7 @@ async fn forward(
                 .tool_calls
                 .unwrap_or_default()
                 .into_iter()
-                .map(|call| ToolCallDbus {
-                    id: call.id,
-                    name: call.name,
-                    arguments_json: call.arguments_json,
-                })
+                .map(ToolCallDbus::from_varlink)
                 .collect::<Vec<_>>();
             pending.tools = Some(calls);
         }
@@ -135,8 +131,8 @@ async fn forward(
                 }
                 metadata.insert("usage".into(), values.into());
             }
-            // Existing consumers still receive a terminal stream signal. The
-            // frontend also carries the metadata in Request.Response results.
+            // End the payload stream before forwarding completion metadata
+            // for the frontend's Request.Response results.
             if let Some(calls) = pending.tools.take() {
                 LanguagePortalBackend::guided_tool_calls_received(
                     emitter, request, session, &calls, true,
@@ -230,7 +226,7 @@ pub(super) async fn stream(
                     .collect();
                 forward_call!(
                     client,
-                    client.stream_submit_tool_results_guided2(
+                    client.stream_submit_tool_results_guided(
                         record.daemon_session_id,
                         request.input,
                         media_paths,
@@ -243,7 +239,7 @@ pub(super) async fn stream(
             } else {
                 forward_call!(
                     client,
-                    client.stream_respond_guided2(
+                    client.stream_respond_guided(
                         record.daemon_session_id,
                         request.input,
                         media_paths,
@@ -256,7 +252,7 @@ pub(super) async fn stream(
         } else {
             forward_call!(
                 client,
-                client.stream_response2(
+                client.stream_response(
                     record.daemon_session_id,
                     request.input,
                     media_paths,
@@ -330,6 +326,31 @@ pub(super) async fn capabilities(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn generation_options_preserve_all_fields() {
+        let parsed = parse_options(Options::from([
+            ("handle_token".into(), owned("request")),
+            ("maximum_response_tokens".into(), owned(64_i64)),
+            ("temperature".into(), owned(0.25_f64)),
+            ("source_language_hint".into(), owned("en")),
+            ("target_language_hint".into(), owned("es")),
+            ("execution_mode".into(), owned("background")),
+            ("thinking".into(), owned("on")),
+            ("reasoning_effort".into(), owned("high")),
+            ("include_reasoning".into(), owned(true)),
+        ]))
+        .unwrap();
+        assert_eq!(parsed.maximum_response_tokens, Some(64));
+        assert_eq!(parsed.temperature, Some(0.25));
+        assert_eq!(parsed.source_language_hint.as_deref(), Some("en"));
+        assert_eq!(parsed.target_language_hint.as_deref(), Some("es"));
+        assert_eq!(parsed.execution_mode.as_deref(), Some("background"));
+        assert_eq!(parsed.thinking.as_deref(), Some("on"));
+        assert_eq!(parsed.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(parsed.include_reasoning, Some(true));
+        assert!(parse_options(Options::from([("unknown".into(), owned(true))])).is_err());
+    }
+
     #[test]
     fn distinguishes_omitted_temperature_and_rejects_wrong_types() {
         let parsed = parse_options(Options::from([("thinking".into(), owned("on"))])).unwrap();

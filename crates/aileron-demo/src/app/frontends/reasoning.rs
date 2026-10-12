@@ -125,8 +125,8 @@ async fn discover(state: &Arc<Mutex<State>>) -> anyhow::Result<Event> {
     let proxy = zbus::Proxy::new(&connection, PORTAL_BUS, PORTAL_PATH, LANGUAGE_IFACE).await?;
     let version: u32 = proxy.get_property("version").await?;
     anyhow::ensure!(
-        version >= 2,
-        "The Language portal needs version 2 for reasoning controls."
+        version >= 1,
+        "The Language portal needs version 1 for reasoning controls."
     );
     let old = state.lock().unwrap().session.clone();
     close_path(old, SESSION_IFACE).await;

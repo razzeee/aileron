@@ -79,7 +79,11 @@ The llama-server adapter includes `finish_reason` (`stop`, `length`, or
 {"id":"request-id","done":true,"finish_reason":"length","usage":{"prompt_tokens":24,"completion_tokens":512,"total_tokens":536}}
 ```
 
-The V2 daemon API forwards these fields in its completed event. The version 2
+The daemon's `StreamResponse`, `StreamRespondGuided`, and
+`StreamSubmitToolResultsGuided` methods return `GenerationEvent` replies with
+answer, reasoning, snapshot, tool-call, and completed event kinds. Generation
+options are optional fields shared by all three methods.
+The daemon API forwards these fields in its completed event. The version 1
 Language portal includes them in successful Request.Response results. The
 output token limit includes both reasoning and the answer, so a `length`
 completion can contain no answer tokens.
