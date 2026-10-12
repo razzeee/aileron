@@ -4,7 +4,17 @@ use super::{
     stream_guided_response, stream_guided_tool_results, stream_language_text,
 };
 use serde::Deserialize;
+use std::collections::HashSet;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 use zbus::zvariant::OwnedObjectPath;
+
+const STORAGE_SCAN_BUDGET: Duration = Duration::from_secs(5);
+const STORAGE_SCAN_ENTRY_LIMIT: usize = 50_000;
+const STORAGE_SCAN_MAX_DEPTH: usize = 8;
+const STORAGE_SCAN_RESULT_LIMIT: usize = 20;
+const STORAGE_SCAN_HUMAN_UNIT: u64 = 1024;
 
 pub(crate) enum ToolEvent {
     Trace(String),
@@ -83,7 +93,7 @@ impl ToolDemoCase {
                 "Collect read-only Linux PC diagnostics locally, then ask the model for fix guidance."
             }
             ToolDemoCase::StorageCleanupAdvisor => {
-                "Collect real disk usage from fixed user-owned locations, then ask the model for cleanup guidance."
+                "Inspect readable directories on local mounted filesystems within strict time and entry limits, then ask the model for cleanup guidance."
             }
         }
     }
@@ -95,7 +105,7 @@ impl ToolDemoCase {
                 "The app is waiting for approval before collecting bounded, read-only PC diagnostics."
             }
             ToolDemoCase::StorageCleanupAdvisor => {
-                "The app is waiting for approval before reading bounded, user-owned storage locations."
+                "The app is waiting for approval before reading filesystem usage and largest directories without elevated privileges."
             }
         }
     }
@@ -142,6 +152,34 @@ struct DiagnosticCommand {
     label: String,
     program: String,
     args: Vec<String>,
+}
+
+#[derive(Clone)]
+struct StorageMount {
+    path: PathBuf,
+    file_system: String,
+    device: u64,
+}
+
+struct StorageDirectorySize {
+    path: PathBuf,
+    bytes: u64,
+    complete: bool,
+}
+
+struct StorageScanState {
+    deadline: Instant,
+    entries_scanned: usize,
+    limit_reached: bool,
+    depth_limit_reached: bool,
+    unreadable_directories: usize,
+    seen_files: HashSet<(u64, u64)>,
+    mount_paths: HashSet<PathBuf>,
+}
+
+struct DirectoryScan {
+    bytes: u64,
+    complete: bool,
 }
 
 pub(crate) fn run_tool_demo(
@@ -512,7 +550,7 @@ fn run_storage_cleanup_demo(
     let tools = storage_usage_tool_definitions()?;
     let options = generation_options(512, "", "");
     let loop_prompt = format!(
-        "Available read-only app tool:\n- get_storage_usage(): run bounded df and du commands against fixed user-owned storage locations.\n\nPolicy:\n- The app owns tool execution and validates the tool name.\n- The tool only reads storage usage; it never deletes or modifies files.\n- Use the evidence to recommend safe cleanup commands for the user to review.\n- Do not claim that cleanup happened.\n\nUser request: {prompt}\n\nCall get_storage_usage now, then return a concise storage cleanup plan."
+        "Available read-only app tool:\n- get_storage_usage(): report mounted filesystem usage and largest readable directories from a globally bounded scan.\n\nPolicy:\n- The app owns tool execution and validates the tool name.\n- Collection is read-only, runs without elevated privileges, and never deletes or modifies files.\n- Use measured paths and sizes to recommend specific cleanup commands for the user to review.\n- Prefer known cache, package-cache, and journal cleanup commands. For unknown paths, suggest inspection before deletion. Explain what each command removes and any risk or privilege requirement.\n- Do not recommend deleting personal files, and do not claim that cleanup happened.\n\nUser request: {prompt}\n\nCall get_storage_usage now, then return an evidence-based cleanup plan."
     );
 
     tx.send(ToolEvent::Trace(
@@ -555,7 +593,6 @@ fn run_storage_cleanup_demo(
         )))?;
         result_json
     } else {
-        let mut command_results = Vec::new();
         for call in tool_calls {
             tx.send(ToolEvent::Trace(format!(
                 "before_tool_execution: {} id={} args={}; awaiting user approval",
@@ -575,29 +612,26 @@ fn run_storage_cleanup_demo(
                 "before_tool_execution: user approved {} id={}",
                 call.name, call.id
             )))?;
-            let result = execute_storage_usage_tool()?;
-            tx.send(ToolEvent::Trace(format!(
-                "after_tool_execution: result={}",
-                format_diagnostics_tool_result_for_trace(&result)
-            )))?;
-            command_results.extend(result["commands"].as_array().cloned().unwrap_or_default());
         }
-        serde_json::json!({
-            "tool": "get_storage_usage",
-            "read_only": true,
-            "scope": "fixed user-owned storage locations",
-            "fix_policy": "No changes were applied.",
-            "commands": command_results,
-        })
+        let result_json = execute_storage_usage_tool()?;
+        tx.send(ToolEvent::Trace(format!(
+            "after_tool_execution: result={}",
+            format_diagnostics_tool_result_for_trace(&result_json)
+        )))?;
+        result_json
     };
 
-    let model_result_json = compact_diagnostics_result_for_model(&result_json);
+    let model_result_json = compact_storage_result_for_model(&result_json);
     tx.send(ToolEvent::Trace(
-        "before_llm_call: append storage evidence and request cleanup recommendations".to_string(),
+        "before_llm_call: request plain-text storage recommendations from the bounded evidence"
+            .to_string(),
     ))?;
     let final_prompt = format!(
-        "User request: {prompt}\n\nRead-only storage evidence follows. No changes were applied. Give a concise cleanup plan with: largest storage consumers, commands the user can review, what each command removes, and any risks. Never say that commands were run. Prefer commands that target caches, old logs, or clearly disposable data; do not recommend deleting personal files.\n\n{}",
+        "User request: {prompt}\n\nRead-only storage evidence follows. No changes were applied. Name the largest measured paths and sizes, distinguish complete totals from partial scans, and suggest specific cleanup commands only when the path and command are supported by the evidence. Explain what each command removes, whether it needs elevated privileges, and any data-loss risk. For unknown paths, give an inspection command instead of a deletion command. Never say that commands were run.\n\n{}",
         model_result_json
+    );
+    let final_prompt = format!(
+        "{final_prompt}\n\nFor matches in the measured paths: `/var/cache/apt/archives` supports `sudo apt clean` (removes downloaded archives, not installed packages); `/var/cache/dnf` supports `sudo dnf clean packages`; `/var/log/journal` supports `sudo journalctl --vacuum-size=500M`. Under `~/.cache/<app>`, suggest removing only that measured cache after closing the app. Treat `~/.var/app/<id>` as personal app data, not disposable cache. Never suggest deleting a whole home, system, or app-data directory. Do not add parent-directory sizes to their descendants. If a scan was partial, say so and do not present its sizes as exact."
     );
     let final_answer = stream_language_text(&session_handle, &final_prompt, options, None)?;
     tx.send(ToolEvent::Trace(format!(
@@ -624,49 +658,17 @@ fn storage_usage_tool_definitions() -> anyhow::Result<Vec<ToolDefinitionDbus>> {
     });
     Ok(vec![ToolDefinitionDbus {
         name: "get_storage_usage".to_string(),
-        description: "Read disk usage and bounded directory sizes for fixed user-owned storage locations. This tool never deletes or changes files.".to_string(),
+        description: "Read mounted filesystem usage and largest readable directories with strict time and entry limits. This tool never deletes or changes files and does not use elevated privileges.".to_string(),
         schema_json: serde_json::to_string(&schema)?,
     }])
 }
 
 fn storage_usage_commands() -> Vec<DiagnosticCommand> {
-    let home = std::env::var_os("HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    storage_usage_commands_for_home(&home)
-}
-
-fn storage_usage_commands_for_home(home: &std::path::Path) -> Vec<DiagnosticCommand> {
-    let mut commands = vec![diagnostic_command(
+    vec![diagnostic_command(
         "mounted filesystem usage",
         "df",
         vec!["-h", "-x", "tmpfs", "-x", "devtmpfs"],
-    )];
-    for (label, relative) in [
-        ("home directory top-level usage", "."),
-        ("user cache usage", ".cache"),
-        ("user data usage", ".local/share"),
-        ("sandbox app data usage", ".var/app"),
-    ] {
-        let path = if relative == "." {
-            home.to_path_buf()
-        } else {
-            home.join(relative)
-        };
-        if path.exists() {
-            commands.push(DiagnosticCommand {
-                label: label.to_string(),
-                program: "du".to_string(),
-                args: vec![
-                    "-x".to_string(),
-                    "-h".to_string(),
-                    "--max-depth=1".to_string(),
-                    path.display().to_string(),
-                ],
-            });
-        }
-    }
-    commands
+    )]
 }
 
 fn execute_storage_usage_tool() -> anyhow::Result<serde_json::Value> {
@@ -674,13 +676,354 @@ fn execute_storage_usage_tool() -> anyhow::Result<serde_json::Value> {
         .iter()
         .map(run_diagnostic_command)
         .collect::<Vec<_>>();
+    let scan = scan_storage_directories();
     Ok(serde_json::json!({
         "tool": "get_storage_usage",
         "read_only": true,
-        "scope": "fixed user-owned storage locations",
+        "scope": "readable local mounted filesystems",
         "fix_policy": "No changes were applied.",
         "commands": commands,
+        "mounted_filesystems": scan
+            .mounts
+            .iter()
+            .map(|mount| serde_json::json!({
+                "path": mount.path,
+                "file_system": mount.file_system,
+            }))
+            .collect::<Vec<_>>(),
+        "largest_directories": scan
+            .directories
+            .iter()
+            .map(|directory| serde_json::json!({
+                "path": directory.path,
+                "size_bytes": directory.bytes,
+                "size_human": format_storage_bytes(directory.bytes),
+                "complete": directory.complete,
+            }))
+            .collect::<Vec<_>>(),
+        "entries_scanned": scan.entries_scanned,
+        "scan_complete": !scan.limit_reached
+            && !scan.depth_limit_reached
+            && scan.unreadable_directories == 0,
+        "scan_limit_reached": scan.limit_reached,
+        "depth_limit_reached": scan.depth_limit_reached,
+        "unreadable_directories": scan.unreadable_directories,
     }))
+}
+
+struct StorageScanResult {
+    mounts: Vec<StorageMount>,
+    directories: Vec<StorageDirectorySize>,
+    entries_scanned: usize,
+    limit_reached: bool,
+    depth_limit_reached: bool,
+    unreadable_directories: usize,
+}
+
+fn scan_storage_directories() -> StorageScanResult {
+    let deadline = Instant::now() + STORAGE_SCAN_BUDGET;
+    let mounts = std::fs::read_to_string("/proc/self/mountinfo")
+        .map(|contents| storage_mounts_from_mountinfo(&contents))
+        .unwrap_or_default();
+    let mount_scan_available = !mounts.is_empty();
+    let mut state = StorageScanState {
+        deadline,
+        entries_scanned: 0,
+        limit_reached: false,
+        depth_limit_reached: false,
+        unreadable_directories: 0,
+        seen_files: HashSet::new(),
+        mount_paths: mounts.iter().map(|mount| mount.path.clone()).collect(),
+    };
+    let mut directories = Vec::new();
+
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let mut mounts = mounts;
+    mounts.sort_by(|left, right| {
+        storage_mount_priority(&left.path, home.as_deref())
+            .cmp(&storage_mount_priority(&right.path, home.as_deref()))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+
+    let mut any_mount_timed_out = false;
+    let mount_count = mounts.len();
+    for (index, mount) in mounts.iter().enumerate() {
+        let now = Instant::now();
+        if now >= deadline || state.entries_scanned >= STORAGE_SCAN_ENTRY_LIMIT {
+            state.limit_reached = true;
+            break;
+        }
+        let time_left = deadline.saturating_duration_since(now);
+        let mounts_left = mount_count.saturating_sub(index).max(1) as u32;
+        state.deadline = now + time_left / mounts_left;
+        if storage_scan_limit_reached(&mut state) {
+            break;
+        }
+        let _ = scan_storage_directory(&mount.path, mount.device, 0, &mut state, &mut directories);
+        any_mount_timed_out |= state.limit_reached;
+        if Instant::now() >= deadline || state.entries_scanned >= STORAGE_SCAN_ENTRY_LIMIT {
+            state.limit_reached = true;
+            break;
+        }
+        state.limit_reached = false;
+    }
+
+    directories.sort_by_key(|directory| std::cmp::Reverse(directory.bytes));
+    directories.truncate(STORAGE_SCAN_RESULT_LIMIT);
+
+    StorageScanResult {
+        mounts,
+        directories,
+        entries_scanned: state.entries_scanned,
+        limit_reached: any_mount_timed_out || state.limit_reached || !mount_scan_available,
+        depth_limit_reached: state.depth_limit_reached,
+        unreadable_directories: state.unreadable_directories,
+    }
+}
+
+fn storage_mount_priority(path: &Path, home: Option<&Path>) -> u8 {
+    let same_device_as_home =
+        home.is_some_and(
+            |home| match (std::fs::metadata(path), std::fs::metadata(home)) {
+                (Ok(mount), Ok(home)) => mount.dev() == home.dev(),
+                _ => false,
+            },
+        );
+    if home.is_some_and(|home| {
+        path.starts_with(home) || (home.starts_with(path) && same_device_as_home)
+    }) {
+        0
+    } else if path.starts_with("/var") {
+        1
+    } else if path.starts_with("/mnt")
+        || path.starts_with("/media")
+        || path.starts_with("/run/media")
+    {
+        2
+    } else if path == Path::new("/") {
+        3
+    } else {
+        4
+    }
+}
+
+fn storage_mounts_from_mountinfo(contents: &str) -> Vec<StorageMount> {
+    let mut mounts = Vec::new();
+    let mut seen_paths = HashSet::new();
+    for line in contents.lines() {
+        let Some((mount_fields, filesystem_fields)) = line.split_once(" - ") else {
+            continue;
+        };
+        let mount_fields = mount_fields.split_whitespace().collect::<Vec<_>>();
+        let filesystem_fields = filesystem_fields.split_whitespace().collect::<Vec<_>>();
+        let (Some(encoded_path), Some(file_system)) =
+            (mount_fields.get(4), filesystem_fields.first())
+        else {
+            continue;
+        };
+        if is_virtual_or_remote_filesystem(file_system) {
+            continue;
+        }
+
+        let path = PathBuf::from(unescape_mountinfo_path(encoded_path));
+        if !path.is_absolute() || !seen_paths.insert(path.clone()) {
+            continue;
+        }
+        let Ok(metadata) = std::fs::metadata(&path) else {
+            continue;
+        };
+        if !metadata.is_dir() {
+            continue;
+        }
+        mounts.push(StorageMount {
+            path,
+            file_system: (*file_system).to_string(),
+            device: metadata.dev(),
+        });
+    }
+
+    mounts.sort_by(|left, right| {
+        left.path
+            .components()
+            .count()
+            .cmp(&right.path.components().count())
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    mounts
+}
+
+fn is_virtual_or_remote_filesystem(file_system: &str) -> bool {
+    matches!(
+        file_system,
+        "autofs"
+            | "bpf"
+            | "cifs"
+            | "cgroup"
+            | "cgroup2"
+            | "configfs"
+            | "debugfs"
+            | "devpts"
+            | "devtmpfs"
+            | "efivarfs"
+            | "fusectl"
+            | "hugetlbfs"
+            | "mqueue"
+            | "nfs"
+            | "nfs4"
+            | "proc"
+            | "pstore"
+            | "rpc_pipefs"
+            | "securityfs"
+            | "selinuxfs"
+            | "squashfs"
+            | "sysfs"
+            | "tmpfs"
+            | "tracefs"
+    ) || file_system.starts_with("fuse.")
+}
+
+fn unescape_mountinfo_path(encoded: &str) -> String {
+    let bytes = encoded.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'\\' && index + 3 < bytes.len() {
+            let digits = &bytes[index + 1..index + 4];
+            if digits.iter().all(|digit| (b'0'..=b'7').contains(digit)) {
+                let value = (digits[0] - b'0') * 64 + (digits[1] - b'0') * 8 + (digits[2] - b'0');
+                decoded.push(value);
+                index += 4;
+                continue;
+            }
+        }
+        decoded.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
+fn storage_scan_limit_reached(state: &mut StorageScanState) -> bool {
+    if state.entries_scanned >= STORAGE_SCAN_ENTRY_LIMIT || Instant::now() >= state.deadline {
+        state.limit_reached = true;
+    }
+    state.limit_reached
+}
+
+fn scan_storage_directory(
+    path: &Path,
+    root_device: u64,
+    depth: usize,
+    state: &mut StorageScanState,
+    directories: &mut Vec<StorageDirectorySize>,
+) -> DirectoryScan {
+    if storage_scan_limit_reached(state) {
+        return DirectoryScan {
+            bytes: 0,
+            complete: false,
+        };
+    }
+
+    let Ok(entries) = std::fs::read_dir(path) else {
+        state.unreadable_directories += 1;
+        return DirectoryScan {
+            bytes: 0,
+            complete: false,
+        };
+    };
+    let mut bytes = 0_u64;
+    let mut complete = true;
+
+    for entry in entries {
+        if storage_scan_limit_reached(state) {
+            complete = false;
+            break;
+        }
+        state.entries_scanned += 1;
+        let Ok(entry) = entry else {
+            state.unreadable_directories += 1;
+            complete = false;
+            continue;
+        };
+        let Ok(file_type) = entry.file_type() else {
+            state.unreadable_directories += 1;
+            complete = false;
+            continue;
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
+
+        if file_type.is_dir() {
+            let Ok(metadata) = entry.metadata() else {
+                state.unreadable_directories += 1;
+                complete = false;
+                continue;
+            };
+            if metadata.dev() != root_device || state.mount_paths.contains(&entry.path()) {
+                continue;
+            }
+            if depth >= STORAGE_SCAN_MAX_DEPTH {
+                complete = false;
+                state.depth_limit_reached = true;
+                continue;
+            }
+            let child =
+                scan_storage_directory(&entry.path(), root_device, depth + 1, state, directories);
+            bytes = bytes.saturating_add(child.bytes);
+            complete &= child.complete;
+        } else if file_type.is_file() {
+            let Ok(metadata) = entry.metadata() else {
+                state.unreadable_directories += 1;
+                complete = false;
+                continue;
+            };
+            if state.seen_files.insert((metadata.dev(), metadata.ino())) {
+                bytes = bytes.saturating_add(metadata.blocks().saturating_mul(512));
+            }
+        }
+    }
+
+    if state.limit_reached {
+        complete = false;
+    }
+    if bytes > 0 {
+        directories.push(StorageDirectorySize {
+            path: path.to_path_buf(),
+            bytes,
+            complete,
+        });
+    }
+    DirectoryScan { bytes, complete }
+}
+
+fn format_storage_bytes(bytes: u64) -> String {
+    let units = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit_index = 0;
+    while value >= STORAGE_SCAN_HUMAN_UNIT as f64 && unit_index < units.len() - 1 {
+        value /= STORAGE_SCAN_HUMAN_UNIT as f64;
+        unit_index += 1;
+    }
+    format!("{value:.1} {}", units[unit_index])
+}
+
+fn compact_storage_result_for_model(result: &serde_json::Value) -> serde_json::Value {
+    let disk_usage = result
+        .get("commands")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|commands| commands.first())
+        .map(compact_diagnostic_command_for_model)
+        .unwrap_or(serde_json::Value::Null);
+    serde_json::json!({
+        "mounted_filesystems": result.get("mounted_filesystems"),
+        "disk_usage": disk_usage,
+        "largest_directories": result.get("largest_directories"),
+        "entries_scanned": result.get("entries_scanned"),
+        "scan_complete": result.get("scan_complete"),
+        "scan_limit_reached": result.get("scan_limit_reached"),
+        "depth_limit_reached": result.get("depth_limit_reached"),
+        "unreadable_directories": result.get("unreadable_directories"),
+    })
 }
 
 fn format_storage_cleanup_answer(result: &serde_json::Value) -> String {
@@ -1664,15 +2007,18 @@ mod tests {
     }
 
     use super::{
+        STORAGE_SCAN_BUDGET, STORAGE_SCAN_ENTRY_LIMIT, STORAGE_SCAN_MAX_DEPTH, StorageScanState,
         build_linux_pc_diagnostics_plan, compact_diagnostics_result_for_model,
-        diagnostics_arguments_from_response, execute_count_tool,
+        compact_storage_result_for_model, diagnostics_arguments_from_response, execute_count_tool,
         guided_linux_pc_diagnostics_loop_fields, guided_tool_loop_fields, initial_final_answer,
-        is_safe_systemd_unit, linux_pc_diagnostics_tool_definitions,
-        parse_guided_diagnostics_loop_response, parse_guided_tool_loop_response,
-        storage_usage_commands_for_home, storage_usage_tool_definitions,
+        is_safe_systemd_unit, is_virtual_or_remote_filesystem,
+        linux_pc_diagnostics_tool_definitions, parse_guided_diagnostics_loop_response,
+        parse_guided_tool_loop_response, scan_storage_directory, storage_mounts_from_mountinfo,
+        storage_usage_commands, storage_usage_tool_definitions, unescape_mountinfo_path,
     };
     use hegel::TestCase;
     use hegel::generators as gs;
+    use std::os::unix::fs::MetadataExt;
 
     #[test]
     fn count_tool_uses_structured_arguments() {
@@ -1900,6 +2246,11 @@ mod tests {
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "get_storage_usage");
         assert!(tools[0].description.contains("never deletes"));
+        assert!(
+            tools[0]
+                .description
+                .contains("does not use elevated privileges")
+        );
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&tools[0].schema_json)
                 .expect("storage schema should be JSON")["additionalProperties"],
@@ -1909,10 +2260,9 @@ mod tests {
 
     #[test]
     fn storage_commands_have_no_mutating_programs() {
-        let commands = storage_usage_commands_for_home(std::path::Path::new("/tmp"));
+        let commands = storage_usage_commands();
 
         assert!(commands.iter().any(|command| command.program == "df"));
-        assert!(commands.iter().any(|command| command.program == "du"));
         assert!(commands.iter().all(|command| {
             !matches!(command.program.as_str(), "rm" | "rmdir" | "find")
                 && command.args.iter().all(|arg| {
@@ -1921,6 +2271,179 @@ mod tests {
                         && !arg.contains("&&")
                 })
         }));
+    }
+
+    #[test]
+    fn storage_mountinfo_decodes_paths_and_skips_virtual_filesystems() {
+        assert_eq!(
+            unescape_mountinfo_path("/mnt/data\\040disk"),
+            "/mnt/data disk"
+        );
+        assert!(is_virtual_or_remote_filesystem("tmpfs"));
+        assert!(is_virtual_or_remote_filesystem("nfs4"));
+        assert!(!is_virtual_or_remote_filesystem("btrfs"));
+        assert!(!is_virtual_or_remote_filesystem("overlay"));
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be after epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("aileron-mount test-{unique}"));
+        std::fs::create_dir_all(&root).expect("test mount path should be created");
+        let encoded_path = root.display().to_string().replace(' ', "\\040");
+        let mountinfo = format!("30 1 8:1 / {encoded_path} rw - ext4 /dev/test rw");
+        let mounts = storage_mounts_from_mountinfo(&mountinfo);
+
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].path, root);
+        assert_eq!(mounts[0].file_system, "ext4");
+        std::fs::remove_dir_all(root).expect("test mount path should be removed");
+    }
+
+    #[test]
+    fn storage_scan_reports_nested_sizes_and_skips_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be after epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("aileron-storage-test-{unique}"));
+        let nested = root.join("cache").join("browser");
+        let mounted = root.join("cache").join("mounted");
+        std::fs::create_dir_all(&nested).expect("test directory tree should be created");
+        std::fs::create_dir_all(&mounted).expect("mounted test directory should be created");
+        std::fs::write(nested.join("cache.bin"), vec![0_u8; 64 * 1024])
+            .expect("test file should be written");
+        symlink(root.join("cache"), root.join("cache-link"))
+            .expect("test symlink should be created");
+
+        let device = std::fs::metadata(&root)
+            .expect("test root should exist")
+            .dev();
+        let mut state = StorageScanState {
+            deadline: std::time::Instant::now() + STORAGE_SCAN_BUDGET,
+            entries_scanned: 0,
+            limit_reached: false,
+            depth_limit_reached: false,
+            unreadable_directories: 0,
+            seen_files: std::collections::HashSet::new(),
+            mount_paths: [mounted.clone()].into_iter().collect(),
+        };
+        let mut directories = Vec::new();
+        let result = scan_storage_directory(&root, device, 0, &mut state, &mut directories);
+
+        assert!(result.complete);
+        assert!(
+            directories
+                .iter()
+                .any(|directory| { directory.path == nested && directory.bytes >= 64 * 1024 })
+        );
+        assert!(!directories.iter().any(
+            |directory| directory.path == root.join("cache-link") || directory.path == mounted
+        ));
+        std::fs::remove_dir_all(root).expect("test directory tree should be removed");
+    }
+
+    #[test]
+    fn storage_scan_marks_max_depth_results_as_partial() {
+        use std::os::unix::fs::MetadataExt;
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be after epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("aileron-storage-depth-test-{unique}"));
+        let mut deep = root.clone();
+        for level in 0..=STORAGE_SCAN_MAX_DEPTH {
+            deep.push(format!("level-{level}"));
+        }
+        std::fs::create_dir_all(&deep).expect("deep test tree should be created");
+        std::fs::write(
+            deep.parent()
+                .expect("deep path should have a parent")
+                .join("partial.bin"),
+            vec![0_u8; 64 * 1024],
+        )
+        .expect("partial-level test file should be written");
+        std::fs::write(deep.join("data.bin"), vec![0_u8; 64 * 1024])
+            .expect("deep test file should be written");
+        let device = std::fs::metadata(&root)
+            .expect("test root should exist")
+            .dev();
+        let mut state = StorageScanState {
+            deadline: std::time::Instant::now() + STORAGE_SCAN_BUDGET,
+            entries_scanned: 0,
+            limit_reached: false,
+            depth_limit_reached: false,
+            unreadable_directories: 0,
+            seen_files: std::collections::HashSet::new(),
+            mount_paths: std::collections::HashSet::new(),
+        };
+        let mut directories = Vec::new();
+
+        let result = scan_storage_directory(&root, device, 0, &mut state, &mut directories);
+
+        assert!(!result.complete);
+        assert!(state.depth_limit_reached);
+        assert!(directories.iter().any(|directory| !directory.complete));
+        std::fs::remove_dir_all(root).expect("deep test tree should be removed");
+    }
+
+    #[test]
+    fn storage_scan_stops_at_the_global_entry_limit() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be after epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("aileron-storage-budget-test-{unique}"));
+        std::fs::create_dir_all(&root).expect("test directory should be created");
+        let device = std::fs::metadata(&root)
+            .expect("test root should exist")
+            .dev();
+        let mut state = StorageScanState {
+            deadline: std::time::Instant::now() + STORAGE_SCAN_BUDGET,
+            entries_scanned: STORAGE_SCAN_ENTRY_LIMIT,
+            limit_reached: false,
+            depth_limit_reached: false,
+            unreadable_directories: 0,
+            seen_files: std::collections::HashSet::new(),
+            mount_paths: std::collections::HashSet::new(),
+        };
+        let mut directories = Vec::new();
+
+        let result = scan_storage_directory(&root, device, 0, &mut state, &mut directories);
+
+        assert!(!result.complete);
+        assert!(state.limit_reached);
+        assert!(directories.is_empty());
+        std::fs::remove_dir_all(root).expect("test directory should be removed");
+    }
+
+    #[test]
+    fn storage_compaction_preserves_largest_paths_and_partial_status() {
+        let result = serde_json::json!({
+            "commands": [],
+            "largest_directories": [{
+                "path": "/var/cache/apt/archives",
+                "size_human": "1.2 GiB",
+                "size_bytes": 1_288_490_189_u64,
+                "complete": false,
+            }],
+            "entries_scanned": 50000,
+            "scan_complete": false,
+            "scan_limit_reached": true,
+            "unreadable_directories": 3,
+        });
+
+        let compact = compact_storage_result_for_model(&result);
+        assert_eq!(
+            compact["largest_directories"][0]["path"],
+            "/var/cache/apt/archives"
+        );
+        assert_eq!(compact["largest_directories"][0]["size_human"], "1.2 GiB");
+        assert_eq!(compact["scan_complete"], false);
+        assert_eq!(compact["scan_limit_reached"], true);
     }
 
     #[test]

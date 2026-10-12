@@ -253,7 +253,7 @@ fn tool_safety_context(case: ToolDemoCase) -> &'static str {
             "Safety context: this demo only runs bounded, read-only Linux diagnostic commands. It does not apply fixes or change system state."
         }
         ToolDemoCase::StorageCleanupAdvisor => {
-            "Safety context: this demo only reads filesystem usage from fixed user-owned locations. It never runs cleanup commands or changes system state."
+            "Safety context: this demo performs a bounded, read-only scan of readable local mounted filesystems without elevated privileges. It never runs cleanup commands or changes system state."
         }
     }
 }
