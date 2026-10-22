@@ -2471,12 +2471,12 @@ fn validate_value(value: &Value, schema: &Value, path: &str) -> Result<()> {
                 format!("{path}: expected string, got {}", value_type_name(value))
             })?;
             if let Some(min) = schema.get("minLength").and_then(|v| v.as_u64())
-                && s.len() < min as usize
+                && s.chars().count() < min as usize
             {
                 bail!("{path}: string length {} < minLength {min}", s.len());
             }
             if let Some(max) = schema.get("maxLength").and_then(|v| v.as_u64())
-                && s.len() > max as usize
+                && s.chars().count() > max as usize
             {
                 bail!("{path}: string length {} > maxLength {max}", s.len());
             }
@@ -2518,7 +2518,7 @@ fn validate_value(value: &Value, schema: &Value, path: &str) -> Result<()> {
         }
     }
 
-    Ok(())
+    check_enum(value, schema, path)
 }
 
 fn check_enum(value: &Value, schema: &Value, path: &str) -> Result<()> {

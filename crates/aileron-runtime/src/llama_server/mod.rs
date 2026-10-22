@@ -1,6 +1,7 @@
 //! Text generation through a container-private llama-server Unix socket.
 mod embeddings;
 mod gguf;
+mod measurement;
 mod process;
 mod reasoning;
 mod request;
@@ -139,6 +140,26 @@ pub fn run() -> Result<()> {
             send(
                 json!({"id":req.id,"error":"invalid_input","reason":error.to_string(),"done":true}),
             )?;
+            continue;
+        }
+        if req.request_type == "measure_request" {
+            if let Err(error) = server.ensure_running() {
+                send(
+                    json!({"id":req.id,"error":"inference_failed","reason":error.to_string(),"done":true}),
+                )?;
+                return Err(error);
+            }
+            match measurement::measure(&server.transport, &body) {
+                Ok(measurement) => {
+                    send(json!({"id":req.id,"measurement":measurement,"done":true}))?
+                }
+                Err(error) => {
+                    let code = error
+                        .downcast_ref::<RequestFailure>()
+                        .map_or("measurement_failed", |failure| failure.code);
+                    send(json!({"id":req.id,"error":code,"reason":error.to_string(),"done":true}))?;
+                }
+            }
             continue;
         }
         // The rendered HTTP body owns the input now. Keep only response context
