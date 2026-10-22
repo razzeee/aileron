@@ -534,6 +534,45 @@ impl SessionPortalBackend {
 
 #[interface(name = "org.freedesktop.impl.portal.Language")]
 impl LanguagePortalBackend {
+    #[allow(clippy::too_many_arguments)]
+    async fn measure_request(
+        &self,
+        request_handle: OwnedObjectPath,
+        session_handle: OwnedObjectPath,
+        input_json: String,
+        media_fds: Vec<OwnedFd>,
+        guided: bool,
+        fields: Vec<GuidedFieldDbus>,
+        tools: Vec<ToolDefinitionDbus>,
+        options: language::Options,
+        #[zbus(connection)] conn: &zbus::Connection,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> zbus::fdo::Result<()> {
+        ensure_portal_frontend(conn, &header).await?;
+        if !guided && (!fields.is_empty() || !tools.is_empty()) {
+            return Err(zbus::fdo::Error::InvalidArgs(
+                "fields and tools require guided=true".into(),
+            ));
+        }
+        language::measure(
+            self,
+            conn,
+            &emitter,
+            request_handle,
+            session_handle,
+            language::Request {
+                input: input_json,
+                fds: media_fds,
+                fields: guided.then_some(fields),
+                tools,
+                results: None,
+                options,
+            },
+        )
+        .await
+    }
+
     #[zbus(property, name = "version")]
     fn version(&self) -> u32 {
         1

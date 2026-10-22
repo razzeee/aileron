@@ -11,6 +11,7 @@ use std::sync::{
 use std::time::Duration;
 use uuid::Uuid;
 mod generation;
+mod schema;
 use aileron_varlink::aileron_Inference::{Call_GetReasoningCapabilities, GenerationOptions};
 
 use crate::container::{
@@ -197,6 +198,37 @@ impl InferenceHandler {
 }
 
 impl VarlinkInterface for InferenceHandler {
+    fn measure_request(
+        &self,
+        call: &mut dyn aileron_varlink::aileron_Inference::Call_MeasureRequest,
+        session_id: String,
+        input_json: String,
+        media_paths: Vec<String>,
+        guided: bool,
+        fields: Vec<GuidedField>,
+        tools: Vec<ToolDefinition>,
+        options: GenerationOptions,
+    ) -> varlink::Result<()> {
+        if !guided && (!fields.is_empty() || !tools.is_empty()) {
+            return call.reply_invalid_input("fields and tools require guided=true".into());
+        }
+        match self.rt.block_on(generation::measure(
+            &self.state,
+            generation::Request {
+                session_id,
+                input: input_json,
+                media_paths,
+                fields: guided.then_some(fields),
+                tools,
+                results: None,
+                options,
+            },
+        )) {
+            Ok(measurement) => call.reply(measurement),
+            Err(error) => generation::reply_error(call, error),
+        }
+    }
+
     fn get_reasoning_capabilities(
         &self,
         call: &mut dyn Call_GetReasoningCapabilities,

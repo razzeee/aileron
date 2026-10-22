@@ -23,7 +23,8 @@ type GenerationOptions (
   execution_mode: ?string,
   thinking: ?string,
   reasoning_effort: ?string,
-  include_reasoning: ?bool
+  include_reasoning: ?bool,
+  response_schema: ?string
 )
 
 type GenerationUsage (
@@ -176,6 +177,17 @@ method StreamSubmitToolResultsGuided(session_id: string, prompt: string, media_p
 
 # Generation streams carry answer, reasoning, snapshot, tool-call and completion events.
 method GetReasoningCapabilities(session_id: string) -> (capabilities: ReasoningCapabilities)
+
+# Measure an initial generation request without changing conversation history.
+# guided selects the same input/field semantics as StreamRespondGuided.
+method MeasureRequest(session_id: string, input_json: string, media_paths: []string, guided: bool, fields: []GuidedField, tools: []ToolDefinition, options: GenerationOptions) -> (measurement: RequestMeasurement)
+
+type RequestMeasurement (
+  input_tokens: int,
+  context_window_tokens: int,
+  requested_output_tokens: int,
+  measurement_kind: string
+)
 
 # Stream embedding vectors for text. Session must have been created with use_case: language.embed
 # embedding: the embedding vector for the supplied text
