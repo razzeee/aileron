@@ -2,7 +2,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::Mutex;
 
 use crate::assignments::Assignments;
@@ -13,9 +13,12 @@ use crate::manifests::RuntimeManifestStore;
 use crate::permissions::PermissionStore;
 use crate::profiles::ProfileStore;
 
-pub type ActiveContainerEntry = (String, ContainerHandle);
+pub type ActiveContainerEntry = (String, ContainerHandle, u64);
 pub type ActiveContainerRequests = HashMap<String, Vec<ActiveContainerEntry>>;
 pub type SharedActiveContainerRequests = Arc<StdMutex<ActiveContainerRequests>>;
+
+// Process-lifetime IDs: no reuse, including across sessions and registry removal.
+static NEXT_REGISTRATION: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Default)]
 pub struct ProfileExecutionState {
@@ -139,21 +142,45 @@ impl SharedState {
     }
 
     pub fn cancel_session_requests(&self, session_id: &str) {
+        // Whenever both locks are needed, epochs precedes closed sessions.
+        let mut epochs = self.7.lock().expect("request epoch mutex poisoned");
         self.3
             .lock()
             .expect("session cancellation mutex poisoned")
             .insert(session_id.to_string());
-        self.7.lock().unwrap().remove(session_id);
+        let epoch = epochs.entry(session_id.to_owned()).or_default();
+        *epoch = epoch.saturating_add(1);
     }
 
     pub fn request_epoch(&self, session_id: &str) -> u64 {
         self.7.lock().unwrap().get(session_id).copied().unwrap_or(0)
     }
 
-    pub fn cancel_active_requests(&self, session_id: &str) {
+    pub fn cancel_active_requests(&self, session_id: &str) -> Vec<ContainerHandle> {
         let mut epochs = self.7.lock().unwrap();
         let epoch = epochs.entry(session_id.to_owned()).or_default();
-        *epoch = epoch.wrapping_add(1);
+        *epoch = epoch.saturating_add(1);
+        // Snapshot and terminate before permitting capture of the new epoch.
+        // Do not enumerate again after releasing the lock: that could kill later work.
+        let active = self.4.lock().expect("active request mutex poisoned");
+        let handles: Vec<_> = active
+            .get(session_id)
+            .into_iter()
+            .flatten()
+            .map(|(_, handle, _)| handle.clone())
+            .collect();
+        for handle in &handles {
+            handle.terminate();
+        }
+        handles
+    }
+
+    pub fn is_request_cancelled(&self, session_id: &str, captured: u64) -> bool {
+        let epochs = self.7.lock().expect("request epoch mutex poisoned");
+        let closed = self.3.lock().expect("session cancellation mutex poisoned");
+        let current = epochs.get(session_id).copied().unwrap_or(0);
+        // MAX is a permanent exhausted tombstone, never an admissible epoch.
+        closed.contains(session_id) || current == u64::MAX || current != captured
     }
 
     pub fn is_session_cancelled(&self, session_id: &str) -> bool {
@@ -164,6 +191,8 @@ impl SharedState {
     }
 
     pub fn clear_session_cancelled(&self, session_id: &str) {
+        // Keep the epoch tombstone: reopening must not revive old guards.
+        let _epochs = self.7.lock().expect("request epoch mutex poisoned");
         self.3
             .lock()
             .expect("session cancellation mutex poisoned")
@@ -191,28 +220,27 @@ impl SharedState {
         profile_id: &str,
         session_id: &str,
         handle: ContainerHandle,
-    ) {
+    ) -> u64 {
+        let registration = NEXT_REGISTRATION
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .expect("request registration IDs exhausted");
         self.4
             .lock()
             .expect("active request mutex poisoned")
             .entry(session_id.to_string())
             .or_default()
-            .push((profile_id.to_string(), handle));
+            .push((profile_id.to_string(), handle, registration));
+        registration
     }
 
-    pub fn end_container_request(
-        &self,
-        profile_id: &str,
-        session_id: &str,
-        handle: &ContainerHandle,
-    ) {
+    pub fn end_container_request(&self, session_id: &str, registration: u64) {
         let mut active = self.4.lock().expect("active request mutex poisoned");
         let Some(handles) = active.get_mut(session_id) else {
             return;
         };
-        handles.retain(|(active_profile, active_handle)| {
-            active_profile != profile_id || !active_handle.ptr_eq(handle)
-        });
+        handles.retain(|(_, _, entry)| *entry != registration);
         if handles.is_empty() {
             active.remove(session_id);
         }
@@ -230,8 +258,8 @@ impl SharedState {
             .map(|handles| {
                 handles
                     .iter()
-                    .filter(|(active_profile, _)| active_profile == profile_id)
-                    .map(|(_, handle)| handle.clone())
+                    .filter(|(active_profile, _, _)| active_profile == profile_id)
+                    .map(|(_, handle, _)| handle.clone())
                     .collect()
             })
             .unwrap_or_default()
@@ -248,8 +276,8 @@ impl SharedState {
             .map(|handles| {
                 handles
                     .iter()
-                    .filter(|(active_profile, _)| active_profile == profile_id)
-                    .map(|(_, handle)| handle.clone())
+                    .filter(|(active_profile, _, _)| active_profile == profile_id)
+                    .map(|(_, handle, _)| handle.clone())
                     .collect()
             })
             .unwrap_or_default();
@@ -344,5 +372,26 @@ impl SharedState {
         {
             states.remove(profile_id);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registration_allocator_stops_before_reusing_an_id() {
+        // Exercise the production try_update protocol without modifying the
+        // process-global allocator or affecting concurrently running tests.
+        let counter = AtomicU64::new(u64::MAX - 1);
+        let allocate = || {
+            counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+        };
+        assert_eq!(allocate(), Ok(u64::MAX - 1));
+        assert_eq!(allocate(), Err(u64::MAX));
+        assert_eq!(allocate(), Err(u64::MAX));
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
     }
 }
