@@ -671,19 +671,19 @@ impl VarlinkInterface for InferenceHandler {
         session_id: String,
     ) -> varlink::Result<()> {
         self.rt.block_on(async {
-            let profile_id = {
+            let (profile_id, handles) = {
                 let guard = self.state.0.lock().await;
                 let Some(session) = guard.sessions.get(&session_id) else {
                     return call.reply_session_not_found(session_id);
                 };
-                self.state.cancel_active_requests(&session_id);
+                let handles = self.state.cancel_active_requests(&session_id);
                 session.tools.lock().unwrap().cancel();
-                session.profile_id.clone()
+                (session.profile_id.clone(), handles)
             };
-            request_execution::terminate_active_container_handles_for_session(
+            request_execution::finish_terminating_container_handles(
                 &self.state,
                 &profile_id,
-                &session_id,
+                handles,
             )
             .await;
             call.reply()

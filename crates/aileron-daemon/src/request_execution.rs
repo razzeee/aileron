@@ -13,9 +13,8 @@ use crate::state::SharedState;
 
 pub(crate) struct ActiveContainerRequest<'a> {
     state: &'a SharedState,
-    profile_id: &'a str,
     session_id: &'a str,
-    handle: ContainerHandle,
+    registration: u64,
 }
 
 impl<'a> ActiveContainerRequest<'a> {
@@ -25,12 +24,11 @@ impl<'a> ActiveContainerRequest<'a> {
         session_id: &'a str,
         handle: ContainerHandle,
     ) -> Self {
-        state.begin_container_request(profile_id, session_id, handle.clone());
+        let registration = state.begin_container_request(profile_id, session_id, handle);
         Self {
             state,
-            profile_id,
             session_id,
-            handle,
+            registration,
         }
     }
 }
@@ -38,7 +36,7 @@ impl<'a> ActiveContainerRequest<'a> {
 impl Drop for ActiveContainerRequest<'_> {
     fn drop(&mut self) {
         self.state
-            .end_container_request(self.profile_id, self.session_id, &self.handle);
+            .end_container_request(self.session_id, self.registration);
     }
 }
 
@@ -64,8 +62,7 @@ impl<'a> RequestCancellation<'a> {
     }
 
     pub(crate) fn is_cancelled(self) -> bool {
-        self.state.is_session_cancelled(self.session_id)
-            || self.state.request_epoch(self.session_id) != self.epoch
+        self.state.is_request_cancelled(self.session_id, self.epoch)
     }
 
     pub(crate) fn ensure_not_cancelled(self) -> Result<(), String> {
@@ -110,6 +107,14 @@ pub(crate) async fn terminate_active_container_handles_for_session(
     session_id: &str,
 ) {
     let handles = state.terminate_active_container_handles(profile_id, session_id);
+    finish_terminating_container_handles(state, profile_id, handles).await;
+}
+
+pub(crate) async fn finish_terminating_container_handles(
+    state: &SharedState,
+    profile_id: &str,
+    handles: Vec<ContainerHandle>,
+) {
     if handles.is_empty() {
         return;
     }
@@ -173,8 +178,7 @@ fn spawn_cancel_watcher(
     let thread_stop = stop.clone();
     let thread = thread::spawn(move || {
         loop {
-            if state.is_session_cancelled(&session_id) || state.request_epoch(&session_id) != epoch
-            {
+            if state.is_request_cancelled(&session_id, epoch) {
                 handle.terminate();
                 break;
             }
@@ -298,5 +302,122 @@ mod tests {
                 .unwrap_err()
                 .contains("request_cancelled")
         );
+    }
+
+    #[test]
+    fn epoch_exhaustion_is_permanent_and_session_local() {
+        let state = shared_state();
+        state.7.lock().unwrap().insert("a".into(), u64::MAX - 1);
+        let old = RequestCancellation::for_session(&state, "a");
+        state.cancel_active_requests("a");
+        assert!(old.is_cancelled());
+        assert!(RequestCancellation::for_session(&state, "a").is_cancelled());
+        state.cancel_active_requests("a");
+        mark_session_closed(&state, "a");
+        state.clear_session_cancelled("a");
+        assert_eq!(state.request_epoch("a"), u64::MAX);
+        assert!(RequestCancellation::for_session(&state, "a").is_cancelled());
+        assert!(!RequestCancellation::for_session(&state, "b").is_cancelled());
+    }
+
+    #[test]
+    fn close_reopen_never_revives_a_captured_epoch() {
+        let state = shared_state();
+        let old = RequestCancellation::for_session(&state, "a");
+        mark_session_closed(&state, "a");
+        state.clear_session_cancelled("a");
+        assert!(old.is_cancelled());
+        assert!(!RequestCancellation::for_session(&state, "a").is_cancelled());
+    }
+
+    #[test]
+    fn stale_guard_drop_preserves_new_registration_of_same_handle() {
+        let state = shared_state();
+        let handle = ContainerHandle::for_lifecycle_test();
+        let old = ActiveContainerRequest::new(&state, "profile", "a", handle.clone());
+        let newer = ActiveContainerRequest::new(&state, "profile", "a", handle.clone());
+        let other = ActiveContainerRequest::new(&state, "profile", "b", handle.clone());
+        thread::scope(|scope| {
+            // Move the actual RAII guard across threads; join fixes the interleaving.
+            scope.spawn(move || drop(old)).join().unwrap();
+        });
+        assert_eq!(state.active_container_handles("profile", "a").len(), 1);
+        assert_eq!(state.active_container_handles("profile", "b").len(), 1);
+        drop(newer);
+        assert!(state.active_container_handles("profile", "a").is_empty());
+        assert_eq!(state.active_container_handles("profile", "b").len(), 1);
+        drop(other);
+        assert!(state.4.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancellation_snapshot_excludes_later_and_other_session_handles() {
+        let state = shared_state();
+        let old = ContainerHandle::for_lifecycle_test();
+        let later = ContainerHandle::for_lifecycle_test();
+        let other = ContainerHandle::for_lifecycle_test();
+        let _old = ActiveContainerRequest::new(&state, "profile", "a", old.clone());
+        let _other = ActiveContainerRequest::new(&state, "profile", "b", other.clone());
+        let captured = state.request_epoch("a");
+        let worker_state = state.clone();
+        let snapshot = thread::spawn(move || worker_state.cancel_active_requests("a"))
+            .join()
+            .unwrap();
+        assert_eq!(snapshot.len(), 1);
+        assert!(snapshot[0].ptr_eq(&old));
+        assert!(old.is_terminating());
+        let _later = ActiveContainerRequest::new(&state, "profile", "a", later.clone());
+        finish_terminating_container_handles(&state, "profile", snapshot).await;
+        assert!(state.is_request_cancelled("a", captured));
+        assert!(!RequestCancellation::for_session(&state, "a").is_cancelled());
+        assert!(!later.is_terminating());
+        assert!(!other.is_terminating());
+    }
+
+    #[test]
+    fn racing_epoch_capture_has_a_single_cancellation_order() {
+        use std::sync::Barrier;
+        let state = shared_state();
+        for _ in 0..32 {
+            let before = state.request_epoch("a");
+            let barrier = Barrier::new(2);
+            thread::scope(|scope| {
+                let captured = scope.spawn(|| {
+                    barrier.wait();
+                    state.request_epoch("a")
+                });
+                barrier.wait();
+                state.cancel_active_requests("a");
+                let captured = captured.join().unwrap();
+                assert!(captured == before || captured == before + 1);
+                assert_eq!(
+                    state.is_request_cancelled("a", captured),
+                    captured == before
+                );
+                assert_eq!(state.request_epoch("b"), 0);
+            });
+        }
+    }
+
+    #[tokio::test]
+    async fn watcher_cancels_late_registration_but_not_a_new_epoch() {
+        let state = shared_state();
+        let old_epoch = state.request_epoch("a");
+        // Nothing was registered when cancellation took its snapshot.
+        assert!(state.cancel_active_requests("a").is_empty());
+        let old_handle = ContainerHandle::for_lifecycle_test();
+        let new_handle = ContainerHandle::for_lifecycle_test();
+        let _old = ActiveContainerRequest::new(&state, "profile", "a", old_handle.clone());
+        let _new = ActiveContainerRequest::new(&state, "profile", "a", new_handle.clone());
+        let old_watcher =
+            RequestCancellation::for_epoch(&state, "a", old_epoch).spawn_watcher(&old_handle);
+        let new_watcher = RequestCancellation::for_session(&state, "a").spawn_watcher(&new_handle);
+        tokio::time::timeout(Duration::from_secs(2), old_handle.wait_terminated())
+            .await
+            .expect("old-token watcher must queue termination");
+        old_watcher.stop();
+        new_watcher.stop();
+        assert!(old_handle.is_terminating());
+        assert!(!new_handle.is_terminating());
     }
 }
