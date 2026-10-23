@@ -60,6 +60,21 @@ impl PermissionStore {
         path: &Path,
         sync_directory: impl FnOnce(&std::fs::File) -> std::io::Result<()>,
     ) -> Result<()> {
+        self.save_to_path_with_io(
+            path,
+            std::fs::File::sync_all,
+            |from, to| std::fs::rename(from, to),
+            sync_directory,
+        )
+    }
+
+    fn save_to_path_with_io(
+        &self,
+        path: &Path,
+        sync_file: impl FnOnce(&std::fs::File) -> std::io::Result<()>,
+        rename: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+        sync_directory: impl FnOnce(&std::fs::File) -> std::io::Result<()>,
+    ) -> Result<()> {
         let data = serde_json::to_vec_pretty(self)?;
         let parent = path.parent().unwrap();
         std::fs::create_dir_all(parent)?;
@@ -72,8 +87,8 @@ impl PermissionStore {
             .open(&temporary)?;
         let result = (|| {
             file.write_all(&data)?;
-            file.sync_all()?;
-            std::fs::rename(&temporary, path)?;
+            sync_file(&file)?;
+            rename(&temporary, path)?;
             sync_directory(&directory).map_err(UncertainCommit)?;
             Ok(())
         })();
@@ -213,6 +228,46 @@ mod tests {
     use super::*;
     use hegel::TestCase;
     use hegel::generators as gs;
+
+    #[test]
+    fn injected_prepublication_failures_preserve_entire_store() {
+        for fail_sync in [false, true] {
+            for allowed in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("permissions.json");
+                let mut store = PermissionStore::default();
+                store.set_to_path("app", "case", !allowed, &path).unwrap();
+                store.set_to_path("other", "case", true, &path).unwrap();
+                let before = std::fs::read(&path).unwrap();
+                let mut next = store.clone();
+                next.0.get_mut("app/case").unwrap().allowed = allowed;
+                let result = store.commit_next(next, |next| {
+                    next.save_to_path_with_io(
+                        &path,
+                        |file| {
+                            if fail_sync {
+                                Err(std::io::Error::other("injected file sync failure"))
+                            } else {
+                                file.sync_all()
+                            }
+                        },
+                        |from, to| {
+                            assert!(!fail_sync, "rename must follow successful file sync");
+                            assert!(from.is_file());
+                            assert_eq!(to, path);
+                            Err(std::io::Error::other("injected rename failure"))
+                        },
+                        |_| panic!("directory sync must not run before publication"),
+                    )
+                });
+                assert!(result.is_err());
+                assert!(!result.unwrap_err().is::<UncertainCommit>());
+                assert_eq!(serde_json::to_vec_pretty(&store).unwrap(), before);
+                assert_eq!(std::fs::read(&path).unwrap(), before);
+                assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+            }
+        }
+    }
 
     #[test]
     fn permission_save_atomically_replaces_existing_file() {
