@@ -2578,6 +2578,15 @@ pub struct ContainerHandle {
 }
 
 impl ContainerHandle {
+    #[cfg(test)]
+    pub(crate) fn for_lifecycle_test() -> Self {
+        Self::new(tests::test_container(
+            Variant::Cpu,
+            "lifecycle-test",
+            Path::new("/unused-lifecycle-test-artifact"),
+        ))
+    }
+
     fn new(container: Container) -> Self {
         Self::new_with_published(container, true)
     }
@@ -4411,7 +4420,11 @@ mod tests {
         ))
     }
 
-    fn test_container(variant: Variant, image_ref: &str, artifact_path: &Path) -> Container {
+    pub(super) fn test_container(
+        variant: Variant,
+        image_ref: &str,
+        artifact_path: &Path,
+    ) -> Container {
         let child = std::process::Command::new("sleep")
             .arg("60")
             .stdin(Stdio::piped())
