@@ -1,0 +1,74 @@
+name: Tool conversation verification
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/tool-conversation-verification.yml'
+      - 'crates/aileron-tool-conversation-core/**'
+      - 'crates/aileron-daemon/**'
+      - 'docs/verification/tool-conversations/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/tool-conversation-verification.yml'
+      - 'crates/aileron-tool-conversation-core/**'
+      - 'crates/aileron-daemon/**'
+      - 'docs/verification/tool-conversations/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install verifier Rust toolchain
+        uses: dtolnay/rust-toolchain@1.98.1
+
+      - name: Install pinned Verus release
+        working-directory: ${{ runner.temp }}
+        run: |
+          curl --fail --location --retry 3 --silent --show-error \
+            https://github.com/verus-lang/verus/releases/download/release/0.2026.10.04.426d8b0/verus-0.2026.10.04.426d8b0-x86-linux.zip \
+            -o verus.zip
+          echo '624018662868563a7bec0dd07be5e4dd0c3d61124b4b55105765884bf2d4d1a0  verus.zip' | sha256sum --check
+          unzip -q verus.zip
+
+      - name: Verify production core and negative controls
+        run: >
+          python3 crates/aileron-tool-conversation-core/verify.py
+          "$RUNNER_TEMP/verus-x86-linux/verus"
+          "$RUNNER_TEMP/tool-conversation-evidence"
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Install daemon system dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libdbus-1-dev pkg-config
+
+      - name: Test core and daemon integration
+        run: cargo test --locked -p aileron-tool-conversation-core -p aileron-daemon --lib
+
+      - name: Check core and daemon lints
+        run: cargo clippy --locked -p aileron-tool-conversation-core -p aileron-daemon --lib --tests -- -D warnings
+
+      - name: Retain proof inputs and diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: tool-conversation-verification
+          path: ${{ runner.temp }}/tool-conversation-evidence
+          if-no-files-found: warn
+          retention-days: 30

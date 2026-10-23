@@ -9,6 +9,7 @@ name = "aileron-daemon"
 path = "src/main.rs"
 
 [dependencies]
+aileron-tool-conversation-core = { path = "../aileron-tool-conversation-core" }
 aileron-varlink = { workspace = true }
 aileron-ipc     = { workspace = true }
 tokio           = { workspace = true }
