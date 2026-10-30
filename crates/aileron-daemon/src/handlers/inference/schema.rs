@@ -81,16 +81,16 @@ fn validate(schema: &Value, depth: usize) -> Result<(), String> {
         ("minimum", "maximum", false),
     ] {
         for key in [min, max] {
-            if let Some(value) = object.get(key) {
-                if (integer && value.as_u64().is_none()) || (!integer && !value.is_number()) {
-                    return Err(format!("invalid {key}"));
-                }
+            if let Some(value) = object.get(key)
+                && ((integer && value.as_u64().is_none()) || (!integer && !value.is_number()))
+            {
+                return Err(format!("invalid {key}"));
             }
         }
-        if let (Some(min), Some(max)) = (schema[min].as_f64(), schema[max].as_f64()) {
-            if min > max {
-                return Err("schema minimum exceeds maximum".into());
-            }
+        if let (Some(min), Some(max)) = (schema[min].as_f64(), schema[max].as_f64())
+            && min > max
+        {
+            return Err("schema minimum exceeds maximum".into());
         }
     }
     if let Some(values) = object.get("enum") {
