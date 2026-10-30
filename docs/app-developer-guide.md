@@ -100,6 +100,77 @@ This is appropriate for extraction, classification, and form-filling workflows. 
 
 Use `StreamRespondGuided` for structured updates. It accepts guided fields and tool definitions, then emits JSON snapshots or tool-call requests instead of token deltas; each snapshot is validated against the same guided schema before the daemon forwards it.
 
+The Language interface accepts a `response_schema` string in the
+options of `StreamRespondGuided` and `StreamSubmitToolResultsGuided`. Pass an empty
+`fields` array when using it. For example, serialize this schema as the option:
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "category": {"type": "string", "enum": ["work", "personal", "other"]},
+    "urgency": {"type": "integer", "minimum": 0, "maximum": 5},
+    "contacts": {
+      "type": "array",
+      "maxItems": 10,
+      "items": {
+        "type": "object",
+        "properties": {"name": {"type": "string", "maxLength": 100}},
+        "required": ["name"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": ["category", "urgency"],
+  "additionalProperties": false
+}
+```
+
+Every schema node requires one scalar `type` name. The root must be an object;
+objects require `properties`, arrays require `items`. Supported constraints are
+`required`, boolean `additionalProperties`, scalar `enum`, `minimum`/`maximum`,
+`minLength`/`maxLength` (Unicode code points), and `minItems`/`maxItems`.
+`description` is optional. Unsupported keywords (including `$ref`, composition,
+and `pattern`), invalid bounds, schemas over 64 KiB, and nesting deeper than 16
+are rejected before generation. Schema validity does not guarantee factual
+accuracy. Send the same schema again when submitting tool results.
+
+## Measuring Request Size
+
+The Language interface provides:
+
+```text
+MeasureRequest(session_handle, input_json, media_fds, guided, fields, tools, options)
+    -> Request handle
+```
+
+Use `guided=false` with the same input and options as `StreamResponse`, and empty
+fields/tools. Use `guided=true` with the same prompt, fields, tools, and options
+as an initial `StreamRespondGuided` call, including `response_schema` if used.
+The `input_json` argument follows the selected method's input conventions:
+ordinary generation requires message/content-part JSON; guided generation also
+accepts plain text. Stable session instructions are included automatically.
+
+The successful `Request.Response` results contain `input_tokens`,
+`context_window_tokens`, and `requested_output_tokens` as int64 values, plus
+`measurement_kind` (`exact` or `estimate`). Compare input plus requested output
+with the context window to decide whether to trim or split the document. An
+oversized input can still be measured successfully. Counts are specific to the
+session's runtime/model and are not a reservation or a generation guarantee.
+
+The llama-server runtime currently measures text-only initial requests exactly
+by applying its chat template and tokenizer, without generating tokens. It
+includes tool definitions and any schema text inserted by the template. Tool
+selection omits the final-answer grammar, just as generation does; subsequent
+tool/answer passes depend on future output and are not measured. Media-bearing
+requests and unsupported runtimes fail rather than returning a text-only count.
+Tool-result continuations are not supported by this measurement method.
+
+Measurement may load the runtime. Use the normal Request lifecycle and
+cancellation; successful measurement does not retain the input or replace a
+pending tool conversation. Applications still own document chunking and history
+trimming.
+
 ## Tool Calling
 
 Use guided tool calls when the model should ask the app for app-local data or actions. Pass tool definitions to `StreamRespondGuided`, execute or reject any streamed `ToolCall` objects in the app, then send results back with `StreamSubmitToolResultsGuided` using the same guided fields.

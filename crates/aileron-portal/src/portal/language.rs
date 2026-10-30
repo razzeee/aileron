@@ -30,6 +30,7 @@ fn parse_options(mut values: Options) -> zbus::fdo::Result<GenerationOptions> {
         thinking: option(&mut values, "thinking")?,
         reasoning_effort: option(&mut values, "reasoning_effort")?,
         include_reasoning: option(&mut values, "include_reasoning")?,
+        response_schema: option(&mut values, "response_schema")?,
     };
     if !values.is_empty() {
         return Err(zbus::fdo::Error::InvalidArgs(
@@ -269,6 +270,89 @@ pub(super) async fn stream(
     }
     .await;
     finish_request(conn, &backend.state, request_id).await;
+    result
+}
+
+pub(super) async fn measure(
+    backend: &LanguagePortalBackend,
+    conn: &zbus::Connection,
+    emitter: &SignalEmitter<'_>,
+    request: OwnedObjectPath,
+    session: OwnedObjectPath,
+    input: Request,
+) -> zbus::fdo::Result<()> {
+    let options = parse_options(input.options)?;
+    begin_request(
+        conn,
+        &backend.state,
+        request.as_str(),
+        Some(session.as_str()),
+    )
+    .await?;
+    let result = async {
+        let record =
+            ensure_known_session(&backend.state, session.as_str(), PortalInterface::Language)?;
+        ensure_language_generation_session(&record)?;
+        attach_request_daemon_session(&backend.state, request.as_str(), &record.daemon_session_id)?;
+        backend.emit_loading(&request, &session, emitter).await?;
+        let state = backend.state.clone();
+        let request_id = request.to_string();
+        let measurement = blocking(
+            &TRANSPORT_WORKERS,
+            Some((&backend.state, request.as_str())),
+            move || {
+                let connection = connect_request_daemon(&state, &request_id)?;
+                let mut client = aileron_varlink::aileron_Inference::VarlinkClient::new(connection);
+                let guided = input.fields.is_some();
+                let reply = client
+                    .measure_request(
+                        record.daemon_session_id,
+                        input.input,
+                        input.fds.iter().map(fd_proc_path).collect(),
+                        guided,
+                        input
+                            .fields
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(GuidedFieldDbus::into_varlink)
+                            .collect(),
+                        input
+                            .tools
+                            .into_iter()
+                            .map(ToolDefinitionDbus::into_varlink)
+                            .collect(),
+                        options,
+                    )
+                    .call()
+                    .map(|reply| reply.measurement)
+                    .map_err(|e| map_request_error(&state, &request_id, e));
+                drop(input.fds);
+                reply
+            },
+        )
+        .await?;
+        ensure_request_active(&backend.state, request.as_str())?;
+        let values = Options::from([
+            ("input_tokens".into(), measurement.input_tokens.into()),
+            (
+                "context_window_tokens".into(),
+                measurement.context_window_tokens.into(),
+            ),
+            (
+                "requested_output_tokens".into(),
+                measurement.requested_output_tokens.into(),
+            ),
+            (
+                "measurement_kind".into(),
+                owned(measurement.measurement_kind),
+            ),
+        ]);
+        LanguagePortalBackend::generation_completed(emitter, &request, &session, values)
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))
+    }
+    .await;
+    finish_request(conn, &backend.state, request.as_str()).await;
     result
 }
 

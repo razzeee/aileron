@@ -126,6 +126,37 @@ scheduling/preemption but has no fixed per-token delay in the server.
 An incomplete or invalid structured answer instead returns
 `schema_validation_failed` and leaves the runtime available for another request.
 
+## Request Measurement
+
+The optional `measure_request` operation takes the same `system`, `prompt`,
+`input`, `max_tokens`, reasoning options, `tools`, and `response_format` as an
+initial generation request. Presence of `response_format` selects structured
+generation semantics. It must not generate tokens or mutate conversation state.
+
+```json
+{"id":"measure-id","type":"measure_request","system":"Be concise","prompt":"Summarize this document","max_tokens":512}
+{"id":"measure-id","measurement":{"input_tokens":24,"context_window_tokens":4096,"requested_output_tokens":512,"measurement_kind":"exact"},"done":true}
+```
+
+Counts are nonnegative input tokens, positive context capacity, and the positive
+requested output budget, all representable as signed 64-bit integers.
+`measurement_kind` is `exact` or `estimate`. Include template formatting, system
+instructions, tool definitions, and any response-constraint text actually added
+to the initial prompt. Count oversized prompts without evaluating them. Do not
+claim an exact count when modality preprocessing or tokenization is unavailable;
+return a terminal error instead. This operation measures initial requests, not
+tool-result continuations or future generation passes, and is not a reservation.
+
+The llama-server adapter uses `/props`, `/apply-template`, and `/tokenize` on its
+container-private Unix socket. These do not perform inference. The pinned
+server's template endpoint uses the same chat request parser as generation;
+tokenization enables special tokens and special-token parsing as generation
+does. Image/audio counting is unsupported. For tool selection, the adapter
+removes the final-answer grammar just as it does during generation. The later
+answer pass cannot be measured before the model produces its first response.
+Measurement failures use `unsupported_request` or `measurement_failed`; no
+partial count is returned. Other runtimes may reject this optional operation.
+
 ## Structured Generation
 
 Request:

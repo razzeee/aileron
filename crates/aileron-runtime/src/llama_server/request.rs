@@ -7,7 +7,9 @@ const DEFAULT_SYSTEM: &str = "You are a helpful assistant. Always respond in the
 
 pub(super) fn maximum_tokens(req: &Request) -> u32 {
     req.max_tokens.unwrap_or(
-        if matches!(req.request_type.as_str(), "generate" | "describe") {
+        if matches!(req.request_type.as_str(), "generate" | "describe")
+            || (req.request_type == "measure_request" && req.response_format.is_none())
+        {
             512
         } else {
             1024
@@ -36,6 +38,7 @@ pub(super) fn convert(req: &Request) -> Result<Value> {
         matches!(
             req.request_type.as_str(),
             "generate"
+                | "measure_request"
                 | "generate_structured"
                 | "generate_structured_stream"
                 | "describe"
@@ -52,7 +55,7 @@ pub(super) fn convert(req: &Request) -> Result<Value> {
     let structured = matches!(
         req.request_type.as_str(),
         "generate_structured" | "generate_structured_stream" | "detect"
-    );
+    ) || (req.request_type == "measure_request" && req.response_format.is_some());
     let dedicated_vision = matches!(req.request_type.as_str(), "describe" | "ocr" | "detect");
     let max_tokens = maximum_tokens(req);
     ensure!(max_tokens > 0, "max_tokens must be positive");

@@ -111,7 +111,7 @@ pub(super) async fn serve<C: EventCall + ?Sized>(
         ));
     }
     let mut aggregate = event("completed");
-    let result = generate(state, request, |incoming| {
+    let result = generate(state, request, false, |incoming| {
         let done = incoming.kind == "completed";
         if wants_events {
             return call.emit(incoming, !done);
@@ -137,16 +137,26 @@ pub(super) async fn serve<C: EventCall + ?Sized>(
     })
     .await;
     match result {
-        Ok(()) => Ok(()),
+        Ok(_) => Ok(()),
         Err(error) => call.fail(error),
     }
+}
+
+pub(super) async fn measure(
+    state: &SharedState,
+    request: Request,
+) -> Result<aileron_varlink::aileron_Inference::RequestMeasurement, GenerationError> {
+    generate(state, request, true, |_| Ok(()))
+        .await?
+        .ok_or_else(|| GenerationError::Failed("runtime omitted measurement".into()))
 }
 
 async fn generate(
     state: &SharedState,
     request: Request,
+    measure: bool,
     mut emit: impl FnMut(GenerationEvent) -> varlink::Result<()>,
-) -> Result<(), GenerationError> {
+) -> Result<Option<aileron_varlink::aileron_Inference::RequestMeasurement>, GenerationError> {
     let options = request.options;
     let (max_tokens, mode) = validate_token_options(
         options.maximum_response_tokens.unwrap_or(512),
@@ -183,12 +193,11 @@ async fn generate(
         .as_deref()
         .map(render_text_prompt)
         .unwrap_or(request.input);
-    let schema = request
-        .fields
-        .as_ref()
-        .map(|fields| guided_fields_schema(fields))
-        .transpose()
-        .map_err(GenerationError::Failed)?;
+    let schema = super::schema::response_schema(
+        request.fields.as_deref(),
+        options.response_schema.as_deref(),
+    )
+    .map_err(GenerationError::InvalidOptions)?;
     let conversation = state
         .0
         .lock()
@@ -231,7 +240,9 @@ async fn generate(
             }
             let mut runtime = ContainerRequest::new(
                 Uuid::new_v4().to_string(),
-                if guided {
+                if measure {
+                    "measure_request"
+                } else if guided {
                     "generate_structured_stream"
                 } else {
                     "generate"
@@ -262,6 +273,40 @@ async fn generate(
                     .map(varlink_tool_definition)
                     .collect(),
             );
+            if measure {
+                // Do not start/replace a tool conversation or retain any input.
+                let mut measurement = None;
+                container
+                    .stream_generation(&runtime, |value| {
+                        RequestCancellation::for_epoch(
+                            state,
+                            &request.session_id,
+                            resolved.request_epoch,
+                        )
+                        .ensure_not_cancelled()
+                        .map_err(anyhow::Error::msg)?;
+                        if value["done"] == true {
+                            let measured: aileron_varlink::aileron_Inference::RequestMeasurement =
+                                serde_json::from_value(value["measurement"].clone())?;
+                            anyhow::ensure!(
+                                measured.input_tokens >= 0
+                                    && measured.context_window_tokens > 0
+                                    && measured.requested_output_tokens == i64::from(max_tokens)
+                                    && matches!(
+                                        measured.measurement_kind.as_str(),
+                                        "exact" | "estimate"
+                                    ),
+                                "invalid runtime measurement"
+                            );
+                            measurement = Some(measured);
+                        }
+                        Ok(())
+                    })
+                    .map_err(|e| GenerationError::Failed(e.to_string()))?;
+                return measurement
+                    .map(Some)
+                    .ok_or_else(|| GenerationError::Failed("runtime omitted measurement".into()));
+            }
             let (epoch, context) = if let Some(results) = request.results {
                 let results: Vec<_> = results.into_iter().map(varlink_tool_result).collect();
                 let prepared = conversation
@@ -349,7 +394,9 @@ async fn generate(
             if let Some(error) = reply_error {
                 return Err(GenerationError::Reply(error));
             }
-            result.map_err(|e| GenerationError::Failed(e.to_string()))
+            result
+                .map(|_| None)
+                .map_err(|e| GenerationError::Failed(e.to_string()))
         },
     )
     .await
