@@ -270,14 +270,16 @@ async fn generate(
                     .continue_with(&results, &prompt, input.as_deref())
                     .map_err(|e| GenerationError::InvalidInput(e.to_string()))?;
                 runtime.tool_results = Some(results);
-                prepared
+                (Some(prepared.0), prepared.1)
             } else if guided {
-                conversation
+                let prepared = conversation
                     .lock()
                     .unwrap()
                     .start(&prompt, input.as_deref())
+                    .map_err(|e| GenerationError::InvalidInput(e.to_string()))?;
+                (Some(prepared.0), prepared.1)
             } else {
-                (0, Value::Null)
+                (None, Value::Null)
             };
             if guided {
                 runtime.tool_context = Some(context.clone());
@@ -314,17 +316,23 @@ async fn generate(
                 if let Some(calls) = value.get("tool_calls") {
                     let calls: Vec<crate::container::ToolCall> =
                         serde_json::from_value(calls.clone())?;
-                    conversation
-                        .lock()
-                        .unwrap()
-                        .remember(epoch, &context, &calls)?;
+                    conversation.lock().unwrap().remember(
+                        epoch.ok_or_else(|| {
+                            anyhow::anyhow!("unexpected tool calls outside a tool conversation")
+                        })?,
+                        &context,
+                        &calls,
+                    )?;
                     let mut e = event("tool_calls");
                     e.tool_calls = Some(varlink_tool_calls(calls));
                     events.push(e);
                 }
                 if value["done"] == true {
                     if guided && value.get("tool_calls").is_none() {
-                        conversation.lock().unwrap().complete(epoch)?;
+                        conversation
+                            .lock()
+                            .unwrap()
+                            .complete(epoch.ok_or_else(|| anyhow::anyhow!("missing tool turn"))?)?;
                     }
                     let mut e = event("completed");
                     e.finish_reason = value["finish_reason"]
